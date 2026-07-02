@@ -14,6 +14,9 @@
  */
 const express = require("express");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());            // lock to your app's origin in prod: cors({ origin: "https://yourapp.com" })
@@ -22,6 +25,22 @@ app.use(express.json());
 const PORT = process.env.PORT || 8787;
 const YF = "https://query1.finance.yahoo.com";
 const UA = { "User-Agent": "Mozilla/5.0 (MatrixProxy)" };
+
+/* ------------------------------ user store --------------------------------
+ * NOTE: this is a simple JSON-file store — fine for a hobby project, but
+ * Render's free-tier disk is wiped on every new deploy (not on sleep/wake).
+ * For anything real, swap this for a proper database (e.g. Supabase,
+ * MongoDB Atlas free tier) and keep the same function signatures below. */
+const USERS_FILE = path.join(__dirname, "users.json");
+function loadUsers() {
+  try { return JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch { return {}; }
+}
+function saveUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+}
+function normId(identifier) {
+  return String(identifier || "").trim().toLowerCase();
+}
 
 /* ----------------------------- tiny TTL cache ----------------------------- */
 const cache = new Map();
@@ -124,6 +143,57 @@ app.post("/api/ask", async (req, res) => {
     const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
     res.json({ text });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
+});
+
+/* -------------------------------- /api/auth -------------------------------- */
+// Signup: { identifier (mobile or email), name, pin } -> creates the account
+app.post("/api/auth/signup", async (req, res) => {
+  const identifier = normId(req.body?.identifier);
+  const name = String(req.body?.name || "").trim();
+  const pin = String(req.body?.pin || "");
+  if (!identifier || !name) return res.status(400).json({ error: "identifier and name required" });
+  if (!/^\d{4,6}$/.test(pin)) return res.status(400).json({ error: "PIN must be 4-6 digits" });
+
+  const users = loadUsers();
+  if (users[identifier]) return res.status(409).json({ error: "An account with this mobile/email already exists" });
+
+  const pinHash = await bcrypt.hash(pin, 10);
+  users[identifier] = { identifier, name, pinHash, onboarded: false, profile: null, createdAt: Date.now() };
+  saveUsers(users);
+
+  res.json({ ok: true, user: { identifier, name, onboarded: false, profile: null } });
+});
+
+// Login: { identifier, pin } -> returns the saved profile/onboarded flag
+app.post("/api/auth/login", async (req, res) => {
+  const identifier = normId(req.body?.identifier);
+  const pin = String(req.body?.pin || "");
+  if (!identifier || !pin) return res.status(400).json({ error: "identifier and pin required" });
+
+  const users = loadUsers();
+  const u = users[identifier];
+  if (!u) return res.status(404).json({ error: "No account found for this mobile/email" });
+
+  const ok = await bcrypt.compare(pin, u.pinHash);
+  if (!ok) return res.status(401).json({ error: "Incorrect PIN" });
+
+  res.json({ ok: true, user: { identifier: u.identifier, name: u.name, onboarded: u.onboarded, profile: u.profile } });
+});
+
+// Save personalization profile after onboarding, so it never shows again
+app.post("/api/auth/profile", (req, res) => {
+  const identifier = normId(req.body?.identifier);
+  const profile = req.body?.profile ?? null;
+  if (!identifier) return res.status(400).json({ error: "identifier required" });
+
+  const users = loadUsers();
+  const u = users[identifier];
+  if (!u) return res.status(404).json({ error: "No account found" });
+
+  u.profile = profile;
+  u.onboarded = true;
+  saveUsers(users);
+  res.json({ ok: true, user: { identifier: u.identifier, name: u.name, onboarded: true, profile } });
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
