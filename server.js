@@ -39,12 +39,22 @@ const j = async (url) => {
 /* ------------------------------- /api/quote ------------------------------- */
 // e.g. /api/quote?symbols=RELIANCE.NS,AAPL,BTC-USD,^NSEI
 // Uses the v8 chart endpoint per symbol (no crumb/cookie needed → reliable).
+// Run async fn over items with limited concurrency (avoids Yahoo 429s on big lists).
+async function mapLimit(arr, limit, fn) {
+  const out = new Array(arr.length);
+  let i = 0;
+  const workers = Array(Math.min(limit, arr.length || 1)).fill(0).map(async () => {
+    while (i < arr.length) { const idx = i++; out[idx] = await fn(arr[idx], idx); }
+  });
+  await Promise.all(workers);
+  return out;
+}
 app.get("/api/quote", async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
     const quotes = await memo(`q:${symbols.join(",")}`, 15_000, async () => {
-      const rows = await Promise.all(symbols.map(async (sym) => {
+      const rows = await mapLimit(symbols, 6, async (sym) => {
         try {
           const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=1d`);
           const m = d.chart?.result?.[0]?.meta;
@@ -54,7 +64,7 @@ app.get("/api/quote", async (req, res) => {
           const chg = prev ? (price / prev - 1) * 100 : 0;
           return { sym, name: m.symbol || sym, price, chg: +chg.toFixed(2), currency: m.currency };
         } catch { return null; }
-      }));
+      });
       return rows.filter(Boolean);
     });
     res.json({ quotes });
