@@ -14,6 +14,8 @@
  */
 const express = require("express");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());            // lock to your app's origin in prod: cors({ origin: "https://yourapp.com" })
@@ -22,6 +24,36 @@ app.use(express.json());
 const PORT = process.env.PORT || 8787;
 const YF = "https://query1.finance.yahoo.com";
 const UA = { "User-Agent": "Mozilla/5.0 (MatrixProxy)" };
+
+/* --------------------- flat-file trade store (per user) -------------------- */
+// Simple JSON "database" on disk. Structure: { [userId]: [ {id, sym, name,
+// entry, entryAt, exit, exitAt, pnl, qty, market}, ... ] }. Good enough for a
+// virtual-trading app; swap for SQLite/Postgres when you outgrow a flat file.
+const DB_FILE = process.env.TRADES_FILE || path.join(__dirname, "trades.json");
+function readDB() { try { return JSON.parse(fs.readFileSync(DB_FILE, "utf8")); } catch { return {}; } }
+function writeDB(db) { try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch (e) { console.error("trades write failed", e.message); } }
+
+// Save a completed trade:  POST /api/trades   body: { userId, trade }
+app.post("/api/trades", (req, res) => {
+  const { userId, trade } = req.body || {};
+  if (!userId || !trade || !trade.sym) return res.status(400).json({ error: "userId and trade required" });
+  const db = readDB();
+  const rec = { id: trade.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...trade };
+  db[userId] = [rec, ...(db[userId] || [])].slice(0, 5000);   // cap history per user
+  writeDB(db);
+  res.json({ ok: true, trade: rec });
+});
+
+// Fetch trade history:  GET /api/trades?userId=&from=<ms>&to=<ms>
+app.get("/api/trades", (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const from = req.query.from ? +req.query.from : 0;
+  const to = req.query.to ? +req.query.to : Date.now();
+  const all = readDB()[userId] || [];
+  const trades = all.filter((t) => { const x = t.exitAt || t.entryAt || 0; return x >= from && x <= to; });
+  res.json({ trades });
+});
 
 /* ----------------------------- tiny TTL cache ----------------------------- */
 const cache = new Map();
@@ -113,26 +145,40 @@ app.get("/api/news", async (req, res) => {
 });
 
 /* -------------------------------- /api/ask -------------------------------- */
-// Server-side Ask Matrix: keeps your Anthropic key off the client.
+// Server-side Ask Matrix. Uses Gemini if GEMINI_API_KEY is set, else Anthropic.
+// Set ONE of:  GEMINI_API_KEY=...   or   ANTHROPIC_API_KEY=...
 app.post("/api/ask", async (req, res) => {
   const { messages = [], context = "", system: sysOverride, max_tokens = 1000 } = req.body || {};
-  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
   const DEFAULT = `You are Matrix — the world's sharpest stock-market research assistant, fluent in fundamental, technical and macro analysis. Be crisp and structured; give bull case, bear case and key levels rather than a bare command. End with a one-line reminder that this is educational research, not financial advice.`;
-  // Callers may pass a complete `system` (persona already included) OR just `context`.
   const system = sysOverride ? sysOverride : (DEFAULT + (context ? "\n\nCONTEXT:\n" + context : ""));
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens, system, messages }),
-    });
-    const data = await r.json();
-    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-    res.json({ text });
+    // ---- Preferred: Google Gemini ----
+    if (process.env.GEMINI_API_KEY) {
+      const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+      const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: typeof m.content === "string" ? m.content : (m.content || []).map((c) => c.text || "").join("\n") }] }));
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ system_instruction: { parts: [{ text: system }] }, contents, generationConfig: { maxOutputTokens: max_tokens } }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error?.message || `gemini ${r.status}`);
+      const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("\n").trim();
+      return res.json({ text, engine: "gemini" });
+    }
+    // ---- Fallback: Anthropic ----
+    if (process.env.ANTHROPIC_API_KEY) {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens, system, messages }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error?.message || `anthropic ${r.status}`);
+      const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+      return res.json({ text, engine: "anthropic" });
+    }
+    return res.status(500).json({ error: "No LLM key set. Set GEMINI_API_KEY (preferred) or ANTHROPIC_API_KEY." });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
 
