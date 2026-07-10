@@ -1,85 +1,53 @@
-# Matrix — live-data backend (starter)
+# Matrix — backend proxy
 
-A thin proxy that lets the Matrix app use **real** prices, candles, news, and a
-server-side **Ask Matrix**, without exposing API keys in the browser.
+A thin Node/Express service that gives the Matrix app:
+
+- **Live prices / candles / news** (Yahoo Finance, cached) — Yahoo can't be called from the browser (CORS + crumb auth), so it's proxied here.
+- **Ask Matrix / Deep Analysis / plain-language interpretation** via an LLM. Tries **Groq → OpenRouter → Gemini → Anthropic** (first key found wins).
+- **Login** (phone + PIN) and **per-user persistence** stored in flat JSON files.
+
+Keys never touch the browser — they live only as environment variables on the server.
+
+## Endpoints
+- `GET  /api/quote?symbols=NVDA,RELIANCE.NS` — batched live quotes
+- `GET  /api/history?symbol=NVDA&range=6mo&interval=1d` — OHLC candles
+- `GET  /api/news?symbol=NVDA` — recent headlines
+- `POST /api/ask` — `{ messages, system, max_tokens }` → `{ text, engine }`
+- `POST /api/register` — `{ phone, pin, name? }` → `{ ok, userId }`
+- `POST /api/login` — `{ phone, pin }` → `{ ok, userId, name }`
+- `POST /api/trades` / `GET /api/trades?userId=&from=&to=` — trade history
+- `POST /api/state` / `GET /api/state?userId=` — per-user app state
+
+## Environment variables
+Set **one** LLM key (free tiers first):
+
+| Variable | Purpose |
+|---|---|
+| `GROQ_API_KEY` | **Recommended, free.** Groq (console.groq.com). |
+| `OPENROUTER_API_KEY` | OpenRouter (has free `:free` models). |
+| `GEMINI_API_KEY` | Google Gemini free tier. |
+| `ANTHROPIC_API_KEY` | Anthropic (paid). |
+| `GROQ_MODEL` | optional, default `llama-3.3-70b-versatile` |
+| `NEWS_API_KEY` | optional, enables richer news |
+| `PORT` | set automatically by Render |
+
+Data files (`trades.json`, `users.json`, `state.json`) are created next to `server.js`.
+On Render's free tier the disk is **ephemeral** (wiped on redeploy/restart) — fine for a demo;
+add a Render Disk or a real database (SQLite/Postgres) for durable storage.
 
 ## Run locally
 ```bash
 cd matrix-backend
-npm init -y
-npm i express cors
-ANTHROPIC_API_KEY=sk-ant-...  PORT=8787  node server.js
-```
-Node 18+ (uses global `fetch`). Optional: `NEWS_API_KEY` for NewsAPI; otherwise
-Yahoo's search-news fallback is used.
-
-## Endpoints
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/quote?symbols=RELIANCE.NS,AAPL` | live price, % change, volume, P/E |
-| GET | `/api/history?symbol=RELIANCE.NS&range=6mo&interval=1d` | OHLC candles |
-| GET | `/api/news?symbol=RELIANCE.NS` | recent headlines |
-| POST | `/api/ask` `{messages, context}` | Ask Matrix (Claude, key stays server-side) |
-| GET | `/health` | liveness |
-
-Indian tickers use Yahoo suffixes: NSE `.NS` (e.g. `RELIANCE.NS`), BSE `.BO`.
-Crypto: `BTC-USD`. Commodities/futures: `GC=F` (gold), `CL=F` (WTI).
-
-## Turn on live Yahoo prices in the app
-The app already has the wiring. In `Matrix.jsx`, set:
-```js
-const BACKEND_URL = "https://your-matrix-proxy.onrender.com"; // your deployed proxy
-```
-On load (and every 30s) the app calls `/api/quote` for the whole universe,
-maps app tickers → Yahoo tickers, and overlays **real price + % change** onto
-every screen. The header badge flips from **SIM** to **LIVE**. With
-`BACKEND_URL` empty (e.g. the chat preview), it stays on simulated data.
-
-Ticker mapping is built in: NSE stocks → `RELIANCE.NS`, US → `AAPL`, crypto →
-`BTC-USD`, and indexes/commodities via a small table (`NIFTY50 → ^NSEI`,
-`BANKNIFTY → ^NSEBANK`, `SENSEX → ^BSESN`, `SPX → ^GSPC`, `GOLD → GC=F`, …).
-Charts/technicals stay simulated for now — only the headline price and change
-are live. Wire `/api/history` into `<CandleChart/>` next to make charts live too.
-
-**Update:** charts and news are now wired too. Once `BACKEND_URL` is set, the
-candle charts (drawer, Ideas, and the detail page) pull real OHLC from
-`/api/history` for the selected timeframe (3m/5m/30m/1h/4h/1d → nearest Yahoo
-interval), showing a small "● LIVE" tag, and the detail-page News section pulls
-real headlines from `/api/news` (Yahoo, or NewsAPI if `NEWS_API_KEY` is set).
-Prices refresh every 1 minute.
-
-## Point the app at it (details)
-In `Matrix.jsx`, replace the mock dataset with a fetch layer. Minimal example:
-
-```js
-const API = "http://localhost:8787";
-
-export async function getQuotes(symbols) {
-  const r = await fetch(`${API}/api/quote?symbols=${symbols.join(",")}`);
-  return (await r.json()).quotes;
-}
-export async function getCandles(symbol, range = "6mo", interval = "1d") {
-  const r = await fetch(`${API}/api/history?symbol=${symbol}&range=${range}&interval=${interval}`);
-  return (await r.json()).candles; // feed straight into <CandleChart/>
-}
+npm install
+GROQ_API_KEY=gsk_xxx node server.js      # http://localhost:8787
 ```
 
-Then in `useMatrixChat`, swap the direct Anthropic call for:
-```js
-const res = await fetch(`${API}/api/ask`, {
-  method: "POST", headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ messages: next, context: systemContext }),
-});
-const { text } = await res.json();
-```
+## Deploy on Render
+1. Push this `matrix-backend` folder to a GitHub repo.
+2. Render → **New → Web Service** → connect the repo.
+3. **Root Directory:** `matrix-backend` · **Build:** `npm install` · **Start:** `npm start`
+4. **Environment → Add** `GROQ_API_KEY` (and optionally `NEWS_API_KEY`).
+5. Deploy, then copy the service URL (e.g. `https://matrix-backend-xxxx.onrender.com`).
+6. In the frontend `src/Matrix.jsx`, set `const BACKEND_URL = "https://matrix-backend-xxxx.onrender.com";` (no trailing slash).
 
-## Production notes
-- **Lock CORS** to your domain: `cors({ origin: "https://yourapp.com" })`.
-- Yahoo endpoints are unofficial + rate-limited — fine for a prototype. For
-  scale, license **NSE Data**, **Twelve Data**, or **Alpha Vantage** and keep
-  these same response shapes so the app doesn't change.
-- Add Redis instead of the in-memory cache if you run more than one instance.
-- Deploy on Render / Railway / Fly.io. If you later add real broker order
-  placement (Zerodha Kite, Upstox, Dhan…), note SEBI's **static-IP requirement
-  for API trading from 1 Apr 2026** — use a fixed-IP host.
-- Keep the app's "educational / not investment advice" disclaimer.
+**Smoke test:** open `https://<your-url>/api/quote?symbols=NVDA` — real JSON = working.
