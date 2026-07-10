@@ -55,6 +55,50 @@ app.get("/api/trades", (req, res) => {
   res.json({ trades });
 });
 
+/* ----------------------- users (phone + PIN) & state ---------------------- */
+// Flat-file auth for a virtual-trading app. NOTE: PINs are lightly hashed, not
+// bank-grade security — fine for a demo, swap for a real auth provider for prod.
+const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, "users.json");
+const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, "state.json");
+const readUsers = () => { try { return JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch { return {}; } };
+const writeUsers = (d) => { try { fs.writeFileSync(USERS_FILE, JSON.stringify(d)); } catch (e) { console.error(e.message); } };
+const readState = () => { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return {}; } };
+const writeState = (d) => { try { fs.writeFileSync(STATE_FILE, JSON.stringify(d)); } catch (e) { console.error(e.message); } };
+const crypto = require("crypto");
+const hashPin = (pin) => crypto.createHash("sha256").update(String(pin) + "|matrix").digest("hex");
+const cleanPhone = (p) => String(p || "").replace(/[^0-9]/g, "");
+
+app.post("/api/register", (req, res) => {
+  const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin, name = (req.body && req.body.name) || "";
+  if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
+  const users = readUsers();
+  if (users[phone]) return res.status(409).json({ error: "That number is already registered — please log in." });
+  users[phone] = { pin: hashPin(pin), name, createdAt: Date.now() };
+  writeUsers(users);
+  res.json({ ok: true, userId: phone, name });
+});
+
+app.post("/api/login", (req, res) => {
+  const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin;
+  const users = readUsers();
+  const u = users[phone];
+  if (!u || u.pin !== hashPin(pin)) return res.status(401).json({ error: "Wrong phone or PIN." });
+  res.json({ ok: true, userId: phone, name: u.name || "" });
+});
+
+// Save/load a user's app state blob (automations, watchlists, wallets, profile).
+app.post("/api/state", (req, res) => {
+  const { userId, state } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const all = readState(); all[userId] = { ...state, updatedAt: Date.now() }; writeState(all);
+  res.json({ ok: true });
+});
+app.get("/api/state", (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  res.json({ state: readState()[userId] || null });
+});
+
 /* ----------------------------- tiny TTL cache ----------------------------- */
 const cache = new Map();
 function memo(key, ttlMs, fn) {
@@ -152,6 +196,26 @@ app.post("/api/ask", async (req, res) => {
   const DEFAULT = `You are Matrix — the world's sharpest stock-market research assistant, fluent in fundamental, technical and macro analysis. Be crisp and structured; give bull case, bear case and key levels rather than a bare command. End with a one-line reminder that this is educational research, not financial advice.`;
   const system = sysOverride ? sysOverride : (DEFAULT + (context ? "\n\nCONTEXT:\n" + context : ""));
   try {
+    // ---- Groq (free tier, OpenAI-compatible, very fast) ----
+    if (process.env.GROQ_API_KEY) {
+      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+        body: JSON.stringify({ model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile", max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error?.message || `groq ${r.status}`);
+      return res.json({ text: (data.choices?.[0]?.message?.content || "").trim(), engine: "groq" });
+    }
+    // ---- OpenRouter (has free `:free` models) ----
+    if (process.env.OPENROUTER_API_KEY) {
+      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
+        body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct:free", max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error?.message || `openrouter ${r.status}`);
+      return res.json({ text: (data.choices?.[0]?.message?.content || "").trim(), engine: "openrouter" });
+    }
     // ---- Preferred: Google Gemini ----
     if (process.env.GEMINI_API_KEY) {
       const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
@@ -178,7 +242,7 @@ app.post("/api/ask", async (req, res) => {
       const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
       return res.json({ text, engine: "anthropic" });
     }
-    return res.status(500).json({ error: "No LLM key set. Set GEMINI_API_KEY (preferred) or ANTHROPIC_API_KEY." });
+    return res.status(500).json({ error: "No LLM key set. Set a free one: GROQ_API_KEY or OPENROUTER_API_KEY (free tiers), or GEMINI_API_KEY / ANTHROPIC_API_KEY." });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
 
