@@ -16,6 +16,8 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const db = require("./db");   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
 app.use(cors());            // lock to your app's origin in prod: cors({ origin: "https://yourapp.com" })
@@ -24,79 +26,71 @@ app.use(express.json());
 const PORT = process.env.PORT || 8787;
 const YF = "https://query1.finance.yahoo.com";
 const UA = { "User-Agent": "Mozilla/5.0 (MatrixProxy)" };
+db.initDb().catch((e) => console.error("[db] init failed:", e.message));
 
-/* --------------------- flat-file trade store (per user) -------------------- */
-// Simple JSON "database" on disk. Structure: { [userId]: [ {id, sym, name,
-// entry, entryAt, exit, exitAt, pnl, qty, market}, ... ] }. Good enough for a
-// virtual-trading app; swap for SQLite/Postgres when you outgrow a flat file.
-const DB_FILE = process.env.TRADES_FILE || path.join(__dirname, "trades.json");
-function readDB() { try { return JSON.parse(fs.readFileSync(DB_FILE, "utf8")); } catch { return {}; } }
-function writeDB(db) { try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch (e) { console.error("trades write failed", e.message); } }
-
-// Save a completed trade:  POST /api/trades   body: { userId, trade }
-app.post("/api/trades", (req, res) => {
-  const { userId, trade } = req.body || {};
-  if (!userId || !trade || !trade.sym) return res.status(400).json({ error: "userId and trade required" });
-  const db = readDB();
-  const rec = { id: trade.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...trade };
-  db[userId] = [rec, ...(db[userId] || [])].slice(0, 5000);   // cap history per user
-  writeDB(db);
-  res.json({ ok: true, trade: rec });
+/* ------------------------------- trade store ------------------------------ */
+// Save a completed/opened trade:  POST /api/trades   body: { userId, trade }
+app.post("/api/trades", async (req, res) => {
+  try {
+    const { userId, trade } = req.body || {};
+    if (!userId || !trade || !trade.sym) return res.status(400).json({ error: "userId and trade required" });
+    const rec = { id: trade.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...trade };
+    await db.saveTrade(userId, rec);
+    res.json({ ok: true, trade: rec });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Fetch trade history:  GET /api/trades?userId=&from=<ms>&to=<ms>
-app.get("/api/trades", (req, res) => {
-  const { userId } = req.query;
-  if (!userId) return res.status(400).json({ error: "userId required" });
-  const from = req.query.from ? +req.query.from : 0;
-  const to = req.query.to ? +req.query.to : Date.now();
-  const all = readDB()[userId] || [];
-  const trades = all.filter((t) => { const x = t.exitAt || t.entryAt || 0; return x >= from && x <= to; });
-  res.json({ trades });
+app.get("/api/trades", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    const from = req.query.from ? +req.query.from : 0;
+    const to = req.query.to ? +req.query.to : Date.now();
+    res.json({ trades: await db.getTrades(userId, from, to) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ----------------------- users (phone + PIN) & state ---------------------- */
-// Flat-file auth for a virtual-trading app. NOTE: PINs are lightly hashed, not
-// bank-grade security — fine for a demo, swap for a real auth provider for prod.
-const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, "users.json");
-const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, "state.json");
-const readUsers = () => { try { return JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch { return {}; } };
-const writeUsers = (d) => { try { fs.writeFileSync(USERS_FILE, JSON.stringify(d)); } catch (e) { console.error(e.message); } };
-const readState = () => { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return {}; } };
-const writeState = (d) => { try { fs.writeFileSync(STATE_FILE, JSON.stringify(d)); } catch (e) { console.error(e.message); } };
-const crypto = require("crypto");
+// PINs are SHA-256 hashed. Fine for a virtual-trading demo; use a real auth
+// provider (and rate-limiting) before handling anything sensitive.
 const hashPin = (pin) => crypto.createHash("sha256").update(String(pin) + "|matrix").digest("hex");
 const cleanPhone = (p) => String(p || "").replace(/[^0-9]/g, "");
 
-app.post("/api/register", (req, res) => {
-  const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin, name = (req.body && req.body.name) || "";
-  if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
-  const users = readUsers();
-  if (users[phone]) return res.status(409).json({ error: "That number is already registered — please log in." });
-  users[phone] = { pin: hashPin(pin), name, createdAt: Date.now() };
-  writeUsers(users);
-  res.json({ ok: true, userId: phone, name });
+app.post("/api/register", async (req, res) => {
+  try {
+    const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin, name = (req.body && req.body.name) || "";
+    if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
+    if (await db.getUser(phone)) return res.status(409).json({ error: "That number is already registered — please log in." });
+    await db.createUser(phone, hashPin(pin), name);
+    res.json({ ok: true, userId: phone, name });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/login", (req, res) => {
-  const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin;
-  const users = readUsers();
-  const u = users[phone];
-  if (!u || u.pin !== hashPin(pin)) return res.status(401).json({ error: "Wrong phone or PIN." });
-  res.json({ ok: true, userId: phone, name: u.name || "" });
+app.post("/api/login", async (req, res) => {
+  try {
+    const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin;
+    const u = await db.getUser(phone);
+    if (!u || u.pin !== hashPin(pin)) return res.status(401).json({ error: "Wrong phone or PIN." });
+    res.json({ ok: true, userId: phone, name: u.name || "" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Save/load a user's app state blob (automations, watchlists, wallets, profile).
-app.post("/api/state", (req, res) => {
-  const { userId, state } = req.body || {};
-  if (!userId) return res.status(400).json({ error: "userId required" });
-  const all = readState(); all[userId] = { ...state, updatedAt: Date.now() }; writeState(all);
-  res.json({ ok: true });
+app.post("/api/state", async (req, res) => {
+  try {
+    const { userId, state } = req.body || {};
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    await db.saveState(userId, state || {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get("/api/state", (req, res) => {
-  const { userId } = req.query;
-  if (!userId) return res.status(400).json({ error: "userId required" });
-  res.json({ state: readState()[userId] || null });
+app.get("/api/state", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    res.json({ state: await db.getState(userId) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ----------------------------- tiny TTL cache ----------------------------- */
