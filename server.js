@@ -183,61 +183,86 @@ app.get("/api/news", async (req, res) => {
 });
 
 /* -------------------------------- /api/ask -------------------------------- */
-// Server-side Ask Matrix. Uses Gemini if GEMINI_API_KEY is set, else Anthropic.
-// Set ONE of:  GEMINI_API_KEY=...   or   ANTHROPIC_API_KEY=...
+// Server-side Ask Matrix. Tries providers in order and FALLS THROUGH on failure,
+// so a bad model name or rate-limit on one provider doesn't kill the request.
+// Set any of: GROQ_API_KEY (free, recommended) / OPENROUTER_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY
+const GROQ_MODELS = () => [process.env.GROQ_MODEL, "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"].filter(Boolean);
+
+async function callGroq(system, messages, max_tokens) {
+  let lastErr = "";
+  for (const model of GROQ_MODELS()) {
+    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({ model, max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) return (data.choices?.[0]?.message?.content || "").trim();
+    lastErr = data.error?.message || `groq ${r.status}`;
+    console.error(`[ask] groq model ${model} failed: ${lastErr}`);
+  }
+  throw new Error(lastErr || "groq failed");
+}
+async function callOpenRouter(system, messages, max_tokens) {
+  const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
+    body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct:free", max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error?.message || `openrouter ${r.status}`);
+  return (data.choices?.[0]?.message?.content || "").trim();
+}
+async function callGemini(system, messages, max_tokens) {
+  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+  const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: typeof m.content === "string" ? m.content : (m.content || []).map((c) => c.text || "").join("\n") }] }));
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ system_instruction: { parts: [{ text: system }] }, contents, generationConfig: { maxOutputTokens: max_tokens } }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error?.message || `gemini ${r.status}`);
+  return (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("\n").trim();
+}
+async function callAnthropic(system, messages, max_tokens) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens, system, messages }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error?.message || `anthropic ${r.status}`);
+  return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+}
+
+// Which providers are configured (also used by /api/health)
+const providers = () => [
+  process.env.GROQ_API_KEY && { name: "groq", fn: callGroq },
+  process.env.OPENROUTER_API_KEY && { name: "openrouter", fn: callOpenRouter },
+  process.env.GEMINI_API_KEY && { name: "gemini", fn: callGemini },
+  process.env.ANTHROPIC_API_KEY && { name: "anthropic", fn: callAnthropic },
+].filter(Boolean);
+
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, engines: providers().map((p) => p.name), db: db.USING_PG ? "postgres" : "flat-file" });
+});
+
 app.post("/api/ask", async (req, res) => {
   const { messages = [], context = "", system: sysOverride, max_tokens = 1000 } = req.body || {};
   const DEFAULT = `You are Matrix — the world's sharpest stock-market research assistant, fluent in fundamental, technical and macro analysis. Be crisp and structured; give bull case, bear case and key levels rather than a bare command. End with a one-line reminder that this is educational research, not financial advice.`;
   const system = sysOverride ? sysOverride : (DEFAULT + (context ? "\n\nCONTEXT:\n" + context : ""));
-  try {
-    // ---- Groq (free tier, OpenAI-compatible, very fast) ----
-    if (process.env.GROQ_API_KEY) {
-      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.GROQ_API_KEY}` },
-        body: JSON.stringify({ model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile", max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error?.message || `groq ${r.status}`);
-      return res.json({ text: (data.choices?.[0]?.message?.content || "").trim(), engine: "groq" });
+  const chain = providers();
+  if (!chain.length) return res.status(500).json({ error: "No LLM key set. Add GROQ_API_KEY (free) in your Render environment." });
+  const errors = [];
+  for (const p of chain) {
+    try {
+      const text = await p.fn(system, messages, max_tokens);
+      if (text) return res.json({ text, engine: p.name });
+      errors.push(`${p.name}: empty response`);
+    } catch (e) {
+      errors.push(`${p.name}: ${e.message}`);
+      console.error(`[ask] ${p.name} failed:`, e.message);
     }
-    // ---- OpenRouter (has free `:free` models) ----
-    if (process.env.OPENROUTER_API_KEY) {
-      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
-        body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct:free", max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error?.message || `openrouter ${r.status}`);
-      return res.json({ text: (data.choices?.[0]?.message?.content || "").trim(), engine: "openrouter" });
-    }
-    // ---- Preferred: Google Gemini ----
-    if (process.env.GEMINI_API_KEY) {
-      const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
-      const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: typeof m.content === "string" ? m.content : (m.content || []).map((c) => c.text || "").join("\n") }] }));
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ system_instruction: { parts: [{ text: system }] }, contents, generationConfig: { maxOutputTokens: max_tokens } }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error?.message || `gemini ${r.status}`);
-      const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("\n").trim();
-      return res.json({ text, engine: "gemini" });
-    }
-    // ---- Fallback: Anthropic ----
-    if (process.env.ANTHROPIC_API_KEY) {
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens, system, messages }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error?.message || `anthropic ${r.status}`);
-      const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-      return res.json({ text, engine: "anthropic" });
-    }
-    return res.status(500).json({ error: "No LLM key set. Set a free one: GROQ_API_KEY or OPENROUTER_API_KEY (free tiers), or GEMINI_API_KEY / ANTHROPIC_API_KEY." });
-  } catch (e) { res.status(502).json({ error: String(e.message) }); }
+  }
+  res.status(502).json({ error: errors.join(" | ") });
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
