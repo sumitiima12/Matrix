@@ -186,13 +186,31 @@ app.get("/api/news", async (req, res) => {
 // Server-side Ask Matrix. Tries providers in order and FALLS THROUGH on failure,
 // so a bad model name or rate-limit on one provider doesn't kill the request.
 // Set any of: GROQ_API_KEY (free, recommended) / OPENROUTER_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY
+// Tolerant env reader: trims whitespace and strips accidental surrounding quotes,
+// and accepts a few common alternate names (a stray space or quotes in the Render
+// dashboard is the usual reason a key "is set" but isn't seen).
+function envKey(...names) {
+  for (const n of names) {
+    let v = process.env[n];
+    if (typeof v === "string") {
+      v = v.trim().replace(/^["']|["']$/g, "");
+      if (v) return v;
+    }
+  }
+  return "";
+}
+const GROQ_KEY = () => envKey("GROQ_API_KEY", "GROQ_KEY", "GROQ_APIKEY", "groq_api_key");
+const OPENROUTER_KEY = () => envKey("OPENROUTER_API_KEY", "OPENROUTER_KEY");
+const GEMINI_KEY = () => envKey("GEMINI_API_KEY", "GOOGLE_API_KEY");
+const ANTHROPIC_KEY = () => envKey("ANTHROPIC_API_KEY");
+
 const GROQ_MODELS = () => [process.env.GROQ_MODEL, "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"].filter(Boolean);
 
 async function callGroq(system, messages, max_tokens) {
   let lastErr = "";
   for (const model of GROQ_MODELS()) {
     const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${GROQ_KEY()}` },
       body: JSON.stringify({ model, max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
     });
     const data = await r.json().catch(() => ({}));
@@ -204,7 +222,7 @@ async function callGroq(system, messages, max_tokens) {
 }
 async function callOpenRouter(system, messages, max_tokens) {
   const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${OPENROUTER_KEY()}` },
     body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct:free", max_tokens, messages: [{ role: "system", content: system }, ...messages] }),
   });
   const data = await r.json().catch(() => ({}));
@@ -214,7 +232,7 @@ async function callOpenRouter(system, messages, max_tokens) {
 async function callGemini(system, messages, max_tokens) {
   const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
   const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: typeof m.content === "string" ? m.content : (m.content || []).map((c) => c.text || "").join("\n") }] }));
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY()}`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ system_instruction: { parts: [{ text: system }] }, contents, generationConfig: { maxOutputTokens: max_tokens } }),
   });
@@ -225,7 +243,7 @@ async function callGemini(system, messages, max_tokens) {
 async function callAnthropic(system, messages, max_tokens) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    headers: { "content-type": "application/json", "x-api-key": ANTHROPIC_KEY(), "anthropic-version": "2023-06-01" },
     body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens, system, messages }),
   });
   const data = await r.json().catch(() => ({}));
@@ -235,14 +253,26 @@ async function callAnthropic(system, messages, max_tokens) {
 
 // Which providers are configured (also used by /api/health)
 const providers = () => [
-  process.env.GROQ_API_KEY && { name: "groq", fn: callGroq },
-  process.env.OPENROUTER_API_KEY && { name: "openrouter", fn: callOpenRouter },
-  process.env.GEMINI_API_KEY && { name: "gemini", fn: callGemini },
-  process.env.ANTHROPIC_API_KEY && { name: "anthropic", fn: callAnthropic },
+  GROQ_KEY() && { name: "groq", fn: callGroq },
+  OPENROUTER_KEY() && { name: "openrouter", fn: callOpenRouter },
+  GEMINI_KEY() && { name: "gemini", fn: callGemini },
+  ANTHROPIC_KEY() && { name: "anthropic", fn: callAnthropic },
 ].filter(Boolean);
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, engines: providers().map((p) => p.name), db: db.USING_PG ? "postgres" : "flat-file" });
+  const engines = providers().map((p) => p.name);
+  const groq = GROQ_KEY();
+  res.json({
+    ok: true,
+    engines,
+    db: db.USING_PG ? "postgres" : "flat-file",
+    // Debug helpers (no secret values are ever returned):
+    groqKeySeen: !!groq,
+    groqKeyLength: groq ? groq.length : 0,
+    groqKeyPrefix: groq ? groq.slice(0, 4) + "..." : null,
+    envVarsContainingKEY: Object.keys(process.env).filter((k) => /KEY|TOKEN|GROQ/i.test(k)).sort(),
+    hint: engines.length ? "LLM configured." : "No LLM key visible to the process. Check the variable NAME on the correct Render service, then redeploy.",
+  });
 });
 
 app.post("/api/ask", async (req, res) => {
