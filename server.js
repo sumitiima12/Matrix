@@ -410,6 +410,71 @@ async function indicatorsFor(symbol) {
   };
 }
 
+/* ----------------------------- /api/intraday -----------------------------
+   Real short-term momentum, computed from actual 5-minute candles.
+
+   Trending previously ranked on the DAY change, which is not "trending" at all —
+   a stock up 4% since 9:15 but flat for the last hour is not moving now. This
+   returns what actually happened in the last 5 and 15 minutes, plus a volume
+   surge measured against the session's own average 5-min volume.
+
+   Everything here is derived from real candles. If a symbol has no intraday data
+   (illiquid, market closed with no session, unsupported) it is simply absent from
+   the response — the UI then shows nothing rather than a zero.                  */
+async function intradayFor(sym) {
+  const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`);
+  const r = d?.chart?.result?.[0];
+  const q = r?.indicators?.quote?.[0];
+  if (!r || !q) return null;
+
+  // Keep only complete candles (Yahoo pads the array with nulls).
+  const rows = (r.timestamp || [])
+    .map((t, i) => ({ t, c: q.close?.[i], v: q.volume?.[i] }))
+    .filter((x) => x.c != null && !Number.isNaN(x.c));
+
+  if (rows.length < 2) return null;
+
+  const last = rows[rows.length - 1];
+  const at = (barsBack) => rows[rows.length - 1 - barsBack];
+
+  const pctFrom = (bar) => (bar && bar.c ? +(((last.c - bar.c) / bar.c) * 100).toFixed(2) : null);
+
+  // 1 bar back = 5 minutes, 3 bars back = 15 minutes.
+  const chg5m = rows.length >= 2 ? pctFrom(at(1)) : null;
+  const chg15m = rows.length >= 4 ? pctFrom(at(3)) : null;
+
+  // Volume surge: the latest 5-min bar against the average 5-min bar this session.
+  const vols = rows.map((x) => x.v).filter((v) => v != null && v > 0);
+  const avg5m = vols.length ? vols.reduce((a, b) => a + b, 0) / vols.length : null;
+  const volSurge = avg5m && last.v != null ? +(last.v / avg5m).toFixed(2) : null;
+
+  return {
+    chg5m,
+    chg15m,
+    volSurge,               // 1.0 = normal, 3.0 = three times its usual 5-min volume
+    lastBarAt: last.t * 1000,
+    bars: rows.length,
+  };
+}
+
+app.get("/api/intraday", async (req, res) => {
+  const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 60);
+  if (!symbols.length) return res.status(400).json({ error: "symbols required" });
+  try {
+    const out = {};
+    await mapLimit(symbols, 5, async (sym) => {
+      try {
+        // 60s cache: this is the one thing that genuinely needs to be fresh.
+        const v = await memo(`intra:${sym}`, 60_000, () => intradayFor(sym));
+        if (v) out[sym] = v;
+      } catch { /* absent from the response rather than zeroed */ }
+    });
+    res.json(out);
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
 app.get("/api/indicators", async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 60);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
