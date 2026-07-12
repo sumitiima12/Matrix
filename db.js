@@ -49,14 +49,19 @@ const writeJSON = (f, d) => { try { fs.writeFileSync(f, JSON.stringify(d)); } ca
 async function saveTrade(userId, trade) {
   const ts = trade.exitAt || trade.entryAt || Date.now();
   if (USING_PG) {
+    // Upsert: the app re-posts a trade when risk orders change or when it closes.
     await pool.query(
-      `INSERT INTO trades (id, user_id, ts, data) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`,
+      `INSERT INTO trades (id, user_id, ts, data) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts, data = EXCLUDED.data`,
       [trade.id, userId, ts, trade]
     );
     return trade;
   }
   const db = readJSON(FILES.trades);
-  db[userId] = [trade, ...(db[userId] || [])].slice(0, 5000);
+  const list = db[userId] || [];
+  const i = list.findIndex((t) => t.id === trade.id);
+  if (i >= 0) list[i] = trade; else list.unshift(trade);
+  db[userId] = list.slice(0, 5000);
   writeJSON(FILES.trades, db);
   return trade;
 }
@@ -104,4 +109,36 @@ async function saveState(userId, state) {
   writeJSON(FILES.state, all);
 }
 
-module.exports = { initDb, saveTrade, getTrades, getUser, createUser, getState, saveState, USING_PG };
+/* ----------------------- open positions (exit monitor) --------------------- */
+// All still-open trades across users that carry a target/stop (so the server-side
+// monitor can close them at real prices even when nobody has the app open).
+async function getOpenTrades(limit = 200) {
+  if (USING_PG) {
+    const r = await pool.query(
+      `SELECT user_id, data FROM trades
+        WHERE (data->>'exitAt') IS NULL
+          AND ( (data->>'tp') IS NOT NULL OR (data->>'sl') IS NOT NULL OR (data->>'tsl') IS NOT NULL )
+        ORDER BY ts DESC LIMIT $1`, [limit]);
+    return r.rows.map((x) => ({ userId: x.user_id, trade: x.data }));
+  }
+  const db = readJSON(FILES.trades);
+  const out = [];
+  for (const userId of Object.keys(db)) {
+    for (const t of db[userId] || []) {
+      if (t.exitAt == null && (t.tp || t.sl || t.tsl)) out.push({ userId, trade: t });
+    }
+  }
+  return out.slice(0, limit);
+}
+async function updateTrade(userId, trade) {
+  if (USING_PG) {
+    await pool.query(`UPDATE trades SET data=$3, ts=$2 WHERE id=$1`,
+      [trade.id, trade.exitAt || trade.entryAt || Date.now(), trade]);
+    return;
+  }
+  const db = readJSON(FILES.trades);
+  db[userId] = (db[userId] || []).map((t) => (t.id === trade.id ? trade : t));
+  writeJSON(FILES.trades, db);
+}
+
+module.exports = { initDb, saveTrade, getTrades, getUser, createUser, getState, saveState, getOpenTrades, updateTrade, USING_PG };
