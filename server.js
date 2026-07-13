@@ -385,12 +385,105 @@ function bollingerPctB(closes, n = 20) {
   return +((closes[closes.length - 1] - lo) / (up - lo)).toFixed(3);
 }
 
+/* ------------------------- SERIES FACTS (for tags) -------------------------
+   Everything below is derived from the SAME candles indicatorsFor already
+   fetched — no extra Yahoo calls.
+
+   These exist because the important tags are EVENTS, not states. "Golden Cross"
+   means the 50-DMA actually crossed above the 200-DMA; it does not mean the 50 is
+   merely above the 200. A stock three years into an uptrend would otherwise be
+   tagged "Golden Cross" every single day, which is a lie dressed as a signal.
+   Detecting the cross needs the series, so we compute it here and return the
+   REAL number of bars since it happened.                                      */
+
+/** Rolling SMA series (not just the latest value). */
+function smaSeries(a, n) {
+  if (a.length < n) return [];
+  const out = new Array(a.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    sum += a[i];
+    if (i >= n) sum -= a[i - n];
+    if (i >= n - 1) out[i] = sum / n;
+  }
+  return out;
+}
+
+/**
+ * Bars since `fast` crossed `slow` in the given direction, or null if it never
+ * did within the series. Bars, not days — a real, checkable count.
+ */
+function barsSinceCross(fast, slow, dir = "above") {
+  for (let i = fast.length - 1; i > 0; i--) {
+    const a = fast[i], b = slow[i], pa = fast[i - 1], pb = slow[i - 1];
+    if (a == null || b == null || pa == null || pb == null) break;
+    const crossed = dir === "above" ? pa <= pb && a > b : pa >= pb && a < b;
+    if (crossed) return fast.length - 1 - i;
+  }
+  return null;
+}
+
+/** Swing pivots: a high with `k` lower highs either side (and the mirror for lows). */
+function pivots(c, k = 5) {
+  const highs = [], lows = [];
+  for (let i = k; i < c.length - k; i++) {
+    let isH = true, isL = true;
+    for (let j = i - k; j <= i + k; j++) {
+      if (j === i) continue;
+      if (c[j].h >= c[i].h) isH = false;
+      if (c[j].l <= c[i].l) isL = false;
+    }
+    if (isH) highs.push({ i, v: c[i].h });
+    if (isL) lows.push({ i, v: c[i].l });
+  }
+  return { highs, lows };
+}
+
+/**
+ * Bull flag, defined strictly:
+ *   1. an impulse leg of >= 8% within the prior 20 bars, then
+ *   2. a consolidation of 3-15 bars whose range is at most 40% of the impulse,
+ *   3. still holding in the upper half of that impulse (it has not given it back).
+ * Returns null unless all three hold. No "close enough".
+ */
+function bullFlag(c) {
+  if (c.length < 30) return null;
+  const w = c.slice(-35);
+  for (let cons = 3; cons <= 15; cons++) {
+    const flag = w.slice(w.length - cons);
+    const pole = w.slice(Math.max(0, w.length - cons - 20), w.length - cons);
+    if (pole.length < 8) continue;
+    const poleLow = Math.min(...pole.map((x) => x.l));
+    const poleHigh = Math.max(...pole.map((x) => x.h));
+    const poleMove = ((poleHigh - poleLow) / poleLow) * 100;
+    if (poleMove < 8) continue;
+    const flagHigh = Math.max(...flag.map((x) => x.h));
+    const flagLow = Math.min(...flag.map((x) => x.l));
+    const flagRange = flagHigh - flagLow;
+    if (flagRange > (poleHigh - poleLow) * 0.4) continue;
+    if (flagLow < poleLow + (poleHigh - poleLow) * 0.5) continue;
+    return { consolidationBars: cons, poleMovePct: +poleMove.toFixed(1) };
+  }
+  return null;
+}
+
 async function indicatorsFor(symbol) {
   const c = await candlesFor(symbol, "1y", "1d");
   if (!c || c.length < 30) return null;
   const closes = c.map((x) => x.c);
   const last = c[c.length - 1], prev = c[c.length - 2] || last;
   const { macd, signal, hist } = MACD(closes);
+
+  // Series facts — real events, from the candles we already have.
+  const s50 = smaSeries(closes, 50);
+  const s200 = smaSeries(closes, 200);
+  const goldenCross = (s50.length && s200.length) ? barsSinceCross(s50, s200, "above") : null;
+  const deathCross = (s50.length && s200.length) ? barsSinceCross(s50, s200, "below") : null;
+
+  const { highs, lows } = pivots(c, 5);
+  const hh = highs.length >= 2 ? highs[highs.length - 1].v > highs[highs.length - 2].v : null;
+  const hl = lows.length >= 2 ? lows[lows.length - 1].v > lows[lows.length - 2].v : null;
+
   return {
     price: +last.c.toFixed(4),
     chg: prev.c ? +(((last.c - prev.c) / prev.c) * 100).toFixed(2) : 0,
@@ -407,6 +500,14 @@ async function indicatorsFor(symbol) {
     // REAL support/resistance: recent swing low/high over the last ~60 sessions.
     support: +Math.min(...c.slice(-60).map((x) => x.l)).toFixed(2),
     resistance: +Math.max(...c.slice(-60).map((x) => x.h)).toFixed(2),
+
+    /* Series facts. Null means "did not happen", never "we could not be bothered".
+       goldenCross/deathCross are BARS SINCE the cross actually occurred. */
+    goldenCross,
+    deathCross,
+    higherHigh: hh,
+    higherLow: hl,
+    bullFlag: bullFlag(c),
   };
 }
 
