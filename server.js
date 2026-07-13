@@ -106,6 +106,49 @@ const j = async (url) => {
   return r.json();
 };
 
+/* --------------------- Yahoo crumb + cookie (fundamentals) -------------------
+   The v8 /chart endpoint used everywhere else is open. But /v10/quoteSummary —
+   the ONLY source of P/E, margins, quarterly revenue etc. — has required a
+   session cookie plus a matching "crumb" since 2023, and returns 401 without one.
+   That is why the Fundamentals panel was blank: not a UI bug, an auth handshake
+   we never performed.
+
+   So: fetch a cookie, exchange it for a crumb, cache both, and retry once if the
+   crumb goes stale. If the handshake fails, fundamentalsFor returns null and the
+   UI says the data is unavailable — it does NOT invent a P/E ratio.
+---------------------------------------------------------------------------- */
+let _yc = { cookie: null, crumb: null, at: 0 };
+
+async function yahooCreds(force = false) {
+  const FRESH = 30 * 60 * 1000;                       // re-handshake every 30 min
+  if (!force && _yc.crumb && Date.now() - _yc.at < FRESH) return _yc;
+
+  const r1 = await fetch("https://fc.yahoo.com", { headers: UA });
+  const raw = r1.headers.get("set-cookie") || "";
+  const cookie = raw.split(",").map((c) => c.split(";")[0].trim()).filter(Boolean).join("; ");
+  if (!cookie) throw new Error("yahoo: no cookie");
+
+  const r2 = await fetch("https://query1.finance.yahoo.com/v1/test/getcrumb", {
+    headers: { ...UA, cookie },
+  });
+  const crumb = (await r2.text()).trim();
+  if (!crumb || crumb.includes("<")) throw new Error("yahoo: no crumb");
+
+  _yc = { cookie, crumb, at: Date.now() };
+  return _yc;
+}
+
+/** GET a crumb-protected Yahoo endpoint, re-handshaking once on 401/403. */
+async function jAuth(build) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { cookie, crumb } = await yahooCreds(attempt === 1);
+    const r = await fetch(build(crumb), { headers: { ...UA, cookie } });
+    if (r.ok) return r.json();
+    if (r.status !== 401 && r.status !== 403) throw new Error(`upstream ${r.status}`);
+  }
+  throw new Error("yahoo: auth failed");
+}
+
 /* ------------------------------- /api/quote ------------------------------- */
 // e.g. /api/quote?symbols=RELIANCE.NS,AAPL,BTC-USD,^NSEI
 // Uses the v8 chart endpoint per symbol (no crumb/cookie needed → reliable).
@@ -487,8 +530,14 @@ async function indicatorsFor(symbol) {
   return {
     price: +last.c.toFixed(4),
     chg: prev.c ? +(((last.c - prev.c) / prev.c) * 100).toFixed(2) : 0,
-    vol: last.v || 0,                                  // REAL traded volume
-    avgVol: Math.round(c.slice(-20).reduce((a, x) => a + (x.v || 0), 0) / Math.min(20, c.length)),
+    // `|| 0` was a fabricated fallback: it turned "we have no volume for this
+    // instrument" into "zero shares traded", which is a claim, not an absence.
+    // Indices genuinely have no volume. null means null.
+    vol: last.v ?? null,
+    avgVol: (() => {
+      const vs = c.slice(-20).map((x) => x.v).filter((v) => v != null);
+      return vs.length ? Math.round(vs.reduce((a, b) => a + b, 0) / vs.length) : null;
+    })(),
     rsi: RSI(closes),
     sma50: SMA(closes, 50), sma200: SMA(closes, 200),
     ema20: EMA(closes, 20), ema50: EMA(closes, 50),
@@ -597,8 +646,11 @@ app.get("/api/indicators", async (req, res) => {
    invented. Holders come from Yahoo's institutionOwnership module.            */
 async function fundamentalsFor(symbol) {
   const mods = "defaultKeyStatistics,financialData,summaryDetail,institutionOwnership,price,earnings";
-  const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${mods}`;
-  const d = await j(url);
+  // quoteSummary is crumb-protected -> jAuth, not j. This was the bug.
+  const d = await jAuth((crumb) =>
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}` +
+    `?modules=${mods}&crumb=${encodeURIComponent(crumb)}`
+  );
   const r = d.quoteSummary?.result?.[0];
   if (!r) return null;
   const ks = r.defaultKeyStatistics || {}, fd = r.financialData || {}, sd = r.summaryDetail || {}, px = r.price || {};
@@ -631,12 +683,20 @@ app.get("/api/fundamentals", async (req, res) => {
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
     const out = {};
+    const errors = {};                     // why a symbol produced nothing
     await mapLimit(symbols, 4, async (sym) => {
       try {
         const v = await memo(`fund:${sym}`, 900_000, () => fundamentalsFor(sym));   // 15-min cache
         if (v) out[sym] = v;
-      } catch { /* some tickers (indices, futures) have no fundamentals */ }
+        else errors[sym] = "yahoo returned no quoteSummary result";
+      } catch (e) {
+        // Swallowing this is why the panel was blank with no explanation. If the
+        // data cannot be had, we need to KNOW that, not silently render nothing.
+        errors[sym] = String(e.message || e);
+      }
     });
+    // ?debug=1 surfaces the real upstream failure instead of an empty object.
+    if (req.query.debug) return res.json({ fundamentals: out, errors });
     res.json({ fundamentals: out });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
