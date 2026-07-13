@@ -706,14 +706,24 @@ app.post("/api/ask", async (req, res) => {
   const chain = providers();
   if (!chain.length) return res.status(500).json({ error: "No LLM key set. Add GROQ_API_KEY (free) in your Render environment." });
   const errors = [];
+  /* Each provider gets 8 seconds, no more. The chain used to await each one with
+     no timeout, so a single hanging provider stalled every fallback behind it and
+     the request just sat there. Groq answers in well under a second; if something
+     takes longer than 8s it is broken, not thinking. */
+  const withTimeout = (promise, ms, label) => Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: timed out after ${ms}ms`)), ms)),
+  ]);
+
   for (const p of chain) {
+    const t0 = Date.now();
     try {
-      const text = await p.fn(system, messages, max_tokens);
-      if (text) return res.json({ text, engine: p.name });
+      const text = await withTimeout(p.fn(system, messages, max_tokens), 8000, p.name);
+      if (text) return res.json({ text, engine: p.name, ms: Date.now() - t0 });
       errors.push(`${p.name}: empty response`);
     } catch (e) {
       errors.push(`${p.name}: ${e.message}`);
-      console.error(`[ask] ${p.name} failed:`, e.message);
+      console.error(`[ask] ${p.name} failed after ${Date.now() - t0}ms:`, e.message);
     }
   }
   res.status(502).json({ error: errors.join(" | ") });
