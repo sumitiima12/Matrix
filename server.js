@@ -106,48 +106,14 @@ const j = async (url) => {
   return r.json();
 };
 
-/* --------------------- Yahoo crumb + cookie (fundamentals) -------------------
-   The v8 /chart endpoint used everywhere else is open. But /v10/quoteSummary —
-   the ONLY source of P/E, margins, quarterly revenue etc. — has required a
-   session cookie plus a matching "crumb" since 2023, and returns 401 without one.
-   That is why the Fundamentals panel was blank: not a UI bug, an auth handshake
-   we never performed.
+/* Yahoo's crumb-authenticated quoteSummary endpoint (P/E, ROE, margins, quarterly
+   revenue) refuses requests from datacenter IPs — verified from Render: the cookie
+   and crumb handshake both return 401 ("yahoo: auth failed"). The open v8 /chart
+   endpoint that powers everything else is unaffected.
 
-   So: fetch a cookie, exchange it for a crumb, cache both, and retry once if the
-   crumb goes stale. If the handshake fails, fundamentalsFor returns null and the
-   UI says the data is unavailable — it does NOT invent a P/E ratio.
----------------------------------------------------------------------------- */
-let _yc = { cookie: null, crumb: null, at: 0 };
-
-async function yahooCreds(force = false) {
-  const FRESH = 30 * 60 * 1000;                       // re-handshake every 30 min
-  if (!force && _yc.crumb && Date.now() - _yc.at < FRESH) return _yc;
-
-  const r1 = await fetch("https://fc.yahoo.com", { headers: UA });
-  const raw = r1.headers.get("set-cookie") || "";
-  const cookie = raw.split(",").map((c) => c.split(";")[0].trim()).filter(Boolean).join("; ");
-  if (!cookie) throw new Error("yahoo: no cookie");
-
-  const r2 = await fetch("https://query1.finance.yahoo.com/v1/test/getcrumb", {
-    headers: { ...UA, cookie },
-  });
-  const crumb = (await r2.text()).trim();
-  if (!crumb || crumb.includes("<")) throw new Error("yahoo: no crumb");
-
-  _yc = { cookie, crumb, at: Date.now() };
-  return _yc;
-}
-
-/** GET a crumb-protected Yahoo endpoint, re-handshaking once on 401/403. */
-async function jAuth(build) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { cookie, crumb } = await yahooCreds(attempt === 1);
-    const r = await fetch(build(crumb), { headers: { ...UA, cookie } });
-    if (r.ok) return r.json();
-    if (r.status !== 401 && r.status !== 403) throw new Error(`upstream ${r.status}`);
-  }
-  throw new Error("yahoo: auth failed");
-}
+   So there is NO fundamentals data source, and /api/fundamentals is gone rather
+   than left returning {} forever. Scraping Moneycontrol was considered and rejected:
+   numbers whose provenance we cannot verify are worse than no numbers.       */
 
 /* ------------------------------- /api/quote ------------------------------- */
 // e.g. /api/quote?symbols=RELIANCE.NS,AAPL,BTC-USD,^NSEI
@@ -637,67 +603,6 @@ app.get("/api/indicators", async (req, res) => {
       } catch { /* skip symbols with no history */ }
     });
     res.json({ indicators: out });
-  } catch (e) { res.status(502).json({ error: String(e.message) }); }
-});
-
-/* -------------------------- /api/fundamentals -----------------------------
-   REAL fundamentals + REAL institutional holders from Yahoo quoteSummary.
-   P/E, ROE, revenue & earnings growth, margins, market cap — all reported, none
-   invented. Holders come from Yahoo's institutionOwnership module.            */
-async function fundamentalsFor(symbol) {
-  const mods = "defaultKeyStatistics,financialData,summaryDetail,institutionOwnership,price,earnings";
-  // quoteSummary is crumb-protected -> jAuth, not j. This was the bug.
-  const d = await jAuth((crumb) =>
-    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}` +
-    `?modules=${mods}&crumb=${encodeURIComponent(crumb)}`
-  );
-  const r = d.quoteSummary?.result?.[0];
-  if (!r) return null;
-  const ks = r.defaultKeyStatistics || {}, fd = r.financialData || {}, sd = r.summaryDetail || {}, px = r.price || {};
-  const num = (o) => (o && typeof o.raw === "number" ? o.raw : null);
-  const pct = (o) => { const v = num(o); return v == null ? null : +(v * 100).toFixed(1); };
-  const holders = (r.institutionOwnership?.ownershipList || []).slice(0, 4).map((h) => ({
-    n: h.organization,
-    v: num(h.value),                       // position value (USD/INR as reported)
-    pct: pct(h.pctHeld),
-    c: pct(h.pctChange),
-    date: num(h.reportDate),
-  })).filter((h) => h.n);
-  // REAL quarterly revenue & earnings as reported (Yahoo earnings module).
-  const eq = r.earnings?.financialsChart?.quarterly || [];
-  const quarters = eq.map((q) => ({ q: q.date, rev: num(q.revenue), earn: num(q.earnings) })).filter((q) => q.rev != null);
-  return {
-    quarters: quarters.length ? quarters : null,
-    pe: num(sd.trailingPE) != null ? +num(sd.trailingPE).toFixed(1) : (num(ks.forwardPE) != null ? +num(ks.forwardPE).toFixed(1) : null),
-    roe: pct(fd.returnOnEquity),
-    revGrowth: pct(fd.revenueGrowth),
-    ebitdaGrowth: pct(fd.earningsGrowth),        // earnings growth (EBITDA growth isn't published)
-    profitMargin: pct(fd.profitMargins),
-    marketCap: num(px.marketCap) ?? num(sd.marketCap),
-    debtToEquity: num(fd.debtToEquity),
-    inst: holders.length ? holders : null,
-  };
-}
-app.get("/api/fundamentals", async (req, res) => {
-  const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 40);
-  if (!symbols.length) return res.status(400).json({ error: "symbols required" });
-  try {
-    const out = {};
-    const errors = {};                     // why a symbol produced nothing
-    await mapLimit(symbols, 4, async (sym) => {
-      try {
-        const v = await memo(`fund:${sym}`, 900_000, () => fundamentalsFor(sym));   // 15-min cache
-        if (v) out[sym] = v;
-        else errors[sym] = "yahoo returned no quoteSummary result";
-      } catch (e) {
-        // Swallowing this is why the panel was blank with no explanation. If the
-        // data cannot be had, we need to KNOW that, not silently render nothing.
-        errors[sym] = String(e.message || e);
-      }
-    });
-    // ?debug=1 surfaces the real upstream failure instead of an empty object.
-    if (req.query.debug) return res.json({ fundamentals: out, errors });
-    res.json({ fundamentals: out });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
 
