@@ -1324,20 +1324,15 @@ app.post("/api/broker/order", async (req, res) => {
    never mixed: Real mode shows this, Virtual mode shows the paper book. Merging them
    would produce a P&L that is true of no account that exists. */
 
-/* ─────────────────────────── OPTION CHAIN ───────────────────────────
+
+/* ─────────────────────── OPTION CHAIN — from the broker ───────────────────────
    THE SYMBOL COMES FROM THE BROKER. WE NEVER BUILD ONE.
 
-   It is tempting to construct "NSE:NIFTY26JUL24500CE" from parts — underlying +
-   expiry + strike + CE. Doing so requires guessing FOUR things: the expiry calendar
-   (NSE has changed its expiry day; a stale rule silently picks the wrong week), the
-   weekly-vs-monthly encoding, the strike interval, and which strikes actually exist.
-   Get any one wrong and the order does not fail politely — it BUYS A DIFFERENT
-   CONTRACT. A typo'd stock symbol gets rejected; a plausible-but-wrong option symbol
-   gets filled.
-
-   So: we ask the broker what contracts exist, and the user picks from that list. If we
-   cannot load the chain, option trading is unavailable and we say so. We do not fall
-   back to a guess.                                                                  */
+   Constructing "NSE:NIFTY26JUL24050CE" from parts means guessing the expiry calendar
+   (NSE has changed its expiry day), the weekly-vs-monthly encoding, the strike interval,
+   and which strikes exist. Any one wrong and the order does not fail politely — it BUYS
+   A DIFFERENT CONTRACT. So we ask what exists, and pick from that. If we can't load the
+   chain, the strategy does not trade. It does not guess.                              */
 
 const optCache = new Map();
 const optMemo = async (k, ms, fn) => {
@@ -1356,10 +1351,7 @@ app.get("/api/broker/optionchain", async (req, res) => {
 
   try {
     if (broker === "fyers") {
-      /* FYERS option chain. Returns the REAL tradable symbols, strikes and expiries.
-         We read only fields we can identify; anything we cannot read, we drop rather
-         than infer. */
-      const idx = { NIFTY: "NSE:NIFTY50-INDEX", BANKNIFTY: "NSE:NIFTYBANK-INDEX", FINNIFTY: "NSE:FINNIFTY-INDEX" };
+      const idx = { NIFTY: "NSE:NIFTY50-INDEX", NIFTY50: "NSE:NIFTY50-INDEX", BANKNIFTY: "NSE:NIFTYBANK-INDEX", FINNIFTY: "NSE:FINNIFTY-INDEX" };
       const sym = idx[underlying] || `NSE:${underlying}-EQ`;
 
       const data = await optMemo(`oc:${sym}`, 60_000, async () => {
@@ -1374,12 +1366,11 @@ app.get("/api/broker/optionchain", async (req, res) => {
         return res.status(502).json({ error: "broker returned no option chain", raw: data && data.message });
       }
 
-      // Keep ONLY rows whose symbol, strike and type we can actually read.
       const contracts = rows
         .map((r) => ({
           symbol: r.symbol || r.tradingsymbol || null,
           strike: r.strike_price != null ? Number(r.strike_price) : null,
-          type: r.option_type || r.optionType || null,     // CE / PE
+          type: r.option_type || r.optionType || null,
           expiry: r.expiry || r.expiryDate || null,
           lot: r.lot_size != null ? Number(r.lot_size) : (r.minLot != null ? Number(r.minLot) : null),
           ltp: r.ltp != null ? Number(r.ltp) : null,
@@ -1390,20 +1381,16 @@ app.get("/api/broker/optionchain", async (req, res) => {
         return res.status(502).json({ error: "option chain shape not recognised — refusing to guess symbols" });
       }
 
-      const spot = d.callOi != null && d.indiaVixData ? null : (d.spot != null ? Number(d.spot) : null);
-      const expiries = [...new Set(contracts.map((c) => c.expiry).filter(Boolean))].sort();
-
       return res.json({
-        broker, underlying, spot,
-        expiries,
+        broker, underlying,
+        spot: d.spot != null ? Number(d.spot) : null,
+        expiries: [...new Set(contracts.map((c) => c.expiry).filter(Boolean))].sort(),
         contracts,
         lot: contracts.find((c) => c.lot)?.lot ?? null,
       });
     }
 
     if (broker === "zerodha") {
-      /* Kite publishes the full instrument dump as CSV. It is the authoritative list of
-         what is tradable today — expiries, strikes and tradingsymbols included. */
       const csv = await optMemo("kite:nfo", 6 * 3600_000, async () => {
         const r = await fetch("https://api.kite.trade/instruments/NFO", { headers: brokerAuth(broker, token) });
         return r.text();
@@ -1435,10 +1422,9 @@ app.get("/api/broker/optionchain", async (req, res) => {
       }
       if (!contracts.length) return res.status(404).json({ error: `no option contracts found for ${underlying}` });
 
-      const expiries = [...new Set(contracts.map((c) => c.expiry).filter(Boolean))].sort();
       return res.json({
         broker, underlying, spot: null,
-        expiries,
+        expiries: [...new Set(contracts.map((c) => c.expiry).filter(Boolean))].sort(),
         contracts,
         lot: contracts.find((c) => c.lot)?.lot ?? null,
       });
