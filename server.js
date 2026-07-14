@@ -878,7 +878,102 @@ const BROKERS = {
     loginUrl: (key, redirect) =>
       `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code&state=matrix`,
   },
+
+  /* DELTA EXCHANGE — no OAuth.
+     Delta authenticates every request with an HMAC signature over
+     (method + timestamp + path + query + body), using an API key/secret pair. There is
+     no login redirect and no user token: the KEYS ARE THE CREDENTIAL.
+
+     That has a consequence worth stating plainly: the keys live in this server's env, so
+     Delta trades on THE SERVER'S account, not on a per-user account the way the OAuth
+     brokers do. For a single-operator app that is exactly right. If this ever became
+     multi-user, Delta would need per-user keys and this design would be wrong. */
+  delta: {
+    name: "Delta Exchange",
+    noOAuth: true,
+    key: () => envKey("DELTA_API_KEY"),
+    secret: () => envKey("DELTA_API_SECRET"),
+    loginUrl: () => null,
+  },
+
+  /* CHARLES SCHWAB — OAuth2, but with a much shorter fuse than the Indian brokers.
+     The access token lives ~30 MINUTES (not a day), so a session that only stored the
+     access token would die mid-afternoon. We keep the refresh token (~7 days) and mint
+     a new access token when the old one expires. */
+  schwab: {
+    name: "Charles Schwab",
+    key: () => envKey("SCHWAB_APP_KEY"),
+    secret: () => envKey("SCHWAB_APP_SECRET"),
+    loginUrl: (key, redirect) =>
+      `https://api.schwabapi.com/v1/oauth/authorize?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code`,
+  },
 };
+
+/* ── Delta request signing ───────────────────────────────────────────────────────
+   signature = HMAC_SHA256(secret, method + timestamp + path + query + body)
+   Sent as: api-key, timestamp, signature. The secret never leaves this process. */
+const DELTA_BASE = "https://api.india.delta.exchange";
+
+function deltaHeaders(method, path, query = "", body = "") {
+  const key = envKey("DELTA_API_KEY");
+  const secret = envKey("DELTA_API_SECRET");
+  if (!key || !secret) throw new Error("Delta keys not set on the server");
+
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const payload = method + ts + path + query + body;
+  const signature = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+
+  return {
+    "api-key": key,
+    timestamp: ts,
+    signature,
+    "Content-Type": "application/json",
+    "User-Agent": "matrix",
+  };
+}
+
+async function deltaCall(method, path, { query = "", body = null, signed = true } = {}) {
+  const bodyStr = body ? JSON.stringify(body) : "";
+  const headers = signed
+    ? deltaHeaders(method, path, query, bodyStr)
+    : { "Content-Type": "application/json", "User-Agent": "matrix" };
+
+  const r = await fetch(DELTA_BASE + path + query, {
+    method,
+    headers,
+    ...(bodyStr ? { body: bodyStr } : {}),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.success === false) {
+    throw new Error((d.error && (d.error.code || d.error)) || d.message || `delta ${r.status}`);
+  }
+  return d;
+}
+
+/* ── Schwab token refresh ────────────────────────────────────────────────────────
+   The access token expires in ~30 minutes. Rather than letting the session die (and
+   showing a LIVE badge over dead data), we refresh it on demand. If the refresh token
+   is also dead — they last ~7 days — we surface that honestly and the user re-links. */
+async function schwabToken(sess) {
+  if (sess.expiresAt && Date.now() < sess.expiresAt - 60_000) return sess.accessToken;
+  if (!sess.refreshToken) throw new Error("Schwab session expired — reconnect");
+
+  const key = envKey("SCHWAB_APP_KEY"), secret = envKey("SCHWAB_APP_SECRET");
+  const basic = Buffer.from(`${key}:${secret}`).toString("base64");
+
+  const r = await fetch("https://api.schwabapi.com/v1/oauth/token", {
+    method: "POST",
+    headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: sess.refreshToken }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.access_token) throw new Error(d.error_description || d.error || "Schwab refresh failed");
+
+  sess.accessToken = d.access_token;
+  if (d.refresh_token) sess.refreshToken = d.refresh_token;
+  sess.expiresAt = Date.now() + (Number(d.expires_in) || 1800) * 1000;
+  return sess.accessToken;
+}
 
 /** Which brokers are actually configured on this server. */
 app.get("/api/broker/status", (_req, res) => {
@@ -905,8 +1000,9 @@ app.post("/api/broker/session", async (req, res) => {
   const { broker, requestToken, userId } = req.body || {};
   const b = BROKERS[broker];
   if (!b) return res.status(400).json({ error: "unknown broker" });
-  if (!requestToken) return res.status(400).json({ error: "requestToken required" });
   if (!userId) return res.status(400).json({ error: "userId required" });
+  // Delta has no OAuth redirect, so it has no requestToken. Everyone else must have one.
+  if (!b.noOAuth && !requestToken) return res.status(400).json({ error: "requestToken required" });
 
   const key = b.key(), secret = b.secret();
   if (!key || !secret) return res.status(400).json({ error: `${b.name} is not configured on the server.` });
@@ -938,6 +1034,48 @@ app.post("/api/broker/session", async (req, res) => {
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
       const sid = putBrokerSession(userId, broker, d.access_token);
+      return res.json({ sessionId: sid, user: null, broker });
+    }
+
+    if (broker === "delta") {
+      /* No token to exchange — the keys ARE the credential. So "connecting" has to mean
+         something real: we make a SIGNED call and see if Delta accepts it. Otherwise we
+         would hand back a session id for keys that don't work, and the failure would only
+         surface later, at the worst possible moment: on an order. */
+      const d = await deltaCall("GET", "/v2/wallet/balances");
+      const bal = (d.result || [])[0] || null;
+      const sid = putBrokerSession(userId, broker, "server-signed");   // no per-user token exists
+      return res.json({
+        sessionId: sid,
+        broker,
+        user: bal && bal.user_id ? String(bal.user_id) : null,
+      });
+    }
+
+    if (broker === "schwab") {
+      // OAuth2 authorization-code exchange. Basic auth with the app key/secret.
+      const basic = Buffer.from(`${key}:${secret}`).toString("base64");
+      const redirect = String(req.body.redirect || "");
+      const r = await fetch("https://api.schwabapi.com/v1/oauth/token", {
+        method: "POST",
+        headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: requestToken,
+          redirect_uri: redirect,
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.access_token) throw new Error(d.error_description || d.error || `schwab ${r.status}`);
+
+      const sid = putBrokerSession(userId, broker, d.access_token);
+      // Keep the refresh token and expiry ON THE SESSION — a 30-minute access token alone
+      // would leave the app showing a LIVE badge over a dead connection by mid-afternoon.
+      const sess = brokerSessions.get(sid);
+      if (sess) {
+        sess.refreshToken = d.refresh_token || null;
+        sess.expiresAt = Date.now() + (Number(d.expires_in) || 1800) * 1000;
+      }
       return res.json({ sessionId: sid, user: null, broker });
     }
 
@@ -1010,6 +1148,53 @@ app.get("/api/broker/quotes", async (req, res) => {
       });
     }
 
+    if (broker === "delta") {
+      /* Delta's tickers endpoint is PUBLIC — no signature needed for market data. One
+         call returns every contract; we pick out the ones asked for rather than making
+         N round trips. */
+      const d = await deltaCall("GET", "/v2/tickers", { signed: false });
+      const want = new Set(symbols);
+      (d.result || []).forEach((t) => {
+        if (!want.has(t.symbol)) return;
+        const price = t.mark_price != null ? Number(t.mark_price)
+                    : t.close != null ? Number(t.close)
+                    : t.spot_price != null ? Number(t.spot_price) : null;
+        const open = t.open != null ? Number(t.open) : null;
+        out[t.symbol] = {
+          price,
+          // Delta gives open/close, not a percent. Compute it only when BOTH are real.
+          chg: (price != null && open) ? +(((price - open) / open) * 100).toFixed(2) : null,
+          vol: t.volume != null ? Number(t.volume) : null,
+          oi: t.open_interest != null ? Number(t.open_interest) : null,   // real OI
+          bid: t.quotes?.best_bid != null ? Number(t.quotes.best_bid) : null,
+          ask: t.quotes?.best_ask != null ? Number(t.quotes.best_ask) : null,
+        };
+      });
+    }
+
+    if (broker === "schwab") {
+      const tk = await schwabToken(sess);                       // refreshes if the 30-min token died
+      const r = await fetch(
+        `https://api.schwabapi.com/marketdata/v1/quotes?symbols=${encodeURIComponent(symbols.join(","))}`,
+        { headers: { Authorization: `Bearer ${tk}`, Accept: "application/json" } }
+      );
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.message || d.error || `schwab ${r.status}`);
+
+      Object.entries(d || {}).forEach(([sym, row]) => {
+        const q = row && row.quote;
+        if (!q) return;
+        out[sym] = {
+          price: q.lastPrice ?? null,
+          chg: q.netPercentChange ?? q.netPercentChangeInDouble ?? null,
+          vol: q.totalVolume ?? null,
+          oi: null,                                             // equities have no OI. null, not 0.
+          bid: q.bidPrice ?? null,
+          ask: q.askPrice ?? null,
+        };
+      });
+    }
+
     res.json({ quotes: out, broker, live: true, at: Date.now() });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
@@ -1071,6 +1256,60 @@ app.post("/api/broker/order", async (req, res) => {
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
       return res.json({ orderId: d.id, status: "PENDING", broker });
+    }
+
+    if (broker === "delta") {
+      /* Delta orders are signed like everything else. product_id is REQUIRED — the API
+         does not take a bare symbol — so we look the product up first and fail if we
+         can't find it, rather than posting an order against a guessed id. */
+      const prods = await deltaCall("GET", "/v2/products", { signed: false });
+      const prod = (prods.result || []).find((p) => p.symbol === symbol);
+      if (!prod) throw new Error(`Delta does not list ${symbol}`);
+
+      const d = await deltaCall("POST", "/v2/orders", {
+        body: {
+          product_id: prod.id,
+          size: Number(qty),
+          side: String(side).toLowerCase() === "buy" ? "buy" : "sell",
+          order_type: "market_order",
+        },
+      });
+      return res.json({ ok: true, broker, orderId: d.result?.id ?? null, raw: d.result ?? null });
+    }
+
+    if (broker === "schwab") {
+      const tk = await schwabToken(sess);
+
+      // Schwab orders are placed against an ACCOUNT HASH, not the account number.
+      const ar = await fetch("https://api.schwabapi.com/trader/v1/accounts/accountNumbers", {
+        headers: { Authorization: `Bearer ${tk}`, Accept: "application/json" },
+      });
+      const accs = await ar.json().catch(() => []);
+      const hash = Array.isArray(accs) && accs[0] && accs[0].hashValue;
+      if (!hash) throw new Error("Could not resolve a Schwab account");
+
+      const r = await fetch(`https://api.schwabapi.com/trader/v1/accounts/${hash}/orders`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${tk}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          orderType: "MARKET",
+          session: "NORMAL",
+          duration: "DAY",
+          orderStrategyType: "SINGLE",
+          orderLegCollection: [{
+            instruction: String(side).toUpperCase() === "BUY" ? "BUY" : "SELL",
+            quantity: Number(qty),
+            instrument: { symbol, assetType: "EQUITY" },
+          }],
+        }),
+      });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        throw new Error(e.message || e.error || `schwab ${r.status}`);
+      }
+      // Schwab returns the new order id in the Location header, not the body.
+      const loc = r.headers.get("location") || "";
+      return res.json({ ok: true, broker, orderId: loc.split("/").pop() || null });
     }
 
     res.status(400).json({ error: "unsupported broker" });
@@ -1261,6 +1500,66 @@ app.get("/api/broker/portfolio", async (req, res) => {
       const bucket = (f.fund_limit || []).find((x) => /available/i.test(x.title || ""));
       const cash = bucket ? bucket.equityAmount ?? null : null;
       return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    if (broker === "delta") {
+      // Real balances + real open positions. Signed calls; keys never leave this process.
+      const [w, p] = await Promise.all([
+        deltaCall("GET", "/v2/wallet/balances"),
+        deltaCall("GET", "/v2/positions/margined"),
+      ]);
+
+      const cash = (w.result || []).reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
+
+      const holdings = (p.result || [])
+        .filter((x) => Number(x.size) !== 0)
+        .map((x) => ({
+          sym: x.product_symbol || (x.product && x.product.symbol) || null,
+          qty: Number(x.size),
+          avg: x.entry_price != null ? Number(x.entry_price) : null,
+          ltp: x.mark_price != null ? Number(x.mark_price) : null,
+          pnl: x.unrealized_pnl != null ? Number(x.unrealized_pnl) : null,
+        }))
+        .filter((h) => h.sym);
+
+      return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    if (broker === "schwab") {
+      const tk = await schwabToken(sess);
+      const r = await fetch("https://api.schwabapi.com/trader/v1/accounts?fields=positions", {
+        headers: { Authorization: `Bearer ${tk}`, Accept: "application/json" },
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.message || d.error || `schwab ${r.status}`);
+
+      const accounts = Array.isArray(d) ? d : [];
+      const holdings = [];
+      let cash = 0;
+
+      accounts.forEach((a) => {
+        const acc = a.securitiesAccount || {};
+        cash += Number(acc.currentBalances?.cashBalance ?? 0);
+
+        (acc.positions || []).forEach((p) => {
+          const inst = p.instrument || {};
+          const qty = Number(p.longQuantity ?? 0) - Number(p.shortQuantity ?? 0);
+          if (!qty || !inst.symbol) return;
+          const mv = p.marketValue != null ? Number(p.marketValue) : null;
+          holdings.push({
+            sym: inst.symbol,
+            qty,
+            avg: p.averagePrice != null ? Number(p.averagePrice) : null,
+            /* Schwab reports market VALUE, not last price. Deriving LTP = value/qty is
+               exact, so it's fine — but if value is missing we leave LTP null rather than
+               reaching for a number we'd be half-inventing. */
+            ltp: mv != null && qty ? +(mv / qty).toFixed(4) : null,
+            pnl: p.longOpenProfitLoss != null ? Number(p.longOpenProfitLoss) : null,
+          });
+        });
+      });
+
+      return res.json({ broker, holdings, cash, currency: "USD" });
     }
 
     res.status(400).json({ error: "portfolio not supported for this broker yet" });
