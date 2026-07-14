@@ -128,6 +128,78 @@ async function mapLimit(arr, limit, fn) {
   await Promise.all(workers);
   return out;
 }
+
+/* MARKET NEWS FEED — many symbols at once, tagged by what kind of event it is.
+   The single-symbol /api/news gives you one stock's headlines; the Dashboard needs a
+   feed across the whole watchlist, which is why "In the news" was only ever showing
+   one stock.
+
+   ON SCRAPING MONEYCONTROL / NSE: not done, deliberately. NSE's announcement API
+   rejects datacenter IPs (the same wall Yahoo's quoteSummary put up, which is why
+   fundamentals got deleted), and Moneycontrol has no public API — scraping their HTML
+   means shipping a parser that breaks silently and, worse, presents numbers whose
+   provenance we cannot verify. A wrong dividend or split figure is not a cosmetic bug.
+   Yahoo's news IS real, sourced and attributed, so that is what we aggregate. If you
+   want NSE corporate announcements, the honest path is a broker feed or a licensed
+   data vendor, not a scraper.
+
+   Event tagging is done on the HEADLINE TEXT ONLY — we tag what the headline says, and
+   nothing is inferred beyond it. */
+const NEWS_TAGS = [
+  { tag: "Earnings",  re: /\b(q[1-4]|quarter(ly)?|results?|earnings|profit|revenue|net income|pat\b)/i },
+  { tag: "Dividend",  re: /\b(dividend|payout|record date|ex-dividend)/i },
+  { tag: "Split",     re: /\b(stock split|share split|bonus issue|bonus share)/i },
+  { tag: "Bulk deal", re: /\b(bulk deal|block deal|bulk sell|stake sale|offloads?|pledge[ds]?)/i },
+  { tag: "Buyback",   re: /\b(buyback|buy-back|repurchase)/i },
+  { tag: "M&A",       re: /\b(acquisition|acquires?|merger|takeover|stake buy)/i },
+  { tag: "Order win", re: /\b(order win|bags order|wins? contract|awarded)/i },
+];
+
+const tagOf = (title) => {
+  const hit = NEWS_TAGS.find((t) => t.re.test(title || ""));
+  return hit ? hit.tag : null;
+};
+
+app.get("/api/news/feed", async (req, res) => {
+  const syms = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 12);
+  const onlyTagged = String(req.query.tagged || "") === "1";
+  if (!syms.length) return res.status(400).json({ error: "symbols required" });
+
+  try {
+    const per = await Promise.all(syms.map(async (sym) => {
+      try {
+        const items = await memo(`nf:${sym}`, 300_000, async () => {
+          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(sym)}&newsCount=6&quotesCount=0`;
+          const d = await j(u);
+          return (d.news || []).map((a) => ({
+            sym,
+            t: a.title,
+            d: a.providerPublishTime ? a.providerPublishTime * 1000 : null,
+            src: a.publisher || null,
+            url: a.link || null,
+          }));
+        });
+        return items;
+      } catch { return []; }                 // one bad symbol must not kill the feed
+    }));
+
+    let all = per.flat().filter((x) => x.t);
+    all.forEach((x) => { x.tag = tagOf(x.t); });
+    if (onlyTagged) all = all.filter((x) => x.tag);
+
+    // newest first; de-duplicate identical headlines across symbols
+    const seen = new Set();
+    all = all
+      .sort((a, b) => (b.d || 0) - (a.d || 0))
+      .filter((x) => { const k = (x.t || "").toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
+      .slice(0, 30);
+
+    res.json({ news: all, count: all.length });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
 app.get("/api/quote", async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
@@ -1002,6 +1074,69 @@ app.post("/api/broker/order", async (req, res) => {
     }
 
     res.status(400).json({ error: "unsupported broker" });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+
+/* THE USER'S REAL PORTFOLIO, pulled from the broker.
+   Read-only. This is what they actually own — not our paper positions. The two are
+   never mixed: Real mode shows this, Virtual mode shows the paper book. Merging them
+   would produce a P&L that is true of no account that exists. */
+app.get("/api/broker/portfolio", async (req, res) => {
+  const sess = getBrokerSession(req);
+  if (!sess) return res.status(401).json({ error: "no broker session" });
+  const { broker, accessToken: token } = sess;
+
+  try {
+    if (broker === "zerodha") {
+      const [hRes, mRes] = await Promise.all([
+        fetch("https://api.kite.trade/portfolio/holdings", { headers: brokerAuth(broker, token) }),
+        fetch("https://api.kite.trade/user/margins", { headers: brokerAuth(broker, token) }),
+      ]);
+      const h = await hRes.json();
+      const m = await mRes.json();
+      if (h.status === "error") throw new Error(h.message);
+
+      const holdings = (h.data || []).map((p) => ({
+        sym: p.tradingsymbol,
+        qty: p.quantity ?? 0,
+        avg: p.average_price ?? null,
+        ltp: p.last_price ?? null,
+        pnl: p.pnl ?? null,
+        value: p.last_price != null ? p.last_price * (p.quantity ?? 0) : null,
+      }));
+      const cash = m.data && m.data.equity && m.data.equity.available
+        ? m.data.equity.available.live_balance ?? null
+        : null;
+      return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    if (broker === "fyers") {
+      const [hRes, fRes] = await Promise.all([
+        fetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token) }),
+        fetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token) }),
+      ]);
+      const h = await hRes.json();
+      const f = await fRes.json();
+      if (h.s === "error") throw new Error(h.message || "fyers holdings failed");
+
+      const holdings = (h.holdings || []).map((p) => ({
+        sym: String(p.symbol || "").replace(/^NSE:/, "").replace(/-EQ$/, ""),
+        qty: p.quantity ?? 0,
+        avg: p.costPrice ?? null,
+        ltp: p.ltp ?? null,
+        pnl: p.pl ?? null,
+        value: p.marketVal ?? null,
+      }));
+      // fund_limit is a list of labelled buckets; the available cash is the one we want.
+      const bucket = (f.fund_limit || []).find((x) => /available/i.test(x.title || ""));
+      const cash = bucket ? bucket.equityAmount ?? null : null;
+      return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    res.status(400).json({ error: "portfolio not supported for this broker yet" });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
   }
