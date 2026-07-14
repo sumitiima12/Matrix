@@ -1084,6 +1084,133 @@ app.post("/api/broker/order", async (req, res) => {
    Read-only. This is what they actually own — not our paper positions. The two are
    never mixed: Real mode shows this, Virtual mode shows the paper book. Merging them
    would produce a P&L that is true of no account that exists. */
+
+/* ─────────────────────────── OPTION CHAIN ───────────────────────────
+   THE SYMBOL COMES FROM THE BROKER. WE NEVER BUILD ONE.
+
+   It is tempting to construct "NSE:NIFTY26JUL24500CE" from parts — underlying +
+   expiry + strike + CE. Doing so requires guessing FOUR things: the expiry calendar
+   (NSE has changed its expiry day; a stale rule silently picks the wrong week), the
+   weekly-vs-monthly encoding, the strike interval, and which strikes actually exist.
+   Get any one wrong and the order does not fail politely — it BUYS A DIFFERENT
+   CONTRACT. A typo'd stock symbol gets rejected; a plausible-but-wrong option symbol
+   gets filled.
+
+   So: we ask the broker what contracts exist, and the user picks from that list. If we
+   cannot load the chain, option trading is unavailable and we say so. We do not fall
+   back to a guess.                                                                  */
+
+const optCache = new Map();
+const optMemo = async (k, ms, fn) => {
+  const hit = optCache.get(k);
+  if (hit && Date.now() - hit.at < ms) return hit.v;
+  const v = await fn();
+  optCache.set(k, { at: Date.now(), v });
+  return v;
+};
+
+app.get("/api/broker/optionchain", async (req, res) => {
+  const sess = getBrokerSession(req);
+  if (!sess) return res.status(401).json({ error: "no broker session" });
+  const { broker, accessToken: token } = sess;
+  const underlying = String(req.query.underlying || "NIFTY").toUpperCase();
+
+  try {
+    if (broker === "fyers") {
+      /* FYERS option chain. Returns the REAL tradable symbols, strikes and expiries.
+         We read only fields we can identify; anything we cannot read, we drop rather
+         than infer. */
+      const idx = { NIFTY: "NSE:NIFTY50-INDEX", BANKNIFTY: "NSE:NIFTYBANK-INDEX", FINNIFTY: "NSE:FINNIFTY-INDEX" };
+      const sym = idx[underlying] || `NSE:${underlying}-EQ`;
+
+      const data = await optMemo(`oc:${sym}`, 60_000, async () => {
+        const u = `https://api-t1.fyers.in/data/options-chain-v3?symbol=${encodeURIComponent(sym)}&strikecount=20`;
+        const r = await fetch(u, { headers: brokerAuth(broker, token) });
+        return r.json();
+      });
+
+      const d = data && (data.data || data);
+      const rows = (d && (d.optionsChain || d.options_chain)) || [];
+      if (!Array.isArray(rows) || !rows.length) {
+        return res.status(502).json({ error: "broker returned no option chain", raw: data && data.message });
+      }
+
+      // Keep ONLY rows whose symbol, strike and type we can actually read.
+      const contracts = rows
+        .map((r) => ({
+          symbol: r.symbol || r.tradingsymbol || null,
+          strike: r.strike_price != null ? Number(r.strike_price) : null,
+          type: r.option_type || r.optionType || null,     // CE / PE
+          expiry: r.expiry || r.expiryDate || null,
+          lot: r.lot_size != null ? Number(r.lot_size) : (r.minLot != null ? Number(r.minLot) : null),
+          ltp: r.ltp != null ? Number(r.ltp) : null,
+        }))
+        .filter((r) => r.symbol && r.strike != null && (r.type === "CE" || r.type === "PE"));
+
+      if (!contracts.length) {
+        return res.status(502).json({ error: "option chain shape not recognised — refusing to guess symbols" });
+      }
+
+      const spot = d.callOi != null && d.indiaVixData ? null : (d.spot != null ? Number(d.spot) : null);
+      const expiries = [...new Set(contracts.map((c) => c.expiry).filter(Boolean))].sort();
+
+      return res.json({
+        broker, underlying, spot,
+        expiries,
+        contracts,
+        lot: contracts.find((c) => c.lot)?.lot ?? null,
+      });
+    }
+
+    if (broker === "zerodha") {
+      /* Kite publishes the full instrument dump as CSV. It is the authoritative list of
+         what is tradable today — expiries, strikes and tradingsymbols included. */
+      const csv = await optMemo("kite:nfo", 6 * 3600_000, async () => {
+        const r = await fetch("https://api.kite.trade/instruments/NFO", { headers: brokerAuth(broker, token) });
+        return r.text();
+      });
+
+      const lines = csv.split("\n");
+      const head = lines[0].split(",").map((x) => x.trim());
+      const col = (n) => head.indexOf(n);
+      const iTs = col("tradingsymbol"), iName = col("name"), iExp = col("expiry"),
+            iStrike = col("strike"), iType = col("instrument_type"), iLot = col("lot_size");
+      if (iTs < 0 || iStrike < 0 || iType < 0) {
+        return res.status(502).json({ error: "instrument dump shape not recognised — refusing to guess symbols" });
+      }
+
+      const contracts = [];
+      for (let i = 1; i < lines.length; i++) {
+        const p = lines[i].split(",");
+        if (p[iName] !== underlying) continue;
+        const t = p[iType];
+        if (t !== "CE" && t !== "PE") continue;
+        contracts.push({
+          symbol: `NFO:${p[iTs]}`,
+          strike: Number(p[iStrike]),
+          type: t,
+          expiry: p[iExp],
+          lot: iLot >= 0 ? Number(p[iLot]) : null,
+          ltp: null,
+        });
+      }
+      if (!contracts.length) return res.status(404).json({ error: `no option contracts found for ${underlying}` });
+
+      const expiries = [...new Set(contracts.map((c) => c.expiry).filter(Boolean))].sort();
+      return res.json({
+        broker, underlying, spot: null,
+        expiries,
+        contracts,
+        lot: contracts.find((c) => c.lot)?.lot ?? null,
+      });
+    }
+
+    return res.status(400).json({ error: `option chain not supported for ${broker}` });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
 app.get("/api/broker/portfolio", async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
