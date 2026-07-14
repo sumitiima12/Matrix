@@ -729,5 +729,290 @@ app.post("/api/ask", async (req, res) => {
   res.status(502).json({ error: errors.join(" | ") });
 });
 
+
+/* ═══════════════════════════ BROKER INTEGRATION ═══════════════════════════
+   Real-time market data (and, if explicitly enabled, real orders) from Zerodha
+   Kite Connect and FYERS.
+
+   WHY THE SECRET LIVES HERE AND NOT IN THE BROWSER
+   ------------------------------------------------
+   The OAuth flow needs your api_secret to exchange a request token for an access
+   token. Anything shipped to the browser is readable by anyone who opens devtools,
+   so the secret NEVER leaves this server. The browser only ever holds the resulting
+   short-lived access token, and sends it back as a header.
+
+   Set on Render (Environment):
+     KITE_API_KEY, KITE_API_SECRET          <- Zerodha Kite Connect
+     FYERS_APP_ID, FYERS_SECRET_ID          <- FYERS API v3
+     BROKER_TRADING_ENABLED=false           <- must be "true" to allow REAL orders
+
+   BROKER_TRADING_ENABLED defaults to FALSE. Connecting a broker gives you live
+   PRICES; it does not arm real-money execution. That is a separate, deliberate
+   switch, because the difference between paper and real is somebody's savings.
+
+   Tokens are NOT persisted server-side. They expire daily (both brokers force a
+   re-login each morning — that is their rule, not something we can engineer away).
+------------------------------------------------------------------------- */
+
+const TRADING_ENABLED = String(process.env.BROKER_TRADING_ENABLED || "").toLowerCase() === "true";
+
+/* THE BROKER TOKEN NEVER GOES TO THE BROWSER.
+   It was being handed to the client, which meant a token capable of placing REAL
+   TRADES was sitting in the user's browser storage, readable by any XSS. Now the
+   server keeps it and the client only ever holds an opaque session id that is
+   useless anywhere else.
+
+   Bound to a userId, so one user's session id cannot be replayed against another's
+   broker account. In memory: broker tokens die daily anyway, and a restart forcing
+   a re-login is the correct failure mode for something this sensitive. */
+const brokerSessions = new Map();           // sessionId -> { userId, broker, accessToken, at }
+const SESSION_TTL = 12 * 60 * 60 * 1000;    // 12h; brokers expire theirs daily regardless
+
+function putBrokerSession(userId, broker, accessToken) {
+  const id = crypto.randomBytes(32).toString("hex");
+  brokerSessions.set(id, { userId: String(userId), broker, accessToken, at: Date.now() });
+  return id;
+}
+
+/** Resolve a session id to a live token, checking it belongs to this user. */
+function getBrokerSession(req) {
+  const id = req.get("X-Broker-Session");
+  const userId = req.get("X-User-Id");
+  if (!id || !userId) return null;
+  const s = brokerSessions.get(id);
+  if (!s) return null;
+  if (Date.now() - s.at > SESSION_TTL) { brokerSessions.delete(id); return null; }
+  if (s.userId !== String(userId)) return null;    // not yours
+  return s;
+}
+
+// Sweep expired sessions so the map cannot grow without bound.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of brokerSessions) if (now - s.at > SESSION_TTL) brokerSessions.delete(id);
+}, 30 * 60 * 1000).unref?.();
+
+const BROKERS = {
+  zerodha: {
+    name: "Zerodha",
+    key: () => envKey("KITE_API_KEY"),
+    secret: () => envKey("KITE_API_SECRET"),
+    loginUrl: (key) => `https://kite.zerodha.com/connect/login?v=3&api_key=${key}`,
+  },
+  fyers: {
+    name: "FYERS",
+    key: () => envKey("FYERS_APP_ID"),
+    secret: () => envKey("FYERS_SECRET_ID"),
+    loginUrl: (key, redirect) =>
+      `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code&state=matrix`,
+  },
+};
+
+/** Which brokers are actually configured on this server. */
+app.get("/api/broker/status", (_req, res) => {
+  const out = {};
+  Object.entries(BROKERS).forEach(([id, b]) => {
+    out[id] = { name: b.name, configured: Boolean(b.key() && b.secret()) };
+  });
+  res.json({ brokers: out, tradingEnabled: TRADING_ENABLED });
+});
+
+/** Step 1 of OAuth: where the user logs in. */
+app.get("/api/broker/login-url", (req, res) => {
+  const id = String(req.query.broker || "");
+  const b = BROKERS[id];
+  if (!b) return res.status(400).json({ error: "unknown broker" });
+  const key = b.key();
+  if (!key) return res.status(400).json({ error: `${b.name} is not configured on the server (missing API key).` });
+  res.json({ url: b.loginUrl(key, req.query.redirect) });
+});
+
+/* Step 2: exchange the short-lived request/auth code for an access token.
+   This is the ONLY place the api_secret is used, and it never leaves the server. */
+app.post("/api/broker/session", async (req, res) => {
+  const { broker, requestToken, userId } = req.body || {};
+  const b = BROKERS[broker];
+  if (!b) return res.status(400).json({ error: "unknown broker" });
+  if (!requestToken) return res.status(400).json({ error: "requestToken required" });
+  if (!userId) return res.status(400).json({ error: "userId required" });
+
+  const key = b.key(), secret = b.secret();
+  if (!key || !secret) return res.status(400).json({ error: `${b.name} is not configured on the server.` });
+
+  try {
+    if (broker === "zerodha") {
+      // Kite: checksum = SHA256(api_key + request_token + api_secret)
+      const checksum = crypto.createHash("sha256").update(key + requestToken + secret).digest("hex");
+      const r = await fetch("https://api.kite.trade/session/token", {
+        method: "POST",
+        headers: { "X-Kite-Version": "3", "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ api_key: key, request_token: requestToken, checksum }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.status === "error") throw new Error(d.message || `kite ${r.status}`);
+      // Opaque id out; the access token stays in this process.
+      const sid = putBrokerSession(userId, broker, d.data.access_token);
+      return res.json({ sessionId: sid, user: d.data.user_name || null, broker });
+    }
+
+    if (broker === "fyers") {
+      // FYERS: appIdHash = SHA256(app_id:secret_id)
+      const appIdHash = crypto.createHash("sha256").update(`${key}:${secret}`).digest("hex");
+      const r = await fetch("https://api-t1.fyers.in/api/v3/validate-authcode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ grant_type: "authorization_code", appIdHash, code: requestToken }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
+      const sid = putBrokerSession(userId, broker, d.access_token);
+      return res.json({ sessionId: sid, user: null, broker });
+    }
+
+    res.status(400).json({ error: "unsupported broker" });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+/** Auth header for a broker call. */
+function brokerAuth(broker, token) {
+  if (broker === "zerodha") {
+    return { "X-Kite-Version": "3", Authorization: `token ${BROKERS.zerodha.key()}:${token}` };
+  }
+  if (broker === "fyers") {
+    return { Authorization: `${BROKERS.fyers.key()}:${token}` };
+  }
+  return {};
+}
+
+/* REAL-TIME QUOTES. This is the point of the whole exercise: Yahoo is ~15 minutes
+   delayed on NSE; a broker feed is live. Symbols arrive already in broker format
+   (see domain/brokerSymbols.js) — the server does not guess at symbol names. */
+app.get("/api/broker/quotes", async (req, res) => {
+  const sess = getBrokerSession(req);
+  if (!sess) return res.status(401).json({ error: "no broker session" });
+  const broker = sess.broker;
+  const token = sess.accessToken;
+  const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!BROKERS[broker]) return res.status(400).json({ error: "unknown broker" });
+  if (!symbols.length) return res.status(400).json({ error: "symbols required" });
+
+  try {
+    const out = {};
+
+    if (broker === "zerodha") {
+      const qs = symbols.map((s) => `i=${encodeURIComponent(s)}`).join("&");
+      const r = await fetch(`https://api.kite.trade/quote?${qs}`, { headers: brokerAuth(broker, token) });
+      const d = await r.json();
+      if (!r.ok || d.status === "error") throw new Error(d.message || `kite ${r.status}`);
+      Object.entries(d.data || {}).forEach(([sym, q]) => {
+        const prev = q.ohlc && q.ohlc.close;
+        out[sym] = {
+          price: q.last_price ?? null,
+          chg: prev ? +(((q.last_price - prev) / prev) * 100).toFixed(2) : null,
+          vol: q.volume ?? null,
+          oi: q.oi ?? null,                          // REAL open interest — Yahoo has none
+          bid: q.depth?.buy?.[0]?.price ?? null,
+          ask: q.depth?.sell?.[0]?.price ?? null,
+        };
+      });
+    }
+
+    if (broker === "fyers") {
+      const r = await fetch(`https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(symbols.join(","))}`, {
+        headers: brokerAuth(broker, token),
+      });
+      const d = await r.json();
+      if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
+      (d.d || []).forEach((row) => {
+        const v = row.v || {};
+        out[row.n] = {
+          price: v.lp ?? null,
+          chg: v.chp ?? null,
+          vol: v.volume ?? null,
+          oi: v.oi ?? null,
+          bid: v.bid ?? null,
+          ask: v.ask ?? null,
+        };
+      });
+    }
+
+    res.json({ quotes: out, broker, live: true, at: Date.now() });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+/* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
+   the client must send X-Confirm-Live: yes. Two locks, because the failure mode
+   here is real money moving without the user meaning it. */
+app.post("/api/broker/order", async (req, res) => {
+  if (!TRADING_ENABLED) {
+    return res.status(403).json({
+      error: "Live trading is disabled on this server. Set BROKER_TRADING_ENABLED=true to allow real orders.",
+    });
+  }
+  if (req.get("X-Confirm-Live") !== "yes") {
+    return res.status(400).json({ error: "Live order not explicitly confirmed by the client." });
+  }
+
+  const sess = getBrokerSession(req);
+  if (!sess) return res.status(401).json({ error: "no broker session" });
+  const broker = sess.broker;
+  const token = sess.accessToken;
+  const { symbol, side, qty, orderType = "MARKET", price, product = "CNC" } = req.body || {};
+  if (!BROKERS[broker]) return res.status(400).json({ error: "unknown broker" });
+  if (!symbol || !side || !qty) return res.status(400).json({ error: "symbol, side and qty are required" });
+
+  try {
+    if (broker === "zerodha") {
+      const [exchange, tradingsymbol] = String(symbol).split(":");
+      const body = new URLSearchParams({
+        exchange, tradingsymbol,
+        transaction_type: side, quantity: String(qty),
+        order_type: orderType, product,
+        validity: "DAY",
+        ...(orderType === "LIMIT" && price ? { price: String(price) } : {}),
+      });
+      const r = await fetch("https://api.kite.trade/orders/regular", {
+        method: "POST", headers: { ...brokerAuth(broker, token), "Content-Type": "application/x-www-form-urlencoded" }, body,
+      });
+      const d = await r.json();
+      if (!r.ok || d.status === "error") throw new Error(d.message || `kite ${r.status}`);
+      return res.json({ orderId: d.data.order_id, status: "PENDING", broker });
+    }
+
+    if (broker === "fyers") {
+      const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+        method: "POST",
+        headers: { ...brokerAuth(broker, token), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol, qty: Number(qty),
+          type: orderType === "LIMIT" ? 1 : 2,           // 1 = limit, 2 = market
+          side: side === "BUY" ? 1 : -1,
+          productType: product === "CNC" ? "CNC" : "INTRADAY",
+          limitPrice: orderType === "LIMIT" ? Number(price) : 0,
+          stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
+      return res.json({ orderId: d.id, status: "PENDING", broker });
+    }
+
+    res.status(400).json({ error: "unsupported broker" });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+/** Drop a broker session (logout, or the user disconnecting). */
+app.post("/api/broker/logout", (req, res) => {
+  const id = req.get("X-Broker-Session");
+  if (id) brokerSessions.delete(id);
+  res.json({ ok: true });
+});
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
