@@ -187,8 +187,13 @@ async function isUserBlocked(phone) {
 async function getUserFull(phone) {
   const user = await getUser(phone);
   if (!user) return null;
-  const state = await getState(phone);
-  const trades = await getTrades(phone, 0, Date.now());
+  // The users table is keyed by the bare phone, but the app stores state + trades under the
+  // "ph_"-prefixed userId (see useAuth). Look those up under the prefixed id, with a bare
+  // fallback in case any older data was stored without the prefix.
+  const uid = "ph_" + phone;
+  const state = (await getState(uid)) || (await getState(phone));
+  let trades = await getTrades(uid, 0, Date.now());
+  if (!trades || !trades.length) trades = await getTrades(phone, 0, Date.now());
   const { pin, ...safeUser } = user;   // never expose the hash
   return { phone, user: safeUser, state: state || null, trades: trades || [] };
 }

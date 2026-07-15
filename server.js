@@ -166,13 +166,14 @@ app.get("/api/state", async (req, res) => {
 /* Locked behind TWO checks: the caller's userId must be in ADMIN_USER_IDS, AND they must
    present the ADMIN_KEY secret. Both are required — a leaked key alone, or a known admin
    userId alone, is not enough. Set ADMIN_USER_IDS (comma-separated) and ADMIN_KEY in env. */
+const stripPh = (s) => String(s || "").replace(/^ph_/, "");
 function isAdmin(req) {
-  const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => stripPh(x.trim())).filter(Boolean);
   const adminKey = process.env.ADMIN_KEY || "";
-  const uid = req.get("X-User-Id") || req.query.userId || "";
+  const uid = stripPh(req.get("X-User-Id") || req.query.userId || "");
   const key = req.get("X-Admin-Key") || req.query.key || "";
   if (!adminKey || !adminIds.length) return false;       // admin not configured -> no access
-  return adminIds.includes(String(uid)) && key === adminKey;
+  return adminIds.includes(uid) && key === adminKey;
 }
 function requireAdmin(req, res) {
   if (!isAdmin(req)) { res.status(403).json({ error: "Forbidden" }); return false; }
@@ -218,10 +219,16 @@ app.get("/api/admin/check", async (req, res) => {
 // only decides whether to SHOW the button — it grants no access (every admin route still
 // demands the key). Returns false if admin isn't configured at all.
 app.get("/api/admin/is-admin-user", async (req, res) => {
-  const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => stripPh(x.trim())).filter(Boolean);
   const adminKey = process.env.ADMIN_KEY || "";
-  const uid = req.get("X-User-Id") || req.query.userId || "";
-  res.json({ adminUser: Boolean(adminKey && adminIds.length && adminIds.includes(String(uid))) });
+  const uid = stripPh(req.get("X-User-Id") || req.query.userId || "");
+  res.json({
+    adminUser: Boolean(adminKey && adminIds.length && adminIds.includes(uid)),
+    // Diagnostics: helps you set ADMIN_USER_IDS correctly. `yourUserId` is the exact string
+    // that must appear in ADMIN_USER_IDS. No secrets are exposed here.
+    yourUserId: String(uid),
+    adminConfigured: Boolean(adminKey && adminIds.length),
+  });
 });
 
 
