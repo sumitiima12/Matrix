@@ -1115,7 +1115,10 @@ function brokerAuth(broker, token) {
    (see domain/brokerSymbols.js) — the server does not guess at symbol names. */
 app.get("/api/broker/quotes", async (req, res) => {
   const sess = getBrokerSession(req);
-  if (!sess) return res.status(401).json({ error: "no broker session" });
+  /* 401 = the session is genuinely gone (expired, or wiped by a server restart — sessions
+     live in memory on the free tier). The client should reconnect. This is DISTINCT from a
+     quote-fetch hiccup below, which is a 502 and must NOT drop the session. */
+  if (!sess) return res.status(401).json({ error: "no broker session", code: "SESSION_GONE" });
   const broker = sess.broker;
   const token = sess.accessToken;
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
