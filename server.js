@@ -934,18 +934,11 @@ const providers = () => [
 ].filter(Boolean);
 
 app.get("/api/health", (req, res) => {
-  const engines = providers().map((p) => p.name);
-  const groq = GROQ_KEY();
+  // Public health: liveness, engines, DB mode only. No key metadata or env-var names.
   res.json({
     ok: true,
-    engines,
+    engines: providers().map((p) => p.name),
     db: db.USING_PG ? "postgres" : "flat-file",
-    // Debug helpers (no secret values are ever returned):
-    groqKeySeen: !!groq,
-    groqKeyLength: groq ? groq.length : 0,
-    groqKeyPrefix: groq ? groq.slice(0, 4) + "..." : null,
-    envVarsContainingKEY: Object.keys(process.env).filter((k) => /KEY|TOKEN|GROQ/i.test(k)).sort(),
-    hint: engines.length ? "LLM configured." : "No LLM key visible to the process. Check the variable NAME on the correct Render service, then redeploy.",
   });
 });
 
@@ -1413,6 +1406,12 @@ app.post("/api/broker/order", async (req, res) => {
   // A LIMIT order needs a price; the client may send it as `limitPrice` or `price`.
   const price = req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price;
   if (!BROKERS[broker]) return res.status(400).json({ error: "unknown broker" });
+  // Quantity must be a finite positive number within a sane ceiling — a negative, NaN, or
+  // absurd qty must never reach a live broker.
+  const nQty = Number(qty);
+  if (!Number.isFinite(nQty) || nQty <= 0 || nQty > 1_000_000) {
+    return res.status(400).json({ error: "quantity must be a positive number within limits" });
+  }
   if (!symbol || !side || !qty) return res.status(400).json({ error: "symbol, side and qty are required" });
 
   try {

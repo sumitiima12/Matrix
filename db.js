@@ -16,10 +16,17 @@ let pool = null;
 
 if (USING_PG) {
   const { Pool } = require("pg");
+  // TLS: default lenient (unchanged) so existing deploys keep working. To harden, set
+  // DB_SSL_STRICT=true; optionally provide the provider's CA bundle in DB_CA_CERT so the
+  // certificate is actually verified. Neon/Supabase/Render all support this.
+  const strict = String(process.env.DB_SSL_STRICT || "").toLowerCase() === "true";
+  const ca = process.env.DB_CA_CERT || null;
+  const ssl = strict
+    ? (ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true })
+    : { rejectUnauthorized: false };
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    // Most hosted Postgres (Neon, Supabase, Render) require SSL:
-    ssl: { rejectUnauthorized: false },
+    ssl,
   });
 }
 
