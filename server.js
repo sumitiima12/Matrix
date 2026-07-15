@@ -854,9 +854,9 @@ const TRADING_ENABLED = String(process.env.BROKER_TRADING_ENABLED || "").toLower
 const brokerSessions = new Map();           // sessionId -> { userId, broker, accessToken, at }
 const SESSION_TTL = 12 * 60 * 60 * 1000;    // 12h; brokers expire theirs daily regardless
 
-function putBrokerSession(userId, broker, accessToken) {
+function putBrokerSession(userId, broker, accessToken, refreshToken = null) {
   const id = crypto.randomBytes(32).toString("hex");
-  brokerSessions.set(id, { userId: String(userId), broker, accessToken, at: Date.now() });
+  brokerSessions.set(id, { userId: String(userId), broker, accessToken, refreshToken, at: Date.now() });
   return id;
 }
 
@@ -1047,7 +1047,7 @@ app.post("/api/broker/session", async (req, res) => {
       });
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
-      const sid = putBrokerSession(userId, broker, d.access_token);
+      const sid = putBrokerSession(userId, broker, d.access_token, d.refresh_token || null);
       return res.json({ sessionId: sid, user: null, broker });
     }
 
@@ -1485,22 +1485,55 @@ app.get("/api/broker/portfolio", async (req, res) => {
     }
 
     if (broker === "fyers") {
-      const [hRes, fRes] = await Promise.all([
+      /* FYERS splits what you own across TWO endpoints, and BOTH matter:
+           /holdings  -> stock that has settled into your demat (T+1 and older)
+           /positions -> today's trades, incl. delivery buys not yet settled
+         Reading only /holdings meant a freshly-bought delivery stock (still sitting in
+         the Positions tab in the FYERS app) showed as "No holdings" here — even though
+         it is very much yours. We now fetch both and merge them. */
+      const [hRes, pRes, fRes] = await Promise.all([
         fetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token) }),
+        fetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token) }),
         fetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token) }),
       ]);
       const h = await hRes.json();
+      const p = await pRes.json();
       const f = await fRes.json();
-      if (h.s === "error") throw new Error(h.message || "fyers holdings failed");
+      if (h.s === "error" && p.s === "error") throw new Error(h.message || p.message || "fyers portfolio failed");
 
-      const holdings = (h.holdings || []).map((p) => ({
-        sym: String(p.symbol || "").replace(/^NSE:/, "").replace(/-EQ$/, ""),
-        qty: p.quantity ?? 0,
-        avg: p.costPrice ?? null,
-        ltp: p.ltp ?? null,
-        pnl: p.pl ?? null,
-        value: p.marketVal ?? null,
+      const clean = (sym) => String(sym || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
+
+      const settled = (h.holdings || []).map((x) => ({
+        sym: clean(x.symbol),
+        qty: x.quantity ?? 0,
+        avg: x.costPrice ?? null,
+        ltp: x.ltp ?? null,
+        pnl: x.pl ?? null,
+        value: x.marketVal ?? null,
+        source: "holdings",
       }));
+
+      /* Positions with a non-zero net quantity are open. netQty > 0 is a long you hold;
+         we skip flat (0) rows, which are closed round-trips FYERS still lists. */
+      const open = (p.netPositions || [])
+        .filter((x) => Number(x.netQty ?? x.qty ?? 0) !== 0)
+        .map((x) => ({
+          sym: clean(x.symbol),
+          qty: Number(x.netQty ?? x.qty ?? 0),
+          avg: x.netAvg ?? x.avgPrice ?? x.buyAvg ?? null,
+          ltp: x.ltp ?? null,
+          pnl: x.pl ?? x.realized_profit ?? null,
+          value: (x.ltp != null && x.netQty != null) ? +(x.ltp * x.netQty).toFixed(2) : null,
+          source: "positions",
+        }));
+
+      /* Merge: if the same symbol appears in both (a partially-settled holding), keep the
+         settled holding row and don't double-count the position. */
+      const bySym = new Map();
+      settled.forEach((x) => bySym.set(x.sym, x));
+      open.forEach((x) => { if (!bySym.has(x.sym)) bySym.set(x.sym, x); });
+      const holdings = [...bySym.values()];
+
       // fund_limit is a list of labelled buckets; the available cash is the one we want.
       const bucket = (f.fund_limit || []).find((x) => /available/i.test(x.title || ""));
       const cash = bucket ? bucket.equityAmount ?? null : null;
