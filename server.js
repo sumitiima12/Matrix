@@ -21,7 +21,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
-const { validateOrder: serverValidateOrder } = require("./riskEngine");   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
+const { validateOrder: serverValidateOrder } = require("./riskEngine");
+const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
 
@@ -107,9 +108,8 @@ const isLegacyHash = (stored) => stored && !/^\$2[aby]\$/.test(stored);
 const cleanPhone = (p) => String(p || "").replace(/[^0-9]/g, "");
 
 /* ------------------------------ AUTH TOKENS ------------------------------- */
-/* Token signing/verification + the requireAuth middleware live in auth.js so they can be
-   unit-tested without booting the server. */
-const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");
+/* Token signing/verification + the requireAuth middleware live in auth.js (required at the
+   top of this file, before any route uses them). */
 
 
 /* Rate limit auth endpoints: 10 attempts per 15 min per IP. Blocks brute force without
