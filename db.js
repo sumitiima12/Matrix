@@ -82,6 +82,11 @@ async function getUser(phone) {
   if (USING_PG) { const r = await pool.query(`SELECT pin, name FROM users WHERE phone=$1`, [phone]); return r.rows[0] || null; }
   return readJSON(FILES.users)[phone] || null;
 }
+async function updateUserPin(phone, pinHash) {
+  if (USING_PG) { await pool.query(`UPDATE users SET pin=$2 WHERE phone=$1`, [phone, pinHash]); return; }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].pin = pinHash; writeJSON(FILES.users, users); }
+}
 async function createUser(phone, pinHash, name) {
   if (USING_PG) { await pool.query(`INSERT INTO users (phone, pin, name, created_at) VALUES ($1,$2,$3,$4)`, [phone, pinHash, name, Date.now()]); return; }
   const users = readJSON(FILES.users);
@@ -141,4 +146,4 @@ async function updateTrade(userId, trade) {
   writeJSON(FILES.trades, db);
 }
 
-module.exports = { initDb, saveTrade, getTrades, getUser, createUser, getState, saveState, getOpenTrades, updateTrade, USING_PG };
+module.exports = { initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, USING_PG };

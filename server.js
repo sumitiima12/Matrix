@@ -14,13 +14,37 @@
  */
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");        // gzip API responses
+const rateLimit = require("express-rate-limit");   // brute-force protection
+const bcrypt = require("bcryptjs");                 // proper PIN hashing
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
-app.use(cors());            // lock to your app's origin in prod: cors({ origin: "https://yourapp.com" })
+
+/* CORS locked to known origins (was wide-open app.use(cors())). The custom broker headers
+   MUST stay allowed or every /api/broker/* preflight fails. Extra origins can be added via
+   the CORS_ORIGINS env var (comma-separated) without a code change. */
+const ALLOWED_ORIGINS = [
+  "https://matrix-frontend-indol.vercel.app",
+  "http://localhost:5173",
+  "http://localhost:4173",
+  ...String(process.env.CORS_ORIGINS || "").split(",").map((x) => x.trim()).filter(Boolean),
+];
+app.use(cors({
+  origin(origin, cb) {
+    // allow same-origin / curl / server-to-server (no Origin header) and any listed origin
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  allowedHeaders: ["Content-Type", "X-Broker-Session", "X-User-Id", "X-Confirm-Live"],
+  exposedHeaders: ["Location"],   // Schwab returns the order id in the Location header
+}));
+
+app.use(compression());     // gzip JSON responses — big win on the indicators/quotes payloads
+// (was: app.use(cors());  wide openpp.com" })
 app.use(express.json());
 
 const PORT = process.env.PORT || 8787;
@@ -34,6 +58,17 @@ app.post("/api/trades", async (req, res) => {
   try {
     const { userId, trade } = req.body || {};
     if (!userId || !trade || !trade.sym) return res.status(400).json({ error: "userId and trade required" });
+
+    /* Validate fields that must be sane. We DON'T reject unknown fields — the frontend
+       sends a rich trade object — but a negative qty or non-numeric price is never valid. */
+    if (trade.side && !["BUY", "SELL"].includes(String(trade.side).toUpperCase()))
+      return res.status(400).json({ error: "side must be BUY or SELL" });
+    if (trade.qty != null && (!Number.isFinite(+trade.qty) || +trade.qty <= 0))
+      return res.status(400).json({ error: "qty must be a positive number" });
+    if (trade.price != null && (!Number.isFinite(+trade.price) || +trade.price < 0))
+      return res.status(400).json({ error: "price must be a non-negative number" });
+    if (String(trade.sym).length > 64)
+      return res.status(400).json({ error: "symbol too long" });
     const rec = { id: trade.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...trade };
     await db.saveTrade(userId, rec);
     res.json({ ok: true, trade: rec });
@@ -52,12 +87,35 @@ app.get("/api/trades", async (req, res) => {
 });
 
 /* ----------------------- users (phone + PIN) & state ---------------------- */
-// PINs are SHA-256 hashed. Fine for a virtual-trading demo; use a real auth
-// provider (and rate-limiting) before handling anything sensitive.
-const hashPin = (pin) => crypto.createHash("sha256").update(String(pin) + "|matrix").digest("hex");
+/* PINs are now bcrypt-hashed. Existing users were SHA-256 — we MUST NOT lock them out, so
+   verifyPin accepts the old scheme too, and a successful legacy login is transparently
+   re-hashed to bcrypt (see /api/login). No user re-registers; the upgrade is invisible. */
+const BCRYPT_ROUNDS = 10;
+const legacySha = (pin) => crypto.createHash("sha256").update(String(pin) + "|matrix").digest("hex");
+const hashPin = (pin) => bcrypt.hashSync(String(pin), BCRYPT_ROUNDS);
+
+/** True if `pin` matches the stored hash, whether that hash is bcrypt or legacy SHA-256. */
+function verifyPin(pin, stored) {
+  if (!stored) return false;
+  // bcrypt hashes start with $2a$/$2b$/$2y$. Anything else is a legacy SHA-256 hex digest.
+  if (/^\$2[aby]\$/.test(stored)) return bcrypt.compareSync(String(pin), stored);
+  return stored === legacySha(pin);
+}
+/** True if the stored hash is the old SHA-256 scheme and should be upgraded on login. */
+const isLegacyHash = (stored) => stored && !/^\$2[aby]\$/.test(stored);
 const cleanPhone = (p) => String(p || "").replace(/[^0-9]/g, "");
 
-app.post("/api/register", async (req, res) => {
+/* Rate limit auth endpoints: 10 attempts per 15 min per IP. Blocks brute force without
+   getting in a real user's way. */
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Please wait a few minutes and try again." },
+});
+
+app.post("/api/register", authLimiter, async (req, res) => {
   try {
     const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin, name = (req.body && req.body.name) || "";
     if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
@@ -67,11 +125,17 @@ app.post("/api/register", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", authLimiter, async (req, res) => {
   try {
     const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin;
     const u = await db.getUser(phone);
-    if (!u || u.pin !== hashPin(pin)) return res.status(401).json({ error: "Wrong phone or PIN." });
+    if (!u || !verifyPin(pin, u.pin)) return res.status(401).json({ error: "Wrong phone or PIN." });
+
+    /* Upgrade a legacy SHA-256 user to bcrypt now that we've verified their PIN. Best-effort:
+       a failed upgrade must not fail the login. */
+    if (isLegacyHash(u.pin) && typeof db.updateUserPin === "function") {
+      try { await db.updateUserPin(phone, hashPin(pin)); } catch { /* upgrade later */ }
+    }
     res.json({ ok: true, userId: phone, name: u.name || "" });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -100,8 +164,24 @@ function memo(key, ttlMs, fn) {
   if (hit && Date.now() - hit.t < ttlMs) return Promise.resolve(hit.v);
   return Promise.resolve(fn()).then((v) => { cache.set(key, { v, t: Date.now() }); return v; });
 }
+const FETCH_TIMEOUT_MS = 8000;
+/* Timed fetch: aborts after 8s so a hanging upstream (Yahoo, an LLM provider) fails fast
+   instead of stalling the whole request behind it. */
+async function fetchT(url, opts = {}, ms = FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`upstream timeout after ${ms}ms`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const j = async (url) => {
-  const r = await fetch(url, { headers: UA });
+  const r = await fetchT(url, { headers: UA });
   if (!r.ok) throw new Error(`upstream ${r.status}`);
   return r.json();
 };
