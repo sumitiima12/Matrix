@@ -37,6 +37,9 @@ async function initDb() {
     phone TEXT PRIMARY KEY, pin TEXT NOT NULL, name TEXT, created_at BIGINT)`);
   // `blocked` added after launch — ALTER is idempotent, so existing DBs pick it up.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE`);
+  // Security-question recovery (set at signup). Answer is bcrypt-hashed, never plaintext.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sec_question TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sec_answer TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY, user_id TEXT, ts BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS trades_user_ts ON trades (user_id, ts)`);
@@ -91,15 +94,36 @@ async function getUser(phone) {
   if (USING_PG) { const r = await pool.query(`SELECT pin, name FROM users WHERE phone=$1`, [phone]); return r.rows[0] || null; }
   return readJSON(FILES.users)[phone] || null;
 }
+
+/* The user's security QUESTION (public-ish — shown so they know what to answer). Returns
+   null if the user never set one (e.g. accounts created before this feature). */
+async function getSecurityQuestion(phone) {
+  if (USING_PG) { const r = await pool.query(`SELECT sec_question FROM users WHERE phone=$1`, [phone]); return r.rows[0] ? (r.rows[0].sec_question || null) : null; }
+  const u = readJSON(FILES.users)[phone];
+  return u ? (u.secQuestion || null) : null;
+}
+
+/* The hashed security ANSWER — only pulled when verifying a reset attempt. Never sent out. */
+async function getSecurityAnswerHash(phone) {
+  if (USING_PG) { const r = await pool.query(`SELECT sec_answer FROM users WHERE phone=$1`, [phone]); return r.rows[0] ? (r.rows[0].sec_answer || null) : null; }
+  const u = readJSON(FILES.users)[phone];
+  return u ? (u.secAnswer || null) : null;
+}
 async function updateUserPin(phone, pinHash) {
   if (USING_PG) { await pool.query(`UPDATE users SET pin=$2 WHERE phone=$1`, [phone, pinHash]); return; }
   const users = readJSON(FILES.users);
   if (users[phone]) { users[phone].pin = pinHash; writeJSON(FILES.users, users); }
 }
-async function createUser(phone, pinHash, name) {
-  if (USING_PG) { await pool.query(`INSERT INTO users (phone, pin, name, created_at) VALUES ($1,$2,$3,$4)`, [phone, pinHash, name, Date.now()]); return; }
+async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHash = null) {
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO users (phone, pin, name, created_at, sec_question, sec_answer) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [phone, pinHash, name, Date.now(), secQuestion, secAnswerHash]
+    );
+    return;
+  }
   const users = readJSON(FILES.users);
-  users[phone] = { pin: pinHash, name, createdAt: Date.now() };
+  users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null };
   writeJSON(FILES.users, users);
 }
 
@@ -205,4 +229,4 @@ async function getUserFull(phone) {
   return { phone, user: safeUser, state: state || null, trades: trades || [] };
 }
 
-module.exports = { listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, USING_PG };
+module.exports = { getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, USING_PG };

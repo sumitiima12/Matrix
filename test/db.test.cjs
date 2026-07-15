@@ -71,3 +71,20 @@ test("getUserFull returns null for an unknown user", async () => {
   const full = await db.getUserFull("0000000000");
   assert.strictEqual(full, null);
 });
+
+test("security question is stored and retrievable; answer hash is separate", async () => {
+  const bcrypt = require("bcryptjs");
+  const answerHash = bcrypt.hashSync("fluffy", 10);
+  await db.createUser("9998887776", "pinhash", "Test", "First pet's name?", answerHash);
+
+  const q = await db.getSecurityQuestion("9998887776");
+  assert.strictEqual(q, "First pet's name?");
+
+  const h = await db.getSecurityAnswerHash("9998887776");
+  assert.ok(h && bcrypt.compareSync("fluffy", h), "stored answer hash verifies against the answer");
+  assert.ok(!bcrypt.compareSync("wrong", h), "wrong answer does not verify");
+
+  // A user without a security question returns null (not an error).
+  await db.createUser("1112223334", "pinhash", "NoQ");
+  assert.strictEqual(await db.getSecurityQuestion("1112223334"), null);
+});

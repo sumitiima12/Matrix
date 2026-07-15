@@ -127,7 +127,13 @@ app.post("/api/register", authLimiter, async (req, res) => {
     const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin, name = (req.body && req.body.name) || "";
     if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
     if (await db.getUser(phone)) return res.status(409).json({ error: "That number is already registered — please log in." });
-    await db.createUser(phone, hashPin(pin), name);
+    const secQuestion = ((req.body && req.body.secQuestion) || "").trim();
+    const secAnswer = ((req.body && req.body.secAnswer) || "").trim();
+    // Security question is required at signup so every new account has a recovery path.
+    if (!secQuestion || !secAnswer) return res.status(400).json({ error: "Set a security question and answer so you can recover your PIN." });
+    // Answer normalized (trim + lowercase) then bcrypt-hashed — never plaintext.
+    const answerHash = hashPin(secAnswer.toLowerCase());
+    await db.createUser(phone, hashPin(pin), name, secQuestion, answerHash);
     res.json({ ok: true, userId: phone, name, token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -149,6 +155,46 @@ app.post("/api/login", authLimiter, async (req, res) => {
       try { await db.updateUserPin(phone, hashPin(pin)); } catch { /* upgrade later */ }
     }
     res.json({ ok: true, userId: phone, name: u.name || "", token: signToken(phone) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ---------------------------- FORGOT PIN (recovery) ---------------------------
+   Two steps, both rate-limited (authLimiter) so the security answer can't be brute-forced:
+     1) GET the user's security question so the app can show it.
+     2) POST the answer + a new PIN; if the answer matches, the PIN is reset.
+   The answer is compared against its bcrypt hash; it is never returned or logged. To avoid
+   leaking which phone numbers exist, step 1 gives a generic response when there's no
+   question on file. */
+app.get("/api/forgot/question", authLimiter, async (req, res) => {
+  try {
+    const phone = cleanPhone(req.query.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    const q = typeof db.getSecurityQuestion === "function" ? await db.getSecurityQuestion(phone) : null;
+    if (!q) {
+      // No question (unknown number OR an older account without one). Don't reveal which.
+      return res.json({ ok: false, reason: "no_recovery", message: "No security question is set for this number. If this is your account, an admin can reset your PIN." });
+    }
+    res.json({ ok: true, question: q });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/forgot/reset", authLimiter, async (req, res) => {
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    const answer = ((req.body && req.body.answer) || "").trim().toLowerCase();
+    const newPin = req.body && req.body.newPin;
+    if (!phone || !answer || !newPin) return res.status(400).json({ error: "phone, answer and newPin are required." });
+    if (String(newPin).length < 4) return res.status(400).json({ error: "PIN must be at least 4 digits." });
+
+    const hash = typeof db.getSecurityAnswerHash === "function" ? await db.getSecurityAnswerHash(phone) : null;
+    if (!hash) return res.status(400).json({ error: "No recovery is set up for this number." });
+    // verifyPin works for any bcrypt/legacy hash — reuse it to check the answer.
+    if (!verifyPin(answer, hash)) return res.status(401).json({ error: "That answer doesn't match." });
+
+    await db.updateUserPin(phone, hashPin(newPin));
+    // Log them straight in with a fresh token.
+    const u = await db.getUser(phone);
+    res.json({ ok: true, userId: phone, name: (u && u.name) || "", token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -213,6 +259,20 @@ app.post("/api/admin/block", async (req, res) => {
     if (!phone) return res.status(400).json({ error: "phone required" });
     await db.setUserBlocked(phone, blocked);
     res.json({ ok: true, phone, blocked });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin backstop: reset any user's PIN. The last-resort recovery when a user can't answer
+// their security question (or never set one).
+app.post("/api/admin/reset-pin", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    const newPin = req.body && req.body.newPin;
+    if (!phone || !newPin || String(newPin).length < 4) return res.status(400).json({ error: "phone and a 4+ digit newPin are required." });
+    if (!(await db.getUser(phone))) return res.status(404).json({ error: "user not found" });
+    await db.updateUserPin(phone, hashPin(newPin));
+    res.json({ ok: true, phone });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
