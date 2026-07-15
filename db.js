@@ -28,6 +28,8 @@ async function initDb() {
   if (!USING_PG) { console.log("[db] flat-file mode (set DATABASE_URL to use Postgres)"); return; }
   await pool.query(`CREATE TABLE IF NOT EXISTS users (
     phone TEXT PRIMARY KEY, pin TEXT NOT NULL, name TEXT, created_at BIGINT)`);
+  // `blocked` added after launch — ALTER is idempotent, so existing DBs pick it up.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE`);
   await pool.query(`CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY, user_id TEXT, ts BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS trades_user_ts ON trades (user_id, ts)`);
@@ -146,4 +148,49 @@ async function updateTrade(userId, trade) {
   writeJSON(FILES.trades, db);
 }
 
-module.exports = { initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, USING_PG };
+/* ------------------------------- admin ----------------------------------- */
+/* List every user with their basic record (NO pin hash leaves the DB layer here —
+   the admin route strips it, but we also never select it in PG). */
+async function listUsers() {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT phone, name, created_at, blocked FROM users ORDER BY created_at DESC`);
+    return r.rows.map((x) => ({ phone: x.phone, name: x.name, createdAt: x.created_at, blocked: !!x.blocked }));
+  }
+  const users = readJSON(FILES.users);
+  return Object.entries(users).map(([phone, u]) => ({
+    phone, name: u.name || "", createdAt: u.createdAt || null, blocked: !!u.blocked,
+  })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+/* Block / unblock a user. A blocked user cannot log in (enforced in /api/login). */
+async function setUserBlocked(phone, blocked) {
+  if (USING_PG) {
+    await pool.query(`UPDATE users SET blocked=$2 WHERE phone=$1`, [phone, !!blocked]);
+    return;
+  }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].blocked = !!blocked; writeJSON(FILES.users, users); }
+}
+
+/* Is this user blocked? Used by the login route. */
+async function isUserBlocked(phone) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT blocked FROM users WHERE phone=$1`, [phone]);
+    return r.rows[0] ? !!r.rows[0].blocked : false;
+  }
+  const u = readJSON(FILES.users)[phone];
+  return u ? !!u.blocked : false;
+}
+
+/* Everything the admin needs about ONE user: profile, saved state (strategies +
+   onboarding answers live here), and full trade history. No pin hash. */
+async function getUserFull(phone) {
+  const user = await getUser(phone);
+  if (!user) return null;
+  const state = await getState(phone);
+  const trades = await getTrades(phone, 0, Date.now());
+  const { pin, ...safeUser } = user;   // never expose the hash
+  return { phone, user: safeUser, state: state || null, trades: trades || [] };
+}
+
+module.exports = { listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, USING_PG };

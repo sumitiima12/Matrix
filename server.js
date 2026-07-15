@@ -131,6 +131,11 @@ app.post("/api/login", authLimiter, async (req, res) => {
     const u = await db.getUser(phone);
     if (!u || !verifyPin(pin, u.pin)) return res.status(401).json({ error: "Wrong phone or PIN." });
 
+    // Blocked users are turned away even with a correct PIN.
+    if (typeof db.isUserBlocked === "function" && await db.isUserBlocked(phone)) {
+      return res.status(403).json({ error: "This account has been blocked. Contact support." });
+    }
+
     /* Upgrade a legacy SHA-256 user to bcrypt now that we've verified their PIN. Best-effort:
        a failed upgrade must not fail the login. */
     if (isLegacyHash(u.pin) && typeof db.updateUserPin === "function") {
@@ -156,6 +161,59 @@ app.get("/api/state", async (req, res) => {
     res.json({ state: await db.getState(userId) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+/* ================================ ADMIN ================================== */
+/* Locked behind TWO checks: the caller's userId must be in ADMIN_USER_IDS, AND they must
+   present the ADMIN_KEY secret. Both are required — a leaked key alone, or a known admin
+   userId alone, is not enough. Set ADMIN_USER_IDS (comma-separated) and ADMIN_KEY in env. */
+function isAdmin(req) {
+  const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const adminKey = process.env.ADMIN_KEY || "";
+  const uid = req.get("X-User-Id") || req.query.userId || "";
+  const key = req.get("X-Admin-Key") || req.query.key || "";
+  if (!adminKey || !adminIds.length) return false;       // admin not configured -> no access
+  return adminIds.includes(String(uid)) && key === adminKey;
+}
+function requireAdmin(req, res) {
+  if (!isAdmin(req)) { res.status(403).json({ error: "Forbidden" }); return false; }
+  return true;
+}
+
+// List all users (basic records, no PINs).
+app.get("/api/admin/users", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try { res.json({ users: await db.listUsers() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Full detail on one user: profile, saved state (strategies + onboarding answers), trades.
+app.get("/api/admin/user", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const phone = cleanPhone(req.query.phone);
+    const full = await db.getUserFull(phone);
+    if (!full) return res.status(404).json({ error: "user not found" });
+    res.json(full);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Block or unblock a user.
+app.post("/api/admin/block", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    const blocked = !!(req.body && req.body.blocked);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    await db.setUserBlocked(phone, blocked);
+    res.json({ ok: true, phone, blocked });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Lets the frontend check whether the current user is an admin (to show/hide the panel).
+app.get("/api/admin/check", async (req, res) => {
+  res.json({ admin: isAdmin(req) });
+});
+
 
 /* ----------------------------- tiny TTL cache ----------------------------- */
 const cache = new Map();
@@ -787,6 +845,17 @@ function envKey(...names) {
   }
   return "";
 }
+
+/* Build the ordered list of env-var names to try for a per-user credential:
+   perUser("FYERS_APP_ID", "MAT1") -> ["FYERS_APP_ID_MAT1", "FYERS_APP_ID"].
+   The userId is sanitized to the characters valid in an env-var name (letters, digits,
+   underscore) so it matches exactly how the Render variable would be named. If there's no
+   per-user variable set, envKey falls through to the global one — so a single-user server
+   with just FYERS_APP_ID keeps working unchanged. */
+function perUser(base, userId) {
+  const safe = String(userId || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  return safe ? [`${base}_${safe}`, base] : [base];
+}
 const GROQ_KEY = () => envKey("GROQ_API_KEY", "GROQ_KEY", "GROQ_APIKEY", "GROQ", "Groq", "groq", "groq_api_key");
 const OPENROUTER_KEY = () => envKey("OPENROUTER_API_KEY", "OPENROUTER_KEY");
 const GEMINI_KEY = () => envKey("GEMINI_API_KEY", "GOOGLE_API_KEY");
@@ -961,14 +1030,17 @@ setInterval(() => {
 const BROKERS = {
   zerodha: {
     name: "Zerodha",
-    key: () => envKey("KITE_API_KEY"),
-    secret: () => envKey("KITE_API_SECRET"),
+    // Per-user first (KITE_API_KEY_<userId>), then the global KITE_API_KEY fallback.
+    key: (userId) => envKey(...perUser("KITE_API_KEY", userId)),
+    secret: (userId) => envKey(...perUser("KITE_API_SECRET", userId)),
     loginUrl: (key) => `https://kite.zerodha.com/connect/login?v=3&api_key=${key}`,
   },
   fyers: {
     name: "FYERS",
-    key: () => envKey("FYERS_APP_ID"),
-    secret: () => envKey("FYERS_SECRET_ID"),
+    // Per-user first (FYERS_APP_ID_<userId>), then the global FYERS_APP_ID fallback. This is
+    // what lets two users connect with their OWN FYERS apps: set FYERS_APP_ID_MAT1 etc.
+    key: (userId) => envKey(...perUser("FYERS_APP_ID", userId)),
+    secret: (userId) => envKey(...perUser("FYERS_SECRET_ID", userId)),
     loginUrl: (key, redirect) =>
       `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code&state=matrix`,
   },
@@ -1070,10 +1142,12 @@ async function schwabToken(sess) {
 }
 
 /** Which brokers are actually configured on this server. */
-app.get("/api/broker/status", (_req, res) => {
+app.get("/api/broker/status", (req, res) => {
+  // Report configuration for THIS user (per-user creds if set, else the global fallback).
+  const userId = req.query.userId || req.get("X-User-Id");
   const out = {};
   Object.entries(BROKERS).forEach(([id, b]) => {
-    out[id] = { name: b.name, configured: Boolean(b.key() && b.secret()) };
+    out[id] = { name: b.name, configured: Boolean(b.key(userId) && b.secret(userId)) };
   });
   res.json({ brokers: out, tradingEnabled: TRADING_ENABLED });
 });
@@ -1083,7 +1157,8 @@ app.get("/api/broker/login-url", (req, res) => {
   const id = String(req.query.broker || "");
   const b = BROKERS[id];
   if (!b) return res.status(400).json({ error: "unknown broker" });
-  const key = b.key();
+  const userId = req.query.userId || req.get("X-User-Id");   // whose FYERS app to use
+  const key = b.key(userId);
   if (!key) return res.status(400).json({ error: `${b.name} is not configured on the server (missing API key).` });
   res.json({ url: b.loginUrl(key, req.query.redirect) });
 });
@@ -1098,7 +1173,7 @@ app.post("/api/broker/session", async (req, res) => {
   // Delta has no OAuth redirect, so it has no requestToken. Everyone else must have one.
   if (!b.noOAuth && !requestToken) return res.status(400).json({ error: "requestToken required" });
 
-  const key = b.key(), secret = b.secret();
+  const key = b.key(userId), secret = b.secret(userId);
   if (!key || !secret) return res.status(400).json({ error: `${b.name} is not configured on the server.` });
 
   try {
@@ -1180,12 +1255,14 @@ app.post("/api/broker/session", async (req, res) => {
 });
 
 /** Auth header for a broker call. */
-function brokerAuth(broker, token) {
+function brokerAuth(broker, token, userId) {
+  // The app key in this header MUST be the same app that issued the token — so for a
+  // per-user setup we look up THIS user's app key (falling back to the global one).
   if (broker === "zerodha") {
-    return { "X-Kite-Version": "3", Authorization: `token ${BROKERS.zerodha.key()}:${token}` };
+    return { "X-Kite-Version": "3", Authorization: `token ${BROKERS.zerodha.key(userId)}:${token}` };
   }
   if (broker === "fyers") {
-    return { Authorization: `${BROKERS.fyers.key()}:${token}` };
+    return { Authorization: `${BROKERS.fyers.key(userId)}:${token}` };
   }
   return {};
 }
@@ -1210,7 +1287,7 @@ app.get("/api/broker/quotes", async (req, res) => {
 
     if (broker === "zerodha") {
       const qs = symbols.map((s) => `i=${encodeURIComponent(s)}`).join("&");
-      const r = await fetch(`https://api.kite.trade/quote?${qs}`, { headers: brokerAuth(broker, token) });
+      const r = await fetch(`https://api.kite.trade/quote?${qs}`, { headers: brokerAuth(broker, token, sess.userId) });
       const d = await r.json();
       if (!r.ok || d.status === "error") throw new Error(d.message || `kite ${r.status}`);
       Object.entries(d.data || {}).forEach(([sym, q]) => {
@@ -1228,7 +1305,7 @@ app.get("/api/broker/quotes", async (req, res) => {
 
     if (broker === "fyers") {
       const r = await fetch(`https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(symbols.join(","))}`, {
-        headers: brokerAuth(broker, token),
+        headers: brokerAuth(broker, token, sess.userId),
       });
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
@@ -1332,7 +1409,7 @@ app.post("/api/broker/order", async (req, res) => {
         ...(orderType === "LIMIT" && price ? { price: String(price) } : {}),
       });
       const r = await fetch("https://api.kite.trade/orders/regular", {
-        method: "POST", headers: { ...brokerAuth(broker, token), "Content-Type": "application/x-www-form-urlencoded" }, body,
+        method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/x-www-form-urlencoded" }, body,
       });
       const d = await r.json();
       if (!r.ok || d.status === "error") throw new Error(d.message || `kite ${r.status}`);
@@ -1342,7 +1419,7 @@ app.post("/api/broker/order", async (req, res) => {
     if (broker === "fyers") {
       const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
         method: "POST",
-        headers: { ...brokerAuth(broker, token), "Content-Type": "application/json" },
+        headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
         body: JSON.stringify({
           symbol, qty: Number(qty),
           type: orderType === "LIMIT" ? 1 : 2,           // 1 = limit, 2 = market
@@ -1455,7 +1532,7 @@ app.get("/api/broker/optionchain", async (req, res) => {
 
       const data = await optMemo(`oc:${sym}`, 60_000, async () => {
         const u = `https://api-t1.fyers.in/data/options-chain-v3?symbol=${encodeURIComponent(sym)}&strikecount=20`;
-        const r = await fetch(u, { headers: brokerAuth(broker, token) });
+        const r = await fetch(u, { headers: brokerAuth(broker, token, sess.userId) });
         return r.json();
       });
 
@@ -1491,7 +1568,7 @@ app.get("/api/broker/optionchain", async (req, res) => {
 
     if (broker === "zerodha") {
       const csv = await optMemo("kite:nfo", 6 * 3600_000, async () => {
-        const r = await fetch("https://api.kite.trade/instruments/NFO", { headers: brokerAuth(broker, token) });
+        const r = await fetch("https://api.kite.trade/instruments/NFO", { headers: brokerAuth(broker, token, sess.userId) });
         return r.text();
       });
 
@@ -1543,8 +1620,8 @@ app.get("/api/broker/portfolio", async (req, res) => {
   try {
     if (broker === "zerodha") {
       const [hRes, mRes] = await Promise.all([
-        fetch("https://api.kite.trade/portfolio/holdings", { headers: brokerAuth(broker, token) }),
-        fetch("https://api.kite.trade/user/margins", { headers: brokerAuth(broker, token) }),
+        fetch("https://api.kite.trade/portfolio/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
+        fetch("https://api.kite.trade/user/margins", { headers: brokerAuth(broker, token, sess.userId) }),
       ]);
       const h = await hRes.json();
       const m = await mRes.json();
@@ -1572,9 +1649,9 @@ app.get("/api/broker/portfolio", async (req, res) => {
          the Positions tab in the FYERS app) showed as "No holdings" here — even though
          it is very much yours. We now fetch both and merge them. */
       const [hRes, pRes, fRes] = await Promise.all([
-        fetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token) }),
-        fetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token) }),
-        fetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token) }),
+        fetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
+        fetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token, sess.userId) }),
+        fetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token, sess.userId) }),
       ]);
       const h = await hRes.json();
       const p = await pRes.json();
