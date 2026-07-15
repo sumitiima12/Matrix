@@ -209,9 +209,19 @@ app.post("/api/admin/block", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Lets the frontend check whether the current user is an admin (to show/hide the panel).
+// Full admin check (userId + key) — used before actually opening the panel.
 app.get("/api/admin/check", async (req, res) => {
   res.json({ admin: isAdmin(req) });
+});
+
+// Visibility-only check: is this userId in the admin list? No key required, because this
+// only decides whether to SHOW the button — it grants no access (every admin route still
+// demands the key). Returns false if admin isn't configured at all.
+app.get("/api/admin/is-admin-user", async (req, res) => {
+  const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const adminKey = process.env.ADMIN_KEY || "";
+  const uid = req.get("X-User-Id") || req.query.userId || "";
+  res.json({ adminUser: Boolean(adminKey && adminIds.length && adminIds.includes(String(uid))) });
 });
 
 
