@@ -646,7 +646,8 @@ async function intradayFor(sym) {
 }
 
 app.get("/api/intraday", async (req, res) => {
-  const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 60);
+  // Same silent-truncation bug as /api/indicators: 60 < the 79-symbol Indian universe.
+  const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 200);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
     const out = {};
@@ -664,7 +665,18 @@ app.get("/api/intraday", async (req, res) => {
 });
 
 app.get("/api/indicators", async (req, res) => {
-  const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 60);
+  /* The cap used to be 60, applied with a SILENT .slice(). The Indian universe is 79
+     symbols, so everything from position 61 on — RELIANCE among them — never received
+     indicators at all, and its card read "Data currently unavailable" forever. The stock
+     was fine; the request was quietly truncated.
+
+     A cap is still sensible (it protects the upstream from a runaway query), but it must
+     be big enough for a real market and it must SAY when it bites, rather than dropping
+     symbols on the floor. */
+  const asked = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const CAP = 200;
+  const symbols = asked.slice(0, CAP);
+  const truncated = asked.length > CAP ? asked.length - CAP : 0;
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
     const out = {};
@@ -674,7 +686,7 @@ app.get("/api/indicators", async (req, res) => {
         if (v) out[sym] = v;
       } catch { /* skip symbols with no history */ }
     });
-    res.json({ indicators: out });
+    res.json({ indicators: out, ...(truncated ? { truncated } : {}) });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
 
@@ -791,7 +803,9 @@ app.post("/api/ask", async (req, res) => {
     const t0 = Date.now();
     try {
       const text = await withTimeout(p.fn(system, messages, max_tokens), 8000, p.name);
-      if (text) return res.json({ text, engine: p.name, ms: Date.now() - t0 });
+      /* NEVER leak the provider name to the client. The user talks to Neo; which
+         vendor answers is an internal detail (and it changes on fallback). */
+      if (text) return res.json({ text, engine: "Neo", ms: Date.now() - t0 });
       errors.push(`${p.name}: empty response`);
     } catch (e) {
       errors.push(`${p.name}: ${e.message}`);
@@ -1218,7 +1232,9 @@ app.post("/api/broker/order", async (req, res) => {
   if (!sess) return res.status(401).json({ error: "no broker session" });
   const broker = sess.broker;
   const token = sess.accessToken;
-  const { symbol, side, qty, orderType = "MARKET", price, product = "CNC" } = req.body || {};
+  const { symbol, side, qty, orderType = "MARKET", product = "CNC" } = req.body || {};
+  // A LIMIT order needs a price; the client may send it as `limitPrice` or `price`.
+  const price = req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price;
   if (!BROKERS[broker]) return res.status(400).json({ error: "unknown broker" });
   if (!symbol || !side || !qty) return res.status(400).json({ error: "symbol, side and qty are required" });
 
