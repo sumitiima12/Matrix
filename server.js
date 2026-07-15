@@ -20,7 +20,8 @@ const bcrypt = require("bcryptjs");                 // proper PIN hashing
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const db = require("./db");   // Postgres when DATABASE_URL is set, else flat files
+const db = require("./db");
+const { validateOrder: serverValidateOrder } = require("./riskEngine");   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
 
@@ -54,10 +55,11 @@ db.initDb().catch((e) => console.error("[db] init failed:", e.message));
 
 /* ------------------------------- trade store ------------------------------ */
 // Save a completed/opened trade:  POST /api/trades   body: { userId, trade }
-app.post("/api/trades", async (req, res) => {
+app.post("/api/trades", requireAuth, async (req, res) => {
   try {
-    const { userId, trade } = req.body || {};
-    if (!userId || !trade || !trade.sym) return res.status(400).json({ error: "userId and trade required" });
+    const { trade } = req.body || {};
+    const userId = storageKeyFor(req.authUserId);   // from the verified token, NOT the client
+    if (!trade || !trade.sym) return res.status(400).json({ error: "trade required" });
 
     /* Validate fields that must be sane. We DON'T reject unknown fields — the frontend
        sends a rich trade object — but a negative qty or non-numeric price is never valid. */
@@ -76,10 +78,9 @@ app.post("/api/trades", async (req, res) => {
 });
 
 // Fetch trade history:  GET /api/trades?userId=&from=<ms>&to=<ms>
-app.get("/api/trades", async (req, res) => {
+app.get("/api/trades", requireAuth, async (req, res) => {
   try {
-    const { userId } = req.query;
-    if (!userId) return res.status(400).json({ error: "userId required" });
+    const userId = storageKeyFor(req.authUserId);   // from the verified token
     const from = req.query.from ? +req.query.from : 0;
     const to = req.query.to ? +req.query.to : Date.now();
     res.json({ trades: await db.getTrades(userId, from, to) });
@@ -105,6 +106,12 @@ function verifyPin(pin, stored) {
 const isLegacyHash = (stored) => stored && !/^\$2[aby]\$/.test(stored);
 const cleanPhone = (p) => String(p || "").replace(/[^0-9]/g, "");
 
+/* ------------------------------ AUTH TOKENS ------------------------------- */
+/* Token signing/verification + the requireAuth middleware live in auth.js so they can be
+   unit-tested without booting the server. */
+const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");
+
+
 /* Rate limit auth endpoints: 10 attempts per 15 min per IP. Blocks brute force without
    getting in a real user's way. */
 const authLimiter = rateLimit({
@@ -121,7 +128,7 @@ app.post("/api/register", authLimiter, async (req, res) => {
     if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
     if (await db.getUser(phone)) return res.status(409).json({ error: "That number is already registered — please log in." });
     await db.createUser(phone, hashPin(pin), name);
-    res.json({ ok: true, userId: phone, name });
+    res.json({ ok: true, userId: phone, name, token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -141,23 +148,22 @@ app.post("/api/login", authLimiter, async (req, res) => {
     if (isLegacyHash(u.pin) && typeof db.updateUserPin === "function") {
       try { await db.updateUserPin(phone, hashPin(pin)); } catch { /* upgrade later */ }
     }
-    res.json({ ok: true, userId: phone, name: u.name || "" });
+    res.json({ ok: true, userId: phone, name: u.name || "", token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Save/load a user's app state blob (automations, watchlists, wallets, profile).
-app.post("/api/state", async (req, res) => {
+app.post("/api/state", requireAuth, async (req, res) => {
   try {
-    const { userId, state } = req.body || {};
-    if (!userId) return res.status(400).json({ error: "userId required" });
+    const { state } = req.body || {};
+    const userId = storageKeyFor(req.authUserId);   // from the verified token
     await db.saveState(userId, state || {});
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get("/api/state", async (req, res) => {
+app.get("/api/state", requireAuth, async (req, res) => {
   try {
-    const { userId } = req.query;
-    if (!userId) return res.status(400).json({ error: "userId required" });
+    const userId = storageKeyFor(req.authUserId);   // from the verified token
     res.json({ state: await db.getState(userId) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1385,6 +1391,57 @@ app.get("/api/broker/quotes", async (req, res) => {
   }
 });
 
+/* Fetch the user's REAL account state from their broker: available cash + open positions.
+   Used to run risk checks server-side before a live order. Returns { wallet, portfolio } or
+   null if it can't be fetched (caller decides how to fail). Reuses the same broker endpoints
+   the portfolio view uses. Has an overall timeout so a slow broker can't hang the order. */
+async function fetchBrokerAccount(sess) {
+  const { broker, accessToken: token } = sess;
+  const withTimeout = (p, ms = 6000) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("broker account fetch timed out")), ms))]);
+  const clean = (sym) => String(sym || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
+  try {
+    if (broker === "zerodha") {
+      const [hRes, mRes] = await withTimeout(Promise.all([
+        fetch("https://api.kite.trade/portfolio/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
+        fetch("https://api.kite.trade/user/margins", { headers: brokerAuth(broker, token, sess.userId) }),
+      ]));
+      const h = await hRes.json(); const m = await mRes.json();
+      const portfolio = (h.data || []).map((p) => ({ sym: p.tradingsymbol, qty: p.quantity ?? 0, avg: p.average_price ?? null, price: p.last_price ?? null, market: "IN" }));
+      const wallet = m.data?.equity?.available?.live_balance ?? 0;
+      return { wallet: Number(wallet) || 0, portfolio };
+    }
+    if (broker === "fyers") {
+      const [hRes, pRes, fRes] = await withTimeout(Promise.all([
+        fetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
+        fetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token, sess.userId) }),
+        fetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token, sess.userId) }),
+      ]));
+      const h = await hRes.json(); const p = await pRes.json(); const f = await fRes.json();
+      const settled = (h.holdings || []).map((x) => ({ sym: clean(x.symbol), qty: x.quantity ?? 0, avg: x.costPrice ?? null, price: x.ltp ?? null, market: "IN" }));
+      const open = (p.netPositions || []).filter((x) => Number(x.netQty ?? x.qty ?? 0) !== 0)
+        .map((x) => ({ sym: clean(x.symbol), qty: Number(x.netQty ?? x.qty ?? 0), avg: x.netAvg ?? x.avgPrice ?? null, price: x.ltp ?? null, market: "IN" }));
+      const bySym = new Map(); settled.forEach((x) => bySym.set(x.sym, x)); open.forEach((x) => { if (!bySym.has(x.sym)) bySym.set(x.sym, x); });
+      const bucket = (f.fund_limit || []).find((x) => /available/i.test(x.title || ""));
+      const wallet = bucket ? (bucket.equityAmount ?? 0) : 0;
+      return { wallet: Number(wallet) || 0, portfolio: [...bySym.values()] };
+    }
+    if (broker === "delta") {
+      const [w, pos] = await withTimeout(Promise.all([
+        deltaCall("GET", "/v2/wallet/balances"),
+        deltaCall("GET", "/v2/positions/margined"),
+      ]));
+      const wallet = (w.result || []).reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
+      const portfolio = (pos.result || []).filter((x) => Number(x.size) !== 0)
+        .map((x) => ({ sym: x.product_symbol || (x.product && x.product.symbol) || null, qty: Number(x.size), avg: x.entry_price != null ? Number(x.entry_price) : null, price: x.mark_price != null ? Number(x.mark_price) : null, market: "Crypto" }));
+      return { wallet, portfolio };
+    }
+  } catch (e) {
+    console.error("[risk] broker account fetch failed:", e.message);
+    return null;
+  }
+  return null;
+}
+
 /* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
    the client must send X-Confirm-Live: yes. Two locks, because the failure mode
    here is real money moving without the user meaning it. */
@@ -1413,6 +1470,30 @@ app.post("/api/broker/order", async (req, res) => {
     return res.status(400).json({ error: "quantity must be a positive number within limits" });
   }
   if (!symbol || !side || !qty) return res.status(400).json({ error: "symbol, side and qty are required" });
+
+  /* SERVER-SIDE RISK CHECK. The frontend risk engine is a UX affordance; THIS is the real
+     control. We fetch the user's actual account state from their broker (cash + open
+     positions) and validate the order against it — funds, position size, max positions,
+     sell-vs-held, daily-loss cap. Client-supplied values are never trusted here.
+     If we CAN'T fetch account state, we refuse rather than place blind — this is real money. */
+  {
+    const rkMarket = (broker === "delta") ? "Crypto" : "IN";
+    const account = await fetchBrokerAccount(sess);
+    if (!account) {
+      return res.status(503).json({ error: "Could not verify your account state with the broker to risk-check this order. Try again in a moment." });
+    }
+    const orderSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+    const rkTrades = await db.getTrades(storageKeyFor(sess.userId), 0, Date.now()).catch(() => []);
+    const rkPrice = price != null ? Number(price) : (account.portfolio.find((h) => h.sym === orderSym) ? account.portfolio.find((h) => h.sym === orderSym).price : null);
+    const check = serverValidateOrder(
+      { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket },
+      { wallet: account.wallet, portfolio: account.portfolio, trades: rkTrades || [] },
+    );
+    if (!check.ok) {
+      return res.status(422).json({ error: "Order blocked by risk checks: " + (check.reasons[0] || "not allowed"), reasons: check.reasons });
+    }
+  }
+
 
   try {
     if (broker === "zerodha") {
