@@ -31,6 +31,8 @@ const app = express();
    MUST stay allowed or every /api/broker/* preflight fails. Extra origins can be added via
    the CORS_ORIGINS env var (comma-separated) without a code change. */
 const ALLOWED_ORIGINS = [
+  "https://matrixone.app",
+  "https://www.matrixone.app",
   "https://matrix-frontend-indol.vercel.app",
   "http://localhost:5173",
   "http://localhost:4173",
@@ -42,7 +44,9 @@ app.use(cors({
     if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
   },
-  allowedHeaders: ["Content-Type", "X-Broker-Session", "X-User-Id", "X-Confirm-Live"],
+  // "Authorization" MUST be here or every authed call (login token → trades, state,
+  // username, public strategies, ideas) is blocked by the browser as a CORS error.
+  allowedHeaders: ["Content-Type", "Authorization", "X-Broker-Session", "X-User-Id", "X-Confirm-Live", "X-Admin-Key"],
   exposedHeaders: ["Location"],   // Schwab returns the order id in the Location header
 }));
 
