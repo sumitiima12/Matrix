@@ -22,7 +22,8 @@ const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
-const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
+const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
+const stripPh = (s) => String(s || "").replace(/^ph_/, "");   // "ph_9167..." -> "9167..."   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
 
@@ -122,19 +123,36 @@ const authLimiter = rateLimit({
   message: { error: "Too many attempts. Please wait a few minutes and try again." },
 });
 
+/* A user-chosen handle: 3–20 chars, must start with a letter, then letters/digits/_ .
+   Returns the cleaned handle, or null if it doesn't meet the rules. */
+function cleanUsername(raw) {
+  const u = String(raw || "").trim();
+  if (!/^[A-Za-z][A-Za-z0-9_]{2,19}$/.test(u)) return null;
+  return u;
+}
+
 app.post("/api/register", authLimiter, async (req, res) => {
   try {
     const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin, name = (req.body && req.body.name) || "";
     if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
     if (await db.getUser(phone)) return res.status(409).json({ error: "That number is already registered — please log in." });
+    const username = cleanUsername(req.body && req.body.username);
+    if (!username) return res.status(400).json({ error: "Choose a user ID: 3–20 characters, starting with a letter (letters, numbers, underscore)." });
+    if (typeof db.getUserByUsername === "function" && await db.getUserByUsername(username)) {
+      return res.status(409).json({ error: "That user ID is taken — try another." });
+    }
     const secQuestion = ((req.body && req.body.secQuestion) || "").trim();
     const secAnswer = ((req.body && req.body.secAnswer) || "").trim();
     // Security question is required at signup so every new account has a recovery path.
     if (!secQuestion || !secAnswer) return res.status(400).json({ error: "Set a security question and answer so you can recover your PIN." });
     // Answer normalized (trim + lowercase) then bcrypt-hashed — never plaintext.
     const answerHash = hashPin(secAnswer.toLowerCase());
-    await db.createUser(phone, hashPin(pin), name, secQuestion, answerHash);
-    res.json({ ok: true, userId: phone, name, token: signToken(phone) });
+    // Optional referral: resolve the referral code (a user's handle) to a real account.
+    let referredBy = null;
+    const refRaw = cleanUsername(req.body && req.body.referralCode);
+    if (refRaw && typeof db.getUserByUsername === "function" && await db.getUserByUsername(refRaw)) referredBy = refRaw;
+    await db.createUser(phone, hashPin(pin), name, secQuestion, answerHash, username, referredBy);
+    res.json({ ok: true, userId: phone, name, username, referredBy, token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -154,7 +172,108 @@ app.post("/api/login", authLimiter, async (req, res) => {
     if (isLegacyHash(u.pin) && typeof db.updateUserPin === "function") {
       try { await db.updateUserPin(phone, hashPin(pin)); } catch { /* upgrade later */ }
     }
-    res.json({ ok: true, userId: phone, name: u.name || "", token: signToken(phone) });
+    res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, token: signToken(phone) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ---------------------------- USER ID (username) ---------------------------
+   Availability check (public) and set-handle (for existing accounts that don't have one
+   yet — the app mandates it right after their first login). */
+app.get("/api/username/available", authLimiter, async (req, res) => {
+  try {
+    const username = cleanUsername(req.query.u);
+    if (!username) return res.json({ ok: true, valid: false, available: false });
+    const taken = typeof db.getUserByUsername === "function" ? await db.getUserByUsername(username) : null;
+    res.json({ ok: true, valid: true, available: !taken });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/username", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const username = cleanUsername(req.body && req.body.username);
+    if (!username) return res.status(400).json({ error: "User ID must be 3–20 characters, starting with a letter (letters, numbers, underscore)." });
+    const owner = typeof db.getUserByUsername === "function" ? await db.getUserByUsername(username) : null;
+    if (owner && stripPh(owner) !== phone) return res.status(409).json({ error: "That user ID is taken — try another." });
+    await db.setUsername(phone, username);
+    res.json({ ok: true, username });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ---------------------------- PUBLIC STRATEGIES ---------------------------
+   Anyone signed in can publish their own strategy; everyone can browse them. */
+app.get("/api/public-strategies", async (req, res) => {
+  try {
+    let list = typeof db.listPublicStrategies === "function" ? await db.listPublicStrategies() : [];
+    const sym = (req.query.symbol || "").trim();
+    const by = (req.query.by || "").trim().toLowerCase();
+    if (sym) list = list.filter((s) => (s.symbols || []).includes(sym));
+    if (by) list = list.filter((s) => String(s.owner_name || "").toLowerCase() === by);
+    res.json({ strategies: list });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/public-strategies", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const s = (req.body && req.body.strategy) || {};
+    const u = await db.getUser(phone);
+    const ownerName = (u && u.username) || (u && u.name) || phone;
+    const id = String(s.id || ("pub_" + phone + "_" + Date.now()));
+    const row = await db.publishStrategy({
+      id, owner: phone, owner_name: ownerName,
+      name: s.name || "Strategy", symbols: s.symbols || [], data: s.cfg || s.data || {}, created_at: Date.now(),
+    });
+    res.json({ ok: true, strategy: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/public-strategies/:id", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const isAdm = isAdmin(req);
+    await db.unpublishStrategy(req.params.id, isAdm ? "" : phone);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ------------------------------ COMMUNITY IDEAS ------------------------------
+   Any signed-in user can post an idea; everyone can browse them. */
+app.get("/api/ideas", async (req, res) => {
+  try {
+    let list = typeof db.listIdeas === "function" ? await db.listIdeas() : [];
+    const sym = (req.query.symbol || "").trim();
+    const by = (req.query.by || "").trim().toLowerCase();
+    if (sym) list = list.filter((i) => i.symbol === sym);
+    if (by) list = list.filter((i) => String(i.owner_name || "").toLowerCase() === by);
+    res.json({ ideas: list });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/ideas", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const b = req.body || {};
+    const symbol = String(b.symbol || "").trim();
+    if (!symbol) return res.status(400).json({ error: "Pick a symbol for your idea." });
+    const u = await db.getUser(phone);
+    const ownerName = (u && u.username) || (u && u.name) || phone;
+    const id = "idea_" + phone + "_" + Date.now();
+    const row = await db.postIdea({
+      id, owner: phone, owner_name: ownerName, symbol,
+      direction: b.direction === "Short" ? "Short" : "Long",
+      note: String(b.note || "").slice(0, 600), target: String(b.target || "").slice(0, 24), stop: String(b.stop || "").slice(0, 24),
+      created_at: Date.now(),
+    });
+    res.json({ ok: true, idea: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/ideas/:id", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    await db.deleteIdea(req.params.id, isAdmin(req) ? "" : phone);
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -198,6 +317,32 @@ app.post("/api/forgot/reset", authLimiter, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* ---------------------- SECURITY QUESTION (logged-in user) ----------------------
+   Lets a signed-in user set OR change their own security question — the recovery path for
+   accounts made before this existed. The phone comes from the verified token, so a user can
+   only ever set their OWN question. */
+app.get("/api/security-question", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);   // token subject -> bare phone
+    const q = typeof db.getSecurityQuestion === "function" ? await db.getSecurityQuestion(phone) : null;
+    res.json({ ok: true, hasQuestion: !!q, question: q || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/security-question", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const question = ((req.body && req.body.question) || "").trim();
+    const answer = ((req.body && req.body.answer) || "").trim();
+    if (!question || !answer) return res.status(400).json({ error: "A question and an answer are both required." });
+    if (typeof db.updateSecurityQuestion !== "function") return res.status(500).json({ error: "not supported" });
+    // Answer normalized (trim + lowercase) then bcrypt-hashed — never stored in plaintext.
+    const answerHash = hashPin(answer.toLowerCase());
+    await db.updateSecurityQuestion(phone, question, answerHash);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Save/load a user's app state blob (automations, watchlists, wallets, profile).
 app.post("/api/state", requireAuth, async (req, res) => {
   try {
@@ -218,7 +363,6 @@ app.get("/api/state", requireAuth, async (req, res) => {
 /* Locked behind TWO checks: the caller's userId must be in ADMIN_USER_IDS, AND they must
    present the ADMIN_KEY secret. Both are required — a leaked key alone, or a known admin
    userId alone, is not enough. Set ADMIN_USER_IDS (comma-separated) and ADMIN_KEY in env. */
-const stripPh = (s) => String(s || "").replace(/^ph_/, "");
 function isAdmin(req) {
   const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => stripPh(x.trim())).filter(Boolean);
   const adminKey = process.env.ADMIN_KEY || "";

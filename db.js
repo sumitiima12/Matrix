@@ -40,11 +40,27 @@ async function initDb() {
   // Security-question recovery (set at signup). Answer is bcrypt-hashed, never plaintext.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sec_question TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sec_answer TEXT`);
+  // Unique, user-chosen handle. Case-insensitive uniqueness via a functional index.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (LOWER(username)) WHERE username IS NOT NULL`);
+  // Optional referral: the user ID of whoever referred this account (from ?ref= at signup).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY, user_id TEXT, ts BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS trades_user_ts ON trades (user_id, ts)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS app_state (
     user_id TEXT PRIMARY KEY, updated_at BIGINT, data JSONB)`);
+  // Public strategies — shared across users. `owner` is the bare phone; `owner_name` is the
+  // publisher's username (shown as the "created by" tag and used by the "created by" filter).
+  await pool.query(`CREATE TABLE IF NOT EXISTS public_strategies (
+    id TEXT PRIMARY KEY, owner TEXT, owner_name TEXT, name TEXT,
+    symbols JSONB, data JSONB, created_at BIGINT)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS public_strats_created ON public_strategies (created_at DESC)`);
+  // Community ideas — any signed-in user can post; everyone can browse.
+  await pool.query(`CREATE TABLE IF NOT EXISTS ideas (
+    id TEXT PRIMARY KEY, owner TEXT, owner_name TEXT, symbol TEXT,
+    direction TEXT, note TEXT, target TEXT, stop TEXT, created_at BIGINT)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS ideas_created ON ideas (created_at DESC)`);
   console.log("[db] Postgres ready");
 }
 
@@ -53,6 +69,8 @@ const FILES = {
   trades: process.env.TRADES_FILE || path.join(__dirname, "trades.json"),
   users: process.env.USERS_FILE || path.join(__dirname, "users.json"),
   state: process.env.STATE_FILE || path.join(__dirname, "state.json"),
+  public: process.env.PUBLIC_STRATS_FILE || path.join(__dirname, "public_strategies.json"),
+  ideas: process.env.IDEAS_FILE || path.join(__dirname, "ideas.json"),
 };
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return {}; } };
 const writeJSON = (f, d) => { try { fs.writeFileSync(f, JSON.stringify(d)); } catch (e) { console.error("[db] write failed", e.message); } };
@@ -91,8 +109,27 @@ async function getTrades(userId, from, to) {
 
 /* --------------------------------- users --------------------------------- */
 async function getUser(phone) {
-  if (USING_PG) { const r = await pool.query(`SELECT pin, name FROM users WHERE phone=$1`, [phone]); return r.rows[0] || null; }
+  if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) row.referredBy = row.referred_by; return row || null; }
   return readJSON(FILES.users)[phone] || null;
+}
+
+/* Look up a user by their chosen username (case-insensitive). Returns the phone or null.
+   Used to enforce uniqueness at registration and when a user sets/changes their handle. */
+async function getUserByUsername(username) {
+  const u = String(username || "").trim();
+  if (!u) return null;
+  if (USING_PG) { const r = await pool.query(`SELECT phone FROM users WHERE LOWER(username)=LOWER($1) LIMIT 1`, [u]); return r.rows[0] ? r.rows[0].phone : null; }
+  const users = readJSON(FILES.users);
+  const hit = Object.entries(users).find(([, v]) => String(v.username || "").toLowerCase() === u.toLowerCase());
+  return hit ? hit[0] : null;
+}
+
+/* Set (or change) a user's username. Caller must have checked uniqueness first. */
+async function setUsername(phone, username) {
+  const u = String(username || "").trim();
+  if (USING_PG) { await pool.query(`UPDATE users SET username=$2 WHERE phone=$1`, [phone, u]); return; }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].username = u; writeJSON(FILES.users, users); }
 }
 
 /* The user's security QUESTION (public-ish — shown so they know what to answer). Returns
@@ -114,17 +151,85 @@ async function updateUserPin(phone, pinHash) {
   const users = readJSON(FILES.users);
   if (users[phone]) { users[phone].pin = pinHash; writeJSON(FILES.users, users); }
 }
-async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHash = null) {
+
+/* Set or change a user's security question + hashed answer (for existing accounts). */
+async function updateSecurityQuestion(phone, secQuestion, secAnswerHash) {
+  if (USING_PG) { await pool.query(`UPDATE users SET sec_question=$2, sec_answer=$3 WHERE phone=$1`, [phone, secQuestion, secAnswerHash]); return; }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].secQuestion = secQuestion; users[phone].secAnswer = secAnswerHash; writeJSON(FILES.users, users); }
+}
+async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHash = null, username = null, referredBy = null) {
   if (USING_PG) {
     await pool.query(
-      `INSERT INTO users (phone, pin, name, created_at, sec_question, sec_answer) VALUES ($1,$2,$3,$4,$5,$6)`,
-      [phone, pinHash, name, Date.now(), secQuestion, secAnswerHash]
+      `INSERT INTO users (phone, pin, name, created_at, sec_question, sec_answer, username, referred_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [phone, pinHash, name, Date.now(), secQuestion, secAnswerHash, username, referredBy]
     );
     return;
   }
   const users = readJSON(FILES.users);
-  users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null };
+  users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null, username: username || null, referredBy: referredBy || null };
   writeJSON(FILES.users, users);
+}
+
+/* ---------------------------- public strategies -------------------------- */
+async function publishStrategy(rec) {
+  const row = { id: rec.id, owner: rec.owner, owner_name: rec.owner_name || "", name: rec.name || "Strategy", symbols: rec.symbols || [], data: rec.data || {}, created_at: rec.created_at || Date.now() };
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO public_strategies (id, owner, owner_name, name, symbols, data, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (id) DO UPDATE SET owner_name=EXCLUDED.owner_name, name=EXCLUDED.name, symbols=EXCLUDED.symbols, data=EXCLUDED.data`,
+      [row.id, row.owner, row.owner_name, row.name, JSON.stringify(row.symbols), JSON.stringify(row.data), row.created_at]
+    );
+    return row;
+  }
+  const all = readJSON(FILES.public);
+  all[row.id] = row;
+  writeJSON(FILES.public, all);
+  return row;
+}
+async function unpublishStrategy(id, owner) {
+  if (USING_PG) { await pool.query(`DELETE FROM public_strategies WHERE id=$1 AND ($2 = '' OR owner=$2)`, [id, owner || ""]); return; }
+  const all = readJSON(FILES.public);
+  if (all[id] && (!owner || all[id].owner === owner)) { delete all[id]; writeJSON(FILES.public, all); }
+}
+async function listPublicStrategies() {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT id, owner, owner_name, name, symbols, data, created_at FROM public_strategies ORDER BY created_at DESC LIMIT 1000`);
+    return r.rows.map((x) => ({ id: x.id, owner: x.owner, owner_name: x.owner_name, name: x.name, symbols: x.symbols || [], data: x.data || {}, created_at: Number(x.created_at) }));
+  }
+  const all = readJSON(FILES.public);
+  return Object.values(all).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+}
+
+/* ------------------------------- ideas ----------------------------------- */
+async function postIdea(rec) {
+  const row = { id: rec.id, owner: rec.owner, owner_name: rec.owner_name || "", symbol: rec.symbol || "", direction: rec.direction || "Long", note: rec.note || "", target: rec.target || "", stop: rec.stop || "", created_at: rec.created_at || Date.now() };
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO ideas (id, owner, owner_name, symbol, direction, note, target, stop, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [row.id, row.owner, row.owner_name, row.symbol, row.direction, row.note, row.target, row.stop, row.created_at]
+    );
+    return row;
+  }
+  const all = readJSON(FILES.ideas);
+  all[row.id] = row;
+  writeJSON(FILES.ideas, all);
+  return row;
+}
+async function deleteIdea(id, owner) {
+  if (USING_PG) { await pool.query(`DELETE FROM ideas WHERE id=$1 AND ($2 = '' OR owner=$2)`, [id, owner || ""]); return; }
+  const all = readJSON(FILES.ideas);
+  if (all[id] && (!owner || all[id].owner === owner)) { delete all[id]; writeJSON(FILES.ideas, all); }
+}
+async function listIdeas() {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT id, owner, owner_name, symbol, direction, note, target, stop, created_at FROM ideas ORDER BY created_at DESC LIMIT 1000`);
+    return r.rows.map((x) => ({ ...x, created_at: Number(x.created_at) }));
+  }
+  const all = readJSON(FILES.ideas);
+  return Object.values(all).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
 }
 
 /* --------------------------------- state --------------------------------- */
@@ -184,12 +289,12 @@ async function updateTrade(userId, trade) {
    the admin route strips it, but we also never select it in PG). */
 async function listUsers() {
   if (USING_PG) {
-    const r = await pool.query(`SELECT phone, name, created_at, blocked FROM users ORDER BY created_at DESC`);
-    return r.rows.map((x) => ({ phone: x.phone, name: x.name, createdAt: x.created_at, blocked: !!x.blocked }));
+    const r = await pool.query(`SELECT phone, name, username, referred_by, created_at, blocked FROM users ORDER BY created_at DESC`);
+    return r.rows.map((x) => ({ phone: x.phone, name: x.name, username: x.username || null, referredBy: x.referred_by || null, createdAt: x.created_at, blocked: !!x.blocked }));
   }
   const users = readJSON(FILES.users);
   return Object.entries(users).map(([phone, u]) => ({
-    phone, name: u.name || "", createdAt: u.createdAt || null, blocked: !!u.blocked,
+    phone, name: u.name || "", username: u.username || null, referredBy: u.referredBy || null, createdAt: u.createdAt || null, blocked: !!u.blocked,
   })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 
@@ -229,4 +334,4 @@ async function getUserFull(phone) {
   return { phone, user: safeUser, state: state || null, trades: trades || [] };
 }
 
-module.exports = { getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, USING_PG };
