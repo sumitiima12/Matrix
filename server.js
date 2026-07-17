@@ -614,11 +614,22 @@ let _deltaLastError = null;
 let _fyDebug = null;          // safe (no secrets): shapes + raw FYERS response
 let _fyCooldownUntil = 0;     // don't retry the mint until this time (avoids hammering FYERS -> 429)
 
+/* The standalone undici (from package.json). We must use ITS fetch when routing through a
+   ProxyAgent it created — mixing a standalone-undici dispatcher with Node's built-in fetch
+   throws "invalid onError method" (their internal handler interfaces differ). */
+let _undici = null;
+try { _undici = require("undici"); } catch (e) { console.error("[proxy] undici not available:", e.message); }
+/* A fetch that uses undici's OWN fetch when a dispatcher is supplied; otherwise the global one. */
+function pfetch(url, opts = {}) {
+  if (opts && opts.dispatcher && _undici && typeof _undici.fetch === "function") return _undici.fetch(url, opts);
+  return fetch(url, opts);
+}
+
 /* Build an undici ProxyAgent from a proxy URL (credentials sent as Proxy-Authorization). */
 function makeProxyDispatcher(url) {
-  if (!url) return null;
+  if (!url || !_undici) return null;
   try {
-    const { ProxyAgent } = require("undici");
+    const { ProxyAgent } = _undici;
     const u = new URL(url);
     const opts = { uri: `${u.protocol}//${u.host}` };
     if (u.username || u.password) {
@@ -651,7 +662,7 @@ async function fyersHouseToken() {
   if (appId && secret && refresh && pin) {
     try {
       const appIdHash = crypto.createHash("sha256").update(`${appId}:${secret}`).digest("hex");
-      const r = await fetch(`${FY_HOST}/api/v3/validate-refresh-token`, {
+      const r = await pfetch(`${FY_HOST}/api/v3/validate-refresh-token`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ grant_type: "refresh_token", appIdHash, refresh_token: refresh, pin }),
@@ -729,7 +740,7 @@ async function fyersHouseQuotes(ySyms) {
   const pairs = ySyms.map((y) => [y, yahooToFyers(y)]).filter(([, f]) => f);
   if (!pairs.length) return {};
   try {
-    const r = await fetch(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`, {
+    const r = await pfetch(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`, {
       headers: { Authorization: `${appId}:${token}` },
       ...fyFetchOpts,
     });
@@ -769,7 +780,7 @@ async function fyersHouseHistory(ySym, range, interval) {
   const from = fmt(new Date(Date.now() - days * 864e5)), to = fmt(new Date());
   try {
     const url = `${FY_HOST}/data/history?symbol=${encodeURIComponent(fy)}&resolution=${res}&date_format=1&range_from=${from}&range_to=${to}&cont_flag=1`;
-    const r = await fetch(url, { headers: { Authorization: `${appId}:${token}` }, ...fyFetchOpts });
+    const r = await pfetch(url, { headers: { Authorization: `${appId}:${token}` }, ...fyFetchOpts });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.s === "error" || !Array.isArray(d.candles)) {
       if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };
@@ -1390,7 +1401,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "feeds-diag-4",   // bump on deploy so we can confirm which build is live
+    build: "feeds-diag-5",   // bump on deploy so we can confirm which build is live
   });
 });
 
@@ -1669,24 +1680,8 @@ const DELTA_BASE = "https://api.india.delta.exchange";
    Credentials are pulled out of the URL and sent as a Proxy-Authorization header
    (the most reliable way for undici's ProxyAgent). If the var is unset, Delta calls
    go out directly, exactly as before. */
-let deltaDispatcher = null;
-(() => {
-  const proxyUrl = process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY || "";
-  if (!proxyUrl) return;
-  try {
-    const { ProxyAgent } = require("undici");
-    const u = new URL(proxyUrl);
-    const opts = { uri: `${u.protocol}//${u.host}` };
-    if (u.username || u.password) {
-      const cred = Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64");
-      opts.token = `Basic ${cred}`;
-    }
-    deltaDispatcher = new ProxyAgent(opts);
-    console.log(`[delta] routing Delta API through proxy ${u.host}`);
-  } catch (e) {
-    console.error("[delta] proxy init failed — sending Delta calls directly:", e.message);
-  }
-})();
+const deltaDispatcher = makeProxyDispatcher(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY || "");
+if (deltaDispatcher) console.log("[delta] routing Delta API through the configured proxy");
 
 function deltaHeaders(method, path, query = "", body = "") {
   const key = envKey("DELTA_API_KEY");
@@ -1712,7 +1707,7 @@ async function deltaCall(method, path, { query = "", body = null, signed = true 
     ? deltaHeaders(method, path, query, bodyStr)
     : { "Content-Type": "application/json", "User-Agent": "matrix" };
 
-  const r = await fetch(DELTA_BASE + path + query, {
+  const r = await pfetch(DELTA_BASE + path + query, {
     method,
     headers,
     ...(bodyStr ? { body: bodyStr } : {}),
