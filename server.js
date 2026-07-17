@@ -613,6 +613,28 @@ let _fyLastError = null;      // surfaced by /api/feeds-status for debugging
 let _deltaLastError = null;
 let _fyDebug = null;          // safe (no secrets): shapes + raw FYERS response
 let _fyCooldownUntil = 0;     // don't retry the mint until this time (avoids hammering FYERS -> 429)
+
+/* Build an undici ProxyAgent from a proxy URL (credentials sent as Proxy-Authorization). */
+function makeProxyDispatcher(url) {
+  if (!url) return null;
+  try {
+    const { ProxyAgent } = require("undici");
+    const u = new URL(url);
+    const opts = { uri: `${u.protocol}//${u.host}` };
+    if (u.username || u.password) {
+      const cred = Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64");
+      opts.token = `Basic ${cred}`;
+    }
+    return new ProxyAgent(opts);
+  } catch (e) { console.error("[fyers-proxy] init failed:", e.message); return null; }
+}
+/* FYERS "Static IP" apps only accept calls from whitelisted IPs. Route FYERS house-feed
+   traffic through a proxy that exits from those IPs. Set FYERS_PROXY_URL to the FYERS-specific
+   proxy (its exit IP must match what's whitelisted in the FYERS app). If unset, FYERS calls go
+   DIRECT (from the server's own IP). We deliberately do NOT fall back to the Delta proxy —
+   its exit IP differs and would fail the FYERS whitelist. */
+const fyersDispatcher = makeProxyDispatcher(process.env.FYERS_PROXY_URL || "");
+const fyFetchOpts = fyersDispatcher ? { dispatcher: fyersDispatcher } : {};
 async function fyersHouseToken() {
   if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
   // A directly-provided daily access token WINS — no minting, no refresh-token flow, no rate
@@ -633,6 +655,7 @@ async function fyersHouseToken() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ grant_type: "refresh_token", appIdHash, refresh_token: refresh, pin }),
+        ...fyFetchOpts,
       });
       const d = await r.json().catch(() => ({}));
       // Shapes only — never the secret values themselves.
@@ -708,6 +731,7 @@ async function fyersHouseQuotes(ySyms) {
   try {
     const r = await fetch(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`, {
       headers: { Authorization: `${appId}:${token}` },
+      ...fyFetchOpts,
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.s === "error") {
@@ -745,7 +769,7 @@ async function fyersHouseHistory(ySym, range, interval) {
   const from = fmt(new Date(Date.now() - days * 864e5)), to = fmt(new Date());
   try {
     const url = `${FY_HOST}/data/history?symbol=${encodeURIComponent(fy)}&resolution=${res}&date_format=1&range_from=${from}&range_to=${to}&cont_flag=1`;
-    const r = await fetch(url, { headers: { Authorization: `${appId}:${token}` } });
+    const r = await fetch(url, { headers: { Authorization: `${appId}:${token}` }, ...fyFetchOpts });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.s === "error" || !Array.isArray(d.candles)) {
       if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };
@@ -1365,7 +1389,8 @@ app.get("/api/health", (req, res) => {
     // Is the FYERS house price feed configured? (true = Indian equities served from FYERS)
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
-    build: "feeds-diag-2",   // bump on deploy so we can confirm which build is live
+    fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
+    build: "feeds-diag-4",   // bump on deploy so we can confirm which build is live
   });
 });
 
