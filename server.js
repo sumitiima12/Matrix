@@ -642,6 +642,35 @@ function yahooToFyers(ySym) {
   return null;
 }
 
+/* ── Delta Exchange house crypto feed ─────────────────────────────────────────────────
+   Same idea as the FYERS feed, for CRYPTO. Delta's /v2/tickers is PUBLIC (no keys, no
+   signature), so this works out of the box with no configuration — it just gives crypto
+   prices from Delta instead of Yahoo. "BTC-USD" -> Delta's "BTCUSD" perpetual. */
+function yahooToDelta(ySym) {
+  const m = String(ySym || "").match(/^([A-Z0-9]+)-USD$/);
+  return m ? `${m[1]}USD` : null;
+}
+async function deltaHouseQuotes(ySyms) {
+  const pairs = ySyms.map((y) => [y, yahooToDelta(y)]).filter(([, d]) => d);
+  if (!pairs.length) return {};
+  try {
+    const d = await memo("delta:tickers", 15_000, () => deltaCall("GET", "/v2/tickers", { signed: false }));
+    const byD = {};
+    (d.result || []).forEach((t) => { byD[t.symbol] = t; });
+    const out = {};
+    for (const [y, ds] of pairs) {
+      const t = byD[ds];
+      if (!t) continue;
+      const price = t.mark_price != null ? Number(t.mark_price)
+                  : t.close != null ? Number(t.close)
+                  : t.spot_price != null ? Number(t.spot_price) : null;
+      const open = t.open != null ? Number(t.open) : null;
+      if (price != null) out[y] = { sym: y, name: y, price, chg: open ? +(((price - open) / open) * 100).toFixed(2) : 0, currency: "USD" };
+    }
+    return out;
+  } catch { return {}; }
+}
+
 // Quotes for the Indian-equity subset, keyed back by the ORIGINAL yahoo symbol.
 async function fyersHouseQuotes(ySyms) {
   const token = await fyersHouseToken();
@@ -705,11 +734,13 @@ app.get("/api/quote", async (req, res) => {
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
     const quotes = await memo(`q:${symbols.join(",")}`, 15_000, async () => {
-      // Indian equities from the FYERS house feed first (when configured); Yahoo covers the
-      // rest — and anything FYERS didn't return — so a partial house response still fills in.
-      let fyMap = {};
+      // Indian equities from the FYERS house feed and crypto from the Delta feed first;
+      // Yahoo covers the rest — and anything the house feeds didn't return.
+      let fyMap = {}, dMap = {};
       try { fyMap = await fyersHouseQuotes(symbols); } catch { fyMap = {}; }
-      const need = symbols.filter((s) => !fyMap[s]);
+      try { dMap = await deltaHouseQuotes(symbols); } catch { dMap = {}; }
+      const houseMap = { ...fyMap, ...dMap };
+      const need = symbols.filter((s) => !houseMap[s]);
       const rows = await mapLimit(need, 6, async (sym) => {
         try {
           const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=1d`);
@@ -721,7 +752,7 @@ app.get("/api/quote", async (req, res) => {
           return { sym, name: m.symbol || sym, price, chg: +chg.toFixed(2), currency: m.currency };
         } catch { return null; }
       });
-      return [...Object.values(fyMap), ...rows.filter(Boolean)];
+      return [...Object.values(houseMap), ...rows.filter(Boolean)];
     });
     res.json({ quotes });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
@@ -1449,7 +1480,40 @@ const BROKERS = {
     loginUrl: (key, redirect) =>
       `https://api.schwabapi.com/v1/oauth/authorize?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code`,
   },
+
+  /* BRING-YOUR-OWN-CREDENTIAL brokers. Unlike the OAuth brokers, these don't send the user
+     to a login page — the user generates a token (or enters login + TOTP) and hands it to
+     us directly. `userCreds:true` means "no server app key needed; credentials arrive in
+     the connect body". No secrets sit in the server env for these. */
+  dhan: {
+    name: "Dhan", userCreds: true,
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
+  indmoney: {
+    name: "IND Money", userCreds: true,
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
+  angelone: {
+    name: "Angel One", userCreds: true,
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
+  groww: {
+    name: "Groww", userCreds: true,
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
 };
+
+/* Standard Angel One SmartAPI headers. The private key + JWT identify the app + session;
+   the IP/MAC headers are required by the API but may be placeholders for a server client. */
+function angelHeaders(apiKey, jwt) {
+  return {
+    "Content-Type": "application/json", Accept: "application/json",
+    "X-UserType": "USER", "X-SourceID": "WEB",
+    "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "127.0.0.1", "X-MACAddress": "00:00:00:00:00:00",
+    "X-PrivateKey": apiKey,
+    ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
+  };
+}
 
 /* ── Delta request signing ───────────────────────────────────────────────────────
    signature = HMAC_SHA256(secret, method + timestamp + path + query + body)
@@ -1575,8 +1639,9 @@ app.post("/api/broker/session", async (req, res) => {
   const b = BROKERS[broker];
   if (!b) return res.status(400).json({ error: "unknown broker" });
   if (!userId) return res.status(400).json({ error: "userId required" });
-  // Delta has no OAuth redirect, so it has no requestToken. Everyone else must have one.
-  if (!b.noOAuth && !requestToken) return res.status(400).json({ error: "requestToken required" });
+  // Delta has no OAuth redirect (server keys). userCreds brokers carry credentials in
+  // `extra` instead of a requestToken. Everyone else must present a requestToken.
+  if (!b.noOAuth && !b.userCreds && !requestToken) return res.status(400).json({ error: "requestToken required" });
 
   const key = b.key(userId), secret = b.secret(userId);
   if (!key || !secret) return res.status(400).json({ error: `${b.name} is not configured on the server.` });
@@ -1653,6 +1718,67 @@ app.post("/api/broker/session", async (req, res) => {
       return res.json({ sessionId: sid, user: null, broker });
     }
 
+    if (broker === "dhan") {
+      /* Dhan: no OAuth. The user pastes an access token (+ client id) generated on
+         web.dhan.co. We validate by hitting the funds endpoint. */
+      const extra = req.body.extra || {};
+      const accessToken = String(extra.accessToken || "").trim();
+      const clientId = String(extra.clientId || "").trim();
+      if (!accessToken) throw new Error("Dhan access token is required.");
+      const r = await fetch("https://api.dhan.co/v2/fundlimit", { headers: { "access-token": accessToken, "Content-Type": "application/json" } });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.errorType || d.status === "failed") throw new Error(d.errorMessage || d.message || `Dhan rejected the token (${r.status}).`);
+      const sid = putBrokerSession(userId, broker, accessToken);
+      const s = brokerSessions.get(sid); if (s) s.extra = { clientId };
+      return res.json({ sessionId: sid, user: clientId || null, broker });
+    }
+
+    if (broker === "indmoney") {
+      /* IND Money (INDstocks): Bearer access token from web.indstocks.com. The raw token
+         is the Authorization header value (no "Bearer " prefix). Validate via /user/profile. */
+      const extra = req.body.extra || {};
+      const accessToken = String(extra.accessToken || "").trim();
+      if (!accessToken) throw new Error("INDstocks access token is required.");
+      const r = await fetch("https://api.indstocks.com/user/profile", { headers: { Authorization: accessToken } });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.status !== "success") throw new Error(d.message || d.error || `INDstocks rejected the token (${r.status}).`);
+      const sid = putBrokerSession(userId, broker, accessToken);
+      return res.json({ sessionId: sid, user: (d.data && (d.data.first_name || d.data.user_id)) || null, broker });
+    }
+
+    if (broker === "angelone") {
+      /* Angel One SmartAPI: log in with the user's OWN API key + client code + PIN + TOTP.
+         Returns a JWT we keep server-side; the API key is needed on every later call. */
+      const extra = req.body.extra || {};
+      const apiKey = String(extra.apiKey || "").trim();
+      const clientCode = String(extra.clientCode || "").trim();
+      const pin = String(extra.pin || "").trim();
+      const totp = String(extra.totp || "").trim();
+      if (!apiKey || !clientCode || !pin || !totp) throw new Error("Angel One needs API key, client code, PIN and TOTP.");
+      const r = await fetch("https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword", {
+        method: "POST",
+        headers: angelHeaders(apiKey, null),
+        body: JSON.stringify({ clientcode: clientCode, password: pin, totp }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.status || !d.data || !d.data.jwtToken) throw new Error(d.message || d.errorcode || `Angel One login failed (${r.status}).`);
+      const sid = putBrokerSession(userId, broker, d.data.jwtToken, d.data.refreshToken || null);
+      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, feedToken: d.data.feedToken || null };
+      return res.json({ sessionId: sid, user: clientCode, broker });
+    }
+
+    if (broker === "groww") {
+      /* Groww: paste an access token from the Groww trading API console. Validate via holdings. */
+      const extra = req.body.extra || {};
+      const accessToken = String(extra.accessToken || "").trim();
+      if (!accessToken) throw new Error("Groww access token is required.");
+      const r = await fetch("https://api.groww.in/v1/holdings/user", { headers: brokerAuth("groww", accessToken) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.status === "FAILURE" || d.error) throw new Error((d.error && d.error.message) || d.message || `Groww rejected the token (${r.status}).`);
+      const sid = putBrokerSession(userId, broker, accessToken);
+      return res.json({ sessionId: sid, user: null, broker });
+    }
+
     res.status(400).json({ error: "unsupported broker" });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
@@ -1668,6 +1794,15 @@ function brokerAuth(broker, token, userId) {
   }
   if (broker === "fyers") {
     return { Authorization: `${BROKERS.fyers.key(userId)}:${token}` };
+  }
+  if (broker === "dhan") {
+    return { "access-token": token, "Content-Type": "application/json" };
+  }
+  if (broker === "indmoney") {
+    return { Authorization: token };   // INDstocks: raw token, no "Bearer " prefix
+  }
+  if (broker === "groww") {
+    return { Accept: "application/json", Authorization: `Bearer ${token}`, "X-API-VERSION": "1.0" };
   }
   return {};
 }
@@ -2181,6 +2316,83 @@ app.get("/api/broker/portfolio", async (req, res) => {
       const bucket = (f.fund_limit || []).find((x) => /available/i.test(x.title || ""));
       const cash = bucket ? bucket.equityAmount ?? null : null;
       return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    if (broker === "dhan") {
+      const [hRes, fRes] = await Promise.all([
+        fetch("https://api.dhan.co/v2/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
+        fetch("https://api.dhan.co/v2/fundlimit", { headers: brokerAuth(broker, token, sess.userId) }),
+      ]);
+      const h = await hRes.json().catch(() => ([]));
+      const f = await fRes.json().catch(() => ({}));
+      const arr = Array.isArray(h) ? h : (h.data || []);
+      const holdings = arr.map((x) => ({
+        sym: String(x.tradingSymbol || x.symbol || x.securityId || "").replace(/-EQ$/, ""),
+        qty: x.totalQty ?? x.availableQty ?? x.quantity ?? 0,
+        avg: x.avgCostPrice ?? x.costPrice ?? null,
+        ltp: x.lastTradedPrice ?? x.ltp ?? null,
+        pnl: null,
+        value: (x.lastTradedPrice != null && (x.totalQty ?? x.availableQty) != null) ? +(x.lastTradedPrice * (x.totalQty ?? x.availableQty)).toFixed(2) : null,
+      }));
+      // Dhan spells it "availabelBalance" in places; accept both.
+      const cash = f.availabelBalance ?? f.availableBalance ?? f.sodLimit ?? null;
+      return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    if (broker === "indmoney") {
+      const [hRes, fRes] = await Promise.all([
+        fetch("https://api.indstocks.com/portfolio/holdings", { headers: { Authorization: token } }),
+        fetch("https://api.indstocks.com/funds", { headers: { Authorization: token } }),
+      ]);
+      const h = await hRes.json().catch(() => ({}));
+      const f = await fRes.json().catch(() => ({}));
+      const holdings = ((h && h.data) || []).map((x) => ({
+        sym: String(x.trading_symbol || "").replace(/-EQ$/, ""),
+        qty: x.quantity ?? 0,
+        avg: x.average_price ?? null,
+        ltp: x.last_traded_price ?? null,
+        pnl: x.pnl_absolute ?? null,
+        value: x.market_value ?? null,
+      }));
+      const cash = (f && f.data) ? (f.data.withdrawal_balance ?? f.data.sod_balance ?? null) : null;
+      return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    if (broker === "angelone") {
+      const apiKey = (sess.extra && sess.extra.apiKey) || "";
+      const H = angelHeaders(apiKey, token);
+      const [hRes, fRes] = await Promise.all([
+        fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/portfolio/v1/getAllHolding", { headers: H }),
+        fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/getRMS", { headers: H }),
+      ]);
+      const h = await hRes.json().catch(() => ({}));
+      const f = await fRes.json().catch(() => ({}));
+      const list = (h.data && (h.data.holdings || (Array.isArray(h.data) ? h.data : []))) || [];
+      const holdings = list.map((x) => ({
+        sym: String(x.tradingsymbol || x.symbolname || "").replace(/-EQ$/, ""),
+        qty: x.quantity ?? 0,
+        avg: x.averageprice ?? null,
+        ltp: x.ltp ?? null,
+        pnl: x.profitandloss ?? null,
+        value: (x.ltp != null && x.quantity != null) ? +(x.ltp * x.quantity).toFixed(2) : null,
+      }));
+      const cash = (f && f.data) ? (f.data.availablecash ?? f.data.net ?? null) : null;
+      return res.json({ broker, holdings, cash, currency: "INR" });
+    }
+
+    if (broker === "groww") {
+      const hRes = await fetch("https://api.groww.in/v1/holdings/user", { headers: brokerAuth("groww", token) });
+      const h = await hRes.json().catch(() => ({}));
+      const list = (h.payload && h.payload.holdings) || h.holdings || (Array.isArray(h.payload) ? h.payload : []) || [];
+      const holdings = list.map((x) => ({
+        sym: String(x.trading_symbol || x.tradingSymbol || x.symbol || "").replace(/-EQ$/, ""),
+        qty: x.quantity ?? 0,
+        avg: x.average_price ?? x.avg_price ?? null,
+        ltp: x.ltp ?? x.last_price ?? null,
+        pnl: null,
+        value: (x.ltp != null && x.quantity != null) ? +(x.ltp * x.quantity).toFixed(2) : null,
+      }));
+      return res.json({ broker, holdings, cash: null, currency: "INR" });
     }
 
     if (broker === "delta") {
