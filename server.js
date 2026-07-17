@@ -2168,6 +2168,50 @@ async function liveMarkForOrder(brokerSym, market) {
   } catch { return null; }
 }
 
+/* Round a price to the instrument's tick size — Delta rejects prices off the grid. */
+function roundToTick(price, tick) {
+  const t = Number(tick);
+  if (!Number.isFinite(t) || t <= 0) return price;
+  const decimals = (String(tick).split(".")[1] || "").length;
+  return +(Math.round(price / t) * t).toFixed(Math.min(decimals + 2, 10));
+}
+
+/* NATIVE SL/TP on Delta: a bracket of two market-order legs that close the position when
+   price hits the stop or the target. Placed AFTER the entry fills, so the EXCHANGE enforces
+   the exit even if the app is closed, the phone is off, or the server restarts.
+
+   Never throws: a failed bracket must NOT unwind a filled entry. We return { placed, message }
+   so the caller can tell the user honestly whether protection is actually live — the one thing
+   we must never do is let someone believe a stop exists when it doesn't. */
+async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct) {
+  try {
+    if (!(entryRef > 0)) return { placed: false, message: "no entry price to base SL/TP on" };
+    const long = String(side).toLowerCase() === "buy";
+    const tick = prod.tick_size;
+    const legs = {};
+    if (slPct > 0) {
+      const sl = long ? entryRef * (1 - slPct / 100) : entryRef * (1 + slPct / 100);
+      legs.stop_loss_order = { order_type: "market_order", stop_price: String(roundToTick(sl, tick)) };
+    }
+    if (tpPct > 0) {
+      const tp = long ? entryRef * (1 + tpPct / 100) : entryRef * (1 - tpPct / 100);
+      legs.take_profit_order = { order_type: "market_order", stop_price: String(roundToTick(tp, tick)) };
+    }
+    if (!legs.stop_loss_order && !legs.take_profit_order) return { placed: false, message: "no SL/TP requested" };
+    const body = { product_id: prod.id, product_symbol: prod.symbol, bracket_stop_trigger_method: "last_traded_price", ...legs };
+    // The position may not be visible the instant a market entry returns — one short retry.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await deltaCall("POST", "/v2/orders/bracket", { body });
+        return { placed: true, message: "SL/TP set on Delta", ...legs };
+      } catch (e) {
+        if (attempt === 0) { await new Promise((r) => setTimeout(r, 1200)); continue; }
+        return { placed: false, message: String(e.message || e) };
+      }
+    }
+  } catch (e) { return { placed: false, message: String(e.message || e) }; }
+}
+
 /* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
    the client must send X-Confirm-Live: yes. Two locks, because the failure mode
    here is real money moving without the user meaning it. */
@@ -2188,6 +2232,10 @@ app.post("/api/broker/order", async (req, res) => {
   const { symbol, side, qty, orderType = "MARKET", product = "CNC" } = req.body || {};
   // A LIMIT order needs a price; the client may send it as `limitPrice` or `price`.
   const price = req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price;
+  // Optional native stop-loss / take-profit (percentages) to attach as an exchange-side
+  // bracket, so exits fire even with the app closed. entryPrice anchors the SL/TP maths.
+  const slPct = Number(req.body?.slPct) || 0;
+  const tpPct = Number(req.body?.tpPct) || 0;
   if (!BROKERS[broker]) return res.status(400).json({ error: "unknown broker" });
   // Quantity must be a finite positive number within a sane ceiling — a negative, NaN, or
   // absurd qty must never reach a live broker.
@@ -2276,7 +2324,15 @@ app.post("/api/broker/order", async (req, res) => {
           order_type: "market_order",
         },
       });
-      return res.json({ ok: true, broker, orderId: d.result?.id ?? null, raw: d.result ?? null });
+      /* Attach an exchange-side bracket so the stop-loss / take-profit fire on Delta itself,
+         with the app closed. Best-effort and honestly reported: the entry has already filled,
+         so a bracket failure returns a warning rather than pretending the position is safe. */
+      let bracket = null;
+      if (String(side).toLowerCase() === "buy" && (slPct > 0 || tpPct > 0)) {
+        const entryRef = Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, "Crypto");
+        bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct);
+      }
+      return res.json({ ok: true, broker, orderId: d.result?.id ?? null, bracket, raw: d.result ?? null });
     }
 
     if (broker === "coindcx") {
@@ -2664,11 +2720,14 @@ app.get("/api/broker/portfolio", async (req, res) => {
           qty: Number(x.size),
           avg: x.entry_price != null ? Number(x.entry_price) : null,
           ltp: x.mark_price != null ? Number(x.mark_price) : null,
+          value: (x.mark_price != null && x.size != null) ? Number(x.mark_price) * Number(x.size) : null,
           pnl: x.unrealized_pnl != null ? Number(x.unrealized_pnl) : null,
+          source: "positions",
+          market: "Crypto",
         }))
         .filter((h) => h.sym);
 
-      return res.json({ broker, holdings, cash, currency: "INR" });
+      return res.json({ broker, holdings, cash, currency: "USD" });
     }
 
     if (broker === "schwab") {
