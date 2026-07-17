@@ -1641,20 +1641,24 @@ const BROKERS = {
   },
 };
 
-/* Binance signs with HMAC_SHA256 over the query string; the api key rides in X-MBX-APIKEY. */
-async function binanceSigned(apiKey, apiSecret, path, params = {}) {
+/* Binance signs with HMAC_SHA256 over the query string; the api key rides in X-MBX-APIKEY.
+   Works for GET (reads) and POST (orders) — Binance accepts the signed params in the query
+   string for both. */
+async function binanceSigned(apiKey, apiSecret, path, params = {}, method = "GET") {
   const q = new URLSearchParams({ ...params, timestamp: String(Date.now()), recvWindow: "10000" }).toString();
   const signature = crypto.createHmac("sha256", apiSecret).update(q).digest("hex");
-  const r = await fetch(`https://api.binance.com${path}?${q}&signature=${signature}`, { headers: { "X-MBX-APIKEY": apiKey } });
+  const r = await fetch(`https://api.binance.com${path}?${q}&signature=${signature}`, { method, headers: { "X-MBX-APIKEY": apiKey } });
   const d = await r.json().catch(() => ({}));
   return { r, d };
 }
 
 /* CoinSwitch PRO uses Ed25519: sign (METHOD + request_path + epoch) with the secret (a hex
    Ed25519 private seed). Headers: X-AUTH-APIKEY, X-AUTH-SIGNATURE (hex), X-AUTH-EPOCH. */
-async function coinswitchSigned(apiKey, apiSecret, method, path) {
+async function coinswitchSigned(apiKey, apiSecret, method, path, body = null) {
   const epoch = String(Date.now());
-  const msg = method + path + epoch;
+  // CoinSwitch PRO signs method + endpoint + epoch (+ payload for write calls).
+  const payload = body ? JSON.stringify(body) : "";
+  const msg = method + path + epoch + payload;
   let signature = "";
   try {
     const seed = Buffer.from(apiSecret, "hex");
@@ -1665,10 +1669,66 @@ async function coinswitchSigned(apiKey, apiSecret, method, path) {
     signature = crypto.sign(null, Buffer.from(msg), keyObj).toString("hex");
   } catch (e) { throw new Error("CoinSwitch key format not recognised: " + e.message); }
   const r = await fetch(`https://api-trading.coinswitch.co${path}`, {
-    method, headers: { "Content-Type": "application/json", "X-AUTH-APIKEY": apiKey, "X-AUTH-SIGNATURE": signature, "X-AUTH-EPOCH": epoch },
+    method,
+    headers: { "Content-Type": "application/json", "X-AUTH-APIKEY": apiKey, "X-AUTH-SIGNATURE": signature, "X-AUTH-EPOCH": epoch },
+    ...(body ? { body: payload } : {}),
   });
   const d = await r.json().catch(() => ({}));
   return { r, d };
+}
+
+/* ── Instrument-master resolvers for brokers that trade by NUMERIC id ──────────────────
+   Dhan and Angel One place orders against a numeric instrument id, not a ticker. Getting
+   this wrong doesn't fail politely — it BUYS A DIFFERENT STOCK. So we download the broker's
+   own master, match STRICTLY on (NSE, cash-equity, exact trading symbol), and REFUSE if the
+   match is missing or ambiguous. A refused order is safe; a guessed id is not. Cached 12h. */
+const _scrip = { dhan: { at: 0, map: null }, angel: { at: 0, map: null } };
+
+async function dhanSecurityId(sym) {
+  const now = Date.now();
+  if (!_scrip.dhan.map || now - _scrip.dhan.at > 12 * 3600 * 1000) {
+    const res = await fetchT("https://images.dhan.co/api-data/api-scrip-master.csv", {}, 30000);
+    const txt = await res.text();
+    const lines = txt.split(/\r?\n/);
+    const H = lines[0].split(",").map((s) => s.trim());
+    const iId = H.indexOf("SEM_SMST_SECURITY_ID"), iSym = H.indexOf("SEM_TRADING_SYMBOL"),
+      iExch = H.indexOf("SEM_EXM_EXCH_ID"), iSeg = H.indexOf("SEM_SEGMENT");
+    if (iId < 0 || iSym < 0 || iExch < 0) throw new Error("Dhan scrip master format changed — cannot resolve id safely");
+    const map = {};
+    for (let k = 1; k < lines.length; k++) {
+      const c = lines[k].split(",");
+      if (!c[iExch]) continue;
+      if (c[iExch].trim() !== "NSE") continue;                       // NSE only
+      if (iSeg >= 0 && !/^(E|EQ|I)$/i.test((c[iSeg] || "").trim())) continue;   // cash/equity segment
+      const t = (c[iSym] || "").trim().toUpperCase();
+      if (t) map[t] = (c[iId] || "").trim();
+    }
+    _scrip.dhan = { at: now, map };
+  }
+  const key = String(sym).toUpperCase().replace(/-EQ$/, "");
+  const id = _scrip.dhan.map[key] || _scrip.dhan.map[`${key}-EQ`];
+  if (!id) throw new Error(`Dhan: no NSE equity security id for ${sym} — refusing rather than guess`);
+  return id;
+}
+
+async function angelToken(sym) {
+  const now = Date.now();
+  if (!_scrip.angel.map || now - _scrip.angel.at > 12 * 3600 * 1000) {
+    const res = await fetchT("https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json", {}, 30000);
+    const arr = await res.json();
+    const map = {};
+    for (const x of (Array.isArray(arr) ? arr : [])) {
+      if ((x.exch_seg || x.exchSeg) !== "NSE") continue;
+      const s = String(x.symbol || "").toUpperCase();
+      if (!s.endsWith("-EQ")) continue;                              // NSE cash equity symbols end -EQ
+      map[s] = String(x.token);
+    }
+    _scrip.angel = { at: now, map };
+  }
+  const key = `${String(sym).toUpperCase().replace(/-EQ$/, "")}-EQ`;
+  const token = _scrip.angel.map[key];
+  if (!token) throw new Error(`Angel One: no NSE equity token for ${sym} — refusing rather than guess`);
+  return { token, tradingsymbol: key };
 }
 
 /* CoinDCX signs each request: signature = HMAC_SHA256(JSON body, apiSecret), sent with the
@@ -2276,7 +2336,7 @@ app.post("/api/broker/order", async (req, res) => {
   const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
   async function registerAutoExit() {
     if (!wantAutoExit || String(side).toLowerCase() !== "buy") return null;
-    if (["binance", "coinswitch"].includes(broker)) return null;   // order placement not wired -> can't exit
+    // All brokers now have order placement wired, so any of them can be auto-exited.
     try {
       const bareSym = String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "");
       const entryRef = Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, regMarket) || null;
@@ -2446,6 +2506,89 @@ app.post("/api/broker/order", async (req, res) => {
       // Schwab returns the new order id in the Location header, not the body.
       const loc = r.headers.get("location") || "";
       return res.json({ ok: true, broker, orderId: loc.split("/").pop() || null });
+    }
+
+    if (broker === "binance") {
+      const { apiKey, apiSecret } = sess.extra || {};
+      if (!apiKey || !apiSecret) throw new Error("Binance keys missing — reconnect.");
+      const base = String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+      const isBuy = String(side).toUpperCase() === "BUY";
+      const params = { symbol: `${base}USDT`, side: isBuy ? "BUY" : "SELL", type: "MARKET" };
+      // Market BUY sized by spend (quoteOrderQty) avoids LOT_SIZE rejections; SELL by base qty.
+      const ref = Number(req.body?.entryPrice) || 0;
+      if (isBuy && ref > 0) params.quoteOrderQty = +(Number(qty) * ref).toFixed(2);
+      else params.quantity = Number(qty);
+      const { r, d } = await binanceSigned(apiKey, apiSecret, "/api/v3/order", params, "POST");
+      if (!r.ok) throw new Error((d && d.msg) || `Binance order failed (${r.status})`);
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: d.orderId ?? null, status: d.status || "FILLED", autoExitId });
+    }
+
+    if (broker === "coinswitch") {
+      const { apiKey, apiSecret } = sess.extra || {};
+      const base = String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+      const body = { symbol: `${base}/INR`, side: String(side).toLowerCase(), type: "market", quantity: Number(qty), exchange: "coinswitchx" };
+      const { r, d } = await coinswitchSigned(apiKey, apiSecret, "POST", "/trade/api/v2/order", body);
+      if (!r.ok || (d && (d.error || d.message))) throw new Error((d && (d.message || d.error)) || `CoinSwitch order failed (${r.status})`);
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: (d && d.data && (d.data.order_id || d.data.id)) || null, status: "PENDING", autoExitId });
+    }
+
+    if (broker === "dhan") {
+      const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
+      const body = {
+        dhanClientId: sess.extra && sess.extra.clientId, transactionType: String(side).toUpperCase(),
+        exchangeSegment: "NSE_EQ", productType: product === "CNC" ? "CNC" : "INTRADAY",
+        orderType: "MARKET", validity: "DAY", securityId, quantity: String(Number(qty)),
+        price: "", disclosedQuantity: "", afterMarketOrder: false,
+      };
+      const r = await fetch("https://api.dhan.co/v2/orders", { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.orderStatus === "REJECTED" || d.errorType) throw new Error(d.errorMessage || d.omsErrorDescription || `Dhan order failed (${r.status})`);
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: d.orderId ?? null, status: d.orderStatus || "PENDING", autoExitId });
+    }
+
+    if (broker === "angelone") {
+      const { token: symboltoken, tradingsymbol } = await angelToken(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
+      const body = {
+        variety: "NORMAL", tradingsymbol, symboltoken, transactiontype: String(side).toUpperCase(),
+        exchange: "NSE", ordertype: "MARKET", producttype: product === "CNC" ? "DELIVERY" : "INTRADAY",
+        duration: "DAY", price: "0", squareoff: "0", stoploss: "0", quantity: String(Number(qty)),
+      };
+      const r = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder", {
+        method: "POST", headers: angelHeaders(sess.extra && sess.extra.apiKey, token), body: JSON.stringify(body),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.status === false || d.errorcode) throw new Error(d.message || `Angel One order failed (${r.status})`);
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: (d.data && (d.data.orderid || d.data.uniqueorderid)) || null, status: "PENDING", autoExitId });
+    }
+
+    if (broker === "groww") {
+      const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+      const body = {
+        trading_symbol: bare, quantity: Number(qty), validity: "DAY", exchange: "NSE", segment: "CASH",
+        product: product === "CNC" ? "CNC" : "MIS", order_type: "MARKET", transaction_type: String(side).toUpperCase(),
+      };
+      const r = await fetch("https://api.groww.in/v1/order/create", { method: "POST", headers: { ...brokerAuth("groww", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.status === "FAILURE" || d.error) throw new Error((d.error && (d.error.message || d.error)) || d.message || `Groww order failed (${r.status})`);
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: (d.payload && d.payload.groww_order_id) || d.groww_order_id || null, status: "PENDING", autoExitId });
+    }
+
+    if (broker === "indmoney") {
+      const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+      const body = {
+        symbol: bare, exchange: "NSE", transaction_type: String(side).toUpperCase(), order_type: "MARKET",
+        product: product === "CNC" ? "DELIVERY" : "INTRADAY", quantity: Number(qty), validity: "DAY",
+      };
+      const r = await fetch("https://api.indstocks.com/order/place", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.status === "error" || d.error) throw new Error(d.message || `IND Money order failed (${r.status})`);
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: (d.data && d.data.order_id) || d.order_id || null, status: "PENDING", autoExitId });
     }
 
     res.status(400).json({ error: "unsupported broker" });
@@ -2926,11 +3069,49 @@ async function placeExitOrder(sess, symbol, qty, market, product) {
     const o = (d.orders && d.orders[0]) || d;
     return { orderId: o.id || o.order_id || null };
   }
-  if (broker === "binance" || broker === "coinswitch") {
-    // Order PLACEMENT isn't wired for these yet (connect + portfolio only), so we must not
-    // pretend we can auto-exit them. Registration blocks these brokers up front; this is a
-    // belt-and-braces guard so the engine never fires a broken exit.
-    throw new Error(`auto-exit not yet supported for ${broker} — exit manually`);
+  if (broker === "binance") {
+    const { apiKey, apiSecret } = sess.extra || {};
+    const base = String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+    const { r, d } = await binanceSigned(apiKey, apiSecret, "/api/v3/order", { symbol: `${base}USDT`, side: "SELL", type: "MARKET", quantity: Number(qty) }, "POST");
+    if (!r.ok) throw new Error((d && d.msg) || `Binance exit failed (${r.status})`);
+    return { orderId: d.orderId ?? null };
+  }
+  if (broker === "coinswitch") {
+    const { apiKey, apiSecret } = sess.extra || {};
+    const base = String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+    const { r, d } = await coinswitchSigned(apiKey, apiSecret, "POST", "/trade/api/v2/order", { symbol: `${base}/INR`, side: "sell", type: "market", quantity: Number(qty), exchange: "coinswitchx" });
+    if (!r.ok || (d && (d.error || d.message))) throw new Error((d && (d.message || d.error)) || `CoinSwitch exit failed (${r.status})`);
+    return { orderId: (d && d.data && (d.data.order_id || d.data.id)) || null };
+  }
+  if (broker === "dhan") {
+    const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
+    const body = { dhanClientId: sess.extra && sess.extra.clientId, transactionType: "SELL", exchangeSegment: "NSE_EQ", productType: "INTRADAY", orderType: "MARKET", validity: "DAY", securityId, quantity: String(Number(qty)), price: "", afterMarketOrder: false };
+    const r = await fetch("https://api.dhan.co/v2/orders", { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.orderStatus === "REJECTED") throw new Error(d.errorMessage || d.omsErrorDescription || `Dhan exit failed (${r.status})`);
+    return { orderId: d.orderId ?? null };
+  }
+  if (broker === "angelone") {
+    const { token: symboltoken, tradingsymbol } = await angelToken(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
+    const body = { variety: "NORMAL", tradingsymbol, symboltoken, transactiontype: "SELL", exchange: "NSE", ordertype: "MARKET", producttype: "INTRADAY", duration: "DAY", price: "0", squareoff: "0", stoploss: "0", quantity: String(Number(qty)) };
+    const r = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder", { method: "POST", headers: angelHeaders(sess.extra && sess.extra.apiKey, token), body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.status === false || d.errorcode) throw new Error(d.message || `Angel One exit failed (${r.status})`);
+    return { orderId: (d.data && (d.data.orderid || d.data.uniqueorderid)) || null };
+  }
+  if (broker === "groww") {
+    const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+    const r = await fetch("https://api.groww.in/v1/order/create", { method: "POST", headers: { ...brokerAuth("groww", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify({ trading_symbol: bare, quantity: Number(qty), validity: "DAY", exchange: "NSE", segment: "CASH", product: "MIS", order_type: "MARKET", transaction_type: "SELL" }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.status === "FAILURE" || d.error) throw new Error((d.error && (d.error.message || d.error)) || d.message || `Groww exit failed (${r.status})`);
+    return { orderId: (d.payload && d.payload.groww_order_id) || d.groww_order_id || null };
+  }
+  if (broker === "indmoney") {
+    const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+    const r = await fetch("https://api.indstocks.com/order/place", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify({ symbol: bare, exchange: "NSE", transaction_type: "SELL", order_type: "MARKET", product: "INTRADAY", quantity: Number(qty), validity: "DAY" }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.status === "error" || d.error) throw new Error(d.message || `IND Money exit failed (${r.status})`);
+    return { orderId: (d.data && d.data.order_id) || d.order_id || null };
   }
   if (broker === "zerodha") {
     const [exchange, tradingsymbol] = String(symbol).split(":");
