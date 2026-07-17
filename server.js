@@ -612,8 +612,11 @@ let _fyHouse = { token: null, at: 0 };
 let _fyLastError = null;      // surfaced by /api/feeds-status for debugging
 let _deltaLastError = null;
 let _fyDebug = null;          // safe (no secrets): shapes + raw FYERS response
+let _fyCooldownUntil = 0;     // don't retry the mint until this time (avoids hammering FYERS -> 429)
 async function fyersHouseToken() {
   if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
+  // After a failure we back off, so a bad/expired token can't spam FYERS on every quote poll.
+  if (Date.now() < _fyCooldownUntil) return null;
   // .trim() guards against a stray newline/space pasted into the Render env value.
   const appId = (process.env.FYERS_APP_ID || "").trim();
   const secret = (process.env.FYERS_SECRET_ID || "").trim();
@@ -636,10 +639,12 @@ async function fyersHouseToken() {
         pinLen: pin.length,
         httpStatus: r.status, fyersResponse: d,
       };
-      if (r.ok && d.access_token) { _fyHouse = { token: d.access_token, at: Date.now() }; _fyLastError = null; return d.access_token; }
+      if (r.ok && d.access_token) { _fyHouse = { token: d.access_token, at: Date.now() }; _fyLastError = null; _fyCooldownUntil = 0; return d.access_token; }
       _fyLastError = "refresh-token exchange: " + (d.message || d.s || ("HTTP " + r.status));
+      // 429 = rate-limited: back off HARD (10 min). Other failures: back off 2 min.
+      _fyCooldownUntil = Date.now() + (r.status === 429 ? 10 * 60 * 1000 : 2 * 60 * 1000);
       console.error("[fyers-house]", _fyLastError);
-    } catch (e) { _fyLastError = "refresh error: " + e.message; console.error("[fyers-house]", _fyLastError); }
+    } catch (e) { _fyLastError = "refresh error: " + e.message; _fyCooldownUntil = Date.now() + 2 * 60 * 1000; console.error("[fyers-house]", _fyLastError); }
   } else {
     _fyLastError = "not configured (need FYERS_APP_ID, FYERS_SECRET_ID, FYERS_REFRESH_TOKEN, FYERS_PIN — or FYERS_ACCESS_TOKEN)";
   }
