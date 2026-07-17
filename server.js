@@ -665,7 +665,7 @@ async function deltaHouseQuotes(ySyms) {
                   : t.close != null ? Number(t.close)
                   : t.spot_price != null ? Number(t.spot_price) : null;
       const open = t.open != null ? Number(t.open) : null;
-      if (price != null) out[y] = { sym: y, name: y, price, chg: open ? +(((price - open) / open) * 100).toFixed(2) : 0, currency: "USD" };
+      if (price != null) out[y] = { sym: y, name: y, price, chg: open ? +(((price - open) / open) * 100).toFixed(2) : 0, currency: "USD", src: "delta" };
     }
     return out;
   } catch { return {}; }
@@ -693,7 +693,7 @@ async function fyersHouseQuotes(ySyms) {
     const out = {};
     for (const [y, f] of pairs) {
       const v = byFy[f];
-      if (v && v.lp != null) out[y] = { sym: y, name: y, price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0, currency: "INR" };
+      if (v && v.lp != null) out[y] = { sym: y, name: y, price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0, currency: "INR", src: "fyers" };
     }
     return out;
   } catch (e) { console.error("[fyers-house] quotes error:", e.message); return {}; }
