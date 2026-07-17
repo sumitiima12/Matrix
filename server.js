@@ -1329,6 +1329,34 @@ const BROKERS = {
    Sent as: api-key, timestamp, signature. The secret never leaves this process. */
 const DELTA_BASE = "https://api.india.delta.exchange";
 
+/* ── Delta outbound proxy ─────────────────────────────────────────────────────────
+   Delta whitelists API keys by IP. Render's outbound IP isn't (and can't reliably be)
+   whitelisted, so Delta rejects our calls with `ip_not_whitelisted_for_api_key`.
+   The fix is to route ONLY the Delta requests through a static, whitelisted proxy.
+   Set DELTA_PROXY_URL on the server, e.g.
+     http://<user>:<pass>@dc46-mum-01.algoip.in:443
+   Credentials are pulled out of the URL and sent as a Proxy-Authorization header
+   (the most reliable way for undici's ProxyAgent). If the var is unset, Delta calls
+   go out directly, exactly as before. */
+let deltaDispatcher = null;
+(() => {
+  const proxyUrl = process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY || "";
+  if (!proxyUrl) return;
+  try {
+    const { ProxyAgent } = require("undici");
+    const u = new URL(proxyUrl);
+    const opts = { uri: `${u.protocol}//${u.host}` };
+    if (u.username || u.password) {
+      const cred = Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64");
+      opts.token = `Basic ${cred}`;
+    }
+    deltaDispatcher = new ProxyAgent(opts);
+    console.log(`[delta] routing Delta API through proxy ${u.host}`);
+  } catch (e) {
+    console.error("[delta] proxy init failed — sending Delta calls directly:", e.message);
+  }
+})();
+
 function deltaHeaders(method, path, query = "", body = "") {
   const key = envKey("DELTA_API_KEY");
   const secret = envKey("DELTA_API_SECRET");
@@ -1357,6 +1385,7 @@ async function deltaCall(method, path, { query = "", body = null, signed = true 
     method,
     headers,
     ...(bodyStr ? { body: bodyStr } : {}),
+    ...(deltaDispatcher ? { dispatcher: deltaDispatcher } : {}),   // route via whitelisted proxy when configured
   });
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d.success === false) {

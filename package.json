@@ -19,6 +19,7 @@
     "pg": "^8.13.1",
     "compression": "^1.7.4",
     "express-rate-limit": "^7.4.1",
-    "bcryptjs": "^2.4.3"
+    "bcryptjs": "^2.4.3",
+    "undici": "^6.21.0"
   }
 }
