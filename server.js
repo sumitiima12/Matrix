@@ -21,6 +21,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
+const strat = require("./strategyEngine");   // server-side port of the strategy exit engine
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
 const stripPh = (s) => String(s || "").replace(/^ph_/, "");   // "ph_9167..." -> "9167..."   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
@@ -881,7 +882,7 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   const r = data.chart?.result?.[0];
   const ts = r?.timestamp || [];
   const q = r?.indicators?.quote?.[0] || {};
-  return ts.map((t, i) => ({ t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i] }))
+  return ts.map((t, i) => ({ t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i] }))
            .filter((d) => d.c != null && d.h != null && d.l != null);
 }
 
@@ -2236,6 +2237,29 @@ app.post("/api/broker/order", async (req, res) => {
   // bracket, so exits fire even with the app closed. entryPrice anchors the SL/TP maths.
   const slPct = Number(req.body?.slPct) || 0;
   const tpPct = Number(req.body?.tpPct) || 0;
+  // Server-side signal-based auto-exit opt-in: register this position so the engine watches
+  // its strategy exit (price + indicator) and closes it reduce-only, even with the app shut.
+  const wantAutoExit = req.body?.autoExit === true;
+  const exitCfg = req.body?.strategy || null;      // { defs, exit } from the strategy builder
+  const tslPct = Number(req.body?.tslPct) || 0;
+  const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
+  async function registerAutoExit() {
+    if (!wantAutoExit || String(side).toLowerCase() !== "buy") return null;
+    if (["binance", "coinswitch"].includes(broker)) return null;   // order placement not wired -> can't exit
+    try {
+      const bareSym = String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "");
+      const entryRef = Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, regMarket) || null;
+      const yahoo = req.body?.yahoo || (regMarket === "Crypto"
+        ? `${String(symbol).replace(/(USDT|USD|INR)$/i, "")}-USD`
+        : `${bareSym}.NS`);
+      const pos = await registerManagedPosition({
+        sess, symbol: bareSym, brokerSym: symbol, qty: nQty, entry: entryRef,
+        market: regMarket, sl: slPct || null, tp: tpPct || null, tsl: tslPct || null,
+        cfg: exitCfg, yahoo, interval: req.body?.interval || "5m",
+      });
+      return pos.id;
+    } catch (e) { console.error("[autoexit] register failed:", e.message); return null; }
+  }
   if (!BROKERS[broker]) return res.status(400).json({ error: "unknown broker" });
   // Quantity must be a finite positive number within a sane ceiling — a negative, NaN, or
   // absurd qty must never reach a live broker.
@@ -2287,7 +2311,8 @@ app.post("/api/broker/order", async (req, res) => {
       });
       const d = await r.json();
       if (!r.ok || d.status === "error") throw new Error(d.message || `kite ${r.status}`);
-      return res.json({ orderId: d.data.order_id, status: "PENDING", broker });
+      const autoExitId = await registerAutoExit();
+      return res.json({ orderId: d.data.order_id, status: "PENDING", broker, autoExitId });
     }
 
     if (broker === "fyers") {
@@ -2305,7 +2330,8 @@ app.post("/api/broker/order", async (req, res) => {
       });
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
-      return res.json({ orderId: d.id, status: "PENDING", broker });
+      const autoExitId = await registerAutoExit();
+      return res.json({ orderId: d.id, status: "PENDING", broker, autoExitId });
     }
 
     if (broker === "delta") {
@@ -2332,7 +2358,8 @@ app.post("/api/broker/order", async (req, res) => {
         const entryRef = Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, "Crypto");
         bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct);
       }
-      return res.json({ ok: true, broker, orderId: d.result?.id ?? null, bracket, raw: d.result ?? null });
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: d.result?.id ?? null, bracket, autoExitId, raw: d.result ?? null });
     }
 
     if (broker === "coindcx") {
@@ -2351,7 +2378,8 @@ app.post("/api/broker/order", async (req, res) => {
       const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", body);
       if (!r.ok || d.message || d.code) throw new Error(d.message || `CoinDCX order failed (${r.status}).`);
       const o = (d.orders && d.orders[0]) || d;
-      return res.json({ ok: true, broker, orderId: o.id || o.order_id || null, status: o.status || "PENDING" });
+      const autoExitId = await registerAutoExit();
+      return res.json({ ok: true, broker, orderId: o.id || o.order_id || null, status: o.status || "PENDING", autoExitId });
     }
 
     if (broker === "schwab") {
@@ -2779,6 +2807,198 @@ app.post("/api/broker/logout", (req, res) => {
   if (id) brokerSessions.delete(id);
   res.json({ ok: true });
 });
+
+/* ═══════════════════════ SERVER-SIDE SIGNAL-BASED AUTO-EXIT ═══════════════════════
+   Closes a REAL position on the exchange when the strategy's exit fires (price SL/TP/
+   trailing OR an indicator signal) — with the user's app closed. This is the only place
+   in the app where the SERVER places a real order without a live request from the user,
+   so every guardrail matters:
+     • REDUCE-ONLY: the engine can only CLOSE a position, never open one.
+     • KILL SWITCH: does nothing unless AUTO_EXIT_LIVE=true (otherwise it dry-runs + logs).
+     • IDEMPOTENT: a position is claimed ('closing') before the order, so a restart mid-flight
+       can't double-sell.
+     • ENCRYPTED CREDS: the token/keys needed to act are stored AES-256-GCM, never plaintext.
+   ─────────────────────────────────────────────────────────────────────────────────── */
+
+/* AES-256-GCM. Key derived from CRED_KEY (preferred) or an existing server secret, so a
+   deploy without CRED_KEY still encrypts rather than storing plaintext. Set CRED_KEY (any
+   long random string) in production and rotating it simply forces users to reconnect. */
+const CRED_SECRET = process.env.CRED_KEY || process.env.JWT_SECRET || process.env.DATABASE_URL || "matrix-cred-fallback-secret";
+const CRED_AESKEY = crypto.scryptSync(CRED_SECRET, "matrix-cred-salt-v1", 32);
+function encryptCred(obj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", CRED_AESKEY, iv);
+  const ct = Buffer.concat([cipher.update(JSON.stringify(obj), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return { v: 1, iv: iv.toString("base64"), tag: tag.toString("base64"), ct: ct.toString("base64") };
+}
+function decryptCred(blob) {
+  try {
+    if (!blob || !blob.ct) return null;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", CRED_AESKEY, Buffer.from(blob.iv, "base64"));
+    decipher.setAuthTag(Buffer.from(blob.tag, "base64"));
+    const pt = Buffer.concat([decipher.update(Buffer.from(blob.ct, "base64")), decipher.final()]);
+    return JSON.parse(pt.toString("utf8"));
+  } catch (e) { console.error("[autoexit] cred decrypt failed:", e.message); return null; }
+}
+
+/* Persist just enough to reconstruct a working session unattended: the access/refresh token
+   and any bring-your-own keys. For Delta the server's own env keys are used, so nothing
+   per-user is stored. Called only when a user opts a real position into auto-exit. */
+async function persistSessionCred(sess) {
+  if (!sess || !sess.userId || !sess.broker) return;
+  const payload = { accessToken: sess.accessToken || null, refreshToken: sess.refreshToken || null, extra: sess.extra || null };
+  await db.saveBrokerCred(sess.userId, sess.broker, encryptCred(payload));
+}
+/* Rebuild a session-shaped object from stored creds, for the engine to place an exit. */
+async function sessionFromCred(userId, broker) {
+  if (broker === "delta") return { userId: String(userId), broker, accessToken: "server-signed" };  // Delta uses server env keys
+  const blob = await db.getBrokerCred(userId, broker);
+  const c = decryptCred(blob);
+  if (!c) return null;
+  return { userId: String(userId), broker, accessToken: c.accessToken, refreshToken: c.refreshToken, extra: c.extra || {} };
+}
+
+/* REDUCE-ONLY exit executor. Sells `qty` to CLOSE a long. Every branch is a plain sell;
+   Delta additionally sets reduce_only so it can never flip you short by accident. */
+async function placeExitOrder(sess, symbol, qty, market) {
+  const broker = sess.broker;
+  const token = sess.accessToken;
+  if (broker === "delta") {
+    const prods = await deltaCall("GET", "/v2/products", { signed: false });
+    const prod = (prods.result || []).find((p) => p.symbol === symbol);
+    if (!prod) throw new Error(`Delta does not list ${symbol}`);
+    const d = await deltaCall("POST", "/v2/orders", {
+      body: { product_id: prod.id, size: Number(qty), side: "sell", order_type: "market_order", reduce_only: true },
+    });
+    return { orderId: d.result?.id ?? null };
+  }
+  if (broker === "coindcx") {
+    const { apiKey, apiSecret } = sess.extra || {};
+    const base = String(symbol).replace(/(INR|USDT)$/i, "").toUpperCase();
+    const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", {
+      side: "sell", order_type: "market_order", market: `${base}INR`, total_quantity: Number(qty),
+    });
+    if (!r.ok || d.message || d.code) throw new Error(d.message || `CoinDCX exit failed (${r.status})`);
+    const o = (d.orders && d.orders[0]) || d;
+    return { orderId: o.id || o.order_id || null };
+  }
+  if (broker === "binance" || broker === "coinswitch") {
+    // Order PLACEMENT isn't wired for these yet (connect + portfolio only), so we must not
+    // pretend we can auto-exit them. Registration blocks these brokers up front; this is a
+    // belt-and-braces guard so the engine never fires a broken exit.
+    throw new Error(`auto-exit not yet supported for ${broker} — exit manually`);
+  }
+  if (broker === "zerodha") {
+    const [exchange, tradingsymbol] = String(symbol).split(":");
+    const body = new URLSearchParams({ exchange, tradingsymbol, transaction_type: "SELL", quantity: String(qty), order_type: "MARKET", product: "CNC", validity: "DAY" });
+    const r = await fetch("https://api.kite.trade/orders/regular", { method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/x-www-form-urlencoded" }, body });
+    const d = await r.json();
+    if (!r.ok || d.status === "error") throw new Error(d.message || `kite exit ${r.status}`);
+    return { orderId: d.data.order_id };
+  }
+  if (broker === "fyers") {
+    const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+      method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: -1, productType: "CNC", limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.s === "error") throw new Error(d.message || `fyers exit ${r.status}`);
+    return { orderId: d.id };
+  }
+  throw new Error(`auto-exit not supported for ${broker}`);
+}
+
+/* Register a real position for the engine to watch. Called from /api/broker/order after a
+   real buy that opted into auto-exit. Persists the creds needed to act on it later. */
+async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval }) {
+  await persistSessionCred(sess);
+  const pos = {
+    id: crypto.randomBytes(16).toString("hex"),
+    userId: String(sess.userId), broker: sess.broker,
+    symbol, brokerSym, qty: Number(qty), entry: Number(entry) || null,
+    entryAt: Date.now(), market: market || "Crypto",
+    sl: sl || null, tp: tp || null, tsl: tsl || null,
+    cfg: cfg || null,                       // strategy { defs, exit } for indicator exits
+    yahoo: yahoo || symbol, interval: interval || (market === "IN" || market === "Commodity" ? "5m" : "5m"),
+    status: "open",
+  };
+  await db.saveManagedPosition(pos);
+  return pos;
+}
+
+let autoExitRunning = false;
+let lastAutoExit = { at: null, checked: 0, exited: 0, live: false };
+async function runAutoExitEngine() {
+  if (autoExitRunning) return;
+  autoExitRunning = true;
+  const live = process.env.AUTO_EXIT_LIVE === "true";
+  let checked = 0, exited = 0;
+  try {
+    const open = await db.getOpenManagedPositions(500);
+    for (const pos of open) {
+      if (pos.status === "closing") continue;         // already being handled
+      checked++;
+      try {
+        const range = pos.interval === "1d" ? "6mo" : "1mo";
+        const candles = await candlesFor(pos.yahoo || pos.symbol, range, pos.interval || "5m");
+        if (!candles || candles.length < 30) continue;
+
+        let hit = strat.priceExitFired(pos, candles);
+        if (!hit.fired && pos.cfg) { const s = strat.exitSignalFired(pos.cfg, candles); if (s.fired) hit = { fired: true, reason: s.reason }; }
+        if (!hit.fired) continue;
+
+        // Claim it FIRST so a crash/restart can't sell twice.
+        await db.updateManagedPosition(pos.id, { status: "closing", exitReason: hit.reason });
+
+        if (!live) {
+          console.log(`[autoexit] DRY-RUN (AUTO_EXIT_LIVE!=true): would exit ${pos.symbol} for ${pos.userId} — ${hit.reason}`);
+          await db.updateManagedPosition(pos.id, { status: "open" });
+          continue;
+        }
+
+        const sess = await sessionFromCred(pos.userId, pos.broker);
+        if (!sess) { await db.updateManagedPosition(pos.id, { status: "open", lastError: "no stored credentials — reconnect broker" }); continue; }
+
+        const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market);
+        await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null });
+        exited++;
+        console.log(`[autoexit] EXITED ${pos.symbol} for ${pos.userId} via ${pos.broker} — ${hit.reason} (order ${r.orderId})`);
+      } catch (e) {
+        // Return to 'open' so it retries next sweep; a transient broker/network error must
+        // not silently abandon a position that still needs an exit.
+        await db.updateManagedPosition(pos.id, { status: "open", lastError: String(e.message || e) });
+        console.error(`[autoexit] ${pos.symbol} (${pos.broker}):`, e.message);
+      }
+    }
+  } catch (e) { console.error("[autoexit] sweep failed:", e.message); }
+  finally { autoExitRunning = false; lastAutoExit = { at: Date.now(), checked, exited, live }; }
+}
+if (process.env.EXIT_MONITOR !== "off") {
+  setInterval(runAutoExitEngine, 60_000);
+  setTimeout(runAutoExitEngine, 15_000);
+}
+
+/* The user's own managed positions (to show + cancel in the app). */
+app.get("/api/autoexit", async (req, res) => {
+  const userId = req.get("X-User-Id") || req.query.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const list = await db.getManagedPositionsForUser(userId).catch(() => []);
+  res.json({ engineLive: process.env.AUTO_EXIT_LIVE === "true", last: lastAutoExit, positions: list });
+});
+/* Cancel auto-exit for a position (stops the engine watching it; does NOT touch the position
+   at the broker). The user must own it. */
+app.post("/api/autoexit/cancel", async (req, res) => {
+  const userId = req.get("X-User-Id") || req.body.userId;
+  const { id } = req.body || {};
+  if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
+  const list = await db.getManagedPositionsForUser(userId).catch(() => []);
+  const mine = list.find((p) => p.id === id);
+  if (!mine) return res.status(404).json({ error: "not found" });
+  await db.updateManagedPosition(id, { status: "cancelled", cancelledAt: Date.now() });
+  res.json({ ok: true });
+});
+app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", live: process.env.AUTO_EXIT_LIVE === "true", last: lastAutoExit }));
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));

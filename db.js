@@ -70,6 +70,17 @@ async function initDb() {
   await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS tags JSONB`);
   await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'`);
   await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS reviewed_at BIGINT`);
+  /* Encrypted broker credentials — so the server-side auto-exit engine can place a real
+     exit while the user's app is closed. `data` is an AES-256-GCM blob (encrypted in
+     server.js); the plaintext token/keys NEVER touch this table. One row per user+broker. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS broker_creds (
+    user_id TEXT, broker TEXT, data JSONB, updated_at BIGINT,
+    PRIMARY KEY (user_id, broker))`);
+  /* Managed real positions the engine is watching for an exit (SL/TP/trailing + strategy
+     signal). `data` holds the exit rule and entry context; `status` is open|closing|closed. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS managed_positions (
+    id TEXT PRIMARY KEY, user_id TEXT, broker TEXT, status TEXT, updated_at BIGINT, data JSONB)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS managed_pos_status ON managed_positions (status)`);
   console.log("[db] Postgres ready");
 }
 
@@ -80,6 +91,8 @@ const FILES = {
   state: process.env.STATE_FILE || path.join(__dirname, "state.json"),
   public: process.env.PUBLIC_STRATS_FILE || path.join(__dirname, "public_strategies.json"),
   ideas: process.env.IDEAS_FILE || path.join(__dirname, "ideas.json"),
+  creds: process.env.CREDS_FILE || path.join(__dirname, "broker_creds.json"),
+  managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
 };
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return {}; } };
 const writeJSON = (f, d) => { try { fs.writeFileSync(f, JSON.stringify(d)); } catch (e) { console.error("[db] write failed", e.message); } };
@@ -358,4 +371,79 @@ async function getUserFull(phone) {
   return { phone, user: safeUser, state: state || null, trades: trades || [] };
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, USING_PG };
+/* ----------------------- encrypted broker credentials ----------------------- */
+async function saveBrokerCred(userId, broker, blob) {
+  const now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO broker_creds (user_id, broker, data, updated_at) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (user_id, broker) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+      [String(userId), broker, blob, now]
+    );
+    return;
+  }
+  const db = readJSON(FILES.creds);
+  db[`${userId}:${broker}`] = { user_id: String(userId), broker, data: blob, updated_at: now };
+  writeJSON(FILES.creds, db);
+}
+async function getBrokerCred(userId, broker) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM broker_creds WHERE user_id=$1 AND broker=$2`, [String(userId), broker]);
+    return r.rows[0] ? r.rows[0].data : null;
+  }
+  const row = readJSON(FILES.creds)[`${userId}:${broker}`];
+  return row ? row.data : null;
+}
+async function deleteBrokerCred(userId, broker) {
+  if (USING_PG) { await pool.query(`DELETE FROM broker_creds WHERE user_id=$1 AND broker=$2`, [String(userId), broker]); return; }
+  const db = readJSON(FILES.creds);
+  delete db[`${userId}:${broker}`];
+  writeJSON(FILES.creds, db);
+}
+
+/* ------------------------- managed real positions --------------------------- */
+async function saveManagedPosition(pos) {
+  const now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO managed_positions (id, user_id, broker, status, updated_at, data) VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, data = EXCLUDED.data`,
+      [pos.id, String(pos.userId), pos.broker, pos.status || "open", now, pos]
+    );
+    return pos;
+  }
+  const db = readJSON(FILES.managed);
+  db[pos.id] = { ...pos, updated_at: now };
+  writeJSON(FILES.managed, db);
+  return pos;
+}
+async function getOpenManagedPositions(limit = 500) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM managed_positions WHERE status IN ('open','closing') ORDER BY updated_at ASC LIMIT $1`, [limit]);
+    return r.rows.map((x) => x.data);
+  }
+  return Object.values(readJSON(FILES.managed)).filter((p) => p.status === "open" || p.status === "closing").slice(0, limit);
+}
+async function getManagedPositionsForUser(userId, limit = 200) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM managed_positions WHERE user_id=$1 ORDER BY updated_at DESC LIMIT $2`, [String(userId), limit]);
+    return r.rows.map((x) => x.data);
+  }
+  return Object.values(readJSON(FILES.managed)).filter((p) => String(p.userId) === String(userId)).slice(0, limit);
+}
+async function updateManagedPosition(id, patch) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM managed_positions WHERE id=$1`, [id]);
+    if (!r.rows[0]) return null;
+    const next = { ...r.rows[0].data, ...patch };
+    await pool.query(`UPDATE managed_positions SET status=$2, updated_at=$3, data=$4 WHERE id=$1`, [id, next.status || "open", Date.now(), next]);
+    return next;
+  }
+  const db = readJSON(FILES.managed);
+  if (!db[id]) return null;
+  db[id] = { ...db[id], ...patch, updated_at: Date.now() };
+  writeJSON(FILES.managed, db);
+  return db[id];
+}
+
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, USING_PG };
