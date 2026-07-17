@@ -1584,7 +1584,64 @@ const BROKERS = {
     name: "Groww", userCreds: true,
     key: () => "byo", secret: () => "byo", loginUrl: () => null,
   },
+  coindcx: {
+    name: "CoinDCX", userCreds: true,   // per-user crypto (API key + secret), HMAC-signed
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
+  binance: {
+    name: "Binance", userCreds: true,   // per-user crypto (API key + secret), HMAC query-string
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
+  coinswitch: {
+    name: "CoinSwitch", userCreds: true,   // per-user crypto (Ed25519 signature)
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
 };
+
+/* Binance signs with HMAC_SHA256 over the query string; the api key rides in X-MBX-APIKEY. */
+async function binanceSigned(apiKey, apiSecret, path, params = {}) {
+  const q = new URLSearchParams({ ...params, timestamp: String(Date.now()), recvWindow: "10000" }).toString();
+  const signature = crypto.createHmac("sha256", apiSecret).update(q).digest("hex");
+  const r = await fetch(`https://api.binance.com${path}?${q}&signature=${signature}`, { headers: { "X-MBX-APIKEY": apiKey } });
+  const d = await r.json().catch(() => ({}));
+  return { r, d };
+}
+
+/* CoinSwitch PRO uses Ed25519: sign (METHOD + request_path + epoch) with the secret (a hex
+   Ed25519 private seed). Headers: X-AUTH-APIKEY, X-AUTH-SIGNATURE (hex), X-AUTH-EPOCH. */
+async function coinswitchSigned(apiKey, apiSecret, method, path) {
+  const epoch = String(Date.now());
+  const msg = method + path + epoch;
+  let signature = "";
+  try {
+    const seed = Buffer.from(apiSecret, "hex");
+    const keyObj = crypto.createPrivateKey({
+      key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]),
+      format: "der", type: "pkcs8",
+    });
+    signature = crypto.sign(null, Buffer.from(msg), keyObj).toString("hex");
+  } catch (e) { throw new Error("CoinSwitch key format not recognised: " + e.message); }
+  const r = await fetch(`https://api-trading.coinswitch.co${path}`, {
+    method, headers: { "Content-Type": "application/json", "X-AUTH-APIKEY": apiKey, "X-AUTH-SIGNATURE": signature, "X-AUTH-EPOCH": epoch },
+  });
+  const d = await r.json().catch(() => ({}));
+  return { r, d };
+}
+
+/* CoinDCX signs each request: signature = HMAC_SHA256(JSON body, apiSecret), sent with the
+   api key in X-AUTH-APIKEY and the hex signature in X-AUTH-SIGNATURE. Returns { r, d }. */
+async function coindcxCall(apiKey, apiSecret, path, extraBody = {}) {
+  const body = { timestamp: Date.now(), ...extraBody };
+  const payload = JSON.stringify(body);
+  const signature = crypto.createHmac("sha256", apiSecret).update(payload).digest("hex");
+  const r = await fetch(`https://api.coindcx.com${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-AUTH-APIKEY": apiKey, "X-AUTH-SIGNATURE": signature },
+    body: payload,
+  });
+  const d = await r.json().catch(() => ({}));
+  return { r, d };
+}
 
 /* Standard Angel One SmartAPI headers. The private key + JWT identify the app + session;
    the IP/MAC headers are required by the API but may be placeholders for a server client. */
@@ -1859,6 +1916,42 @@ app.post("/api/broker/session", async (req, res) => {
       const d = await r.json().catch(() => ({}));
       if (!r.ok || d.status === "FAILURE" || d.error) throw new Error((d.error && d.error.message) || d.message || `Groww rejected the token (${r.status}).`);
       const sid = putBrokerSession(userId, broker, accessToken);
+      return res.json({ sessionId: sid, user: null, broker });
+    }
+
+    if (broker === "coindcx") {
+      const extra = req.body.extra || {};
+      const apiKey = String(extra.apiKey || "").trim();
+      const apiSecret = String(extra.apiSecret || "").trim();
+      if (!apiKey || !apiSecret) throw new Error("CoinDCX needs an API key and secret.");
+      const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/users/balances");
+      if (!r.ok || (!Array.isArray(d) && (d.message || d.code))) throw new Error(d.message || `CoinDCX rejected the keys (${r.status}).`);
+      const sid = putBrokerSession(userId, broker, "coindcx");
+      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, apiSecret };
+      return res.json({ sessionId: sid, user: null, broker });
+    }
+
+    if (broker === "binance") {
+      const extra = req.body.extra || {};
+      const apiKey = String(extra.apiKey || "").trim();
+      const apiSecret = String(extra.apiSecret || "").trim();
+      if (!apiKey || !apiSecret) throw new Error("Binance needs an API key and secret.");
+      const { r, d } = await binanceSigned(apiKey, apiSecret, "/api/v3/account");
+      if (!r.ok || d.code) throw new Error(d.msg || `Binance rejected the keys (${r.status}). (Binance may be geo-blocked from the server region.)`);
+      const sid = putBrokerSession(userId, broker, "binance");
+      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, apiSecret };
+      return res.json({ sessionId: sid, user: null, broker });
+    }
+
+    if (broker === "coinswitch") {
+      const extra = req.body.extra || {};
+      const apiKey = String(extra.apiKey || "").trim();
+      const apiSecret = String(extra.apiSecret || "").trim();
+      if (!apiKey || !apiSecret) throw new Error("CoinSwitch needs an API key and secret.");
+      const { r, d } = await coinswitchSigned(apiKey, apiSecret, "GET", "/trade/api/v2/user/portfolio");
+      if (!r.ok || (d && d.message && !d.data)) throw new Error((d && d.message) || `CoinSwitch rejected the keys (${r.status}).`);
+      const sid = putBrokerSession(userId, broker, "coinswitch");
+      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, apiSecret };
       return res.json({ sessionId: sid, user: null, broker });
     }
 
@@ -2476,6 +2569,35 @@ app.get("/api/broker/portfolio", async (req, res) => {
         value: (x.ltp != null && x.quantity != null) ? +(x.ltp * x.quantity).toFixed(2) : null,
       }));
       return res.json({ broker, holdings, cash: null, currency: "INR" });
+    }
+
+    if (broker === "coindcx") {
+      const { apiKey, apiSecret } = sess.extra || {};
+      const { d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/users/balances");
+      const arr = Array.isArray(d) ? d : [];
+      const holdings = arr
+        .filter((x) => Number(x.balance) > 0 || Number(x.locked_balance) > 0)
+        .map((x) => ({ sym: x.currency, qty: +(Number(x.balance) + Number(x.locked_balance || 0)).toFixed(8), avg: null, ltp: null, pnl: null, value: null }));
+      return res.json({ broker, holdings, cash: null, currency: "USD" });
+    }
+
+    if (broker === "binance") {
+      const { apiKey, apiSecret } = sess.extra || {};
+      const { d } = await binanceSigned(apiKey, apiSecret, "/api/v3/account");
+      const holdings = (d.balances || [])
+        .filter((x) => Number(x.free) > 0 || Number(x.locked) > 0)
+        .map((x) => ({ sym: x.asset, qty: +(Number(x.free) + Number(x.locked)).toFixed(8), avg: null, ltp: null, pnl: null, value: null }));
+      return res.json({ broker, holdings, cash: null, currency: "USD" });
+    }
+
+    if (broker === "coinswitch") {
+      const { apiKey, apiSecret } = sess.extra || {};
+      const { d } = await coinswitchSigned(apiKey, apiSecret, "GET", "/trade/api/v2/user/portfolio");
+      const arr = (d && (d.data || d.portfolio)) || [];
+      const holdings = (Array.isArray(arr) ? arr : [])
+        .map((x) => ({ sym: x.currency || x.symbol, qty: Number(x.balance || x.quantity || 0), avg: null, ltp: null, pnl: null, value: null }))
+        .filter((h) => h.qty > 0);
+      return res.json({ broker, holdings, cash: null, currency: "USD" });
     }
 
     if (broker === "delta") {
