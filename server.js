@@ -615,6 +615,10 @@ let _fyDebug = null;          // safe (no secrets): shapes + raw FYERS response
 let _fyCooldownUntil = 0;     // don't retry the mint until this time (avoids hammering FYERS -> 429)
 async function fyersHouseToken() {
   if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
+  // A directly-provided daily access token WINS — no minting, no refresh-token flow, no rate
+  // limit. Set FYERS_ACCESS_TOKEN to bypass the refresh flow entirely (re-set it each day).
+  const directTok = (process.env.FYERS_ACCESS_TOKEN || "").trim();
+  if (directTok) { _fyHouse = { token: directTok, at: Date.now() }; _fyLastError = null; return directTok; }
   // After a failure we back off, so a bad/expired token can't spam FYERS on every quote poll.
   if (Date.now() < _fyCooldownUntil) return null;
   // .trim() guards against a stray newline/space pasted into the Render env value.
