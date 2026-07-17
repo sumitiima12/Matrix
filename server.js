@@ -670,6 +670,36 @@ async function fyersHouseQuotes(ySyms) {
   } catch (e) { console.error("[fyers-house] quotes error:", e.message); return {}; }
 }
 
+/* Historical candles from the FYERS house feed. Returns the SAME shape as the Yahoo path
+   ({ t, o, h, l, c, v }), or null for anything FYERS can't serve (non-equity, weekly/monthly,
+   or when the feed isn't configured) so the caller cleanly falls back to Yahoo. */
+const FY_RES = { "1m": "1", "2m": "2", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "60m": "60", "1h": "60", "90m": "90", "1d": "D", "1D": "D" };
+const FY_RANGE_DAYS = { "1d": 2, "5d": 7, "1mo": 31, "3mo": 93, "6mo": 186, "1y": 370, "2y": 740 };
+async function fyersHouseHistory(ySym, range, interval) {
+  const fy = yahooToFyers(ySym);
+  const res = FY_RES[interval];
+  const days = FY_RANGE_DAYS[range];
+  if (!fy || !res || !days) return null;
+  const token = await fyersHouseToken();
+  if (!token) return null;
+  const appId = process.env.FYERS_APP_ID || "";
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  const from = fmt(new Date(Date.now() - days * 864e5)), to = fmt(new Date());
+  try {
+    const url = `${FY_HOST}/data/history?symbol=${encodeURIComponent(fy)}&resolution=${res}&date_format=1&range_from=${from}&range_to=${to}&cont_flag=1`;
+    const r = await fetch(url, { headers: { Authorization: `${appId}:${token}` } });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error" || !Array.isArray(d.candles)) {
+      if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };
+      return null;
+    }
+    // FYERS candle rows are [epoch_s, o, h, l, c, v].
+    return d.candles
+      .map((c) => ({ t: c[0] * 1000, o: c[1], h: c[2], l: c[3], c: c[4], v: c[5] }))
+      .filter((x) => x.c != null && x.h != null && x.l != null);
+  } catch { return null; }
+}
+
 app.get("/api/quote", async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
@@ -705,15 +735,19 @@ app.get("/api/history", async (req, res) => {
   const interval = String(req.query.interval || "1d");
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   try {
-    const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
-      j(`${YF}/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`));
-    const r = data.chart?.result?.[0];
-    const ts = r?.timestamp || [];
-    const q = r?.indicators?.quote?.[0] || {};
-    const candles = ts.map((t, i) => ({
-      t: t * 1000,
-      o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
-    })).filter((d) => d.c != null);
+    // FYERS house feed first for Indian equities (real, no ~15-min delay); Yahoo otherwise.
+    let candles = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
+    if (!candles || !candles.length) {
+      const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
+        j(`${YF}/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`));
+      const r = data.chart?.result?.[0];
+      const ts = r?.timestamp || [];
+      const q = r?.indicators?.quote?.[0] || {};
+      candles = ts.map((t, i) => ({
+        t: t * 1000,
+        o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
+      })).filter((d) => d.c != null);
+    }
     res.json({ symbol, candles });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
@@ -744,6 +778,9 @@ app.get("/api/news", async (req, res) => {
    closes the position at whichever level was actually touched first.
    Set EXIT_MONITOR=off to disable.                                            */
 async function candlesFor(symbol, range = "5d", interval = "5m") {
+  // FYERS house feed first for Indian equities; Yahoo otherwise / on any gap.
+  const fy = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
+  if (fy && fy.length) return fy;
   const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
     j(`${YF}/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`));
   const r = data.chart?.result?.[0];
@@ -1085,15 +1122,21 @@ async function indicatorsFor(symbol) {
    (illiquid, market closed with no session, unsupported) it is simply absent from
    the response — the UI then shows nothing rather than a zero.                  */
 async function intradayFor(sym) {
-  const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`);
-  const r = d?.chart?.result?.[0];
-  const q = r?.indicators?.quote?.[0];
-  if (!r || !q) return null;
-
-  // Keep only complete candles (Yahoo pads the array with nulls).
-  const rows = (r.timestamp || [])
-    .map((t, i) => ({ t, c: q.close?.[i], v: q.volume?.[i] }))
-    .filter((x) => x.c != null && !Number.isNaN(x.c));
+  // FYERS house feed first (real 5-min bars with volume); Yahoo otherwise.
+  let rows = null;
+  const fy = await fyersHouseHistory(sym, "1d", "5m");
+  if (fy && fy.length >= 2) {
+    rows = fy.map((c) => ({ t: Math.round(c.t / 1000), c: c.c, v: c.v })).filter((x) => x.c != null && !Number.isNaN(x.c));
+  } else {
+    const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`);
+    const r = d?.chart?.result?.[0];
+    const q = r?.indicators?.quote?.[0];
+    if (!r || !q) return null;
+    // Keep only complete candles (Yahoo pads the array with nulls).
+    rows = (r.timestamp || [])
+      .map((t, i) => ({ t, c: q.close?.[i], v: q.volume?.[i] }))
+      .filter((x) => x.c != null && !Number.isNaN(x.c));
+  }
 
   if (rows.length < 2) return null;
 
