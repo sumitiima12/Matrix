@@ -1957,7 +1957,9 @@ app.post("/api/broker/session", async (req, res) => {
 
     res.status(400).json({ error: "unsupported broker" });
   } catch (e) {
-    res.status(502).json({ error: String(e.message || e) });
+    // undici hides the real network reason under e.cause — surface it (helps proxy debugging).
+    const detail = (e && e.cause && (e.cause.message || e.cause.code)) ? ` (${e.cause.message || e.cause.code})` : "";
+    res.status(502).json({ error: String(e.message || e) + detail });
   }
 });
 
@@ -2135,6 +2137,14 @@ async function fetchBrokerAccount(sess) {
         .map((x) => ({ sym: x.product_symbol || (x.product && x.product.symbol) || null, qty: Number(x.size), avg: x.entry_price != null ? Number(x.entry_price) : null, price: x.mark_price != null ? Number(x.mark_price) : null, market: "Crypto" }));
       return { wallet, portfolio };
     }
+    if (broker === "coindcx") {
+      const { apiKey, apiSecret } = sess.extra || {};
+      const { d } = await withTimeout(coindcxCall(apiKey, apiSecret, "/exchange/v1/users/balances"));
+      const arr = Array.isArray(d) ? d : [];
+      const portfolio = arr.filter((x) => Number(x.balance) > 0).map((x) => ({ sym: x.currency, qty: Number(x.balance), avg: null, price: null, market: "Crypto" }));
+      const cash = arr.find((x) => x.currency === "INR") || arr.find((x) => x.currency === "USDT");
+      return { wallet: cash ? Number(cash.balance) : 0, portfolio };
+    }
   } catch (e) {
     console.error("[risk] broker account fetch failed:", e.message);
     return null;
@@ -2177,7 +2187,7 @@ app.post("/api/broker/order", async (req, res) => {
      sell-vs-held, daily-loss cap. Client-supplied values are never trusted here.
      If we CAN'T fetch account state, we refuse rather than place blind — this is real money. */
   {
-    const rkMarket = (broker === "delta") ? "Crypto" : "IN";
+    const rkMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
     const account = await fetchBrokerAccount(sess);
     if (!account) {
       return res.status(503).json({ error: "Could not verify your account state with the broker to risk-check this order. Try again in a moment." });
@@ -2248,6 +2258,25 @@ app.post("/api/broker/order", async (req, res) => {
         },
       });
       return res.json({ ok: true, broker, orderId: d.result?.id ?? null, raw: d.result ?? null });
+    }
+
+    if (broker === "coindcx") {
+      /* CoinDCX spot order. The app's crypto symbol (e.g. "BTC") maps to the INR pair the
+         retail account trades ("BTCINR"). Signed with the user's own key/secret. */
+      const { apiKey, apiSecret } = sess.extra || {};
+      const base = String(symbol).replace(/(INR|USDT)$/i, "").toUpperCase();
+      const market = `${base}INR`;
+      const body = {
+        side: String(side).toLowerCase() === "buy" ? "buy" : "sell",
+        order_type: orderType === "LIMIT" ? "limit_order" : "market_order",
+        market,
+        total_quantity: Number(qty),
+        ...(orderType === "LIMIT" && price ? { price_per_unit: Number(price) } : {}),
+      };
+      const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", body);
+      if (!r.ok || d.message || d.code) throw new Error(d.message || `CoinDCX order failed (${r.status}).`);
+      const o = (d.orders && d.orders[0]) || d;
+      return res.json({ ok: true, broker, orderId: o.id || o.order_id || null, status: o.status || "PENDING" });
     }
 
     if (broker === "schwab") {
