@@ -167,6 +167,28 @@ function exitSignalFired(cfg, rawCandles) {
 }
 
 /**
+ * Does this strategy's ENTRY rule fire on the latest completed candle? Same evaluation as
+ * the exit, against cfg.entry. Used by the (opt-in, real-money) auto-buy engine to decide
+ * whether to open a position — so it must fire on exactly the signal the in-app engine would.
+ */
+function entrySignalFired(cfg, rawCandles) {
+  try {
+    if (!cfg || !Array.isArray(cfg.entry) || !cfg.entry.length) return { fired: false };
+    const c = closedCandles((rawCandles || []).filter((x) => x && x.c != null));
+    if (!c || c.length < 30) return { fired: false };
+    const closes = c.map((x) => x.c);
+    const vols = c.map((x) => x.v || 0);
+    const cache = {};
+    const get = (op) => resolveOperand(op, cfg.defs || [], c, closes, vols, cache);
+    const i = c.length - 1;
+    const fired = chainEval(cfg.entry, i, get);
+    return { fired, reason: fired ? "Strategy entry signal" : undefined, price: fired ? closes[i] : null };
+  } catch (e) {
+    return { fired: false, error: String(e && e.message || e) };
+  }
+}
+
+/**
  * Price-level exit (stop-loss / take-profit / trailing) against candles since entry.
  * Long-only (we only auto-exit positions we opened with a buy). Mirrors the server's
  * paper resolveExit but returns a normalized shape. Ties inside a bar assume the stop.
@@ -195,5 +217,5 @@ function priceExitFired(pos, rawCandles) {
 module.exports = {
   SMAarr, EMAarr, RSIarr, MACDarr, BBarr, CCIarr, ATRarr, VWAParr, ADXarr, STarr,
   CF, closedCandles, resolveOperand, evalCond, chainEval,
-  exitSignalFired, priceExitFired,
+  exitSignalFired, entrySignalFired, priceExitFired,
 };

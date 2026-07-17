@@ -81,6 +81,12 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS managed_positions (
     id TEXT PRIMARY KEY, user_id TEXT, broker TEXT, status TEXT, updated_at BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS managed_pos_status ON managed_positions (status)`);
+  /* Strategies a user has ARMED for real-money auto-buy (opt-in, per strategy). The engine
+     evaluates each one's entry rule and, when it fires, places a real buy + hands the exit to
+     the managed-position engine. `status` is active|paused|cancelled. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS real_strategies (
+    id TEXT PRIMARY KEY, user_id TEXT, status TEXT, updated_at BIGINT, data JSONB)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS real_strats_status ON real_strategies (status)`);
   console.log("[db] Postgres ready");
 }
 
@@ -93,6 +99,7 @@ const FILES = {
   ideas: process.env.IDEAS_FILE || path.join(__dirname, "ideas.json"),
   creds: process.env.CREDS_FILE || path.join(__dirname, "broker_creds.json"),
   managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
+  realStrats: process.env.REAL_STRATS_FILE || path.join(__dirname, "real_strategies.json"),
 };
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return {}; } };
 const writeJSON = (f, d) => { try { fs.writeFileSync(f, JSON.stringify(d)); } catch (e) { console.error("[db] write failed", e.message); } };
@@ -446,4 +453,49 @@ async function updateManagedPosition(id, patch) {
   return db[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, USING_PG };
+/* ----------------------- real (opt-in) auto-buy strategies ------------------ */
+async function saveRealStrategy(s) {
+  const now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO real_strategies (id, user_id, status, updated_at, data) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, data = EXCLUDED.data`,
+      [s.id, String(s.userId), s.status || "active", now, s]
+    );
+    return s;
+  }
+  const dbf = readJSON(FILES.realStrats);
+  dbf[s.id] = { ...s, updated_at: now };
+  writeJSON(FILES.realStrats, dbf);
+  return s;
+}
+async function getActiveRealStrategies(limit = 500) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM real_strategies WHERE status='active' ORDER BY updated_at ASC LIMIT $1`, [limit]);
+    return r.rows.map((x) => x.data);
+  }
+  return Object.values(readJSON(FILES.realStrats)).filter((s) => s.status === "active").slice(0, limit);
+}
+async function getRealStrategiesForUser(userId, limit = 200) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM real_strategies WHERE user_id=$1 ORDER BY updated_at DESC LIMIT $2`, [String(userId), limit]);
+    return r.rows.map((x) => x.data);
+  }
+  return Object.values(readJSON(FILES.realStrats)).filter((s) => String(s.userId) === String(userId)).slice(0, limit);
+}
+async function updateRealStrategy(id, patch) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM real_strategies WHERE id=$1`, [id]);
+    if (!r.rows[0]) return null;
+    const next = { ...r.rows[0].data, ...patch };
+    await pool.query(`UPDATE real_strategies SET status=$2, updated_at=$3, data=$4 WHERE id=$1`, [id, next.status || "active", Date.now(), next]);
+    return next;
+  }
+  const dbf = readJSON(FILES.realStrats);
+  if (!dbf[id]) return null;
+  dbf[id] = { ...dbf[id], ...patch, updated_at: Date.now() };
+  writeJSON(FILES.realStrats, dbf);
+  return dbf[id];
+}
+
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

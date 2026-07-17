@@ -873,7 +873,38 @@ app.get("/api/news", async (req, res) => {
    has the app open. Walks REAL 5-minute candles forward from the entry time and
    closes the position at whichever level was actually touched first.
    Set EXIT_MONITOR=off to disable.                                            */
+/* Range string -> seconds of lookback, for windowing Delta's candle query. */
+function rangeToSeconds(range) {
+  const m = String(range).match(/^(\d+)(d|mo|y)$/);
+  if (!m) return 30 * 86400;
+  const n = Number(m[1]);
+  return m[2] === "d" ? n * 86400 : m[2] === "mo" ? n * 30 * 86400 : n * 365 * 86400;
+}
+/* Delta's OWN candles for a crypto perpetual — EXACT parity with what the position is
+   marked against on Delta (Yahoo spot can drift from the perpetual mark). Public endpoint,
+   routed through the proxy like every other Delta call. Returns ascending { o,h,l,c,v,t(ms) }. */
+async function deltaCandles(deltaSym, resolution, range) {
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - rangeToSeconds(range);
+  const q = `?resolution=${encodeURIComponent(resolution)}&symbol=${encodeURIComponent(deltaSym)}&start=${start}&end=${end}`;
+  const d = await deltaCall("GET", "/v2/history/candles", { query: q, signed: false });
+  const rows = (d && d.result) || [];
+  return rows
+    .map((x) => ({ t: Number(x.time) * 1000, o: x.open, h: x.high, l: x.low, c: x.close, v: x.volume }))
+    .filter((x) => x.c != null)
+    .sort((a, b) => a.t - b.t);
+}
+
 async function candlesFor(symbol, range = "5d", interval = "5m") {
+  // Crypto: use Delta's own candles so the exit engine and charts match the perpetual mark
+  // the position is actually held against. Fall back to Yahoo if Delta returns nothing.
+  const cx = String(symbol).match(/^([A-Z0-9]+)-USD$/);
+  if (cx) {
+    try {
+      const dc = await memo(`dc:${symbol}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, interval, range));
+      if (dc && dc.length) return dc;
+    } catch (e) { /* fall through to Yahoo */ }
+  }
   // FYERS house feed first for Indian equities; Yahoo otherwise / on any gap.
   const fy = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
   if (fy && fy.length) return fy;
@@ -2859,11 +2890,23 @@ async function sessionFromCred(userId, broker) {
   return { userId: String(userId), broker, accessToken: c.accessToken, refreshToken: c.refreshToken, extra: c.extra || {} };
 }
 
+/* Map the app's product choice to each broker's code. "Intraday" auto-square-off (MIS) vs
+   carry-forward / delivery (CNC on equity, NRML on F&O). Crypto ignores it. */
+function mapProduct(broker, product) {
+  const p = String(product || "").toLowerCase();
+  const intraday = p.startsWith("intra") || p === "mis";
+  if (broker === "zerodha") return intraday ? "MIS" : "CNC";
+  if (broker === "fyers") return intraday ? "INTRADAY" : "CNC";
+  return "CNC";
+}
+
 /* REDUCE-ONLY exit executor. Sells `qty` to CLOSE a long. Every branch is a plain sell;
-   Delta additionally sets reduce_only so it can never flip you short by accident. */
-async function placeExitOrder(sess, symbol, qty, market) {
+   Delta additionally sets reduce_only so it can never flip you short by accident. The exit
+   MUST use the same product the entry used (closing an MIS position with CNC would fail). */
+async function placeExitOrder(sess, symbol, qty, market, product) {
   const broker = sess.broker;
   const token = sess.accessToken;
+  const prod = mapProduct(broker, product);
   if (broker === "delta") {
     const prods = await deltaCall("GET", "/v2/products", { signed: false });
     const prod = (prods.result || []).find((p) => p.symbol === symbol);
@@ -2891,7 +2934,7 @@ async function placeExitOrder(sess, symbol, qty, market) {
   }
   if (broker === "zerodha") {
     const [exchange, tradingsymbol] = String(symbol).split(":");
-    const body = new URLSearchParams({ exchange, tradingsymbol, transaction_type: "SELL", quantity: String(qty), order_type: "MARKET", product: "CNC", validity: "DAY" });
+    const body = new URLSearchParams({ exchange, tradingsymbol, transaction_type: "SELL", quantity: String(qty), order_type: "MARKET", product: prod, validity: "DAY" });
     const r = await fetch("https://api.kite.trade/orders/regular", { method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/x-www-form-urlencoded" }, body });
     const d = await r.json();
     if (!r.ok || d.status === "error") throw new Error(d.message || `kite exit ${r.status}`);
@@ -2900,7 +2943,7 @@ async function placeExitOrder(sess, symbol, qty, market) {
   if (broker === "fyers") {
     const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: -1, productType: "CNC", limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
+      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: -1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
     });
     const d = await r.json();
     if (!r.ok || d.s === "error") throw new Error(d.message || `fyers exit ${r.status}`);
@@ -2911,7 +2954,7 @@ async function placeExitOrder(sess, symbol, qty, market) {
 
 /* Register a real position for the engine to watch. Called from /api/broker/order after a
    real buy that opted into auto-exit. Persists the creds needed to act on it later. */
-async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval }) {
+async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval, product }) {
   await persistSessionCred(sess);
   const pos = {
     id: crypto.randomBytes(16).toString("hex"),
@@ -2919,6 +2962,7 @@ async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, ma
     symbol, brokerSym, qty: Number(qty), entry: Number(entry) || null,
     entryAt: Date.now(), market: market || "Crypto",
     sl: sl || null, tp: tp || null, tsl: tsl || null,
+    product: product || "CNC",              // so the exit closes with the SAME product as entry
     cfg: cfg || null,                       // strategy { defs, exit } for indicator exits
     yahoo: yahoo || symbol, interval: interval || (market === "IN" || market === "Commodity" ? "5m" : "5m"),
     status: "open",
@@ -2960,7 +3004,7 @@ async function runAutoExitEngine() {
         const sess = await sessionFromCred(pos.userId, pos.broker);
         if (!sess) { await db.updateManagedPosition(pos.id, { status: "open", lastError: "no stored credentials — reconnect broker" }); continue; }
 
-        const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market);
+        const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product);
         await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null });
         exited++;
         console.log(`[autoexit] EXITED ${pos.symbol} for ${pos.userId} via ${pos.broker} — ${hit.reason} (order ${r.orderId})`);
@@ -2999,6 +3043,178 @@ app.post("/api/autoexit/cancel", async (req, res) => {
   res.json({ ok: true });
 });
 app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", live: process.env.AUTO_EXIT_LIVE === "true", last: lastAutoExit }));
+
+/* ═══════════════════════ REAL-MONEY AUTO-BUY (opt-in per strategy) ═══════════════════════
+   The biggest safety jump in the app: the server places a real ENTRY when a strategy's entry
+   rule fires, unattended. Guardrails:
+     • OPT-IN per strategy (the user arms it with a broker + rupee/dollar amount).
+     • KILL SWITCH: does nothing real unless AUTO_BUY_LIVE=true (else dry-run + log).
+     • CAPS: AUTO_BUY_MAX_POSITIONS (default 5) open real positions per user, and an optional
+       AUTO_BUY_MAX_NOTIONAL ceiling per order on top of the user's own amount.
+     • ONE position per strategy at a time — no pyramiding, no re-entry until the exit closes.
+     • COOLDOWN so a still-true signal can't fire twice inside one candle.
+   Exits are handed to the auto-exit engine (SL/TP/trailing + the strategy's own exit signal). */
+
+const AB_MAX_POSITIONS = Number(process.env.AUTO_BUY_MAX_POSITIONS) || 5;
+const AB_MAX_NOTIONAL = Number(process.env.AUTO_BUY_MAX_NOTIONAL) || 0;   // 0 = only the user's amount
+
+/* A real BUY to OPEN a position. Same per-broker plumbing as the manual order route, kept
+   to the brokers whose order placement is wired. */
+async function placeBuyOrder(sess, symbol, qty, market, product) {
+  const broker = sess.broker, token = sess.accessToken;
+  const prod = mapProduct(broker, product);
+  if (broker === "delta") {
+    const prods = await deltaCall("GET", "/v2/products", { signed: false });
+    const dprod = (prods.result || []).find((p) => p.symbol === symbol);
+    if (!dprod) throw new Error(`Delta does not list ${symbol}`);
+    const d = await deltaCall("POST", "/v2/orders", { body: { product_id: dprod.id, size: Number(qty), side: "buy", order_type: "market_order" } });
+    return { orderId: d.result?.id ?? null };
+  }
+  if (broker === "coindcx") {
+    const { apiKey, apiSecret } = sess.extra || {};
+    const base = String(symbol).replace(/(INR|USDT)$/i, "").toUpperCase();
+    const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", { side: "buy", order_type: "market_order", market: `${base}INR`, total_quantity: Number(qty) });
+    if (!r.ok || d.message || d.code) throw new Error(d.message || `CoinDCX buy failed (${r.status})`);
+    const o = (d.orders && d.orders[0]) || d; return { orderId: o.id || o.order_id || null };
+  }
+  if (broker === "zerodha") {
+    const [exchange, tradingsymbol] = String(symbol).split(":");
+    const body = new URLSearchParams({ exchange, tradingsymbol, transaction_type: "BUY", quantity: String(qty), order_type: "MARKET", product: prod, validity: "DAY" });
+    const r = await fetch("https://api.kite.trade/orders/regular", { method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/x-www-form-urlencoded" }, body });
+    const d = await r.json(); if (!r.ok || d.status === "error") throw new Error(d.message || `kite buy ${r.status}`);
+    return { orderId: d.data.order_id };
+  }
+  if (broker === "fyers") {
+    const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+      method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: 1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
+    });
+    const d = await r.json(); if (!r.ok || d.s === "error") throw new Error(d.message || `fyers buy ${r.status}`);
+    return { orderId: d.id };
+  }
+  throw new Error(`auto-buy not supported for ${broker}`);
+}
+
+let autoBuyRunning = false;
+let lastAutoBuy = { at: null, checked: 0, bought: 0, live: false };
+async function runAutoBuyEngine() {
+  if (autoBuyRunning) return;
+  autoBuyRunning = true;
+  const live = process.env.AUTO_BUY_LIVE === "true";
+  let checked = 0, bought = 0;
+  try {
+    const strategies = await db.getActiveRealStrategies(500);
+    for (const st of strategies) {
+      checked++;
+      try {
+        // One position per strategy: if it still holds an open managed position, do nothing.
+        if (st.openPositionId) {
+          const pos = (await db.getManagedPositionsForUser(st.userId)).find((p) => p.id === st.openPositionId);
+          if (pos && (pos.status === "open" || pos.status === "closing")) continue;
+          await db.updateRealStrategy(st.id, { openPositionId: null });   // position closed -> may re-enter
+          st.openPositionId = null;
+        }
+        // Cooldown: don't re-fire a still-true signal inside the same candle.
+        const intervalMs = (st.interval === "1d" ? 86400 : (Number((st.interval || "5m").replace(/[^\d]/g, "")) || 5) * 60) * 1000;
+        if (st.lastOrderAt && Date.now() - st.lastOrderAt < intervalMs) continue;
+
+        const range = st.interval === "1d" ? "6mo" : "1mo";
+        const candles = await candlesFor(st.yahoo || st.symbol, range, st.interval || "5m");
+        if (!candles || candles.length < 30) continue;
+
+        const sig = strat.entrySignalFired(st.cfg, candles);
+        if (!sig.fired) continue;
+
+        // Cap: total open real positions for this user.
+        const openCount = (await db.getManagedPositionsForUser(st.userId)).filter((p) => p.status === "open" || p.status === "closing").length;
+        if (openCount >= AB_MAX_POSITIONS) { await db.updateRealStrategy(st.id, { lastError: `open-position cap (${AB_MAX_POSITIONS}) reached` }); continue; }
+
+        const px = sig.price || await liveMarkForOrder(st.brokerSym, st.market) || null;
+        if (!(px > 0)) { await db.updateRealStrategy(st.id, { lastError: "no live price" }); continue; }
+        let notional = Number(st.notional) || 0;
+        if (AB_MAX_NOTIONAL > 0) notional = Math.min(notional, AB_MAX_NOTIONAL);
+        const qty = st.market === "Crypto" ? +(notional / px).toFixed(6) : Math.max(1, Math.floor(notional / px));
+        if (!(qty > 0)) { await db.updateRealStrategy(st.id, { lastError: "amount too small for one unit" }); continue; }
+
+        if (!live) {
+          console.log(`[autobuy] DRY-RUN (AUTO_BUY_LIVE!=true): would BUY ${qty} ${st.symbol} for ${st.userId} — ${sig.reason}`);
+          await db.updateRealStrategy(st.id, { lastError: null, lastSignalAt: Date.now() });
+          continue;
+        }
+        const sess = await sessionFromCred(st.userId, st.broker);
+        if (!sess) { await db.updateRealStrategy(st.id, { lastError: "no stored credentials — reconnect broker" }); continue; }
+
+        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product);
+        const pos = await registerManagedPosition({
+          sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry: px, market: st.market,
+          sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product,
+        });
+        await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: null });
+        bought++;
+        console.log(`[autobuy] BOUGHT ${qty} ${st.symbol} for ${st.userId} via ${st.broker} — ${sig.reason} (order ${r.orderId})`);
+      } catch (e) {
+        await db.updateRealStrategy(st.id, { lastError: String(e.message || e) });
+        console.error(`[autobuy] ${st.symbol} (${st.broker}):`, e.message);
+      }
+    }
+  } catch (e) { console.error("[autobuy] sweep failed:", e.message); }
+  finally { autoBuyRunning = false; lastAutoBuy = { at: Date.now(), checked, bought, live }; }
+}
+if (process.env.EXIT_MONITOR !== "off") {
+  setInterval(runAutoBuyEngine, 60_000);
+  setTimeout(runAutoBuyEngine, 20_000);
+}
+
+/* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
+   the creds the engine will act with). Supported brokers only. */
+app.post("/api/autobuy/register", async (req, res) => {
+  const sess = getBrokerSession(req);
+  if (!sess) return res.status(401).json({ error: "connect the broker first" });
+  const b = sess.broker;
+  if (!["delta", "coindcx", "zerodha", "fyers"].includes(b)) return res.status(400).json({ error: `auto-buy isn't supported for ${b} yet` });
+  const { symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product } = req.body || {};
+  if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
+  if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
+  try {
+    await persistSessionCred(sess);
+    const st = {
+      id: crypto.randomBytes(16).toString("hex"),
+      userId: String(sess.userId), broker: b,
+      symbol: symbol || String(brokerSym), brokerSym, market: market || "Crypto",
+      cfg, notional: Number(notional), interval: interval || "5m",
+      product: product || "CNC",              // "Intraday" (MIS/INTRADAY) or "Delivery/NRML" (CNC)
+      sl: sl || null, tp: tp || null, tsl: tsl || null,
+      yahoo: yahoo || (market === "Crypto" ? `${String(brokerSym).replace(/(USDT|USD|INR)$/i, "")}-USD` : `${String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "")}.NS`),
+      status: "active", createdAt: Date.now(), openPositionId: null,
+    };
+    await db.saveRealStrategy(st);
+    res.json({ ok: true, id: st.id, live: process.env.AUTO_BUY_LIVE === "true" });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/autobuy/pause", async (req, res) => {
+  const userId = req.get("X-User-Id") || req.body.userId;
+  const { id, paused } = req.body || {};
+  if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
+  const mine = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
+  if (!mine) return res.status(404).json({ error: "not found" });
+  await db.updateRealStrategy(id, { status: paused ? "paused" : "active" });
+  res.json({ ok: true });
+});
+app.post("/api/autobuy/cancel", async (req, res) => {
+  const userId = req.get("X-User-Id") || req.body.userId;
+  const { id } = req.body || {};
+  if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
+  const mine = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
+  if (!mine) return res.status(404).json({ error: "not found" });
+  await db.updateRealStrategy(id, { status: "cancelled" });
+  res.json({ ok: true });
+});
+app.get("/api/autobuy", async (req, res) => {
+  const userId = req.get("X-User-Id") || req.query.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const list = (await db.getRealStrategiesForUser(userId).catch(() => [])).filter((s) => s.status !== "cancelled");
+  res.json({ engineLive: process.env.AUTO_BUY_LIVE === "true", last: lastAutoBuy, strategies: list });
+});
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
