@@ -156,7 +156,8 @@ app.post("/api/register", authLimiter, async (req, res) => {
     const refRaw = cleanUsername(req.body && req.body.referralCode);
     if (refRaw && typeof db.getUserByUsername === "function" && await db.getUserByUsername(refRaw)) referredBy = refRaw;
     await db.createUser(phone, hashPin(pin), name, secQuestion, answerHash, username, referredBy);
-    res.json({ ok: true, userId: phone, name, username, referredBy, token: signToken(phone) });
+    if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
+    res.json({ ok: true, userId: phone, name, username, referredBy, email: null, token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -176,7 +177,23 @@ app.post("/api/login", authLimiter, async (req, res) => {
     if (isLegacyHash(u.pin) && typeof db.updateUserPin === "function") {
       try { await db.updateUserPin(phone, hashPin(pin)); } catch { /* upgrade later */ }
     }
-    res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, token: signToken(phone) });
+    if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
+    res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, email: u.email || null, token: signToken(phone) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ------------------------------- EMAIL ------------------------------------
+   Optional contact email the user can add/change from their profile. */
+app.post("/api/email", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const email = String((req.body && req.body.email) || "").trim().slice(0, 254);
+    // Empty clears it; otherwise require a basic, sane email shape.
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Enter a valid email address." });
+    }
+    if (typeof db.setEmail === "function") await db.setEmail(phone, email);
+    res.json({ ok: true, email });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

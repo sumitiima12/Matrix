@@ -45,6 +45,10 @@ async function initDb() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (LOWER(username)) WHERE username IS NOT NULL`);
   // Optional referral: the user ID of whoever referred this account (from ?ref= at signup).
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by TEXT`);
+  // Last successful login timestamp (admin console shows it).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login BIGINT`);
+  // Optional contact email the user can add from their profile.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY, user_id TEXT, ts BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS trades_user_ts ON trades (user_id, ts)`);
@@ -61,6 +65,11 @@ async function initDb() {
     id TEXT PRIMARY KEY, owner TEXT, owner_name TEXT, symbol TEXT,
     direction TEXT, note TEXT, target TEXT, stop TEXT, created_at BIGINT)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS ideas_created ON ideas (created_at DESC)`);
+  // Screenshot (data URL), optional tags (max 4), and an admin approval workflow.
+  await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS screenshot TEXT`);
+  await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS tags JSONB`);
+  await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'`);
+  await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS reviewed_at BIGINT`);
   console.log("[db] Postgres ready");
 }
 
@@ -109,8 +118,23 @@ async function getTrades(userId, from, to) {
 
 /* --------------------------------- users --------------------------------- */
 async function getUser(phone) {
-  if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) row.referredBy = row.referred_by; return row || null; }
+  if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by, email, last_login, created_at FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) { row.referredBy = row.referred_by; row.lastLogin = row.last_login ? Number(row.last_login) : null; row.createdAt = row.created_at ? Number(row.created_at) : null; } return row || null; }
   return readJSON(FILES.users)[phone] || null;
+}
+
+/* Set (or change) a user's email. Free-form; validated at the route. */
+async function setEmail(phone, email) {
+  const e = String(email || "").trim();
+  if (USING_PG) { await pool.query(`UPDATE users SET email=$2 WHERE phone=$1`, [phone, e]); return; }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].email = e; writeJSON(FILES.users, users); }
+}
+
+/* Record the moment of a successful login (admin console shows it). */
+async function setLastLogin(phone, ts = Date.now()) {
+  if (USING_PG) { await pool.query(`UPDATE users SET last_login=$2 WHERE phone=$1`, [phone, ts]); return; }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].lastLogin = ts; writeJSON(FILES.users, users); }
 }
 
 /* Look up a user by their chosen username (case-insensitive). Returns the phone or null.
@@ -289,12 +313,12 @@ async function updateTrade(userId, trade) {
    the admin route strips it, but we also never select it in PG). */
 async function listUsers() {
   if (USING_PG) {
-    const r = await pool.query(`SELECT phone, name, username, referred_by, created_at, blocked FROM users ORDER BY created_at DESC`);
-    return r.rows.map((x) => ({ phone: x.phone, name: x.name, username: x.username || null, referredBy: x.referred_by || null, createdAt: x.created_at, blocked: !!x.blocked }));
+    const r = await pool.query(`SELECT phone, name, username, referred_by, email, created_at, last_login, blocked FROM users ORDER BY created_at DESC`);
+    return r.rows.map((x) => ({ phone: x.phone, name: x.name, username: x.username || null, referredBy: x.referred_by || null, email: x.email || null, createdAt: x.created_at ? Number(x.created_at) : null, lastLogin: x.last_login ? Number(x.last_login) : null, blocked: !!x.blocked }));
   }
   const users = readJSON(FILES.users);
   return Object.entries(users).map(([phone, u]) => ({
-    phone, name: u.name || "", username: u.username || null, referredBy: u.referredBy || null, createdAt: u.createdAt || null, blocked: !!u.blocked,
+    phone, name: u.name || "", username: u.username || null, referredBy: u.referredBy || null, email: u.email || null, createdAt: u.createdAt || null, lastLogin: u.lastLogin || null, blocked: !!u.blocked,
   })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 
@@ -334,4 +358,4 @@ async function getUserFull(phone) {
   return { phone, user: safeUser, state: state || null, trades: trades || [] };
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, USING_PG };
