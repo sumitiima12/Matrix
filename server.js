@@ -1536,9 +1536,14 @@ const TRADING_ENABLED = String(process.env.BROKER_TRADING_ENABLED || "").toLower
 const brokerSessions = new Map();           // sessionId -> { userId, broker, accessToken, at }
 const SESSION_TTL = 12 * 60 * 60 * 1000;    // 12h; brokers expire theirs daily regardless
 
-function putBrokerSession(userId, broker, accessToken, refreshToken = null) {
+function putBrokerSession(userId, broker, accessToken, refreshToken = null, extra = null) {
   const id = crypto.randomBytes(32).toString("hex");
-  brokerSessions.set(id, { userId: String(userId), broker, accessToken, refreshToken, at: Date.now() });
+  const sess = { userId: String(userId), broker, accessToken, refreshToken, extra, at: Date.now() };
+  brokerSessions.set(id, sess);
+  /* Persist encrypted creds so the connection SURVIVES a server restart or the browser being
+     closed on mobile: /api/broker/resume can re-mint a session id from these without asking
+     the user to reconnect. (Delta uses server env keys, so it needs nothing stored.) */
+  try { if (typeof persistSessionCred === "function") persistSessionCred(sess).catch(() => {}); } catch { /* best-effort */ }
   return id;
 }
 
@@ -1955,8 +1960,7 @@ app.post("/api/broker/session", async (req, res) => {
       const r = await fetch("https://api.dhan.co/v2/fundlimit", { headers: { "access-token": accessToken, "Content-Type": "application/json" } });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || d.errorType || d.status === "failed") throw new Error(d.errorMessage || d.message || `Dhan rejected the token (${r.status}).`);
-      const sid = putBrokerSession(userId, broker, accessToken);
-      const s = brokerSessions.get(sid); if (s) s.extra = { clientId };
+      const sid = putBrokerSession(userId, broker, accessToken, null, { clientId });
       return res.json({ sessionId: sid, user: clientId || null, broker });
     }
 
@@ -1989,8 +1993,7 @@ app.post("/api/broker/session", async (req, res) => {
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || !d.status || !d.data || !d.data.jwtToken) throw new Error(d.message || d.errorcode || `Angel One login failed (${r.status}).`);
-      const sid = putBrokerSession(userId, broker, d.data.jwtToken, d.data.refreshToken || null);
-      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, feedToken: d.data.feedToken || null };
+      const sid = putBrokerSession(userId, broker, d.data.jwtToken, d.data.refreshToken || null, { apiKey, feedToken: d.data.feedToken || null });
       return res.json({ sessionId: sid, user: clientCode, broker });
     }
 
@@ -2013,8 +2016,7 @@ app.post("/api/broker/session", async (req, res) => {
       if (!apiKey || !apiSecret) throw new Error("CoinDCX needs an API key and secret.");
       const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/users/balances");
       if (!r.ok || (!Array.isArray(d) && (d.message || d.code))) throw new Error(d.message || `CoinDCX rejected the keys (${r.status}).`);
-      const sid = putBrokerSession(userId, broker, "coindcx");
-      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, apiSecret };
+      const sid = putBrokerSession(userId, broker, "coindcx", null, { apiKey, apiSecret });
       return res.json({ sessionId: sid, user: null, broker });
     }
 
@@ -2025,8 +2027,7 @@ app.post("/api/broker/session", async (req, res) => {
       if (!apiKey || !apiSecret) throw new Error("Binance needs an API key and secret.");
       const { r, d } = await binanceSigned(apiKey, apiSecret, "/api/v3/account");
       if (!r.ok || d.code) throw new Error(d.msg || `Binance rejected the keys (${r.status}). (Binance may be geo-blocked from the server region.)`);
-      const sid = putBrokerSession(userId, broker, "binance");
-      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, apiSecret };
+      const sid = putBrokerSession(userId, broker, "binance", null, { apiKey, apiSecret });
       return res.json({ sessionId: sid, user: null, broker });
     }
 
@@ -2037,8 +2038,7 @@ app.post("/api/broker/session", async (req, res) => {
       if (!apiKey || !apiSecret) throw new Error("CoinSwitch needs an API key and secret.");
       const { r, d } = await coinswitchSigned(apiKey, apiSecret, "GET", "/trade/api/v2/user/portfolio");
       if (!r.ok || (d && d.message && !d.data)) throw new Error((d && d.message) || `CoinSwitch rejected the keys (${r.status}).`);
-      const sid = putBrokerSession(userId, broker, "coinswitch");
-      const s = brokerSessions.get(sid); if (s) s.extra = { apiKey, apiSecret };
+      const sid = putBrokerSession(userId, broker, "coinswitch", null, { apiKey, apiSecret });
       return res.json({ sessionId: sid, user: null, broker });
     }
 
@@ -2048,6 +2048,22 @@ app.post("/api/broker/session", async (req, res) => {
     const detail = (e && e.cause && (e.cause.message || e.cause.code)) ? ` (${e.cause.message || e.cause.code})` : "";
     res.status(502).json({ error: String(e.message || e) + detail });
   }
+});
+
+/* Re-establish a broker session from persisted (encrypted) creds — WITHOUT asking the user to
+   reconnect. This is what makes a connection survive the app being closed on mobile or the
+   free-tier server restarting: the browser keeps the broker id in localStorage, and on a dead
+   session it calls this to mint a fresh session id from the stored creds. */
+app.post("/api/broker/resume", async (req, res) => {
+  const userId = req.get("X-User-Id") || (req.body && req.body.userId);
+  const broker = req.body && req.body.broker;
+  if (!userId || !broker) return res.status(400).json({ error: "userId and broker required" });
+  try {
+    const sess = await sessionFromCred(userId, broker);
+    if (!sess) return res.status(404).json({ error: "no stored connection — please reconnect" });
+    const sid = putBrokerSession(userId, broker, sess.accessToken, sess.refreshToken, sess.extra || null);
+    res.json({ sessionId: sid, broker });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 /** Auth header for a broker call. */
@@ -3353,14 +3369,14 @@ app.post("/api/autobuy/register", async (req, res) => {
   if (!sess) return res.status(401).json({ error: "connect the broker first" });
   const b = sess.broker;
   if (!["delta", "coindcx", "zerodha", "fyers"].includes(b)) return res.status(400).json({ error: `auto-buy isn't supported for ${b} yet` });
-  const { symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product } = req.body || {};
+  const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product } = req.body || {};
   if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
   if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
   try {
     await persistSessionCred(sess);
     const st = {
       id: crypto.randomBytes(16).toString("hex"),
-      userId: String(sess.userId), broker: b,
+      userId: String(sess.userId), broker: b, name: name || (symbol || String(brokerSym)),
       symbol: symbol || String(brokerSym), brokerSym, market: market || "Crypto",
       cfg, notional: Number(notional), interval: interval || "5m",
       product: product || "CNC",              // "Intraday" (MIS/INTRADAY) or "Delivery/NRML" (CNC)
