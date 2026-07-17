@@ -2147,6 +2147,27 @@ async function fetchBrokerAccount(sess) {
   return null;
 }
 
+/* A live mark for RISK-CHECKING a market order that carries no price of its own.
+   A market BUY has no limit price, and a brand-new position has no held average, so the
+   risk engine sees price=null and (correctly) refuses. We pull a real mark from the same
+   house feeds the app already uses — Delta for crypto, FYERS for Indian — rather than
+   trusting a client-supplied number. Returns a Number, or null if we genuinely can't
+   price it (in which case the order is still refused, which is the safe outcome). */
+async function liveMarkForOrder(brokerSym, market) {
+  try {
+    if (market === "Crypto") {
+      const base = String(brokerSym).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+      const q = await deltaHouseQuotes([`${base}-USD`]);
+      const hit = q[`${base}-USD`];
+      return hit && hit.price != null ? Number(hit.price) : null;
+    }
+    const base = String(brokerSym).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "").toUpperCase();
+    const q = await fyersHouseQuotes([`${base}.NS`]).catch(() => ({}));
+    const hit = q[`${base}.NS`];
+    return hit && hit.price != null ? Number(hit.price) : null;
+  } catch { return null; }
+}
+
 /* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
    the client must send X-Confirm-Live: yes. Two locks, because the failure mode
    here is real money moving without the user meaning it. */
@@ -2189,7 +2210,10 @@ app.post("/api/broker/order", async (req, res) => {
     }
     const orderSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
     const rkTrades = await db.getTrades(storageKeyFor(sess.userId), 0, Date.now()).catch(() => []);
-    const rkPrice = price != null ? Number(price) : (account.portfolio.find((h) => h.sym === orderSym) ? account.portfolio.find((h) => h.sym === orderSym).price : null);
+    let rkPrice = price != null ? Number(price) : (account.portfolio.find((h) => h.sym === orderSym) ? account.portfolio.find((h) => h.sym === orderSym).price : null);
+    // Market order, new position: no limit price and nothing held. Fetch a live mark so the
+    // risk engine can size the order instead of refusing it for "No live price".
+    if (rkPrice == null) rkPrice = await liveMarkForOrder(symbol, rkMarket);
     const check = serverValidateOrder(
       { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket },
       { wallet: account.wallet, portfolio: account.portfolio, trades: rkTrades || [] },
