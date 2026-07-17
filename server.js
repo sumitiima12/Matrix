@@ -594,12 +594,93 @@ app.get("/api/news/feed", async (req, res) => {
   }
 });
 
+/* ───────────────────────── FYERS house price feed (optional) ─────────────────────────
+   When configured, the server holds its OWN FYERS token and serves Indian equity quotes
+   from FYERS for EVERY user — no per-user broker connection, and no dependence on Yahoo
+   for Indian prices. It's opt-in and self-healing: if the token is missing, expired, or a
+   call fails, we silently fall back to Yahoo, so nothing breaks when it isn't set up.
+
+   Set on the server (Render):
+     FYERS_APP_ID, FYERS_SECRET_ID     — your FYERS API v3 app
+     FYERS_REFRESH_TOKEN, FYERS_PIN    — one-time interactive login gives a refresh token
+                                         (valid ~15 days) + your login PIN; the server mints
+                                         fresh access tokens from these automatically.
+     FYERS_ACCESS_TOKEN (alt)          — or drop in a daily access token directly (expires
+                                         in ~24h; refresh the var each day).                */
+const FY_HOST = "https://api-t1.fyers.in";
+let _fyHouse = { token: null, at: 0 };
+async function fyersHouseToken() {
+  if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
+  const appId = process.env.FYERS_APP_ID || "";
+  const secret = process.env.FYERS_SECRET_ID || "";
+  const refresh = process.env.FYERS_REFRESH_TOKEN || "";
+  const pin = process.env.FYERS_PIN || "";
+  if (appId && secret && refresh && pin) {
+    try {
+      const appIdHash = crypto.createHash("sha256").update(`${appId}:${secret}`).digest("hex");
+      const r = await fetch(`${FY_HOST}/api/v3/validate-refresh-token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ grant_type: "refresh_token", appIdHash, refresh_token: refresh, pin }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.access_token) { _fyHouse = { token: d.access_token, at: Date.now() }; return d.access_token; }
+      console.error("[fyers-house] refresh-token exchange failed:", d.message || r.status);
+    } catch (e) { console.error("[fyers-house] refresh error:", e.message); }
+  }
+  const staticTok = process.env.FYERS_ACCESS_TOKEN || "";
+  if (staticTok) { _fyHouse = { token: staticTok, at: Date.now() }; return staticTok; }
+  return null;
+}
+
+// Yahoo symbol -> FYERS symbol. Only cash equities map cleanly; indices/others return null
+// (and therefore stay on Yahoo).
+function yahooToFyers(ySym) {
+  const s = String(ySym || "");
+  if (s.endsWith(".NS")) return `NSE:${s.slice(0, -3)}-EQ`;
+  if (s.endsWith(".BO")) return `BSE:${s.slice(0, -3)}-EQ`;
+  return null;
+}
+
+// Quotes for the Indian-equity subset, keyed back by the ORIGINAL yahoo symbol.
+async function fyersHouseQuotes(ySyms) {
+  const token = await fyersHouseToken();
+  if (!token) return {};
+  const appId = process.env.FYERS_APP_ID || "";
+  const pairs = ySyms.map((y) => [y, yahooToFyers(y)]).filter(([, f]) => f);
+  if (!pairs.length) return {};
+  try {
+    const r = await fetch(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`, {
+      headers: { Authorization: `${appId}:${token}` },
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") {
+      if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };   // force re-mint next time
+      console.error("[fyers-house] quotes failed:", d.message || r.status);
+      return {};
+    }
+    const byFy = {};
+    (d.d || []).forEach((row) => { byFy[row.n] = row.v || {}; });
+    const out = {};
+    for (const [y, f] of pairs) {
+      const v = byFy[f];
+      if (v && v.lp != null) out[y] = { sym: y, name: y, price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0, currency: "INR" };
+    }
+    return out;
+  } catch (e) { console.error("[fyers-house] quotes error:", e.message); return {}; }
+}
+
 app.get("/api/quote", async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
     const quotes = await memo(`q:${symbols.join(",")}`, 15_000, async () => {
-      const rows = await mapLimit(symbols, 6, async (sym) => {
+      // Indian equities from the FYERS house feed first (when configured); Yahoo covers the
+      // rest — and anything FYERS didn't return — so a partial house response still fills in.
+      let fyMap = {};
+      try { fyMap = await fyersHouseQuotes(symbols); } catch { fyMap = {}; }
+      const need = symbols.filter((s) => !fyMap[s]);
+      const rows = await mapLimit(need, 6, async (sym) => {
         try {
           const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=1d`);
           const m = d.chart?.result?.[0]?.meta;
@@ -610,7 +691,7 @@ app.get("/api/quote", async (req, res) => {
           return { sym, name: m.symbol || sym, price, chg: +chg.toFixed(2), currency: m.currency };
         } catch { return null; }
       });
-      return rows.filter(Boolean);
+      return [...Object.values(fyMap), ...rows.filter(Boolean)];
     });
     res.json({ quotes });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
@@ -1178,6 +1259,9 @@ app.get("/api/health", (req, res) => {
     ok: true,
     engines: providers().map((p) => p.name),
     db: db.USING_PG ? "postgres" : "flat-file",
+    // Is the FYERS house price feed configured? (true = Indian equities served from FYERS)
+    fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
+    deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
   });
 });
 
