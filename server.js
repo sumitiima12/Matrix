@@ -609,6 +609,8 @@ app.get("/api/news/feed", async (req, res) => {
                                          in ~24h; refresh the var each day).                */
 const FY_HOST = "https://api-t1.fyers.in";
 let _fyHouse = { token: null, at: 0 };
+let _fyLastError = null;      // surfaced by /api/feeds-status for debugging
+let _deltaLastError = null;
 async function fyersHouseToken() {
   if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
   const appId = process.env.FYERS_APP_ID || "";
@@ -624,9 +626,12 @@ async function fyersHouseToken() {
         body: JSON.stringify({ grant_type: "refresh_token", appIdHash, refresh_token: refresh, pin }),
       });
       const d = await r.json().catch(() => ({}));
-      if (r.ok && d.access_token) { _fyHouse = { token: d.access_token, at: Date.now() }; return d.access_token; }
-      console.error("[fyers-house] refresh-token exchange failed:", d.message || r.status);
-    } catch (e) { console.error("[fyers-house] refresh error:", e.message); }
+      if (r.ok && d.access_token) { _fyHouse = { token: d.access_token, at: Date.now() }; _fyLastError = null; return d.access_token; }
+      _fyLastError = "refresh-token exchange: " + (d.message || d.s || ("HTTP " + r.status));
+      console.error("[fyers-house]", _fyLastError);
+    } catch (e) { _fyLastError = "refresh error: " + e.message; console.error("[fyers-house]", _fyLastError); }
+  } else {
+    _fyLastError = "not configured (need FYERS_APP_ID, FYERS_SECRET_ID, FYERS_REFRESH_TOKEN, FYERS_PIN — or FYERS_ACCESS_TOKEN)";
   }
   const staticTok = process.env.FYERS_ACCESS_TOKEN || "";
   if (staticTok) { _fyHouse = { token: staticTok, at: Date.now() }; return staticTok; }
@@ -654,19 +659,22 @@ async function deltaHouseQuotes(ySyms) {
   const pairs = ySyms.map((y) => [y, yahooToDelta(y)]).filter(([, d]) => d);
   if (!pairs.length) return {};
   try {
-    const d = await memo("delta:tickers", 15_000, () => deltaCall("GET", "/v2/tickers", { signed: false }));
-    const byD = {};
-    (d.result || []).forEach((t) => { byD[t.symbol] = t; });
+    // Per-symbol public ticker (verified working). One call per crypto symbol, memoised 15s.
     const out = {};
-    for (const [y, ds] of pairs) {
-      const t = byD[ds];
-      if (!t) continue;
-      const price = t.mark_price != null ? Number(t.mark_price)
-                  : t.close != null ? Number(t.close)
-                  : t.spot_price != null ? Number(t.spot_price) : null;
-      const open = t.open != null ? Number(t.open) : null;
-      if (price != null) out[y] = { sym: y, name: y, price, chg: open ? +(((price - open) / open) * 100).toFixed(2) : 0, currency: "USD", src: "delta" };
-    }
+    await Promise.all(pairs.map(async ([y, ds]) => {
+      try {
+        const d = await memo(`delta:${ds}`, 15_000, () =>
+          j(`${DELTA_BASE}/v2/tickers/${encodeURIComponent(ds)}`));
+        const t = d && d.result;
+        if (!t) return;
+        const price = t.mark_price != null ? Number(t.mark_price)
+                    : t.close != null ? Number(t.close)
+                    : t.spot_price != null ? Number(t.spot_price) : null;
+        const open = t.open != null ? Number(t.open) : null;
+        if (price != null) out[y] = { sym: y, name: y, price, chg: open ? +(((price - open) / open) * 100).toFixed(2) : 0, currency: "USD", src: "delta" };
+      } catch (e) { _deltaLastError = "ticker " + ds + ": " + e.message; }
+    }));
+    if (Object.keys(out).length) _deltaLastError = null;
     return out;
   } catch { return {}; }
 }
@@ -685,7 +693,8 @@ async function fyersHouseQuotes(ySyms) {
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.s === "error") {
       if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };   // force re-mint next time
-      console.error("[fyers-house] quotes failed:", d.message || r.status);
+      _fyLastError = "quotes: " + (d.message || ("HTTP " + r.status));
+      console.error("[fyers-house]", _fyLastError);
       return {};
     }
     const byFy = {};
@@ -695,8 +704,9 @@ async function fyersHouseQuotes(ySyms) {
       const v = byFy[f];
       if (v && v.lp != null) out[y] = { sym: y, name: y, price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0, currency: "INR", src: "fyers" };
     }
+    if (Object.keys(out).length) _fyLastError = null;
     return out;
-  } catch (e) { console.error("[fyers-house] quotes error:", e.message); return {}; }
+  } catch (e) { _fyLastError = "quotes error: " + e.message; console.error("[fyers-house]", _fyLastError); return {}; }
 }
 
 /* Historical candles from the FYERS house feed. Returns the SAME shape as the Yahoo path
@@ -1336,6 +1346,34 @@ app.get("/api/health", (req, res) => {
     // Is the FYERS house price feed configured? (true = Indian equities served from FYERS)
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
+    build: "feeds-diag-1",   // bump on deploy so we can confirm which build is live
+  });
+});
+
+/* Live diagnostic for the house price feeds. Hits FYERS + Delta right now and reports what
+   came back (and any error). Open in a browser to see WHY a feed is falling back to Yahoo. */
+app.get("/api/feeds-status", async (req, res) => {
+  let fy = {}, de = {};
+  try { fy = await fyersHouseQuotes(["RELIANCE.NS"]); } catch (e) { _fyLastError = e.message; }
+  try { de = await deltaHouseQuotes(["BTC-USD"]); } catch (e) { _deltaLastError = e.message; }
+  res.json({
+    fyers: {
+      envConfigured: {
+        FYERS_APP_ID: Boolean(process.env.FYERS_APP_ID),
+        FYERS_SECRET_ID: Boolean(process.env.FYERS_SECRET_ID),
+        FYERS_REFRESH_TOKEN: Boolean(process.env.FYERS_REFRESH_TOKEN),
+        FYERS_PIN: Boolean(process.env.FYERS_PIN),
+        FYERS_ACCESS_TOKEN: Boolean(process.env.FYERS_ACCESS_TOKEN),
+      },
+      working: Object.keys(fy).length > 0,
+      sample: fy["RELIANCE.NS"] || null,
+      lastError: _fyLastError,
+    },
+    delta: {
+      working: Object.keys(de).length > 0,
+      sample: de["BTC-USD"] || null,
+      lastError: _deltaLastError,
+    },
   });
 });
 
