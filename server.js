@@ -611,12 +611,14 @@ const FY_HOST = "https://api-t1.fyers.in";
 let _fyHouse = { token: null, at: 0 };
 let _fyLastError = null;      // surfaced by /api/feeds-status for debugging
 let _deltaLastError = null;
+let _fyDebug = null;          // safe (no secrets): shapes + raw FYERS response
 async function fyersHouseToken() {
   if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
-  const appId = process.env.FYERS_APP_ID || "";
-  const secret = process.env.FYERS_SECRET_ID || "";
-  const refresh = process.env.FYERS_REFRESH_TOKEN || "";
-  const pin = process.env.FYERS_PIN || "";
+  // .trim() guards against a stray newline/space pasted into the Render env value.
+  const appId = (process.env.FYERS_APP_ID || "").trim();
+  const secret = (process.env.FYERS_SECRET_ID || "").trim();
+  const refresh = (process.env.FYERS_REFRESH_TOKEN || "").trim();
+  const pin = (process.env.FYERS_PIN || "").trim();
   if (appId && secret && refresh && pin) {
     try {
       const appIdHash = crypto.createHash("sha256").update(`${appId}:${secret}`).digest("hex");
@@ -626,6 +628,14 @@ async function fyersHouseToken() {
         body: JSON.stringify({ grant_type: "refresh_token", appIdHash, refresh_token: refresh, pin }),
       });
       const d = await r.json().catch(() => ({}));
+      // Shapes only — never the secret values themselves.
+      _fyDebug = {
+        appIdLen: appId.length, appIdSuffix: appId.slice(-4),
+        secretLen: secret.length,
+        refreshLen: refresh.length, refreshPrefix: refresh.slice(0, 4), refreshHasSpace: /\s/.test(refresh),
+        pinLen: pin.length,
+        httpStatus: r.status, fyersResponse: d,
+      };
       if (r.ok && d.access_token) { _fyHouse = { token: d.access_token, at: Date.now() }; _fyLastError = null; return d.access_token; }
       _fyLastError = "refresh-token exchange: " + (d.message || d.s || ("HTTP " + r.status));
       console.error("[fyers-house]", _fyLastError);
@@ -1346,7 +1356,7 @@ app.get("/api/health", (req, res) => {
     // Is the FYERS house price feed configured? (true = Indian equities served from FYERS)
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
-    build: "feeds-diag-1",   // bump on deploy so we can confirm which build is live
+    build: "feeds-diag-2",   // bump on deploy so we can confirm which build is live
   });
 });
 
@@ -1368,6 +1378,7 @@ app.get("/api/feeds-status", async (req, res) => {
       working: Object.keys(fy).length > 0,
       sample: fy["RELIANCE.NS"] || null,
       lastError: _fyLastError,
+      debug: _fyDebug,   // shapes + FYERS raw response (no secret values)
     },
     delta: {
       working: Object.keys(de).length > 0,
