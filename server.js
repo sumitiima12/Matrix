@@ -145,19 +145,24 @@ app.post("/api/register", authLimiter, async (req, res) => {
     if (typeof db.getUserByUsername === "function" && await db.getUserByUsername(username)) {
       return res.status(409).json({ error: "That user ID is taken — try another." });
     }
+    /* Security question is now OPTIONAL — the unified sign-up asks only for a user ID and
+       (optionally) an email. If a question+answer are supplied they're stored for PIN
+       recovery; if not, the account is created without one and can set it later from
+       the profile. */
     const secQuestion = ((req.body && req.body.secQuestion) || "").trim();
     const secAnswer = ((req.body && req.body.secAnswer) || "").trim();
-    // Security question is required at signup so every new account has a recovery path.
-    if (!secQuestion || !secAnswer) return res.status(400).json({ error: "Set a security question and answer so you can recover your PIN." });
-    // Answer normalized (trim + lowercase) then bcrypt-hashed — never plaintext.
-    const answerHash = hashPin(secAnswer.toLowerCase());
+    const answerHash = (secQuestion && secAnswer) ? hashPin(secAnswer.toLowerCase()) : null;
+    // Optional email — validated loosely; stored only if it looks like an address.
+    let email = String((req.body && req.body.email) || "").trim().slice(0, 254);
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address, or leave it blank." });
     // Optional referral: resolve the referral code (a user's handle) to a real account.
     let referredBy = null;
     const refRaw = cleanUsername(req.body && req.body.referralCode);
     if (refRaw && typeof db.getUserByUsername === "function" && await db.getUserByUsername(refRaw)) referredBy = refRaw;
-    await db.createUser(phone, hashPin(pin), name, secQuestion, answerHash, username, referredBy);
+    await db.createUser(phone, hashPin(pin), name, secQuestion || null, answerHash, username, referredBy);
+    if (email && typeof db.setEmail === "function") { try { await db.setEmail(phone, email); } catch { email = ""; } }
     if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
-    res.json({ ok: true, userId: phone, name, username, referredBy, email: null, token: signToken(phone) });
+    res.json({ ok: true, userId: phone, name, username, referredBy, email: email || null, createdAt: Date.now(), token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -165,7 +170,10 @@ app.post("/api/login", authLimiter, async (req, res) => {
   try {
     const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin;
     const u = await db.getUser(phone);
-    if (!u || !verifyPin(pin, u.pin)) return res.status(401).json({ error: "Wrong phone or PIN." });
+    // Unified Login / Sign-up: if there's no account for this number, tell the client so
+    // it can switch to the "looks like you're new" sign-up step instead of showing an error.
+    if (!u) return res.status(404).json({ ok: false, newAccount: true, error: "No account for this number." });
+    if (!verifyPin(pin, u.pin)) return res.status(401).json({ error: "Wrong PIN for this number." });
 
     // Blocked users are turned away even with a correct PIN.
     if (typeof db.isUserBlocked === "function" && await db.isUserBlocked(phone)) {
@@ -178,7 +186,7 @@ app.post("/api/login", authLimiter, async (req, res) => {
       try { await db.updateUserPin(phone, hashPin(pin)); } catch { /* upgrade later */ }
     }
     if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
-    res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, email: u.email || null, token: signToken(phone) });
+    res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, email: u.email || null, createdAt: u.createdAt || null, token: signToken(phone) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
