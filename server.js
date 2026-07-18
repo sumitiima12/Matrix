@@ -1553,6 +1553,9 @@ app.get("/api/diag/delta", async (_req, res) => {
   const T = (p, ms = 8000) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error("timed out")), ms))]);
   const cap = (e) => ({ ok: false, error: e && e.message, cause: e && e.cause ? (e.cause.code || e.cause.message || String(e.cause)) : undefined });
   const out = { base: DELTA_BASE, proxyConfigured: Boolean(deltaDispatcher) };
+  // The IP Delta sees for signed calls = this server's outbound IP (via the proxy if configured).
+  // Whitelist THIS on your Delta API key — not your phone's IP.
+  try { const ir = await T(pfetch("https://api.ipify.org?format=json", deltaDispatcher ? { dispatcher: deltaDispatcher } : {})); out.serverOutboundIp = (await ir.json()).ip; } catch (e) { out.serverOutboundIp = "unknown (" + (e && e.message) + ")"; }
   try { const t = await T(deltaCall("GET", "/v2/products", { signed: false })); out.public = { ok: true, products: (t.result || []).length }; }
   catch (e) { out.public = cap(e); }
   try { await T(deltaCall("GET", "/v2/wallet/balances")); out.signed = { ok: true }; }
