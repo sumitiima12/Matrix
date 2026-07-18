@@ -456,6 +456,19 @@ app.post("/api/admin/block", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Verify the login PIN for a step-up action (e.g. entering Real mode / placing a real order).
+   Identity comes from the verified token; the PIN is checked against its bcrypt hash. */
+app.post("/api/pin/verify", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const pin = req.body && req.body.pin;
+    if (!pin) return res.status(400).json({ error: "PIN required" });
+    const u = await db.getUser(phone);
+    if (!u) return res.status(404).json({ error: "user not found" });
+    res.json({ ok: verifyPin(pin, u.pin) === true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* Change your OWN login PIN — requires the CURRENT PIN (so a stolen session can't silently
    change it), derives identity from the verified token, and stores the new PIN bcrypt-hashed. */
 app.post("/api/pin/change", requireAuth, async (req, res) => {
@@ -3580,4 +3593,20 @@ app.get("/api/autobuy", requireAuth, async (req, res) => {
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
+
+/* FAIL FAST in production on missing/weak critical secrets (audit P1-12). A random per-boot
+   JWT secret silently logs everyone out on restart and hides misconfiguration; a missing
+   CRED_KEY weakens broker-credential encryption. In production we refuse to start rather than
+   run insecurely. In dev we only warn. */
+(function guardSecrets() {
+  const prod = process.env.NODE_ENV === "production";
+  const problems = [];
+  if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).length < 16) problems.push("JWT_SECRET (set a long, stable random string)");
+  if (!process.env.CRED_KEY || String(process.env.CRED_KEY).length < 16) problems.push("CRED_KEY (broker-credential encryption key)");
+  if (!problems.length) return;
+  const msg = "Missing/weak critical secrets: " + problems.join(", ");
+  if (prod) { console.error("[startup] FATAL — " + msg + ". Refusing to start in production."); process.exit(1); }
+  console.warn("[startup] WARNING — " + msg + ". OK for dev; MUST be set in production.");
+})();
+
 app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
