@@ -248,12 +248,12 @@ async function listPublicStrategies() {
 
 /* ------------------------------- ideas ----------------------------------- */
 async function postIdea(rec) {
-  const row = { id: rec.id, owner: rec.owner, owner_name: rec.owner_name || "", symbol: rec.symbol || "", direction: rec.direction || "Long", note: rec.note || "", target: rec.target || "", stop: rec.stop || "", created_at: rec.created_at || Date.now() };
+  const row = { id: rec.id, owner: rec.owner, owner_name: rec.owner_name || "", symbol: rec.symbol || "", direction: rec.direction || "Long", note: rec.note || "", target: rec.target || "", stop: rec.stop || "", created_at: rec.created_at || Date.now(), tags: Array.isArray(rec.tags) ? rec.tags.slice(0, 4) : [], screenshot: rec.screenshot || null, status: rec.status || "pending", reviewed_at: null };
   if (USING_PG) {
     await pool.query(
-      `INSERT INTO ideas (id, owner, owner_name, symbol, direction, note, target, stop, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [row.id, row.owner, row.owner_name, row.symbol, row.direction, row.note, row.target, row.stop, row.created_at]
+      `INSERT INTO ideas (id, owner, owner_name, symbol, direction, note, target, stop, created_at, tags, screenshot, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [row.id, row.owner, row.owner_name, row.symbol, row.direction, row.note, row.target, row.stop, row.created_at, JSON.stringify(row.tags), row.screenshot, row.status]
     );
     return row;
   }
@@ -262,6 +262,12 @@ async function postIdea(rec) {
   writeJSON(FILES.ideas, all);
   return row;
 }
+/* Admin approve/reject: set status ('approved'|'rejected') + reviewed timestamp. */
+async function reviewIdea(id, status) {
+  if (USING_PG) { await pool.query(`UPDATE ideas SET status=$2, reviewed_at=$3 WHERE id=$1`, [id, status, Date.now()]); return; }
+  const all = readJSON(FILES.ideas);
+  if (all[id]) { all[id].status = status; all[id].reviewed_at = Date.now(); writeJSON(FILES.ideas, all); }
+}
 async function deleteIdea(id, owner) {
   if (USING_PG) { await pool.query(`DELETE FROM ideas WHERE id=$1 AND ($2 = '' OR owner=$2)`, [id, owner || ""]); return; }
   const all = readJSON(FILES.ideas);
@@ -269,11 +275,11 @@ async function deleteIdea(id, owner) {
 }
 async function listIdeas() {
   if (USING_PG) {
-    const r = await pool.query(`SELECT id, owner, owner_name, symbol, direction, note, target, stop, created_at FROM ideas ORDER BY created_at DESC LIMIT 1000`);
-    return r.rows.map((x) => ({ ...x, created_at: Number(x.created_at) }));
+    const r = await pool.query(`SELECT id, owner, owner_name, symbol, direction, note, target, stop, created_at, tags, screenshot, status FROM ideas ORDER BY created_at DESC LIMIT 1000`);
+    return r.rows.map((x) => ({ ...x, created_at: Number(x.created_at), tags: x.tags || [], status: x.status || "approved" }));
   }
   const all = readJSON(FILES.ideas);
-  return Object.values(all).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  return Object.values(all).map((x) => ({ ...x, tags: x.tags || [], status: x.status || "approved" })).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
 }
 
 /* --------------------------------- state --------------------------------- */
@@ -498,4 +504,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

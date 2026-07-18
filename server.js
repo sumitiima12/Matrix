@@ -276,6 +276,11 @@ app.get("/api/ideas", async (req, res) => {
     const by = (req.query.by || "").trim().toLowerCase();
     if (sym) list = list.filter((i) => i.symbol === sym);
     if (by) list = list.filter((i) => String(i.owner_name || "").toLowerCase() === by);
+    /* APPROVAL GATE: everyone sees APPROVED ideas. An admin sees everything (to review).
+       A signed-in author sees their own still-pending ideas so they know it's awaiting review. */
+    const admin = isAdmin(req);
+    const me = req.get("X-User-Id") ? stripPh(req.get("X-User-Id")) : null;
+    if (!admin) list = list.filter((i) => (i.status || "approved") === "approved" || (me && i.owner === me));
     res.json({ ideas: list });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -289,13 +294,28 @@ app.post("/api/ideas", requireAuth, async (req, res) => {
     const u = await db.getUser(phone);
     const ownerName = (u && u.username) || (u && u.name) || phone;
     const id = "idea_" + phone + "_" + Date.now();
+    // Up to 4 short tags; screenshot is an optional data URL, size-capped so a huge image
+    // can't bloat the row. New ideas start 'pending' and need admin approval to go public.
+    const tags = Array.isArray(b.tags) ? b.tags.map((t) => String(t).slice(0, 24)).filter(Boolean).slice(0, 4) : [];
+    let screenshot = typeof b.screenshot === "string" && b.screenshot.startsWith("data:image/") ? b.screenshot : null;
+    if (screenshot && screenshot.length > 1_500_000) screenshot = null;   // ~1.5MB cap
     const row = await db.postIdea({
       id, owner: phone, owner_name: ownerName, symbol,
       direction: b.direction === "Short" ? "Short" : "Long",
       note: String(b.note || "").slice(0, 600), target: String(b.target || "").slice(0, 24), stop: String(b.stop || "").slice(0, 24),
-      created_at: Date.now(),
+      tags, screenshot, status: "pending", created_at: Date.now(),
     });
     res.json({ ok: true, idea: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* Admin approves or rejects a pending idea before it becomes public. */
+app.post("/api/ideas/:id/review", requireAuth, async (req, res) => {
+  try {
+    if (!isAdmin(req)) return res.status(403).json({ error: "admin only" });
+    const status = req.body && req.body.status === "approved" ? "approved" : "rejected";
+    if (typeof db.reviewIdea === "function") await db.reviewIdea(req.params.id, status);
+    res.json({ ok: true, status });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -733,6 +753,39 @@ async function deltaHouseQuotes(ySyms) {
   } catch { return {}; }
 }
 
+/* ── IND Money US house feed ──────────────────────────────────────────────────────────
+   REAL-TIME US prices for ALL users (Yahoo is ~15 min delayed on US too). IND Money's
+   public graph endpoint returns a live `price` plus intraday candles — no auth needed.
+   A US symbol here is a plain ticker (AAPL, NVDA) — crypto is X-USD, Indian is X.NS. */
+const INDM_US = "https://apixt-us.indmoney.com/us-stock-broker/us/catalog/get-stock-graph";
+let _indmLastError = null;
+const isUsTicker = (s) => /^[A-Z]{1,5}$/.test(String(s || ""));
+const ymd = (ms) => new Date(ms).toISOString().slice(0, 10);
+async function indmoneyHouseQuotes(ySyms) {
+  const us = (ySyms || []).filter(isUsTicker);
+  if (!us.length) return {};
+  const today = ymd(Date.now());
+  const out = {};
+  await Promise.all(us.map(async (sym) => {
+    try {
+      const d = await memo(`im:${sym}`, 20_000, () =>
+        j(`${INDM_US}/${encodeURIComponent(sym)}?start_date=${today}&end_date=${today}&label=1D&response_format=json&currency=USD`));
+      if (d && d.success && d.price != null) {
+        out[sym] = { sym, name: sym, price: Number(d.price), chg: d["1d_percentage_chane"] != null ? Number(d["1d_percentage_chane"]) : 0, currency: "USD", src: "indmoney" };
+      }
+    } catch (e) { _indmLastError = "im " + sym + ": " + e.message; }
+  }));
+  if (Object.keys(out).length) _indmLastError = null;
+  return out;
+}
+async function indmoneyUsCandles(sym, range) {
+  const label = ({ "5d": "1W", "1mo": "1M", "3mo": "3M", "6mo": "6M", "1y": "1Y" })[range] || "1M";
+  const end = ymd(Date.now());
+  const start = ymd(Date.now() - rangeToSeconds(range) * 1000);
+  const d = await j(`${INDM_US}/${encodeURIComponent(sym)}?start_date=${start}&end_date=${end}&label=${label}&response_format=json&currency=USD`);
+  return ((d && d.candles) || []).map((c) => ({ t: c.ts * 1000, o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume })).filter((x) => x.c != null);
+}
+
 // Quotes for the Indian-equity subset, keyed back by the ORIGINAL yahoo symbol.
 async function fyersHouseQuotes(ySyms) {
   const token = await fyersHouseToken();
@@ -801,10 +854,11 @@ app.get("/api/quote", async (req, res) => {
     const quotes = await memo(`q:${symbols.join(",")}`, 15_000, async () => {
       // Indian equities from the FYERS house feed and crypto from the Delta feed first;
       // Yahoo covers the rest — and anything the house feeds didn't return.
-      let fyMap = {}, dMap = {};
+      let fyMap = {}, dMap = {}, imMap = {};
       try { fyMap = await fyersHouseQuotes(symbols); } catch { fyMap = {}; }
       try { dMap = await deltaHouseQuotes(symbols); } catch { dMap = {}; }
-      const houseMap = { ...fyMap, ...dMap };
+      try { imMap = await indmoneyHouseQuotes(symbols); } catch { imMap = {}; }   // real-time US via IND Money
+      const houseMap = { ...fyMap, ...dMap, ...imMap };
       const need = symbols.filter((s) => !houseMap[s]);
       const rows = await mapLimit(need, 6, async (sym) => {
         try {
@@ -903,6 +957,13 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
     try {
       const dc = await memo(`dc:${symbol}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, interval, range));
       if (dc && dc.length) return dc;
+    } catch (e) { /* fall through to Yahoo */ }
+  }
+  // US equities: IND Money's own candles (real-time) before Yahoo (15-min delayed).
+  if (isUsTicker(symbol)) {
+    try {
+      const uc = await memo(`imc:${symbol}:${range}`, 60_000, () => indmoneyUsCandles(symbol, range));
+      if (uc && uc.length) return uc;
     } catch (e) { /* fall through to Yahoo */ }
   }
   // FYERS house feed first for Indian equities; Yahoo otherwise / on any gap.
