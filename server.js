@@ -2656,16 +2656,19 @@ app.post("/api/broker/order", async (req, res) => {
     }
 
     if (broker === "indmoney") {
-      const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+      // INDstocks REST API: POST /order for NSE/BSE equities. security_id is the numeric NSE
+      // scrip id (same numbering brokers share), resolved strictly from the instrument master.
+      const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
       const body = {
-        symbol: bare, exchange: "NSE", transaction_type: String(side).toUpperCase(), order_type: "MARKET",
-        product: product === "CNC" ? "DELIVERY" : "INTRADAY", quantity: Number(qty), validity: "DAY",
+        txn_type: String(side).toUpperCase(), exchange: "NSE", segment: "EQUITY", security_id: String(securityId),
+        qty: Number(qty), order_type: "MARKET", product: product === "CNC" ? "CNC" : "INTRADAY",
+        validity: "DAY", is_amo: false, algo_id: "99999",
       };
-      const r = await fetch("https://api.indstocks.com/order/place", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const r = await fetch("https://api.indstocks.com/order", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const d = await r.json().catch(() => ({}));
-      if (!r.ok || d.status === "error" || d.error) throw new Error(d.message || `IND Money order failed (${r.status})`);
+      if (!r.ok || d.status !== "success") throw new Error((d && d.message) || `IND Money order failed (${r.status})`);
       const autoExitId = await registerAutoExit();
-      return res.json({ ok: true, broker, orderId: (d.data && d.data.order_id) || d.order_id || null, status: "PENDING", autoExitId });
+      return res.json({ ok: true, broker, orderId: (d.data && d.data.order_id) || null, status: (d.data && d.data.order_status) || "PENDING", autoExitId });
     }
 
     res.status(400).json({ error: "unsupported broker" });
@@ -3184,11 +3187,12 @@ async function placeExitOrder(sess, symbol, qty, market, product) {
     return { orderId: (d.payload && d.payload.groww_order_id) || d.groww_order_id || null };
   }
   if (broker === "indmoney") {
-    const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
-    const r = await fetch("https://api.indstocks.com/order/place", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify({ symbol: bare, exchange: "NSE", transaction_type: "SELL", order_type: "MARKET", product: "INTRADAY", quantity: Number(qty), validity: "DAY" }) });
+    const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
+    const body = { txn_type: "SELL", exchange: "NSE", segment: "EQUITY", security_id: String(securityId), qty: Number(qty), order_type: "MARKET", product: "INTRADAY", validity: "DAY", is_amo: false, algo_id: "99999" };
+    const r = await fetch("https://api.indstocks.com/order", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.status === "error" || d.error) throw new Error(d.message || `IND Money exit failed (${r.status})`);
-    return { orderId: (d.data && d.data.order_id) || d.order_id || null };
+    if (!r.ok || d.status !== "success") throw new Error((d && d.message) || `IND Money exit failed (${r.status})`);
+    return { orderId: (d.data && d.data.order_id) || null };
   }
   if (broker === "zerodha") {
     const [exchange, tradingsymbol] = String(symbol).split(":");
