@@ -2388,6 +2388,17 @@ function roundToTick(price, tick) {
    Never throws: a failed bracket must NOT unwind a filled entry. We return { placed, message }
    so the caller can tell the user honestly whether protection is actually live — the one thing
    we must never do is let someone believe a stop exists when it doesn't. */
+/* Delta perpetuals trade in whole CONTRACTS; contract_value = coin units per contract (e.g.
+   BTCUSD = 0.001 BTC). We keep our internal qty in COIN units (so P&L is right everywhere) and
+   convert to/from an integer contract count only at the order boundary. */
+function deltaContracts(prod, coinQty) {
+  const cv = Number(prod && prod.contract_value) || 1;
+  return { cv, contracts: Math.max(0, Math.floor(Number(coinQty) / cv + 1e-9)) };
+}
+function deltaCoinToContracts(prod, coinQty) {
+  const cv = Number(prod && prod.contract_value) || 1;
+  return Math.max(1, Math.round(Number(coinQty) / cv));   // exits round to the nearest contract, min 1
+}
 async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct) {
   try {
     if (!(entryRef > 0)) return { placed: false, message: "no entry price to base SL/TP on" };
@@ -2546,25 +2557,32 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
       const prod = (prods.result || []).find((p) => p.symbol === symbol);
       if (!prod) throw new Error(`Delta does not list ${symbol}`);
 
+      // Delta trades in whole CONTRACTS. Convert coin-unit qty to an integer contract count.
+      const isBuy = String(side).toLowerCase() === "buy";
+      const { cv, contracts } = deltaContracts(prod, qty);
+      const sendSize = isBuy ? contracts : deltaCoinToContracts(prod, qty);   // exits round up to ≥1
+      if (isBuy && sendSize < 1) {
+        return res.status(400).json({ ok: false, status: "rejected", broker, reason: `Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.` });
+      }
       const d = await deltaCall("POST", "/v2/orders", {
         body: {
           product_id: prod.id,
-          size: Number(qty),
-          side: String(side).toLowerCase() === "buy" ? "buy" : "sell",
+          size: sendSize,
+          side: isBuy ? "buy" : "sell",
           order_type: "market_order",
+          ...(isBuy ? {} : { reduce_only: true }),
         },
       });
-      /* A 200 is NOT a fill. Verify the order actually executed — a market order with
-         insufficient margin returns cancelled/unfilled. Report the REJECT with the broker's
-         reason instead of attaching a bracket and pretending a position exists. */
+      /* A 200 is NOT a fill. Verify execution (all sizes here are CONTRACTS). */
       const o = d.result || {};
-      const size = Number(o.size) || Number(qty);
-      const unfilled = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : size);
-      const filled = Math.max(0, size - unfilled);
-      const status = (o.state === "cancelled" || o.state === "rejected" || filled <= 0) ? "rejected" : (filled < size ? "partial" : "filled");
+      const sizeC = Number(o.size) || sendSize;
+      const unfilledC = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : sizeC);
+      const filledC = Math.max(0, sizeC - unfilledC);
+      const status = (o.state === "cancelled" || o.state === "rejected" || filledC <= 0) ? "rejected" : (filledC < sizeC ? "partial" : "filled");
       if (status === "rejected") {
         return res.status(400).json({ ok: false, status: "rejected", broker, orderId: o.id ?? null, reason: o.cancellation_reason || o.meta_data?.reason || "Order not filled — likely insufficient balance/margin on your Delta account" });
       }
+      const filled = filledC * cv;   // report COIN units so the journal/position P&L stays correct
       /* Attach an exchange-side bracket so the stop-loss / take-profit fire on Delta itself,
          with the app closed. Best-effort and honestly reported: the entry has filled, so a
          bracket failure returns a warning rather than pretending the position is safe. */
@@ -3181,8 +3199,10 @@ async function placeExitOrder(sess, symbol, qty, market, product) {
     const prods = await deltaCall("GET", "/v2/products", { signed: false });
     const prod = (prods.result || []).find((p) => p.symbol === symbol);
     if (!prod) throw new Error(`Delta does not list ${symbol}`);
+    // qty is stored in COIN units — convert back to contracts to close the exact position.
+    const size = deltaCoinToContracts(prod, qty);
     const d = await deltaCall("POST", "/v2/orders", {
-      body: { product_id: prod.id, size: Number(qty), side: "sell", order_type: "market_order", reduce_only: true },
+      body: { product_id: prod.id, size, side: "sell", order_type: "market_order", reduce_only: true },
     });
     return { orderId: d.result?.id ?? null };
   }
@@ -3387,6 +3407,7 @@ app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT
 
 const AB_MAX_POSITIONS = Number(process.env.AUTO_BUY_MAX_POSITIONS) || 5;
 const AB_MAX_NOTIONAL = Number(process.env.AUTO_BUY_MAX_NOTIONAL) || 0;   // 0 = only the user's amount
+const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 1000;   // in-flight window: never re-submit while a pending order is unresolved
 
 /* A real BUY to OPEN a position. Same per-broker plumbing as the manual order route, kept
    to the brokers whose order placement is wired. */
@@ -3397,19 +3418,22 @@ async function placeBuyOrder(sess, symbol, qty, market, product) {
     const prods = await deltaCall("GET", "/v2/products", { signed: false });
     const dprod = (prods.result || []).find((p) => p.symbol === symbol);
     if (!dprod) throw new Error(`Delta does not list ${symbol}`);
-    const d = await deltaCall("POST", "/v2/orders", { body: { product_id: dprod.id, size: Number(qty), side: "buy", order_type: "market_order" } });
-    // HTTP 200 is NOT a fill. A market order with insufficient margin comes back cancelled/
-    // unfilled — registering a position off that would show phantom P&L for a trade that never
-    // happened. Verify the fill and, if it didn't happen, throw the broker's real reason so the
-    // caller records a REJECT (with reason) instead of a fake position.
+    // Delta trades in whole CONTRACTS. Convert our coin-unit qty to an integer contract count
+    // (fractional sizes are invalid and get rejected). If the amount can't buy one contract, say
+    // so with the real minimum instead of letting the broker bounce it.
+    const { cv, contracts } = deltaContracts(dprod, qty);
+    if (contracts < 1) throw new Error(`Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.`);
+    const d = await deltaCall("POST", "/v2/orders", { body: { product_id: dprod.id, size: contracts, side: "buy", order_type: "market_order" } });
+    // HTTP 200 is NOT a fill — verify, and throw the real reason on a reject/no-fill.
     const o = d.result || {};
-    const size = Number(o.size) || Number(qty);
-    const unfilled = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : size);
-    const filled = Math.max(0, size - unfilled);
-    if (o.state === "cancelled" || o.state === "rejected" || filled <= 0) {
+    const sizeC = Number(o.size) || contracts;                                   // contracts
+    const unfilledC = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : sizeC);
+    const filledC = Math.max(0, sizeC - unfilledC);
+    if (o.state === "cancelled" || o.state === "rejected" || filledC <= 0) {
       throw new Error(o.cancellation_reason || o.meta_data?.reason || `Order not filled (state: ${o.state || "unknown"}) — likely insufficient balance/margin`);
     }
-    return { orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, state: o.state, partial: filled < size };
+    // Return COIN units (contracts × contract_value) so the stored position + P&L stay correct.
+    return { orderId: o.id ?? null, filledQty: filledC * cv, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, state: o.state, partial: filledC < sizeC };
   }
   if (broker === "coindcx") {
     const { apiKey, apiSecret } = sess.extra || {};
@@ -3460,6 +3484,19 @@ async function runAutoBuyEngine() {
           await db.updateRealStrategy(st.id, { openPositionId: null });   // position closed -> may re-enter
           st.openPositionId = null;
         }
+        /* IDEMPOTENCY (audit P1-01). We stamp `pendingSince` BEFORE sending an order; if we
+           crash after the broker fills but before we persist the position link, a naive retry
+           would BUY AGAIN. So when a pending marker exists we reconcile instead of re-ordering:
+           adopt any open position that already matches this instrument; otherwise, within a
+           reconcile window, skip (the order is in-flight or just filled) rather than double-buy;
+           only after the window with no trace do we clear it and flag for manual verification. */
+        if (st.pendingSince) {
+          const openMatch = (await db.getManagedPositionsForUser(st.userId)).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(st.brokerSym) && Number(p.entry) > 0);
+          if (openMatch) { await db.updateRealStrategy(st.id, { openPositionId: openMatch.id, pendingSince: null }); st.openPositionId = openMatch.id; continue; }
+          if (Date.now() - st.pendingSince < AB_RECONCILE_MS) continue;   // in-flight — never double-submit
+          await db.updateRealStrategy(st.id, { pendingSince: null, lastError: "previous order status unknown — cleared; verify with your broker before it re-enters", lastOrderStatus: "unknown" });
+          st.pendingSince = null;
+        }
         // Cooldown: don't re-fire a still-true signal inside the same candle.
         const intervalMs = (st.interval === "1d" ? 86400 : (Number((st.interval || "5m").replace(/[^\d]/g, "")) || 5) * 60) * 1000;
         if (st.lastOrderAt && Date.now() - st.lastOrderAt < intervalMs) continue;
@@ -3490,9 +3527,15 @@ async function runAutoBuyEngine() {
         const sess = await sessionFromCred(st.userId, st.broker);
         if (!sess) { await db.updateRealStrategy(st.id, { lastError: "no stored credentials — reconnect broker" }); continue; }
 
-        // placeBuyOrder now THROWS on a rejected/unfilled order (caught below → recorded as a
-        // reject with reason, no position). Register the managed position at the ACTUAL fill
-        // quantity and price, so P&L reflects what really executed, not what we requested.
+        // STAMP THE INTENT before we touch the broker. If we crash after the fill but before we
+        // persist the position, the pending marker (reconciled at the top of the loop) prevents a
+        // duplicate order on the next sweep. lastOrderAt is set now too, so the cooldown also holds.
+        await db.updateRealStrategy(st.id, { pendingSince: Date.now(), lastOrderAt: Date.now() });
+        st.pendingSince = Date.now(); st.lastOrderAt = Date.now();
+
+        // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
+        // with reason, no position). Register the managed position at the ACTUAL fill quantity and
+        // price, so P&L reflects what really executed, not what we requested.
         const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product);
         const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
         const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : px;
@@ -3500,12 +3543,13 @@ async function runAutoBuyEngine() {
           sess, symbol: st.symbol, brokerSym: st.brokerSym, qty: fillQty, entry: fillPx, market: st.market,
           sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product,
         });
-        await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled" });
+        await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null });
         bought++;
         console.log(`[autobuy] ${r.partial ? "PARTIAL" : "FILLED"} ${fillQty}/${qty} ${st.symbol} for ${st.userId} via ${st.broker} — ${sig.reason} (order ${r.orderId})`);
       } catch (e) {
-        // Rejected / unfilled — record the reason and status, and do NOT open a position.
-        await db.updateRealStrategy(st.id, { lastError: String(e.message || e), lastOrderStatus: "rejected", lastRejectAt: Date.now() });
+        // Rejected / unfilled — record the reason and status, clear the pending marker, and do
+        // NOT open a position. (A thrown error here means the order did not fill.)
+        await db.updateRealStrategy(st.id, { lastError: String(e.message || e), lastOrderStatus: "rejected", lastRejectAt: Date.now(), pendingSince: null });
         console.error(`[autobuy] REJECTED ${st.symbol} (${st.broker}):`, e.message);
       }
     }
