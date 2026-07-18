@@ -456,6 +456,24 @@ app.post("/api/admin/block", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Change your OWN login PIN — requires the CURRENT PIN (so a stolen session can't silently
+   change it), derives identity from the verified token, and stores the new PIN bcrypt-hashed. */
+app.post("/api/pin/change", requireAuth, async (req, res) => {
+  try {
+    const phone = stripPh(req.authUserId);
+    const currentPin = req.body && req.body.currentPin;
+    const newPin = req.body && req.body.newPin;
+    if (!currentPin || !newPin) return res.status(400).json({ error: "Current and new PIN are both required." });
+    if (!/^\d{4,6}$/.test(String(newPin))) return res.status(400).json({ error: "New PIN must be 4–6 digits." });
+    if (String(newPin) === String(currentPin)) return res.status(400).json({ error: "New PIN must be different from the current one." });
+    const u = await db.getUser(phone);
+    if (!u) return res.status(404).json({ error: "user not found" });
+    if (!verifyPin(currentPin, u.pin)) return res.status(401).json({ error: "Your current PIN is incorrect." });
+    await db.updateUserPin(phone, hashPin(newPin));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Admin backstop: reset any user's PIN. The last-resort recovery when a user can't answer
 // their security question (or never set one).
 app.post("/api/admin/reset-pin", async (req, res) => {
