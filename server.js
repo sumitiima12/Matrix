@@ -766,7 +766,9 @@ async function indmoneyHouseQuotes(ySyms) {
   if (!us.length) return {};
   const today = ymd(Date.now());
   const out = {};
-  await Promise.all(us.map(async (sym) => {
+  // Throttle to 6 at a time — firing 40+ concurrent requests made the feed flaky, which
+  // silently fell back to (delayed) Yahoo. Each symbol is memoised 20s so polls stay cheap.
+  await mapLimit(us, 6, async (sym) => {
     try {
       const d = await memo(`im:${sym}`, 20_000, () =>
         j(`${INDM_US}/${encodeURIComponent(sym)}?start_date=${today}&end_date=${today}&label=1D&response_format=json&currency=USD`));
@@ -774,7 +776,7 @@ async function indmoneyHouseQuotes(ySyms) {
         out[sym] = { sym, name: sym, price: Number(d.price), chg: d["1d_percentage_chane"] != null ? Number(d["1d_percentage_chane"]) : 0, currency: "USD", src: "indmoney" };
       }
     } catch (e) { _indmLastError = "im " + sym + ": " + e.message; }
-  }));
+  });
   if (Object.keys(out).length) _indmLastError = null;
   return out;
 }
