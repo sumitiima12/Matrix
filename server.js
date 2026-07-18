@@ -2520,16 +2520,27 @@ app.post("/api/broker/order", async (req, res) => {
           order_type: "market_order",
         },
       });
+      /* A 200 is NOT a fill. Verify the order actually executed — a market order with
+         insufficient margin returns cancelled/unfilled. Report the REJECT with the broker's
+         reason instead of attaching a bracket and pretending a position exists. */
+      const o = d.result || {};
+      const size = Number(o.size) || Number(qty);
+      const unfilled = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : size);
+      const filled = Math.max(0, size - unfilled);
+      const status = (o.state === "cancelled" || o.state === "rejected" || filled <= 0) ? "rejected" : (filled < size ? "partial" : "filled");
+      if (status === "rejected") {
+        return res.status(400).json({ ok: false, status: "rejected", broker, orderId: o.id ?? null, reason: o.cancellation_reason || o.meta_data?.reason || "Order not filled — likely insufficient balance/margin on your Delta account" });
+      }
       /* Attach an exchange-side bracket so the stop-loss / take-profit fire on Delta itself,
-         with the app closed. Best-effort and honestly reported: the entry has already filled,
-         so a bracket failure returns a warning rather than pretending the position is safe. */
+         with the app closed. Best-effort and honestly reported: the entry has filled, so a
+         bracket failure returns a warning rather than pretending the position is safe. */
       let bracket = null;
       if (String(side).toLowerCase() === "buy" && (slPct > 0 || tpPct > 0)) {
-        const entryRef = Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, "Crypto");
+        const entryRef = Number(o.average_fill_price) || Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, "Crypto");
         bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct);
       }
       const autoExitId = await registerAutoExit();
-      return res.json({ ok: true, broker, orderId: d.result?.id ?? null, bracket, autoExitId, raw: d.result ?? null });
+      return res.json({ ok: true, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, bracket, autoExitId, raw: o });
     }
 
     if (broker === "coindcx") {
@@ -3354,7 +3365,18 @@ async function placeBuyOrder(sess, symbol, qty, market, product) {
     const dprod = (prods.result || []).find((p) => p.symbol === symbol);
     if (!dprod) throw new Error(`Delta does not list ${symbol}`);
     const d = await deltaCall("POST", "/v2/orders", { body: { product_id: dprod.id, size: Number(qty), side: "buy", order_type: "market_order" } });
-    return { orderId: d.result?.id ?? null };
+    // HTTP 200 is NOT a fill. A market order with insufficient margin comes back cancelled/
+    // unfilled — registering a position off that would show phantom P&L for a trade that never
+    // happened. Verify the fill and, if it didn't happen, throw the broker's real reason so the
+    // caller records a REJECT (with reason) instead of a fake position.
+    const o = d.result || {};
+    const size = Number(o.size) || Number(qty);
+    const unfilled = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : size);
+    const filled = Math.max(0, size - unfilled);
+    if (o.state === "cancelled" || o.state === "rejected" || filled <= 0) {
+      throw new Error(o.cancellation_reason || o.meta_data?.reason || `Order not filled (state: ${o.state || "unknown"}) — likely insufficient balance/margin`);
+    }
+    return { orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, state: o.state, partial: filled < size };
   }
   if (broker === "coindcx") {
     const { apiKey, apiSecret } = sess.extra || {};
@@ -3435,17 +3457,23 @@ async function runAutoBuyEngine() {
         const sess = await sessionFromCred(st.userId, st.broker);
         if (!sess) { await db.updateRealStrategy(st.id, { lastError: "no stored credentials — reconnect broker" }); continue; }
 
+        // placeBuyOrder now THROWS on a rejected/unfilled order (caught below → recorded as a
+        // reject with reason, no position). Register the managed position at the ACTUAL fill
+        // quantity and price, so P&L reflects what really executed, not what we requested.
         const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product);
+        const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
+        const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : px;
         const pos = await registerManagedPosition({
-          sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry: px, market: st.market,
+          sess, symbol: st.symbol, brokerSym: st.brokerSym, qty: fillQty, entry: fillPx, market: st.market,
           sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product,
         });
-        await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: null });
+        await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled" });
         bought++;
-        console.log(`[autobuy] BOUGHT ${qty} ${st.symbol} for ${st.userId} via ${st.broker} — ${sig.reason} (order ${r.orderId})`);
+        console.log(`[autobuy] ${r.partial ? "PARTIAL" : "FILLED"} ${fillQty}/${qty} ${st.symbol} for ${st.userId} via ${st.broker} — ${sig.reason} (order ${r.orderId})`);
       } catch (e) {
-        await db.updateRealStrategy(st.id, { lastError: String(e.message || e) });
-        console.error(`[autobuy] ${st.symbol} (${st.broker}):`, e.message);
+        // Rejected / unfilled — record the reason and status, and do NOT open a position.
+        await db.updateRealStrategy(st.id, { lastError: String(e.message || e), lastOrderStatus: "rejected", lastRejectAt: Date.now() });
+        console.error(`[autobuy] REJECTED ${st.symbol} (${st.broker}):`, e.message);
       }
     }
   } catch (e) { console.error("[autobuy] sweep failed:", e.message); }
