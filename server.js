@@ -2297,8 +2297,10 @@ app.get("/api/broker/quotes", requireAuth, async (req, res) => {
    Used to run risk checks server-side before a live order. Returns { wallet, portfolio } or
    null if it can't be fetched (caller decides how to fail). Reuses the same broker endpoints
    the portfolio view uses. Has an overall timeout so a slow broker can't hang the order. */
+let lastAcctError = "";   // surfaced in the risk-check 503 so failures are diagnosable
 async function fetchBrokerAccount(sess) {
   const { broker, accessToken: token } = sess;
+  lastAcctError = "";
   const withTimeout = (p, ms = 6000) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("broker account fetch timed out")), ms))]);
   const clean = (sym) => String(sym || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
   try {
@@ -2332,7 +2334,7 @@ async function fetchBrokerAccount(sess) {
       let w = null;
       for (let attempt = 0; attempt < 2 && !w; attempt++) {
         try { w = await withTimeout(deltaCall("GET", "/v2/wallet/balances"), 8000); }
-        catch (e) { console.error(`[risk] delta wallet fetch attempt ${attempt + 1} failed:`, e.message); if (attempt === 0) await new Promise((r) => setTimeout(r, 700)); }
+        catch (e) { lastAcctError = `wallet: ${e.message}`; console.error(`[risk] delta wallet fetch attempt ${attempt + 1} failed:`, e.message); if (attempt === 0) await new Promise((r) => setTimeout(r, 700)); }
       }
       if (!w) return null;   // can't verify funds -> refuse (real money)
       const wallet = (w.result || []).reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
@@ -2355,6 +2357,7 @@ async function fetchBrokerAccount(sess) {
       return { wallet: cash ? Number(cash.balance) : 0, portfolio };
     }
   } catch (e) {
+    lastAcctError = e.message;
     console.error("[risk] broker account fetch failed:", e.message);
     return null;
   }
@@ -2502,7 +2505,7 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
     const rkMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
     const account = await fetchBrokerAccount(sess);
     if (!account) {
-      return res.status(503).json({ error: "Could not verify your account state with the broker to risk-check this order. Try again in a moment." });
+      return res.status(503).json({ error: "Could not verify your account state with the broker to risk-check this order. Try again in a moment." + (lastAcctError ? ` (${lastAcctError})` : "") });
     }
     const orderSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
     const rkTrades = await db.getTrades(storageKeyFor(sess.userId), 0, Date.now()).catch(() => []);
