@@ -3306,6 +3306,28 @@ app.post("/api/autoexit/cancel", async (req, res) => {
   await db.updateManagedPosition(id, { status: "cancelled", cancelledAt: Date.now() });
   res.json({ ok: true });
 });
+/* Arm an auto-exit (stop-loss / take-profit / trailing) on an EXISTING broker holding — the
+   one the user already owns, not one we just bought. Registers a managed position so the exit
+   engine watches it and places a reduce-only SELL when SL/TP is hit. Entry defaults to the
+   holding's average cost, so "SL 2%" means 2% below what they paid. Requires stored creds. */
+app.post("/api/autoexit/register", async (req, res) => {
+  try {
+    const userId = req.get("X-User-Id") || req.body.userId;
+    const { broker, symbol, brokerSym, qty, entry, market, sl, tp, tsl, product } = req.body || {};
+    if (!userId || !symbol || !brokerSym || !(Number(qty) > 0)) return res.status(400).json({ error: "userId, symbol, brokerSym and qty are required" });
+    if (!(Number(sl) > 0) && !(Number(tp) > 0) && !(Number(tsl) > 0)) return res.status(400).json({ error: "set at least one of stop-loss, take-profit or trailing-stop" });
+    const sess = await sessionFromCred(userId, broker);
+    if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
+    // Avoid arming two engines on the same instrument.
+    const existing = (await db.getManagedPositionsForUser(userId).catch(() => [])).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(brokerSym));
+    if (existing) { await db.updateManagedPosition(existing.id, { sl: sl || null, tp: tp || null, tsl: tsl || null, qty: Number(qty) }); return res.json({ ok: true, id: existing.id, updated: true }); }
+    const pos = await registerManagedPosition({
+      sess, symbol, brokerSym, qty: Number(qty), entry: Number(entry) || null, market: market || "Crypto",
+      sl: Number(sl) || null, tp: Number(tp) || null, tsl: Number(tsl) || null, product: product || "CNC",
+    });
+    res.json({ ok: true, id: pos.id });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
 app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", live: String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true", last: lastAutoExit }));
 
 /* ═══════════════════════ REAL-MONEY AUTO-BUY (opt-in per strategy) ═══════════════════════
