@@ -1628,10 +1628,12 @@ function putBrokerSession(userId, broker, accessToken, refreshToken = null, extr
   return id;
 }
 
-/** Resolve a session id to a live token, checking it belongs to this user. */
+/** Resolve a session id to a live token, checking it belongs to this user. Identity is taken
+    from the VERIFIED token (req.authUserId, set by requireAuth) — never from the spoofable
+    X-User-Id header. Falls back to the header only for legacy/non-authed read paths. */
 function getBrokerSession(req) {
   const id = req.get("X-Broker-Session");
-  const userId = req.get("X-User-Id");
+  const userId = req.authUserId ? storageKeyFor(req.authUserId) : req.get("X-User-Id");
   if (!id || !userId) return null;
   const s = brokerSessions.get(id);
   if (!s) return null;
@@ -1947,8 +1949,9 @@ app.get("/api/broker/login-url", (req, res) => {
 
 /* Step 2: exchange the short-lived request/auth code for an access token.
    This is the ONLY place the api_secret is used, and it never leaves the server. */
-app.post("/api/broker/session", async (req, res) => {
-  const { broker, requestToken, userId } = req.body || {};
+app.post("/api/broker/session", requireAuth, async (req, res) => {
+  const { broker, requestToken } = req.body || {};
+  const userId = storageKeyFor(req.authUserId);   // bind the session to the VERIFIED account
   const b = BROKERS[broker];
   if (!b) return res.status(400).json({ error: "unknown broker" });
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -2135,8 +2138,8 @@ app.post("/api/broker/session", async (req, res) => {
    reconnect. This is what makes a connection survive the app being closed on mobile or the
    free-tier server restarting: the browser keeps the broker id in localStorage, and on a dead
    session it calls this to mint a fresh session id from the stored creds. */
-app.post("/api/broker/resume", async (req, res) => {
-  const userId = req.get("X-User-Id") || (req.body && req.body.userId);
+app.post("/api/broker/resume", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
   const broker = req.body && req.body.broker;
   if (!userId || !broker) return res.status(400).json({ error: "userId and broker required" });
   try {
@@ -2172,7 +2175,7 @@ function brokerAuth(broker, token, userId) {
 /* REAL-TIME QUOTES. This is the point of the whole exercise: Yahoo is ~15 minutes
    delayed on NSE; a broker feed is live. Symbols arrive already in broker format
    (see domain/brokerSymbols.js) — the server does not guess at symbol names. */
-app.get("/api/broker/quotes", async (req, res) => {
+app.get("/api/broker/quotes", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   /* 401 = the session is genuinely gone (expired, or wiped by a server restart — sessions
      live in memory on the free tier). The client should reconnect. This is DISTINCT from a
@@ -2404,7 +2407,7 @@ async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct) {
 /* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
    the client must send X-Confirm-Live: yes. Two locks, because the failure mode
    here is real money moving without the user meaning it. */
-app.post("/api/broker/order", async (req, res) => {
+app.post("/api/broker/order", requireAuth, async (req, res) => {
   if (!TRADING_ENABLED) {
     return res.status(403).json({
       error: "Live trading is disabled on this server. Set BROKER_TRADING_ENABLED=true to allow real orders.",
@@ -2733,7 +2736,7 @@ const optMemo = async (k, ms, fn) => {
   return v;
 };
 
-app.get("/api/broker/optionchain", async (req, res) => {
+app.get("/api/broker/optionchain", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
   const { broker, accessToken: token } = sess;
@@ -2826,7 +2829,7 @@ app.get("/api/broker/optionchain", async (req, res) => {
   }
 });
 
-app.get("/api/broker/portfolio", async (req, res) => {
+app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
   const { broker, accessToken: token } = sess;
@@ -3087,7 +3090,7 @@ app.get("/api/broker/portfolio", async (req, res) => {
 });
 
 /** Drop a broker session (logout, or the user disconnecting). */
-app.post("/api/broker/logout", (req, res) => {
+app.post("/api/broker/logout", requireAuth, (req, res) => {
   const id = req.get("X-Broker-Session");
   if (id) brokerSessions.delete(id);
   res.json({ ok: true });
@@ -3317,16 +3320,15 @@ if (process.env.EXIT_MONITOR !== "off") {
 }
 
 /* The user's own managed positions (to show + cancel in the app). */
-app.get("/api/autoexit", async (req, res) => {
-  const userId = req.get("X-User-Id") || req.query.userId;
-  if (!userId) return res.status(400).json({ error: "userId required" });
+app.get("/api/autoexit", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
   const list = await db.getManagedPositionsForUser(userId).catch(() => []);
   res.json({ engineLive: String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true", last: lastAutoExit, positions: list });
 });
 /* Cancel auto-exit for a position (stops the engine watching it; does NOT touch the position
    at the broker). The user must own it. */
-app.post("/api/autoexit/cancel", async (req, res) => {
-  const userId = req.get("X-User-Id") || req.body.userId;
+app.post("/api/autoexit/cancel", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
   const { id } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
   const list = await db.getManagedPositionsForUser(userId).catch(() => []);
@@ -3339,9 +3341,9 @@ app.post("/api/autoexit/cancel", async (req, res) => {
    one the user already owns, not one we just bought. Registers a managed position so the exit
    engine watches it and places a reduce-only SELL when SL/TP is hit. Entry defaults to the
    holding's average cost, so "SL 2%" means 2% below what they paid. Requires stored creds. */
-app.post("/api/autoexit/register", async (req, res) => {
+app.post("/api/autoexit/register", requireAuth, async (req, res) => {
   try {
-    const userId = req.get("X-User-Id") || req.body.userId;
+    const userId = storageKeyFor(req.authUserId);
     const { broker, symbol, brokerSym, qty, entry, market, sl, tp, tsl, product } = req.body || {};
     if (!userId || !symbol || !brokerSym || !(Number(qty) > 0)) return res.status(400).json({ error: "userId, symbol, brokerSym and qty are required" });
     if (!(Number(sl) > 0) && !(Number(tp) > 0) && !(Number(tsl) > 0)) return res.status(400).json({ error: "set at least one of stop-loss, take-profit or trailing-stop" });
@@ -3504,7 +3506,7 @@ if (process.env.EXIT_MONITOR !== "off") {
 
 /* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
    the creds the engine will act with). Supported brokers only. */
-app.post("/api/autobuy/register", async (req, res) => {
+app.post("/api/autobuy/register", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "connect the broker first" });
   const b = sess.broker;
@@ -3528,8 +3530,8 @@ app.post("/api/autobuy/register", async (req, res) => {
     res.json({ ok: true, id: st.id, live: autoBuyLiveOn() });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
-app.post("/api/autobuy/pause", async (req, res) => {
-  const userId = req.get("X-User-Id") || req.body.userId;
+app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
   const { id, paused } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
   const mine = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
@@ -3537,8 +3539,8 @@ app.post("/api/autobuy/pause", async (req, res) => {
   await db.updateRealStrategy(id, { status: paused ? "paused" : "active" });
   res.json({ ok: true });
 });
-app.post("/api/autobuy/cancel", async (req, res) => {
-  const userId = req.get("X-User-Id") || req.body.userId;
+app.post("/api/autobuy/cancel", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
   const { id } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
   const mine = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
@@ -3552,9 +3554,8 @@ app.post("/api/autobuy/live", async (req, res) => {
   autoBuyLiveOverride = !!(req.body && req.body.on);
   res.json({ ok: true, live: autoBuyLiveOn() });
 });
-app.get("/api/autobuy", async (req, res) => {
-  const userId = req.get("X-User-Id") || req.query.userId;
-  if (!userId) return res.status(400).json({ error: "userId required" });
+app.get("/api/autobuy", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
   const list = (await db.getRealStrategiesForUser(userId).catch(() => [])).filter((s) => s.status !== "cancelled");
   // Enrich each with its open position's unrealised P&L (if it holds one right now).
   const managed = await db.getManagedPositionsForUser(userId).catch(() => []);
