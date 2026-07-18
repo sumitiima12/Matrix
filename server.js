@@ -3234,7 +3234,7 @@ let lastAutoExit = { at: null, checked: 0, exited: 0, live: false };
 async function runAutoExitEngine() {
   if (autoExitRunning) return;
   autoExitRunning = true;
-  const live = process.env.AUTO_EXIT_LIVE === "true";
+  const live = String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true";
   let checked = 0, exited = 0;
   try {
     const open = await db.getOpenManagedPositions(500);
@@ -3286,7 +3286,7 @@ app.get("/api/autoexit", async (req, res) => {
   const userId = req.get("X-User-Id") || req.query.userId;
   if (!userId) return res.status(400).json({ error: "userId required" });
   const list = await db.getManagedPositionsForUser(userId).catch(() => []);
-  res.json({ engineLive: process.env.AUTO_EXIT_LIVE === "true", last: lastAutoExit, positions: list });
+  res.json({ engineLive: String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true", last: lastAutoExit, positions: list });
 });
 /* Cancel auto-exit for a position (stops the engine watching it; does NOT touch the position
    at the broker). The user must own it. */
@@ -3300,7 +3300,7 @@ app.post("/api/autoexit/cancel", async (req, res) => {
   await db.updateManagedPosition(id, { status: "cancelled", cancelledAt: Date.now() });
   res.json({ ok: true });
 });
-app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", live: process.env.AUTO_EXIT_LIVE === "true", last: lastAutoExit }));
+app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", live: String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true", last: lastAutoExit }));
 
 /* ═══════════════════════ REAL-MONEY AUTO-BUY (opt-in per strategy) ═══════════════════════
    The biggest safety jump in the app: the server places a real ENTRY when a strategy's entry
@@ -3355,10 +3355,15 @@ async function placeBuyOrder(sess, symbol, qty, market, product) {
 
 let autoBuyRunning = false;
 let lastAutoBuy = { at: null, checked: 0, bought: 0, live: false };
+/* LIVE flag: the env var (case-insensitive — "TRUE"/"true"/"1" all count) OR a runtime admin
+   override toggled from the app. Override wins when set so the admin can flip it without a
+   redeploy; unset falls back to the env default. */
+let autoBuyLiveOverride = null;
+const autoBuyLiveOn = () => autoBuyLiveOverride != null ? autoBuyLiveOverride : /^(true|1|yes)$/i.test(String(process.env.AUTO_BUY_LIVE || ""));
 async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
   autoBuyRunning = true;
-  const live = process.env.AUTO_BUY_LIVE === "true";
+  const live = autoBuyLiveOn();
   let checked = 0, bought = 0;
   try {
     const strategies = await db.getActiveRealStrategies(500);
@@ -3446,7 +3451,7 @@ app.post("/api/autobuy/register", async (req, res) => {
       status: "active", createdAt: Date.now(), openPositionId: null,
     };
     await db.saveRealStrategy(st);
-    res.json({ ok: true, id: st.id, live: process.env.AUTO_BUY_LIVE === "true" });
+    res.json({ ok: true, id: st.id, live: autoBuyLiveOn() });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 app.post("/api/autobuy/pause", async (req, res) => {
@@ -3467,11 +3472,26 @@ app.post("/api/autobuy/cancel", async (req, res) => {
   await db.updateRealStrategy(id, { status: "cancelled" });
   res.json({ ok: true });
 });
+/* Admin flips the whole auto-buy engine LIVE / dry-run at runtime (no redeploy). */
+app.post("/api/autobuy/live", async (req, res) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: "admin only" });
+  autoBuyLiveOverride = !!(req.body && req.body.on);
+  res.json({ ok: true, live: autoBuyLiveOn() });
+});
 app.get("/api/autobuy", async (req, res) => {
   const userId = req.get("X-User-Id") || req.query.userId;
   if (!userId) return res.status(400).json({ error: "userId required" });
   const list = (await db.getRealStrategiesForUser(userId).catch(() => [])).filter((s) => s.status !== "cancelled");
-  res.json({ engineLive: process.env.AUTO_BUY_LIVE === "true", last: lastAutoBuy, strategies: list });
+  // Enrich each with its open position's unrealised P&L (if it holds one right now).
+  const managed = await db.getManagedPositionsForUser(userId).catch(() => []);
+  const enriched = await Promise.all(list.map(async (s) => {
+    const pos = s.openPositionId ? managed.find((p) => p.id === s.openPositionId && (p.status === "open" || p.status === "closing")) : null;
+    if (!pos || !(pos.entry > 0)) return { ...s, inPosition: false, livePnl: 0 };
+    let px = null; try { px = await liveMarkForOrder(pos.brokerSym || s.brokerSym, s.market); } catch { px = null; }
+    const livePnl = px ? +(((px - pos.entry) * (pos.qty || 0))).toFixed(2) : 0;
+    return { ...s, inPosition: true, livePnl };
+  }));
+  res.json({ engineLive: autoBuyLiveOn(), last: lastAutoBuy, strategies: enriched });
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
