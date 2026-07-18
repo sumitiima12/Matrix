@@ -2334,7 +2334,13 @@ async function fetchBrokerAccount(sess) {
       let w = null;
       for (let attempt = 0; attempt < 2 && !w; attempt++) {
         try { w = await withTimeout(deltaCall("GET", "/v2/wallet/balances"), 8000); }
-        catch (e) { lastAcctError = `wallet: ${e.message}`; console.error(`[risk] delta wallet fetch attempt ${attempt + 1} failed:`, e.message); if (attempt === 0) await new Promise((r) => setTimeout(r, 700)); }
+        catch (e) {
+          // undici wraps the real reason (DNS/connection/TLS) in e.cause — surface it.
+          const cause = e && e.cause ? (e.cause.code || e.cause.message || String(e.cause)) : "";
+          lastAcctError = `wallet: ${e.message}${cause ? " / " + cause : ""}`;
+          console.error(`[risk] delta wallet fetch attempt ${attempt + 1} failed:`, e.message, cause);
+          if (attempt === 0) await new Promise((r) => setTimeout(r, 700));
+        }
       }
       if (!w) return null;   // can't verify funds -> refuse (real money)
       const wallet = (w.result || []).reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
