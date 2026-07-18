@@ -3490,12 +3490,22 @@ app.get("/api/autobuy", async (req, res) => {
   const list = (await db.getRealStrategiesForUser(userId).catch(() => [])).filter((s) => s.status !== "cancelled");
   // Enrich each with its open position's unrealised P&L (if it holds one right now).
   const managed = await db.getManagedPositionsForUser(userId).catch(() => []);
+  const openPos = managed.filter((p) => p.status === "open" || p.status === "closing");
   const enriched = await Promise.all(list.map(async (s) => {
-    const pos = s.openPositionId ? managed.find((p) => p.id === s.openPositionId && (p.status === "open" || p.status === "closing")) : null;
+    // Primary link: the position id the engine stamped on the strategy when it bought.
+    let pos = s.openPositionId ? openPos.find((p) => String(p.id) === String(s.openPositionId)) : null;
+    // Fallback: the order can fill on the exchange while the strategy↔position link fails to
+    // save (a DB hiccup right after the Delta order). Without this the card is stuck on
+    // "waiting for signal" even though a real position is open. Match the strategy's own
+    // instrument so live P&L still shows, and self-heal the link for next time.
+    if (!pos) {
+      pos = openPos.find((p) => String(p.brokerSym || "") === String(s.brokerSym || "") && (p.market || "") === (s.market || "") && Number(p.entry) > 0);
+      if (pos) db.updateRealStrategy(s.id, { openPositionId: pos.id }).catch(() => {});
+    }
     if (!pos || !(pos.entry > 0)) return { ...s, inPosition: false, livePnl: 0 };
     let px = null; try { px = await liveMarkForOrder(pos.brokerSym || s.brokerSym, s.market); } catch { px = null; }
     const livePnl = px ? +(((px - pos.entry) * (pos.qty || 0))).toFixed(2) : 0;
-    return { ...s, inPosition: true, livePnl };
+    return { ...s, inPosition: true, livePnl, entryPrice: pos.entry, positionQty: pos.qty };
   }));
   res.json({ engineLive: autoBuyLiveOn(), last: lastAutoBuy, strategies: enriched });
 });
