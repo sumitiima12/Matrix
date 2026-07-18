@@ -2328,13 +2328,22 @@ async function fetchBrokerAccount(sess) {
       return { wallet: Number(wallet) || 0, portfolio: [...bySym.values()] };
     }
     if (broker === "delta") {
-      const [w, pos] = await withTimeout(Promise.all([
-        deltaCall("GET", "/v2/wallet/balances"),
-        deltaCall("GET", "/v2/positions/margined"),
-      ]));
+      // WALLET is essential (funds check) — try it, with one retry, before giving up.
+      let w = null;
+      for (let attempt = 0; attempt < 2 && !w; attempt++) {
+        try { w = await withTimeout(deltaCall("GET", "/v2/wallet/balances"), 8000); }
+        catch (e) { console.error(`[risk] delta wallet fetch attempt ${attempt + 1} failed:`, e.message); if (attempt === 0) await new Promise((r) => setTimeout(r, 700)); }
+      }
+      if (!w) return null;   // can't verify funds -> refuse (real money)
       const wallet = (w.result || []).reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
-      const portfolio = (pos.result || []).filter((x) => Number(x.size) !== 0)
-        .map((x) => ({ sym: x.product_symbol || (x.product && x.product.symbol) || null, qty: Number(x.size), avg: x.entry_price != null ? Number(x.entry_price) : null, price: x.mark_price != null ? Number(x.mark_price) : null, market: "Crypto" }));
+      // POSITIONS are only used for the "already holding" checks — if that endpoint is flaky,
+      // don't block the whole order; proceed with an empty position list.
+      let portfolio = [];
+      try {
+        const pos = await withTimeout(deltaCall("GET", "/v2/positions/margined"), 8000);
+        portfolio = (pos.result || []).filter((x) => Number(x.size) !== 0)
+          .map((x) => ({ sym: x.product_symbol || (x.product && x.product.symbol) || null, qty: Number(x.size), avg: x.entry_price != null ? Number(x.entry_price) : null, price: x.mark_price != null ? Number(x.mark_price) : null, market: "Crypto" }));
+      } catch (e) { console.error("[risk] delta positions fetch failed (non-fatal):", e.message); }
       return { wallet, portfolio };
     }
     if (broker === "coindcx") {
