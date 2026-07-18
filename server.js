@@ -3670,19 +3670,16 @@ app.get("/api/autobuy", softAuth, async (req, res) => {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-/* FAIL FAST in production on missing/weak critical secrets (audit P1-12). A random per-boot
-   JWT secret silently logs everyone out on restart and hides misconfiguration; a missing
-   CRED_KEY weakens broker-credential encryption. In production we refuse to start rather than
-   run insecurely. In dev we only warn. */
+/* WARN on missing/weak critical secrets (audit P1-12). A random per-boot JWT secret silently
+   logs everyone out on restart; a missing CRED_KEY weakens broker-credential encryption. We log
+   loudly but DO NOT exit — crashing the whole service (and taking down real prices + trading) is
+   worse than running with a warning. Set these in production; the warning tells you to. */
 (function guardSecrets() {
-  const prod = process.env.NODE_ENV === "production";
   const problems = [];
   if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).length < 16) problems.push("JWT_SECRET (set a long, stable random string)");
   if (!process.env.CRED_KEY || String(process.env.CRED_KEY).length < 16) problems.push("CRED_KEY (broker-credential encryption key)");
   if (!problems.length) return;
-  const msg = "Missing/weak critical secrets: " + problems.join(", ");
-  if (prod) { console.error("[startup] FATAL — " + msg + ". Refusing to start in production."); process.exit(1); }
-  console.warn("[startup] WARNING — " + msg + ". OK for dev; MUST be set in production.");
+  console.warn("[startup] WARNING — missing/weak critical secrets: " + problems.join(", ") + ". Set these in production for secure sessions + credential encryption.");
 })();
 
 app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
