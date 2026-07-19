@@ -620,6 +620,18 @@ const tagOf = (title) => {
   return hit ? hit.tag : null;
 };
 
+/* Yahoo's search returns loosely-related (often WRONG) news — EICHERMOT was showing IBM/Nvidia.
+   Keep an item ONLY if it's genuinely about the symbol: its relatedTickers include the ticker,
+   or the ticker appears as a whole word in the headline. Better to show fewer, correct stories. */
+function symBase(s) { return String(s || "").replace(/\.(NS|BO|NSE|BSE)$/i, "").toUpperCase(); }
+function newsRelevant(a, sym) {
+  const base = symBase(sym);
+  if (!base) return false;
+  const rt = (a.relatedTickers || []).map(symBase);
+  if (rt.includes(base)) return true;
+  try { if (base.length >= 3 && new RegExp(`(^|[^A-Za-z0-9])${base}([^A-Za-z0-9]|$)`).test(String(a.title || "").toUpperCase())) return true; } catch { /* bad regex char */ }
+  return false;
+}
 app.get("/api/news/feed", async (req, res) => {
   const syms = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 12);
   const onlyTagged = String(req.query.tagged || "") === "1";
@@ -629,9 +641,9 @@ app.get("/api/news/feed", async (req, res) => {
     const per = await Promise.all(syms.map(async (sym) => {
       try {
         const items = await memo(`nf:${sym}`, 300_000, async () => {
-          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(sym)}&newsCount=6&quotesCount=0`;
+          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(sym)}&newsCount=12&quotesCount=0`;
           const d = await j(u);
-          return (d.news || []).map((a) => ({
+          return (d.news || []).filter((a) => newsRelevant(a, sym)).map((a) => ({
             sym,
             t: a.title,
             d: a.providerPublishTime ? a.providerPublishTime * 1000 : null,
@@ -1007,8 +1019,8 @@ app.get("/api/news", async (req, res) => {
         return (d.articles || []).map((a) => ({ t: a.title, d: a.publishedAt, src: a.source?.name, url: a.url }));
       }
       // Fallback: Yahoo search news
-      const d = await j(`${YF}/v1/finance/search?q=${encodeURIComponent(symbol)}&newsCount=8&quotesCount=0`);
-      return (d.news || []).map((n) => ({ t: n.title, d: new Date(n.providerPublishTime * 1000).toISOString(), src: n.publisher, url: n.link }));
+      const d = await j(`${YF}/v1/finance/search?q=${encodeURIComponent(symbol)}&newsCount=12&quotesCount=0`);
+      return (d.news || []).filter((n) => newsRelevant(n, symbol)).map((n) => ({ t: n.title, d: new Date(n.providerPublishTime * 1000).toISOString(), src: n.publisher, url: n.link }));
     });
     res.json({ symbol, news: items });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
@@ -1023,24 +1035,31 @@ app.get("/api/news", async (req, res) => {
    so those just come back { unavailable:true } and the UI shows "—".                        */
 const Y_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
 let _yAuth = { crumb: null, cookie: null, at: 0 };
-function collectCookies(resp) {
+/* Accumulate Set-Cookie across requests into a name->value jar (last write wins), so we send
+   the SAME cookies to getcrumb AND quoteSummary — a crumb only validates against its own cookies. */
+function mergeCookies(jar, resp) {
   try {
     const arr = typeof resp.headers.getSetCookie === "function"
       ? resp.headers.getSetCookie()
       : (resp.headers.get("set-cookie") ? [resp.headers.get("set-cookie")] : []);
-    return arr.map((c) => c.split(";")[0]).filter(Boolean).join("; ");
-  } catch { return ""; }
+    for (const c of arr) { const nv = c.split(";")[0]; const i = nv.indexOf("="); if (i > 0) jar.set(nv.slice(0, i).trim(), nv.slice(i + 1).trim()); }
+  } catch { /* ignore */ }
 }
+const jarString = (jar) => [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 async function yahooAuth() {
   if (_yAuth.crumb && (Date.now() - _yAuth.at) < 30 * 60 * 1000) return _yAuth;
-  let cookie = "";
-  for (const u of ["https://fc.yahoo.com/", "https://finance.yahoo.com/"]) {
-    try { const c = await fetch(u, { headers: { "User-Agent": Y_UA, Accept: "text/html" }, redirect: "follow" }); cookie = collectCookies(c) || cookie; if (cookie) break; } catch { /* try next */ }
+  const headers = { "User-Agent": Y_UA, "Accept": "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.9" };
+  const jar = new Map();
+  // A1/A3 consent cookies come from the finance host; hit both, MERGE all cookies (don't stop early).
+  for (const u of ["https://finance.yahoo.com/quote/AAPL", "https://fc.yahoo.com/"]) {
+    try { mergeCookies(jar, await fetch(u, { headers, redirect: "follow" })); } catch { /* try next */ }
   }
-  const r = await fetch("https://query1.finance.yahoo.com/v1/test/getcrumb", { headers: { "User-Agent": Y_UA, Cookie: cookie, Accept: "text/plain" } });
+  const cookie = jarString(jar);
+  const r = await fetch("https://query1.finance.yahoo.com/v1/test/getcrumb", { headers: { ...headers, Cookie: cookie, Accept: "text/plain" } });
+  mergeCookies(jar, r);                                   // getcrumb may refresh cookies too
   const crumb = (await r.text()).trim();
-  if (!crumb || crumb.length > 40 || /<html/i.test(crumb)) throw new Error("crumb fetch failed");
-  _yAuth = { crumb, cookie, at: Date.now() };
+  if (!crumb || crumb.length > 40 || /[<>]|error|unauthor/i.test(crumb)) throw new Error("crumb fetch failed (" + r.status + ")");
+  _yAuth = { crumb, cookie: jarString(jar), at: Date.now() };
   return _yAuth;
 }
 const yNum = (x) => (x && typeof x === "object" && "raw" in x ? x.raw : (typeof x === "number" ? x : null));
