@@ -1147,13 +1147,20 @@ async function indianApiFundamentals(symbol) {
   if (!r.ok) throw new Error("indianapi " + r.status);
   const d = await r.json();
   if (!d || !d.companyName) throw new Error("indianapi empty");
-  const peers = (d.companyProfile && d.companyProfile.peerCompanyList) || [];
-  const self = peers.find((p) => String(p.tickerId) === String(d.tickerId)) ||
-               peers.find((p) => String(p.companyName || "").toLowerCase() === String(d.companyName || "").toLowerCase()) || peers[0] || {};
-  const roe = pickNum(self, ["returnOnAverageEquity5YearAverage", "returnOnAverageEquityTrailing12Month", "roe"]);
-  const npm = pickNum(self, ["netProfitMargin5YearAverage", "netProfitMarginPercentTrailing12Month", "netProfitMargin"]);
-  const div = pickNum(self, ["dividendYieldIndicatedAnnualDividend", "dividendYield"]);
-  const mcapCr = pickNum(self, ["marketCap"]);
+  // The company's OWN metrics live in keyMetrics (bucketed {key,value} arrays) + stockDetailsReusableData.
+  // (peerCompanyList is COMPETITORS with 0-filled ratios — do not use it for the subject company.)
+  const km = {};
+  for (const bucket of Object.values(d.keyMetrics || {})) if (Array.isArray(bucket)) for (const it of bucket) if (it && it.key != null) km[it.key] = it.value;
+  const sd = d.stockDetailsReusableData || {};
+  const pk = (keys) => { for (const k of keys) { const v = km[k] != null ? km[k] : sd[k]; if (v != null && v !== "" && !isNaN(+v)) return +v; } return null; };
+  const mcapCr = pk(["marketCap"]);
+  const roe = pk(["returnOnAverageEquityTrailing12Month", "returnOnAverageEquity5YearAverage"]);
+  const npm = pk(["netProfitMarginPercentTrailing12Month", "netProfitMargin5YearAverage"]);
+  const opm = pk(["operatingMarginTrailing12Month", "operatingMargin5YearAverage"]);
+  const revG = pk(["revenueChangePercentTTMPOverTTM", "revenueGrowthRate5Year", "growthRatePercentRevenue3Year"]);
+  const epsG = pk(["ePSChangePercentTTMOverTTM", "ePSGrowthRate5Year"]);
+  const de = pk(["totalDebtPerTotalEquityMostRecentQuarter", "totalDebtPerTotalEquityMostRecentFiscalYear"]);
+  const dy = pk(["currentDividendYieldCommonStockPrimaryIssueLTM", "dividendYieldIndicatedAnnualDividendDividedByClosingprice", "dividendYield5YearAverage"]);
   return {
     symbol,
     name: d.companyName,
@@ -1161,18 +1168,21 @@ async function indianApiFundamentals(symbol) {
     sector: (d.companyProfile && d.companyProfile.mgSector) || d.industry || null,
     industry: d.industry || (d.companyProfile && d.companyProfile.mgIndustry) || null,
     marketCap: mcapCr != null ? mcapCr * 1e7 : null,                 // ₹ crore -> ₹ absolute
-    peTrailing: pickNum(self, ["priceToEarningsValueRatio", "ttmPe", "priceToEarnings"]),
+    peTrailing: pk(["pPerEBasicExcludingExtraordinaryItemsTTM", "pPerEIncludingExtraordinaryItemsTTM", "pPerENormalizedMostRecentFiscalYear"]),
     peForward: null,
-    pb: pickNum(self, ["priceToBookValueRatio", "priceToBook"]),
-    eps: null,
+    pb: pk(["priceToBookMostRecentQuarter", "priceToBookMostRecentFiscalYear"]),
+    eps: pk(["ePSIncludingExtraOrdinaryItemsTrailing12Month"]),
     roe: roe != null ? roe / 100 : null,                            // % -> fraction
     profitMargin: npm != null ? npm / 100 : null,
-    operatingMargin: null,
-    revenueGrowth: null, earningsGrowth: null,
-    debtToEquity: null,
-    dividendYield: div != null ? div / 100 : null,
-    beta: null,
-    high52: pickNum(d, ["yearHigh"]), low52: pickNum(d, ["yearLow"]),
+    operatingMargin: opm != null ? opm / 100 : null,
+    revenueGrowth: revG != null ? revG / 100 : null,
+    earningsGrowth: epsG != null ? epsG / 100 : null,
+    debtToEquity: de != null ? de * 100 : null,                     // ratio 0.07 -> 7 (match Yahoo %)
+    dividendYield: dy != null ? dy / 100 : null,
+    beta: pk(["beta"]),
+    high52: d.yearHigh != null ? +d.yearHigh : pk(["yhigh"]),
+    low52: d.yearLow != null ? +d.yearLow : pk(["ylow"]),
+    sectorPE: pk(["sectorPriceToEarningsValueRatio"]),
     src: "indianapi",
   };
 }
