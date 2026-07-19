@@ -783,8 +783,31 @@ function yahooToFyers(ySym) {
    signature), so this works out of the box with no configuration — it just gives crypto
    prices from Delta instead of Yahoo. "BTC-USD" -> Delta's "BTCUSD" perpetual. */
 function yahooToDelta(ySym) {
-  const m = String(ySym || "").match(/^([A-Z0-9]+)-USD$/);
-  return m ? `${m[1]}USD` : null;
+  /* Accept every shape the app might send for a crypto quote and normalise to Delta's
+     "<COIN>USD" perpetual, so crypto prices come from DELTA and never silently fall back to
+     Yahoo on a format mismatch:
+       BTC-USD  (yahoo)      -> BTCUSD
+       BTCUSDT  (binance fmt)-> BTCUSD
+       BTCUSD   (broker fmt) -> BTCUSD   <-- the frontend was sending this; the old regex missed it */
+  const s = String(ySym || "").toUpperCase().replace(/\.P$/, "");
+  let m = s.match(/^([A-Z0-9]+)-USDT?$/); if (m) return `${m[1]}USD`;
+  m = s.match(/^([A-Z0-9]+?)USDT$/);      if (m) return `${m[1]}USD`;
+  m = s.match(/^([A-Z0-9]+?)USD$/);       if (m) return `${m[1]}USD`;
+  return null;
+}
+/* Best-effort crypto symbol -> Delta perpetual, INCLUDING a bare coin ("LAB" -> "LABUSD").
+   Only used as a LAST-RESORT candle fallback (after Yahoo returns nothing), so a non-crypto
+   symbol that slips through just 404s on Delta and yields no candles — never a wrong instrument. */
+function deltaPerpFromAny(sym) {
+  const d = yahooToDelta(sym);
+  if (d) return d;
+  const s = String(sym || "").toUpperCase().replace(/\.P$/, "");
+  return /^[A-Z0-9]{2,15}$/.test(s) ? `${s}USD` : null;
+}
+/* Yahoo interval -> Delta candle resolution (Delta speaks 1m/5m/15m/30m/1h/2h/4h/1d/1w/30d…). */
+function deltaResolution(interval) {
+  const map = { "1m": "1m", "2m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1h", "1h": "1h", "90m": "1h", "1d": "1d", "1wk": "1w", "1mo": "30d" };
+  return map[String(interval)] || "1d";
 }
 async function deltaHouseQuotes(ySyms) {
   const pairs = ySyms.map((y) => [y, yahooToDelta(y)]).filter(([, d]) => d);
@@ -957,7 +980,17 @@ app.get("/api/history", async (req, res) => {
         o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
       })).filter((d) => d.c != null);
     }
-    res.json({ symbol, candles });
+    // LAST RESORT: Delta's own candles. Yahoo doesn't list smaller Delta tokens (LAB, EVAA, …),
+    // so their chart came back empty ("No price history"). Delta HAS them — pull directly.
+    if (!candles || !candles.length) {
+      const dsym = deltaPerpFromAny(symbol);
+      if (dsym) {
+        try {
+          candles = await memo(`dch:${dsym}:${range}:${interval}`, 60_000, () => deltaCandles(dsym, deltaResolution(interval), range));
+        } catch (e) { /* leave candles empty; UI shows 'unavailable' */ }
+      }
+    }
+    res.json({ symbol, candles: candles || [] });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
 
@@ -1589,6 +1622,9 @@ app.get("/api/diag/delta", async (_req, res) => {
       out.proxyProbe = probe;
     } catch (e) { out.proxyProbe = { error: e.message }; }
   }
+  /* Render's DIRECT outbound IP (NOT through the proxy). THIS is the "trading server / algo source
+     IP" to unblock in AlgoIP — the IP Render connects to the proxy FROM. */
+  try { const dr = await T(fetch("https://api.ipify.org?format=json"), 8000); out.directOutboundIp = (await dr.json()).ip; } catch (e) { out.directOutboundIp = "unknown (" + (e && e.message) + ")"; }
   // The IP Delta sees for signed calls = this server's outbound IP (via the proxy if configured).
   // Whitelist THIS on your Delta API key — not your phone's IP.
   try { const ir = await T(pfetch("https://api.ipify.org?format=json", deltaDispatcher ? { dispatcher: deltaDispatcher } : {})); out.serverOutboundIp = (await ir.json()).ip; } catch (e) { out.serverOutboundIp = "unknown (" + (e && e.message) + ")"; }
