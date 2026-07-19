@@ -1014,6 +1014,75 @@ app.get("/api/news", async (req, res) => {
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
 });
 
+/* ---------------------------- /api/fundamentals ----------------------------
+   Yahoo quoteSummary carries the real fundamentals (P/E, ROE, margins, market cap,
+   revenue/earnings growth, debt, 52w range). It now requires a CRUMB + COOKIE handshake,
+   which is why it 401'd before. Flow: (1) hit Yahoo to get a session cookie, (2) fetch a
+   crumb with that cookie, (3) call quoteSummary with crumb+cookie. Cached 6h — fundamentals
+   barely move and this keeps us well under Yahoo's rate limits. Crypto has no fundamentals,
+   so those just come back { unavailable:true } and the UI shows "—".                        */
+const Y_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
+let _yAuth = { crumb: null, cookie: null, at: 0 };
+function collectCookies(resp) {
+  try {
+    const arr = typeof resp.headers.getSetCookie === "function"
+      ? resp.headers.getSetCookie()
+      : (resp.headers.get("set-cookie") ? [resp.headers.get("set-cookie")] : []);
+    return arr.map((c) => c.split(";")[0]).filter(Boolean).join("; ");
+  } catch { return ""; }
+}
+async function yahooAuth() {
+  if (_yAuth.crumb && (Date.now() - _yAuth.at) < 30 * 60 * 1000) return _yAuth;
+  let cookie = "";
+  for (const u of ["https://fc.yahoo.com/", "https://finance.yahoo.com/"]) {
+    try { const c = await fetch(u, { headers: { "User-Agent": Y_UA, Accept: "text/html" }, redirect: "follow" }); cookie = collectCookies(c) || cookie; if (cookie) break; } catch { /* try next */ }
+  }
+  const r = await fetch("https://query1.finance.yahoo.com/v1/test/getcrumb", { headers: { "User-Agent": Y_UA, Cookie: cookie, Accept: "text/plain" } });
+  const crumb = (await r.text()).trim();
+  if (!crumb || crumb.length > 40 || /<html/i.test(crumb)) throw new Error("crumb fetch failed");
+  _yAuth = { crumb, cookie, at: Date.now() };
+  return _yAuth;
+}
+const yNum = (x) => (x && typeof x === "object" && "raw" in x ? x.raw : (typeof x === "number" ? x : null));
+async function yahooFundamentals(symbol) {
+  const { crumb, cookie } = await yahooAuth();
+  const mods = "price,summaryDetail,defaultKeyStatistics,financialData,summaryProfile";
+  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${mods}&crumb=${encodeURIComponent(crumb)}`;
+  const r = await fetch(url, { headers: { "User-Agent": Y_UA, Cookie: cookie, Accept: "application/json" } });
+  if (!r.ok) { if (r.status === 401 || r.status === 403) _yAuth = { crumb: null, cookie: null, at: 0 }; throw new Error("quoteSummary " + r.status); }
+  const res = (await r.json())?.quoteSummary?.result?.[0];
+  if (!res) throw new Error("no result");
+  const pr = res.price || {}, sd = res.summaryDetail || {}, ks = res.defaultKeyStatistics || {}, fd = res.financialData || {}, prof = res.summaryProfile || {};
+  return {
+    symbol,
+    name: pr.longName || pr.shortName || symbol,
+    currency: pr.currency || null,
+    sector: prof.sector || null, industry: prof.industry || null,
+    marketCap: yNum(pr.marketCap) ?? yNum(sd.marketCap),
+    peTrailing: yNum(sd.trailingPE) ?? yNum(ks.trailingPE),
+    peForward: yNum(sd.forwardPE) ?? yNum(ks.forwardPE),
+    pb: yNum(ks.priceToBook),
+    eps: yNum(ks.trailingEps),
+    roe: yNum(fd.returnOnEquity),
+    profitMargin: yNum(fd.profitMargins) ?? yNum(ks.profitMargins),
+    operatingMargin: yNum(fd.operatingMargins),
+    revenueGrowth: yNum(fd.revenueGrowth),
+    earningsGrowth: yNum(fd.earningsGrowth),
+    debtToEquity: yNum(fd.debtToEquity),
+    dividendYield: yNum(sd.dividendYield),
+    beta: yNum(sd.beta) ?? yNum(ks.beta),
+    high52: yNum(sd.fiftyTwoWeekHigh), low52: yNum(sd.fiftyTwoWeekLow),
+  };
+}
+app.get("/api/fundamentals", async (req, res) => {
+  const symbol = String(req.query.symbol || "").trim();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  try {
+    const data = await memo(`fund:${symbol}`, 6 * 3600 * 1000, () => yahooFundamentals(symbol));
+    res.json(data);
+  } catch (e) { res.json({ symbol, unavailable: true, error: String(e.message) }); }
+});
+
 /* ======================= SERVER-SIDE EXIT MONITOR =========================
    Runs on the server every minute, so a target/stop is honoured even when nobody
    has the app open. Walks REAL 5-minute candles forward from the entry time and
