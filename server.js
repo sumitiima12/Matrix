@@ -703,9 +703,12 @@ function makeProxyDispatcher(url) {
            it does Happy Eyeballs. `autoSelectFamily` makes undici race v4/v6 like curl.
        (2) US->Mumbai proxy handshake can exceed undici's default 10s connect timeout on a cold
            socket, so give it more room. */
+    /* Force IPv4 to the proxy. Render has IPv4 egress but not reliable IPv6; if undici tries the
+       host's AAAA record it hangs -> ETIMEDOUT, while curl (Happy Eyeballs) falls back to v4.
+       The proxy host has an A record (curl reaches it), so pinning family:4 removes the ambiguity. */
     const opts = {
       uri: `${u.protocol}//${u.host}`,
-      connect: { timeout: 20000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 3000 },
+      connect: { timeout: 20000, family: 4 },
     };
     if (u.username || u.password) {
       const cred = Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64");
@@ -1562,6 +1565,30 @@ app.get("/api/diag/delta", async (_req, res) => {
   const T = (p, ms = 18000) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error("timed out")), ms))]);
   const cap = (e) => ({ ok: false, error: e && e.message, cause: e && e.cause ? (e.cause.code || e.cause.message || String(e.cause)) : undefined });
   const out = { base: DELTA_BASE, proxyConfigured: Boolean(deltaDispatcher) };
+  /* Raw reachability probe of the proxy itself — tells us whether Render can even open a TCP
+     socket to the proxy host (independent of undici / auth). If dns resolves but tcp4 fails,
+     the proxy is dropping our IP (AlgoIP client-IP allowlist) rather than a code/tunnel bug. */
+  const proxyUrl = process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY || "";
+  if (proxyUrl) {
+    try {
+      const dns = require("dns").promises; const net = require("net");
+      const pu = new URL(proxyUrl);
+      const port = Number(pu.port) || (pu.protocol === "https:" ? 443 : 80);
+      const probe = { host: pu.hostname, port };
+      try { probe.a = await T(dns.resolve4(pu.hostname), 5000); } catch (e) { probe.a = "err: " + e.message; }
+      try { probe.aaaa = await T(dns.resolve6(pu.hostname), 5000); } catch (e) { probe.aaaa = "none"; }
+      probe.tcp4 = await new Promise((resolve) => {
+        const t0 = Date.now();
+        const s = net.connect({ host: Array.isArray(probe.a) ? probe.a[0] : pu.hostname, port, family: 4 });
+        const done = (v) => { try { s.destroy(); } catch { /* noop */ } resolve(v); };
+        s.setTimeout(10000);
+        s.on("connect", () => done({ ok: true, ms: Date.now() - t0 }));
+        s.on("timeout", () => done({ ok: false, error: "tcp timeout", ms: Date.now() - t0 }));
+        s.on("error", (e) => done({ ok: false, error: e.code || e.message, ms: Date.now() - t0 }));
+      });
+      out.proxyProbe = probe;
+    } catch (e) { out.proxyProbe = { error: e.message }; }
+  }
   // The IP Delta sees for signed calls = this server's outbound IP (via the proxy if configured).
   // Whitelist THIS on your Delta API key — not your phone's IP.
   try { const ir = await T(pfetch("https://api.ipify.org?format=json", deltaDispatcher ? { dispatcher: deltaDispatcher } : {})); out.serverOutboundIp = (await ir.json()).ip; } catch (e) { out.serverOutboundIp = "unknown (" + (e && e.message) + ")"; }
