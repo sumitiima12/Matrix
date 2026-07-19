@@ -1093,13 +1093,55 @@ async function yahooFundamentals(symbol) {
     high52: yNum(sd.fiftyTwoWeekHigh), low52: yNum(sd.fiftyTwoWeekLow),
   };
 }
+/* Financial Modeling Prep — reliable fundamentals from a real API (Yahoo blocks datacenter IPs).
+   Free key at financialmodelingprep.com; set FMP_API_KEY on Render. FMP's free tier is strongest
+   for US tickers; NSE/BSE (.NS/.BO) coverage can need a paid plan, in which case we fall back to
+   Yahoo (and then to "unavailable"). Values are normalised to the same shape as the Yahoo path. */
+async function fmpFundamentals(symbol) {
+  const key = process.env.FMP_API_KEY;
+  if (!key) throw new Error("no FMP key");
+  const base = "https://financialmodelingprep.com/api/v3";
+  const one = (x) => (Array.isArray(x) ? x[0] : (x && x[0])) || null;
+  const [prof, ratios, growth] = await Promise.all([
+    j(`${base}/profile/${encodeURIComponent(symbol)}?apikey=${key}`).catch(() => null),
+    j(`${base}/ratios-ttm/${encodeURIComponent(symbol)}?apikey=${key}`).catch(() => null),
+    j(`${base}/financial-growth/${encodeURIComponent(symbol)}?apikey=${key}&limit=1`).catch(() => null),
+  ]);
+  const p = one(prof), r = one(ratios), g = one(growth);
+  if (!p && !r) throw new Error("FMP empty");
+  return {
+    symbol,
+    name: (p && p.companyName) || symbol,
+    currency: (p && p.currency) || null,
+    sector: (p && p.sector) || null, industry: (p && p.industry) || null,
+    marketCap: p ? p.mktCap : null,
+    peTrailing: r ? r.peRatioTTM : null,
+    peForward: null,
+    pb: r ? r.priceToBookRatioTTM : null,
+    eps: null,
+    roe: r ? r.returnOnEquityTTM : null,                       // fraction (0.18)
+    profitMargin: r ? r.netProfitMarginTTM : null,             // fraction
+    operatingMargin: r ? r.operatingProfitMarginTTM : null,    // fraction
+    revenueGrowth: g ? g.revenueGrowth : null,                 // fraction
+    earningsGrowth: g ? g.epsgrowth : null,
+    debtToEquity: r && r.debtEquityRatioTTM != null ? r.debtEquityRatioTTM * 100 : null,  // ->% to match Yahoo
+    dividendYield: r ? (r.dividendYielTTM != null ? r.dividendYielTTM : r.dividendYieldTTM) : null,  // FMP field is misspelled
+    beta: p ? p.beta : null,
+    high52: null, low52: null,
+    src: "fmp",
+  };
+}
+const _fundCache = new Map();   // success-only cache; failures are NOT cached so we keep retrying
 app.get("/api/fundamentals", async (req, res) => {
   const symbol = String(req.query.symbol || "").trim();
   if (!symbol) return res.status(400).json({ error: "symbol required" });
-  try {
-    const data = await memo(`fund:${symbol}`, 6 * 3600 * 1000, () => yahooFundamentals(symbol));
-    res.json(data);
-  } catch (e) { res.json({ symbol, unavailable: true, error: String(e.message) }); }
+  const hit = _fundCache.get(symbol);
+  if (hit && (Date.now() - hit.at) < 6 * 3600 * 1000) return res.json(hit.data);
+  let data = null, err = "";
+  if (process.env.FMP_API_KEY) { try { data = await fmpFundamentals(symbol); } catch (e) { err = "fmp:" + e.message; } }
+  if (!data) { try { data = await yahooFundamentals(symbol); } catch (e) { err += " yahoo:" + e.message; } }
+  if (data) { _fundCache.set(symbol, { data, at: Date.now() }); return res.json(data); }
+  res.json({ symbol, unavailable: true, error: err.trim() });
 });
 
 /* ======================= SERVER-SIDE EXIT MONITOR =========================
