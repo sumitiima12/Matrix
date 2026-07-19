@@ -1131,14 +1131,68 @@ async function fmpFundamentals(symbol) {
     src: "fmp",
   };
 }
+/* indianapi.in — the India source for NSE/BSE fundamentals. Free tier base is stock.indianapi.in,
+   auth via X-Api-Key. /stock?name=<ticker> returns companyProfile.peerCompanyList where the
+   company's OWN row carries P/E, P/B, market cap (₹ crore), ROE %, net-profit-margin %, div yield.
+   Field names vary slightly, so we probe several. Set INDIANAPI_KEY on Render. */
+function pickNum(obj, keys) {
+  for (const k of keys) { const v = obj && obj[k]; if (v != null && v !== "" && !isNaN(+v)) return +v; }
+  return null;
+}
+async function indianApiFundamentals(symbol) {
+  const key = process.env.INDIANAPI_KEY;
+  if (!key) throw new Error("no INDIANAPI key");
+  const base = String(symbol).replace(/\.(NS|BO|NSE|BSE)$/i, "");
+  const r = await fetch(`https://stock.indianapi.in/stock?name=${encodeURIComponent(base)}`, { headers: { "X-Api-Key": key, Accept: "application/json" } });
+  if (!r.ok) throw new Error("indianapi " + r.status);
+  const d = await r.json();
+  if (!d || !d.companyName) throw new Error("indianapi empty");
+  const peers = (d.companyProfile && d.companyProfile.peerCompanyList) || [];
+  const self = peers.find((p) => String(p.tickerId) === String(d.tickerId)) ||
+               peers.find((p) => String(p.companyName || "").toLowerCase() === String(d.companyName || "").toLowerCase()) || peers[0] || {};
+  const roe = pickNum(self, ["returnOnAverageEquity5YearAverage", "returnOnAverageEquityTrailing12Month", "roe"]);
+  const npm = pickNum(self, ["netProfitMargin5YearAverage", "netProfitMarginPercentTrailing12Month", "netProfitMargin"]);
+  const div = pickNum(self, ["dividendYieldIndicatedAnnualDividend", "dividendYield"]);
+  const mcapCr = pickNum(self, ["marketCap"]);
+  return {
+    symbol,
+    name: d.companyName,
+    currency: "INR",
+    sector: (d.companyProfile && d.companyProfile.mgSector) || d.industry || null,
+    industry: d.industry || (d.companyProfile && d.companyProfile.mgIndustry) || null,
+    marketCap: mcapCr != null ? mcapCr * 1e7 : null,                 // ₹ crore -> ₹ absolute
+    peTrailing: pickNum(self, ["priceToEarningsValueRatio", "ttmPe", "priceToEarnings"]),
+    peForward: null,
+    pb: pickNum(self, ["priceToBookValueRatio", "priceToBook"]),
+    eps: null,
+    roe: roe != null ? roe / 100 : null,                            // % -> fraction
+    profitMargin: npm != null ? npm / 100 : null,
+    operatingMargin: null,
+    revenueGrowth: null, earningsGrowth: null,
+    debtToEquity: null,
+    dividendYield: div != null ? div / 100 : null,
+    beta: null,
+    high52: pickNum(d, ["yearHigh"]), low52: pickNum(d, ["yearLow"]),
+    src: "indianapi",
+  };
+}
 const _fundCache = new Map();   // success-only cache; failures are NOT cached so we keep retrying
 app.get("/api/fundamentals", async (req, res) => {
   const symbol = String(req.query.symbol || "").trim();
   if (!symbol) return res.status(400).json({ error: "symbol required" });
+  if (req.query.raw === "1") {   // debug: see the raw indianapi payload to verify field mapping
+    try { const base = symbol.replace(/\.(NS|BO)$/i, ""); const rr = await fetch(`https://stock.indianapi.in/stock?name=${encodeURIComponent(base)}`, { headers: { "X-Api-Key": process.env.INDIANAPI_KEY || "", Accept: "application/json" } }); return res.json(await rr.json()); }
+    catch (e) { return res.json({ error: String(e.message) }); }
+  }
   const hit = _fundCache.get(symbol);
   if (hit && (Date.now() - hit.at) < 6 * 3600 * 1000) return res.json(hit.data);
+  const isIndian = /\.(NS|BO)$/i.test(symbol);
   let data = null, err = "";
-  if (process.env.FMP_API_KEY) { try { data = await fmpFundamentals(symbol); } catch (e) { err = "fmp:" + e.message; } }
+  if (isIndian) {
+    if (process.env.INDIANAPI_KEY) { try { data = await indianApiFundamentals(symbol); } catch (e) { err = "indianapi:" + e.message; } }
+  } else {
+    if (process.env.FMP_API_KEY) { try { data = await fmpFundamentals(symbol); } catch (e) { err = "fmp:" + e.message; } }
+  }
   if (!data) { try { data = await yahooFundamentals(symbol); } catch (e) { err += " yahoo:" + e.message; } }
   if (data) { _fundCache.set(symbol, { data, at: Date.now() }); return res.json(data); }
   res.json({ symbol, unavailable: true, error: err.trim() });
