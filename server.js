@@ -697,7 +697,16 @@ function makeProxyDispatcher(url) {
   try {
     const { ProxyAgent } = _undici;
     const u = new URL(url);
-    const opts = { uri: `${u.protocol}//${u.host}` };
+    /* connect options for the socket TO THE PROXY. Two things bit us on Render:
+       (1) IPv6 trap: if the proxy host has an AAAA record, undici tries IPv6 first, but Render
+           has no IPv6 egress, so the SYN times out (ETIMEDOUT) — while `curl` succeeds because
+           it does Happy Eyeballs. `autoSelectFamily` makes undici race v4/v6 like curl.
+       (2) US->Mumbai proxy handshake can exceed undici's default 10s connect timeout on a cold
+           socket, so give it more room. */
+    const opts = {
+      uri: `${u.protocol}//${u.host}`,
+      connect: { timeout: 20000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 3000 },
+    };
     if (u.username || u.password) {
       const cred = Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64");
       opts.token = `Basic ${cred}`;
@@ -1550,7 +1559,7 @@ app.get("/api/health", (req, res) => {
 /* Delta reachability probe. Tells us EXACTLY where signed Delta calls break — public feed vs
    signed-via-proxy — without leaking any balance/keys. Open on purpose (no secrets in output). */
 app.get("/api/diag/delta", async (_req, res) => {
-  const T = (p, ms = 8000) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error("timed out")), ms))]);
+  const T = (p, ms = 18000) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error("timed out")), ms))]);
   const cap = (e) => ({ ok: false, error: e && e.message, cause: e && e.cause ? (e.cause.code || e.cause.message || String(e.cause)) : undefined });
   const out = { base: DELTA_BASE, proxyConfigured: Boolean(deltaDispatcher) };
   // The IP Delta sees for signed calls = this server's outbound IP (via the proxy if configured).
