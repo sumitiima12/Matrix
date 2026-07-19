@@ -625,9 +625,16 @@ const tagOf = (title) => {
    or the ticker appears as a whole word in the headline. Better to show fewer, correct stories. */
 function symBase(s) { return String(s || "").replace(/\.(NS|BO|NSE|BSE)$/i, "").toUpperCase(); }
 function newsRelevant(a, sym) {
+  const full = String(sym || "").toUpperCase();
   const base = symBase(sym);
   if (!base) return false;
-  const rt = (a.relatedTickers || []).map(symBase);
+  const rt = (a.relatedTickers || []).map((x) => String(x).toUpperCase());
+  if (/\.(NS|BO)$/i.test(full)) {
+    // INDIAN ticker: an app symbol like "HAL" collides with a US ticker (Halliburton). Require the
+    // EXACT exchange-qualified ticker in relatedTickers so we never show the US namesake's news.
+    return rt.includes(full) || rt.includes(base + ".NS") || rt.includes(base + ".BO");
+  }
+  // US / crypto: relatedTickers base match, or the ticker as a whole word in the headline.
   if (rt.includes(base)) return true;
   try { if (base.length >= 3 && new RegExp(`(^|[^A-Za-z0-9])${base}([^A-Za-z0-9]|$)`).test(String(a.title || "").toUpperCase())) return true; } catch { /* bad regex char */ }
   return false;
@@ -641,7 +648,7 @@ app.get("/api/news/feed", async (req, res) => {
     const per = await Promise.all(syms.map(async (sym) => {
       try {
         const items = await memo(`nf:${sym}`, 300_000, async () => {
-          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(sym)}&newsCount=12&quotesCount=0`;
+          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symBase(sym))}&newsCount=12&quotesCount=0`;
           const d = await j(u);
           return (d.news || []).filter((a) => newsRelevant(a, sym)).map((a) => ({
             sym,
@@ -1019,7 +1026,7 @@ app.get("/api/news", async (req, res) => {
         return (d.articles || []).map((a) => ({ t: a.title, d: a.publishedAt, src: a.source?.name, url: a.url }));
       }
       // Fallback: Yahoo search news
-      const d = await j(`${YF}/v1/finance/search?q=${encodeURIComponent(symbol)}&newsCount=12&quotesCount=0`);
+      const d = await j(`${YF}/v1/finance/search?q=${encodeURIComponent(symBase(symbol))}&newsCount=12&quotesCount=0`);
       return (d.news || []).filter((n) => newsRelevant(n, symbol)).map((n) => ({ t: n.title, d: new Date(n.providerPublishTime * 1000).toISOString(), src: n.publisher, url: n.link }));
     });
     res.json({ symbol, news: items });
