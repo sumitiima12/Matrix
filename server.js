@@ -2564,7 +2564,8 @@ app.post("/api/broker/app-creds", requireAuth, async (req, res) => {
    or connect brokers until the admin explicitly turns it on. Admins are never gated by these. */
 const MARKETS = ["IN", "US", "Crypto", "Commodity"];
 const DEFAULT_APP_SETTINGS = {
-  allowRealMode: false,
+  // Per-market, like allowBrokerConnect: may non-admins switch to REAL trading on this market?
+  allowRealMode: MARKETS.reduce((o, m) => { o[m] = false; return o; }, {}),
   allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = false; return o; }, {}),
   // Virtual (paper) trading, split into Indian exchanges (IN + Commodity/MCX, SEBI-regulated) and
   // Global (US + Crypto). BOTH default OFF — SEBI forbids paper trading on live NSE prices, and we
@@ -2575,8 +2576,13 @@ function mergeAppSettings(stored) {
   const s = stored || {};
   const abc = (s.allowBrokerConnect && typeof s.allowBrokerConnect === "object") ? s.allowBrokerConnect : {};
   const av = (s.allowVirtual && typeof s.allowVirtual === "object") ? s.allowVirtual : {};
+  // Back-compat: allowRealMode used to be a single boolean. If we see a boolean, apply it to every
+  // market; otherwise read it per-market.
+  const armRaw = s.allowRealMode;
+  const armObj = (armRaw && typeof armRaw === "object") ? armRaw : null;
+  const armBool = typeof armRaw === "boolean" ? armRaw : false;
   return {
-    allowRealMode: Boolean(s.allowRealMode),
+    allowRealMode: MARKETS.reduce((o, m) => { o[m] = armObj ? Boolean(armObj[m]) : armBool; return o; }, {}),
     allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = Boolean(abc[m]); return o; }, {}),
     allowVirtual: { IN: Boolean(av.IN), Global: Boolean(av.Global) },
   };
