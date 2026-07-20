@@ -702,6 +702,26 @@ function newsRelevant(a, sym) {
   if (rt.includes(base)) return true;
   return titleHit(3);
 }
+/* Whole-word match of a company NAME or ticker BASE inside a headline/description. NewsAPI tags
+   stories by company name ("Intel", "Reliance"), not the ticker, so a raw keyword search on the
+   symbol returns unrelated stories — this is what strictly limits results to the actual company.
+   Multi-word names also match on their distinctive first word (Reliance Industries -> "Reliance"). */
+function newsTextMatch(text, name, base) {
+  const T = String(text || "").toUpperCase();
+  const cands = new Set();
+  if (name) {
+    const nm = String(name).trim().toUpperCase();
+    if (nm.length >= 3) cands.add(nm);
+    const first = nm.split(/\s+/)[0];
+    if (first && first.length >= 4) cands.add(first);   // distinctive first word only (skip "THE", "HDFC" is 4+)
+  }
+  if (base && base.length >= 3) cands.add(String(base).toUpperCase());
+  for (const c of cands) {
+    try { if (new RegExp(`(^|[^A-Za-z0-9])${c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9]|$)`).test(T)) return true; }
+    catch { /* skip bad pattern */ }
+  }
+  return false;
+}
 app.get("/api/news/feed", async (req, res) => {
   const syms = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 30);
   const onlyTagged = String(req.query.tagged || "") === "1";
@@ -1124,17 +1144,28 @@ app.post("/api/pattern-scan", async (req, res) => {
 // e.g. /api/news?symbol=RELIANCE.NS  (Yahoo) — swap for NewsAPI if NEWS_API_KEY set
 app.get("/api/news", async (req, res) => {
   const symbol = String(req.query.symbol || req.query.q || "").trim();
+  const name = String(req.query.name || "").trim();
   if (!symbol) return res.status(400).json({ error: "symbol/q required" });
+  const base = symBase(symbol);
   try {
-    const items = await memo(`n:${symbol}`, 120_000, async () => {
+    const items = await memo(`n:${symbol}:${name}`, 120_000, async () => {
       if (process.env.NEWS_API_KEY) {
-        const u = `https://newsapi.org/v2/everything?q=${encodeURIComponent(symbol)}&sortBy=publishedAt&pageSize=8&apiKey=${process.env.NEWS_API_KEY}`;
+        // Query by the COMPANY NAME (quoted for an exact phrase) so NewsAPI returns that company's
+        // stories, then STRICTLY filter to headlines/descriptions that actually name it — a raw
+        // symbol keyword search was what pulled in random, unrelated news.
+        const q = name ? `"${name}"` : base;
+        const u = `https://newsapi.org/v2/everything?q=${encodeURIComponent(q)}&language=en&sortBy=publishedAt&pageSize=20&apiKey=${process.env.NEWS_API_KEY}`;
         const d = await j(u);
-        return (d.articles || []).map((a) => ({ t: a.title, d: a.publishedAt, src: a.source?.name, url: a.url }));
+        return (d.articles || [])
+          .filter((a) => newsTextMatch(`${a.title || ""} ${a.description || ""}`, name, base))
+          .slice(0, 8)
+          .map((a) => ({ t: a.title, d: a.publishedAt, src: a.source?.name, url: a.url }));
       }
-      // Fallback: Yahoo search news
-      const d = await j(`${YF}/v1/finance/search?q=${encodeURIComponent(symBase(symbol))}&newsCount=12&quotesCount=0`);
-      return (d.news || []).filter((n) => newsRelevant(n, symbol)).map((n) => ({ t: n.title, d: new Date(n.providerPublishTime * 1000).toISOString(), src: n.publisher, url: n.link }));
+      // Fallback: Yahoo search news — filtered by relatedTickers/ticker, and now also by the name.
+      const d = await j(`${YF}/v1/finance/search?q=${encodeURIComponent(name || base)}&newsCount=12&quotesCount=0`);
+      return (d.news || [])
+        .filter((n) => newsRelevant(n, symbol) || newsTextMatch(n.title, name, base))
+        .map((n) => ({ t: n.title, d: new Date(n.providerPublishTime * 1000).toISOString(), src: n.publisher, url: n.link }));
     });
     res.json({ symbol, news: items });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
