@@ -1214,33 +1214,41 @@ async function yahooFundamentals(symbol) {
 async function fmpFundamentals(symbol) {
   const key = process.env.FMP_API_KEY;
   if (!key) throw new Error("no FMP key");
-  const base = "https://financialmodelingprep.com/api/v3";
-  const one = (x) => (Array.isArray(x) ? x[0] : (x && x[0])) || null;
+  const sym = encodeURIComponent(symbol);
+  /* FMP migrated to the /stable/ API — the legacy /api/v3/ endpoints return empty for keys issued
+     after the change (which is why "FMP empty" showed even with a valid key). Stable uses a
+     ?symbol=X query instead of a path param, and renamed several ratio fields, so we probe a few
+     name variants per metric to survive both stable and any lingering v3 responses. */
+  const base = "https://financialmodelingprep.com/stable";
+  const one = (x) => (Array.isArray(x) ? x[0] : (x && typeof x === "object" && !x["Error Message"] ? x : null)) || null;
   const [prof, ratios, growth] = await Promise.all([
-    j(`${base}/profile/${encodeURIComponent(symbol)}?apikey=${key}`).catch(() => null),
-    j(`${base}/ratios-ttm/${encodeURIComponent(symbol)}?apikey=${key}`).catch(() => null),
-    j(`${base}/financial-growth/${encodeURIComponent(symbol)}?apikey=${key}&limit=1`).catch(() => null),
+    j(`${base}/profile?symbol=${sym}&apikey=${key}`).catch(() => null),
+    j(`${base}/ratios-ttm?symbol=${sym}&apikey=${key}`).catch(() => null),
+    j(`${base}/financial-growth?symbol=${sym}&limit=1&apikey=${key}`).catch(() => null),
   ]);
   const p = one(prof), r = one(ratios), g = one(growth);
   if (!p && !r) throw new Error("FMP empty");
+  const num = (o, keys) => { for (const k of keys) { const v = o && o[k]; if (v != null && v !== "" && !isNaN(+v)) return +v; } return null; };
+  const de = num(r, ["debtToEquityRatioTTM", "debtEquityRatioTTM", "debtToEquityTTM"]);
+  const dy = num(r, ["dividendYieldTTM", "dividendYielTTM"]);
   return {
     symbol,
-    name: (p && p.companyName) || symbol,
+    name: (p && (p.companyName || p.name)) || symbol,
     currency: (p && p.currency) || null,
     sector: (p && p.sector) || null, industry: (p && p.industry) || null,
-    marketCap: p ? p.mktCap : null,
-    peTrailing: r ? r.peRatioTTM : null,
+    marketCap: num(p, ["marketCap", "mktCap"]),
+    peTrailing: num(r, ["priceToEarningsRatioTTM", "peRatioTTM", "priceEarningsRatioTTM"]),
     peForward: null,
-    pb: r ? r.priceToBookRatioTTM : null,
-    eps: null,
-    roe: r ? r.returnOnEquityTTM : null,                       // fraction (0.18)
-    profitMargin: r ? r.netProfitMarginTTM : null,             // fraction
-    operatingMargin: r ? r.operatingProfitMarginTTM : null,    // fraction
-    revenueGrowth: g ? g.revenueGrowth : null,                 // fraction
-    earningsGrowth: g ? g.epsgrowth : null,
-    debtToEquity: r && r.debtEquityRatioTTM != null ? r.debtEquityRatioTTM * 100 : null,  // ->% to match Yahoo
-    dividendYield: r ? (r.dividendYielTTM != null ? r.dividendYielTTM : r.dividendYieldTTM) : null,  // FMP field is misspelled
-    beta: p ? p.beta : null,
+    pb: num(r, ["priceToBookRatioTTM", "pbRatioTTM", "priceToBookTTM"]),
+    eps: num(p, ["eps"]),
+    roe: num(r, ["returnOnEquityTTM"]),                          // fraction (0.18)
+    profitMargin: num(r, ["netProfitMarginTTM", "netIncomeMarginTTM"]),          // fraction
+    operatingMargin: num(r, ["operatingProfitMarginTTM", "operatingMarginTTM"]), // fraction
+    revenueGrowth: num(g, ["revenueGrowth"]),                   // fraction
+    earningsGrowth: num(g, ["epsgrowth", "epsGrowth", "growthEPS"]),
+    debtToEquity: de != null ? de * 100 : null,                 // ->% to match Yahoo
+    dividendYield: dy,                                          // fraction
+    beta: num(p, ["beta"]),
     high52: null, low52: null,
     src: "fmp",
   };
