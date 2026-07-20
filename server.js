@@ -3975,10 +3975,33 @@ async function runAutoExitEngine() {
   autoExitRunning = true;
   const live = String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true";
   let checked = 0, exited = 0;
+  let reconciled = 0;
   try {
     const open = await db.getOpenManagedPositions(500);
+
+    /* RECONCILE (display-truth): fetch Delta's ACTUAL open positions once. Any managed Delta
+       position whose symbol Delta reports as FLAT (size 0 / absent) was closed outside the app
+       — a manual close in the Delta app, or Delta's own bracket SL/TP. Mark it closed so the
+       phantom "in position" P&L disappears from the dashboard. Only acts when we could actually
+       read Delta (deltaHeld !== null); on any fetch error we leave positions untouched. */
+    let deltaHeld = null;
+    if (open.some((p) => p.broker === "delta")) {
+      try {
+        const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined"), 8000);
+        deltaHeld = new Set((pr && pr.result || [])
+          .filter((x) => Number(x.size) !== 0)
+          .map((x) => String(x.product_symbol || (x.product && x.product.symbol) || "")));
+      } catch { deltaHeld = null; }
+    }
+
     for (const pos of open) {
       if (pos.status === "closing") continue;         // already being handled
+      // Broker says this position is gone -> reconcile it closed and skip the exit check.
+      if (pos.broker === "delta" && deltaHeld && !deltaHeld.has(String(pos.brokerSym))) {
+        await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — closed on Delta" });
+        reconciled++;
+        continue;
+      }
       checked++;
       try {
         const range = pos.interval === "1d" ? "6mo" : "1mo";
@@ -4013,7 +4036,7 @@ async function runAutoExitEngine() {
       }
     }
   } catch (e) { console.error("[autoexit] sweep failed:", e.message); }
-  finally { autoExitRunning = false; lastAutoExit = { at: Date.now(), checked, exited, live }; }
+  finally { autoExitRunning = false; lastAutoExit = { at: Date.now(), checked, exited, reconciled, live }; }
 }
 if (process.env.EXIT_MONITOR !== "off") {
   setInterval(runAutoExitEngine, 60_000);
