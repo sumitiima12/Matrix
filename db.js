@@ -37,6 +37,9 @@ async function initDb() {
     phone TEXT PRIMARY KEY, pin TEXT NOT NULL, name TEXT, created_at BIGINT)`);
   // `blocked` added after launch — ALTER is idempotent, so existing DBs pick it up.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE`);
+  // `approved` — admin must approve a new signup before it can do anything. DEFAULT TRUE so
+  // EXISTING accounts stay usable; createUser inserts FALSE for genuinely new signups.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT TRUE`);
   // Security-question recovery (set at signup). Answer is bcrypt-hashed, never plaintext.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sec_question TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sec_answer TEXT`);
@@ -154,8 +157,19 @@ async function getTrades(userId, from, to) {
 
 /* --------------------------------- users --------------------------------- */
 async function getUser(phone) {
-  if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by, email, last_login, created_at FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) { row.referredBy = row.referred_by; row.lastLogin = row.last_login ? Number(row.last_login) : null; row.createdAt = row.created_at ? Number(row.created_at) : null; } return row || null; }
+  if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by, email, last_login, created_at, blocked, approved FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) { row.referredBy = row.referred_by; row.lastLogin = row.last_login ? Number(row.last_login) : null; row.createdAt = row.created_at ? Number(row.created_at) : null; } return row || null; }
   return readJSON(FILES.users)[phone] || null;
+}
+// Approve (or un-approve) a pending signup.
+async function setUserApproved(phone, approved) {
+  if (USING_PG) { await pool.query(`UPDATE users SET approved=$2 WHERE phone=$1`, [phone, !!approved]); return; }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].approved = !!approved; writeJSON(FILES.users, users); }
+}
+// Accounts awaiting approval, for the admin console.
+async function listPendingUsers(limit = 200) {
+  if (USING_PG) { const r = await pool.query(`SELECT phone, name, username, created_at FROM users WHERE approved IS NOT TRUE ORDER BY created_at DESC LIMIT $1`, [limit]); return r.rows.map((u) => ({ phone: u.phone, name: u.name, username: u.username, createdAt: u.created_at ? Number(u.created_at) : null })); }
+  return Object.entries(readJSON(FILES.users)).filter(([, u]) => u.approved !== true).map(([phone, u]) => ({ phone, name: u.name, username: u.username, createdAt: u.createdAt || null })).slice(0, limit);
 }
 
 /* Set (or change) a user's email. Free-form; validated at the route. */
@@ -218,16 +232,16 @@ async function updateSecurityQuestion(phone, secQuestion, secAnswerHash) {
   const users = readJSON(FILES.users);
   if (users[phone]) { users[phone].secQuestion = secQuestion; users[phone].secAnswer = secAnswerHash; writeJSON(FILES.users, users); }
 }
-async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHash = null, username = null, referredBy = null) {
+async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHash = null, username = null, referredBy = null, approved = false) {
   if (USING_PG) {
     await pool.query(
-      `INSERT INTO users (phone, pin, name, created_at, sec_question, sec_answer, username, referred_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [phone, pinHash, name, Date.now(), secQuestion, secAnswerHash, username, referredBy]
+      `INSERT INTO users (phone, pin, name, created_at, sec_question, sec_answer, username, referred_by, approved) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [phone, pinHash, name, Date.now(), secQuestion, secAnswerHash, username, referredBy, !!approved]
     );
     return;
   }
   const users = readJSON(FILES.users);
-  users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null, username: username || null, referredBy: referredBy || null };
+  users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null, username: username || null, referredBy: referredBy || null, approved: !!approved };
   writeJSON(FILES.users, users);
 }
 
@@ -608,4 +622,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

@@ -174,12 +174,23 @@ app.post("/api/register", authLimiter, async (req, res) => {
     let referredBy = null;
     const refRaw = cleanUsername(req.body && req.body.referralCode);
     if (refRaw && typeof db.getUserByUsername === "function" && await db.getUserByUsername(refRaw)) referredBy = refRaw;
-    await db.createUser(phone, hashPin(pin), name, secQuestion || null, answerHash, username, referredBy);
+    // Admins are auto-approved; everyone else starts PENDING and needs admin approval before login.
+    const autoApprove = isAdminPhone(phone);
+    await db.createUser(phone, hashPin(pin), name, secQuestion || null, answerHash, username, referredBy, autoApprove);
     if (email && typeof db.setEmail === "function") { try { await db.setEmail(phone, email); } catch { email = ""; } }
-    if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
-    res.json({ ok: true, userId: phone, name, username, referredBy, email: email || null, createdAt: Date.now(), token: signToken(phone) });
+    if (autoApprove) {
+      if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
+      return res.json({ ok: true, userId: phone, name, username, referredBy, email: email || null, createdAt: Date.now(), token: signToken(phone) });
+    }
+    // Pending: NO token is issued, so the client shows a "waiting for approval" screen.
+    res.json({ ok: true, pending: true, userId: phone, name, username, message: "Account created. An admin will review and activate it shortly." });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+/* Is this phone one of the configured admins? Admins bypass the approval gate. */
+function isAdminPhone(phone) {
+  const ids = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => stripPh(x.trim())).filter(Boolean);
+  return ids.includes(stripPh(phone));
+}
 
 app.post("/api/login", authLimiter, async (req, res) => {
   try {
@@ -193,6 +204,10 @@ app.post("/api/login", authLimiter, async (req, res) => {
     // Blocked users are turned away even with a correct PIN.
     if (typeof db.isUserBlocked === "function" && await db.isUserBlocked(phone)) {
       return res.status(403).json({ error: "This account has been blocked. Contact support." });
+    }
+    // Un-approved (pending) signups can't enter until an admin activates them. Admins bypass.
+    if (u.approved !== true && !isAdminPhone(phone)) {
+      return res.status(403).json({ pending: true, error: "Your account is awaiting admin approval." });
     }
 
     /* Upgrade a legacy SHA-256 user to bcrypt now that we've verified their PIN. Best-effort:
@@ -467,6 +482,24 @@ app.post("/api/admin/block", async (req, res) => {
     if (!phone) return res.status(400).json({ error: "phone required" });
     await db.setUserBlocked(phone, blocked);
     res.json({ ok: true, phone, blocked });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Accounts awaiting approval.
+app.get("/api/admin/pending-users", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try { res.json({ users: typeof db.listPendingUsers === "function" ? await db.listPendingUsers() : [] }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Approve (activate) or un-approve a signup.
+app.post("/api/admin/approve", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    const approved = req.body && req.body.approved === false ? false : true;
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    await db.setUserApproved(phone, approved);
+    res.json({ ok: true, phone, approved });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1979,6 +2012,61 @@ app.post("/api/ask", async (req, res) => {
   res.status(502).json({ error: errors.join(" | ") });
 });
 
+/* AI STRATEGY INTERPRETER — turns any plain-English rule into executable conditions.
+   The deterministic parser (frontend) is the fast path; when it can't fully read a prompt, the
+   app calls this. We prompt the LLM to output STRICT JSON in the engine's own condition grammar,
+   then validate every field against the known operands/ops so a hallucinated rule can't slip in. */
+const AI_STRAT_SYS = `You convert a trader's plain-English strategy into JSON the trading engine can run. Output ONLY compact JSON, no prose, no markdown, shaped exactly:
+{"entry":[cond,...],"exit":[cond,...],"defs":[def,...]}
+A cond is {"la":LEFT,"op":OP,"b":RIGHT,"bType":"num"|"ind","gate":"AND"|"OR"?}. gate is omitted on the first cond in a list.
+OP is one of: ">","<",">=","<=","crosses_above","crosses_below".
+bType "num" means RIGHT is a number as a string (e.g. "50"). bType "ind" means RIGHT is another operand name.
+LEFT/RIGHT operands you may use:
+- "Price", "Volume", "Support", "Resistance"
+- "RSI","ADX","CCI","VWAP" (indicators; add a matching def)
+- "MACD.line","MACD.signal","MACD.hist"
+- "BB.upper","BB.middle","BB.lower"
+- "EMA<n>" / "SMA<n>" e.g. "EMA50","SMA200" (add a def with that name)
+- "CC.open","CC.high","CC.low","CC.close" (current candle), "PC.open".. (previous candle)
+- Chart patterns as a boolean operand compared > 0: "PAT:cup-handle","PAT:double-bottom","PAT:double-top","PAT:head-shoulders","PAT:inv-head-shoulders","PAT:asc-triangle","PAT:desc-triangle","PAT:sym-triangle","PAT:bull-flag","PAT:bear-flag","PAT:rising-wedge","PAT:falling-wedge","PAT:rectangle"
+A def is {"type":"RSI"|"EMA"|"SMA"|"MACD"|"BB"|"ADX"|"CCI"|"VWAP"|"Stoch"|"DMI"|"CurrentCandle"|"PrevCandle","len":"14","name":"RSI"}. Only add defs for operands that need them (RSI/EMA/SMA/BB/ADX/CCI/MACD/candles). Support/Resistance/Price/Volume/PAT: need NO def.
+Examples:
+"buy when a cup and handle forms" -> {"entry":[{"la":"PAT:cup-handle","op":">","b":"0","bType":"num"}],"exit":[],"defs":[]}
+"buy when price bounces from support and rsi above 50" -> {"entry":[{"la":"Price","op":">","b":"Support","bType":"ind"},{"la":"RSI","op":">","b":"50","bType":"num","gate":"AND"}],"exit":[],"defs":[{"type":"RSI","len":"14","name":"RSI"}]}
+"sell when rsi crosses above 80" -> {"entry":[],"exit":[{"la":"RSI","op":"crosses_above","b":"80","bType":"num"}],"defs":[{"type":"RSI","len":"14","name":"RSI"}]}
+If a part is genuinely impossible to express, omit it. Never invent operands outside the list above.`;
+
+const AI_OPS = new Set([">", "<", ">=", "<=", "crosses_above", "crosses_below"]);
+function sanitizeAiConds(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.filter((c) => c && typeof c.la === "string" && AI_OPS.has(c.op) && c.b != null)
+    .map((c, i) => {
+      const cond = { la: c.la, op: c.op, b: String(c.b), bType: c.bType === "ind" ? "ind" : "num" };
+      if (i > 0) cond.gate = c.gate === "OR" ? "OR" : "AND";
+      return cond;
+    }).slice(0, 8);
+}
+app.post("/api/ai/strategy", async (req, res) => {
+  const text = String((req.body && req.body.text) || "").slice(0, 500);
+  if (!text.trim()) return res.status(400).json({ error: "text required" });
+  const chain = providers();
+  if (!chain.length) return res.status(500).json({ error: "no LLM configured" });
+  const withTimeout = (p, ms, l) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error(`${l}: timeout`)), ms))]);
+  for (const p of chain) {
+    try {
+      const out = await withTimeout(p.fn(AI_STRAT_SYS, [{ role: "user", content: text }], 500), 8000, p.name);
+      const m = String(out || "").match(/\{[\s\S]*\}/);   // strip any stray prose/markdown
+      if (!m) continue;
+      const parsed = JSON.parse(m[0]);
+      const entry = sanitizeAiConds(parsed.entry);
+      const exit = sanitizeAiConds(parsed.exit);
+      const defs = Array.isArray(parsed.defs) ? parsed.defs.filter((d) => d && d.type && d.name).slice(0, 8) : [];
+      if (entry.length || exit.length) return res.json({ entry, exit, defs, engine: "Neo" });
+    } catch (e) { console.error("[ai/strategy]", p.name, e.message); }
+  }
+  res.status(502).json({ error: "couldn't interpret" });
+});
+
 
 /* ═══════════════════════════ BROKER INTEGRATION ═══════════════════════════
    Real-time market data (and, if explicitly enabled, real orders) from Zerodha
@@ -2418,13 +2506,19 @@ const MARKETS = ["IN", "US", "Crypto", "Commodity"];
 const DEFAULT_APP_SETTINGS = {
   allowRealMode: false,
   allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = false; return o; }, {}),
+  // Virtual (paper) trading, split into Indian exchanges (IN + Commodity/MCX, SEBI-regulated) and
+  // Global (US + Crypto). BOTH default OFF — SEBI forbids paper trading on live NSE prices, and we
+  // keep the global one off by default too so it's an explicit admin opt-in.
+  allowVirtual: { IN: false, Global: false },
 };
 function mergeAppSettings(stored) {
   const s = stored || {};
   const abc = (s.allowBrokerConnect && typeof s.allowBrokerConnect === "object") ? s.allowBrokerConnect : {};
+  const av = (s.allowVirtual && typeof s.allowVirtual === "object") ? s.allowVirtual : {};
   return {
     allowRealMode: Boolean(s.allowRealMode),
     allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = Boolean(abc[m]); return o; }, {}),
+    allowVirtual: { IN: Boolean(av.IN), Global: Boolean(av.Global) },
   };
 }
 
