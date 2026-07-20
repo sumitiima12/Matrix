@@ -692,7 +692,7 @@ function newsRelevant(a, sym) {
   return titleHit(3);
 }
 app.get("/api/news/feed", async (req, res) => {
-  const syms = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 12);
+  const syms = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 30);
   const onlyTagged = String(req.query.tagged || "") === "1";
   if (!syms.length) return res.status(400).json({ error: "symbols required" });
 
@@ -700,7 +700,7 @@ app.get("/api/news/feed", async (req, res) => {
     const per = await Promise.all(syms.map(async (sym) => {
       try {
         const items = await memo(`nf:${sym}`, 300_000, async () => {
-          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symBase(sym))}&newsCount=12&quotesCount=0`;
+          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symBase(sym))}&newsCount=20&quotesCount=0`;
           const d = await j(u);
           return (d.news || []).filter((a) => newsRelevant(a, sym)).map((a) => ({
             sym,
@@ -723,7 +723,7 @@ app.get("/api/news/feed", async (req, res) => {
     all = all
       .sort((a, b) => (b.d || 0) - (a.d || 0))
       .filter((x) => { const k = (x.t || "").toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
-      .slice(0, 30);
+      .slice(0, 60);
 
     res.json({ news: all, count: all.length });
   } catch (e) {
