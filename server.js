@@ -669,6 +669,15 @@ const tagOf = (title) => {
    Keep an item ONLY if it's genuinely about the symbol: its relatedTickers include the ticker,
    or the ticker appears as a whole word in the headline. Better to show fewer, correct stories. */
 function symBase(s) { return String(s || "").replace(/\.(NS|BO|NSE|BSE)$/i, "").toUpperCase(); }
+/* DELAYED FALLBACK FEED — serve Indian equity prices from BSE (.BO) instead of NSE (.NS).
+   NSE's real-time data terms are stricter; the public/delayed BSE feed is the compliant fallback
+   for users who haven't connected their own broker. Connected-broker users get THEIR broker's
+   live feed via a separate path, so this only affects the non-connected fallback. The app keeps
+   its .NS symbol as the key — we just fetch the .BO listing and return it under the original sym. */
+function fallbackYF(sym) {
+  const s = String(sym || "");
+  return s.endsWith(".NS") ? s.slice(0, -3) + ".BO" : s;
+}
 function newsRelevant(a, sym) {
   const full = String(sym || "").toUpperCase();
   const base = symBase(sym);
@@ -1029,7 +1038,7 @@ app.get("/api/quote", async (req, res) => {
       const need = symbols.filter((s) => !houseMap[s]);
       const rows = await mapLimit(need, 6, async (sym) => {
         try {
-          const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=1d`);
+          const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(sym))}?range=1d&interval=1d`);
           const m = d.chart?.result?.[0]?.meta;
           if (!m || m.regularMarketPrice == null) return null;
           const price = m.regularMarketPrice;
@@ -1056,7 +1065,7 @@ app.get("/api/history", async (req, res) => {
     let candles = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
     if (!candles || !candles.length) {
       const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
-        j(`${YF}/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`));
+        j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(symbol))}?range=${range}&interval=${interval}`));
       const r = data.chart?.result?.[0];
       const ts = r?.timestamp || [];
       const q = r?.indicators?.quote?.[0] || {};
@@ -1758,7 +1767,7 @@ async function intradayFor(sym) {
   if (fy && fy.length >= 2) {
     rows = fy.map((c) => ({ t: Math.round(c.t / 1000), c: c.c, v: c.v })).filter((x) => x.c != null && !Number.isNaN(x.c));
   } else {
-    const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`);
+    const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(sym))}?range=1d&interval=5m`);
     const r = d?.chart?.result?.[0];
     const q = r?.indicators?.quote?.[0];
     if (!r || !q) return null;
@@ -2571,6 +2580,9 @@ const DEFAULT_APP_SETTINGS = {
   // Global (US + Crypto). BOTH default OFF — SEBI forbids paper trading on live NSE prices, and we
   // keep the global one off by default too so it's an explicit admin opt-in.
   allowVirtual: { IN: false, Global: false },
+  // Show the Indian market to users who HAVEN'T connected a broker (on the delayed BSE fallback
+  // feed). Default OFF — by default a non-connected member doesn't see the Indian market at all.
+  showIndianWithoutBroker: false,
 };
 function mergeAppSettings(stored) {
   const s = stored || {};
@@ -2585,6 +2597,7 @@ function mergeAppSettings(stored) {
     allowRealMode: MARKETS.reduce((o, m) => { o[m] = armObj ? Boolean(armObj[m]) : armBool; return o; }, {}),
     allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = Boolean(abc[m]); return o; }, {}),
     allowVirtual: { IN: Boolean(av.IN), Global: Boolean(av.Global) },
+    showIndianWithoutBroker: Boolean(s.showIndianWithoutBroker),
   };
 }
 
