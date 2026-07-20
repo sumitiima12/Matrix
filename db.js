@@ -396,12 +396,12 @@ async function updateTrade(userId, trade) {
    the admin route strips it, but we also never select it in PG). */
 async function listUsers() {
   if (USING_PG) {
-    const r = await pool.query(`SELECT phone, name, username, referred_by, email, created_at, last_login, blocked FROM users ORDER BY created_at DESC`);
-    return r.rows.map((x) => ({ phone: x.phone, name: x.name, username: x.username || null, referredBy: x.referred_by || null, email: x.email || null, createdAt: x.created_at ? Number(x.created_at) : null, lastLogin: x.last_login ? Number(x.last_login) : null, blocked: !!x.blocked }));
+    const r = await pool.query(`SELECT phone, name, username, referred_by, email, created_at, last_login, blocked, approved FROM users ORDER BY created_at DESC`);
+    return r.rows.map((x) => ({ phone: x.phone, name: x.name, username: x.username || null, referredBy: x.referred_by || null, email: x.email || null, createdAt: x.created_at ? Number(x.created_at) : null, lastLogin: x.last_login ? Number(x.last_login) : null, blocked: !!x.blocked, approved: x.approved !== false }));
   }
   const users = readJSON(FILES.users);
   return Object.entries(users).map(([phone, u]) => ({
-    phone, name: u.name || "", username: u.username || null, referredBy: u.referredBy || null, email: u.email || null, createdAt: u.createdAt || null, lastLogin: u.lastLogin || null, blocked: !!u.blocked,
+    phone, name: u.name || "", username: u.username || null, referredBy: u.referredBy || null, email: u.email || null, createdAt: u.createdAt || null, lastLogin: u.lastLogin || null, blocked: !!u.blocked, approved: u.approved !== false,
   })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 

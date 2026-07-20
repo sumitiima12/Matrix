@@ -2553,6 +2553,21 @@ app.post("/api/account/delete", requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Admin: permanently delete ANY account (by phone) and all its data.
+app.post("/api/admin/delete-user", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    if (isAdminPhone(phone)) return res.status(400).json({ error: "Cannot delete an admin account." });
+    const userId = storageKeyFor(phone);
+    await db.deleteAccount(userId, phone);
+    for (const [id, s] of brokerSessions) if (s.userId === String(userId)) brokerSessions.delete(id);
+    for (const k of appCredCache.keys()) if (k.startsWith(`${userId}|`)) appCredCache.delete(k);
+    res.json({ ok: true, phone });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 /** Step 1 of OAuth: where the user logs in. */
 app.get("/api/broker/login-url", (req, res) => {
   const id = String(req.query.broker || "");
