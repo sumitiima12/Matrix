@@ -2072,9 +2072,27 @@ LEFT/RIGHT operands you may use:
 - "CC.open","CC.high","CC.low","CC.close" (current candle), "PC.open".. (previous candle)
 - Chart patterns as a boolean operand compared > 0: "PAT:cup-handle","PAT:double-bottom","PAT:double-top","PAT:head-shoulders","PAT:inv-head-shoulders","PAT:asc-triangle","PAT:desc-triangle","PAT:sym-triangle","PAT:bull-flag","PAT:bear-flag","PAT:rising-wedge","PAT:falling-wedge","PAT:rectangle"
 A def is {"type":"RSI"|"EMA"|"SMA"|"MACD"|"BB"|"ADX"|"CCI"|"VWAP"|"Stoch"|"DMI"|"CurrentCandle"|"PrevCandle","len":"14","name":"RSI"}. Only add defs for operands that need them (RSI/EMA/SMA/BB/ADX/CCI/MACD/candles). Support/Resistance/Price/Volume/PAT: need NO def.
+STochastic operands: "Stoch.k","Stoch.d" (add a Stoch def). DMI operands: "DMI.plus","DMI.minus","DMI.adx" (add a DMI def).
+
+TRANSLATION KNOWLEDGE — map common trader language to the operands above:
+- Trend / moving averages: "golden cross" = EMA50 crosses_above EMA200; "death cross" = EMA50 crosses_below EMA200; "price above 200 DMA" = Price > SMA200; "20 over 50" = EMA20 crosses_above EMA50.
+- Momentum: "oversold" = RSI < 30; "overbought" = RSI > 70; "strong trend" = DMI.adx > 25; "momentum turning up" = MACD.line crosses_above MACD.signal; "MACD bullish/bearish" = MACD.line >/< MACD.signal.
+- Mean reversion / Bollinger: "bollinger bounce" / "reverts from lower band" = Price crosses_above BB.lower; "band squeeze breakout up" = Price crosses_above BB.upper; "back to the mean" = Price crosses_below BB.middle.
+- Breakouts / levels: "breaks resistance" = Price crosses_above Resistance; "breaks support"/"breakdown" = Price crosses_below Support; "bounces off support" = Price crosses_above Support; "new highs" = Price crosses_above Resistance.
+- Volume: "volume spike"/"high volume" = Volume > SMA20 of volume — approximate as Volume > (a def SMA20 named "VOLSMA") only if clearly asked; otherwise omit volume.
+- Candlesticks (use current CC.* vs previous PC.*): "bullish engulfing" = CC.close > PC.open AND CC.open < PC.close; "bearish engulfing" = CC.close < PC.open AND CC.open > PC.close; "green candle"/"bullish candle" = CC.close > CC.open; "red candle" = CC.close < CC.open; "higher close" = CC.close > PC.close; "gap up" = CC.open > PC.close.
+- Chart patterns: use the PAT:* boolean operands (compare > 0). "inverted head and shoulders" = PAT:inv-head-shoulders; "W bottom"/"double bottom" = PAT:double-bottom; "flag"/"bull flag" = PAT:bull-flag; "wedge" pick rising/falling; "triangle" pick asc/desc/sym.
+- Named algo strategies (compose the archetype): "trend following" = EMA50 > EMA200 AND MACD.line > MACD.signal; "mean reversion" = RSI < 30 (exit RSI > 55); "momentum breakout" = Price crosses_above Resistance AND DMI.adx > 20; "RSI reversal" = RSI crosses_above 30 (exit RSI crosses_above 70); "supertrend flip up" (approx) = Price crosses_above EMA20 AND DMI.plus > DMI.minus.
+- Fundamentals (P/E, ROE, revenue growth, debt) are NOT runnable by this technical engine — if a prompt is purely fundamental, return empty entry/exit rather than inventing operands.
+Combine multiple clauses with gate "AND" (default) or "OR" when the user says "or". Always attach the def for every indicator you reference, exactly once, with a sensible default length (RSI 14, EMA/SMA the stated number, ADX/DMI 14, Stoch 14, CCI 20).
+
 Examples:
 "buy when a cup and handle forms" -> {"entry":[{"la":"PAT:cup-handle","op":">","b":"0","bType":"num"}],"exit":[],"defs":[]}
-"buy when price bounces from support and rsi above 50" -> {"entry":[{"la":"Price","op":">","b":"Support","bType":"ind"},{"la":"RSI","op":">","b":"50","bType":"num","gate":"AND"}],"exit":[],"defs":[{"type":"RSI","len":"14","name":"RSI"}]}
+"buy when price bounces from support and rsi above 50" -> {"entry":[{"la":"Price","op":"crosses_above","b":"Support","bType":"ind"},{"la":"RSI","op":">","b":"50","bType":"num","gate":"AND"}],"exit":[],"defs":[{"type":"RSI","len":"14","name":"RSI"}]}
+"golden cross with strong trend, exit on death cross" -> {"entry":[{"la":"EMA50","op":"crosses_above","b":"EMA200","bType":"ind"},{"la":"DMI.adx","op":">","b":"25","bType":"num","gate":"AND"}],"exit":[{"la":"EMA50","op":"crosses_below","b":"EMA200","bType":"ind"}],"defs":[{"type":"EMA","len":"50","name":"EMA50"},{"type":"EMA","len":"200","name":"EMA200"},{"type":"DMI","len":"14","name":"DMI"}]}
+"mean reversion: buy oversold, sell when it recovers" -> {"entry":[{"la":"RSI","op":"<","b":"30","bType":"num"}],"exit":[{"la":"RSI","op":">","b":"55","bType":"num"}],"defs":[{"type":"RSI","len":"14","name":"RSI"}]}
+"bullish engulfing above the 50 EMA" -> {"entry":[{"la":"CC.close","op":">","b":"PC.open","bType":"ind"},{"la":"CC.open","op":"<","b":"PC.close","bType":"ind","gate":"AND"},{"la":"Price","op":">","b":"EMA50","bType":"ind","gate":"AND"}],"exit":[],"defs":[{"type":"CurrentCandle","name":"CC"},{"type":"PrevCandle","name":"PC"},{"type":"EMA","len":"50","name":"EMA50"}]}
+"bollinger bounce off the lower band, exit at the middle" -> {"entry":[{"la":"Price","op":"crosses_above","b":"BB.lower","bType":"ind"}],"exit":[{"la":"Price","op":"crosses_above","b":"BB.middle","bType":"ind"}],"defs":[{"type":"BB","len":"20","name":"BB"}]}
 "sell when rsi crosses above 80" -> {"entry":[],"exit":[{"la":"RSI","op":"crosses_above","b":"80","bType":"num"}],"defs":[{"type":"RSI","len":"14","name":"RSI"}]}
 If a part is genuinely impossible to express, omit it. Never invent operands outside the list above.`;
 
