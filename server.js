@@ -22,6 +22,7 @@ const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
 const strat = require("./strategyEngine");   // server-side port of the strategy exit engine
+const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
@@ -1076,6 +1077,36 @@ app.get("/api/history", async (req, res) => {
     }
     res.json({ symbol, candles: candles || [] });
   } catch (e) { res.status(502).json({ error: String(e.message) }); }
+});
+
+/* ---------------------------- /api/pattern-scan --------------------------- */
+// POST { pattern: "cup-handle", symbols: ["RELIANCE.NS", ...] }
+// Fetches daily candles for each symbol and returns those currently forming the pattern.
+// Symbols are capped and fetched with small concurrency so we never hammer the upstream feed.
+app.post("/api/pattern-scan", async (req, res) => {
+  try {
+    const pattern = String((req.body && req.body.pattern) || "").trim();
+    if (!pattern) return res.status(400).json({ error: "pattern required" });
+    let syms = Array.isArray(req.body && req.body.symbols) ? req.body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
+    syms = [...new Set(syms)].slice(0, 80);           // de-dupe + cap
+    const range = "6mo", interval = "1d";
+    const matches = [];
+    const CONC = 6;                                    // gentle concurrency
+    for (let i = 0; i < syms.length; i += CONC) {
+      const batch = syms.slice(i, i + CONC);
+      const out = await Promise.all(batch.map(async (sym) => {
+        try {
+          const candles = await candlesFor(sym, range, interval);
+          if (!candles || candles.length < 30) return null;
+          const found = patterns.detectPatterns(candles);
+          const hit = found.find((p) => p.key === pattern);
+          return hit ? { sym, pattern: hit.key, name: hit.name, dir: hit.dir } : null;
+        } catch { return null; }
+      }));
+      out.forEach((r) => { if (r) matches.push(r); });
+    }
+    res.json({ pattern, scanned: syms.length, matches });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 /* -------------------------------- /api/news ------------------------------- */
