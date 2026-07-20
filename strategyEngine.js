@@ -70,6 +70,31 @@ function closedCandles(c, now = Date.now()) {
 }
 
 /* ───────────────────────── operand + condition evaluation ───────────────────────── */
+const { pivots, detectPatterns } = require("./patterns");
+const PATTERN_OPERAND_PREFIX = "PAT:";
+/* Support/resistance series — most recent confirmed swing low/high at or before each bar
+   (with a rolling-extreme fallback early on). Mirrors frontend strategyLang.srSeries. */
+function srSeries(c, kind) {
+  const pv = pivots(c, 3);
+  const wantT = kind === "support" ? "L" : "H";
+  const out = new Array(c.length).fill(NaN);
+  let last = NaN, pi = 0;
+  for (let i = 0; i < c.length; i++) {
+    while (pi < pv.length && pv[pi].i <= i) { if (pv[pi].t === wantT) last = pv[pi].p; pi++; }
+    if (!isNaN(last)) { out[i] = last; continue; }
+    let ext = kind === "support" ? Infinity : -Infinity;
+    for (let j = 0; j <= i; j++) ext = kind === "support" ? Math.min(ext, c[j].l) : Math.max(ext, c[j].h);
+    out[i] = ext;
+  }
+  return out;
+}
+/* 1 on bars where a chart pattern of `key` is present (held a few bars), else 0. */
+function patternSeries(c, key, within = 3) {
+  const s = new Array(c.length).fill(0);
+  const pats = detectPatterns(c).filter((p) => p.key === key);
+  for (const p of pats) for (let j = p.at; j <= Math.min(c.length - 1, p.at + within); j++) s[j] = 1;
+  return s;
+}
 function rollExt(c, len, field, max) { const o = Array(c.length).fill(NaN); for (let i = 0; i < c.length; i++) { let v = c[i][field]; for (let j = Math.max(0, i - len + 1); j <= i; j++) v = max ? Math.max(v, c[j][field]) : Math.min(v, c[j][field]); o[i] = v; } return o; }
 
 function resolveOperand(op, defs, c, closes, vols, cache) {
@@ -78,6 +103,9 @@ function resolveOperand(op, defs, c, closes, vols, cache) {
   if (op !== "" && !isNaN(Number(op))) { const n = Number(op); series = closes.map(() => n); }
   else if (op === "Price") series = closes;
   else if (op === "Volume") series = vols;
+  else if (op === "Support") series = srSeries(c, "support");
+  else if (op === "Resistance") series = srSeries(c, "resistance");
+  else if (op.startsWith(PATTERN_OPERAND_PREFIX)) series = patternSeries(c, op.slice(PATTERN_OPERAND_PREFIX.length));
   else {
     const [nm, attr] = op.split(".");
     const d = (defs || []).find((x) => x.name === nm);

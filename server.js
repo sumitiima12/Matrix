@@ -852,15 +852,26 @@ async function deltaHouseQuotes(ySyms) {
   } catch { return {}; }
 }
 
+/* ── EQUITY HOUSE FEED SWITCH ──────────────────────────────────────────────────────────
+   The FYERS (Indian) and IND Money (US) house feeds serve ONE server-held source's prices to
+   EVERY user. That's a data-redistribution grey area (unlicensed), so by default it is OFF:
+   a user who hasn't connected their own broker sees Yahoo (delayed) prices, and a CONNECTED
+   user sees their OWN broker's live feed via the per-user session — the compliant model.
+   Set EQUITY_HOUSE_FEED=true to re-enable the shared feed (e.g. once you hold a redistribution
+   licence). The Delta CRYPTO feed is a genuinely PUBLIC endpoint and is never gated by this. */
+const EQUITY_HOUSE_FEED = String(process.env.EQUITY_HOUSE_FEED || "").toLowerCase() === "true";
+
 /* ── IND Money US house feed ──────────────────────────────────────────────────────────
    REAL-TIME US prices for ALL users (Yahoo is ~15 min delayed on US too). IND Money's
    public graph endpoint returns a live `price` plus intraday candles — no auth needed.
-   A US symbol here is a plain ticker (AAPL, NVDA) — crypto is X-USD, Indian is X.NS. */
+   A US symbol here is a plain ticker (AAPL, NVDA) — crypto is X-USD, Indian is X.NS.
+   Gated by EQUITY_HOUSE_FEED (default OFF => non-connected users fall back to Yahoo). */
 const INDM_US = "https://apixt-us.indmoney.com/us-stock-broker/us/catalog/get-stock-graph";
 let _indmLastError = null;
 const isUsTicker = (s) => /^[A-Z]{1,5}$/.test(String(s || ""));
 const ymd = (ms) => new Date(ms).toISOString().slice(0, 10);
 async function indmoneyHouseQuotes(ySyms) {
+  if (!EQUITY_HOUSE_FEED) return {};   // non-connected users fall back to Yahoo
   const us = (ySyms || []).filter(isUsTicker);
   if (!us.length) return {};
   const today = ymd(Date.now());
@@ -880,6 +891,7 @@ async function indmoneyHouseQuotes(ySyms) {
   return out;
 }
 async function indmoneyUsCandles(sym, range) {
+  if (!EQUITY_HOUSE_FEED) return null;   // gated: fall back to Yahoo candles
   const label = ({ "5d": "1W", "1mo": "1M", "3mo": "3M", "6mo": "6M", "1y": "1Y" })[range] || "1M";
   const end = ymd(Date.now());
   const start = ymd(Date.now() - rangeToSeconds(range) * 1000);
@@ -889,6 +901,7 @@ async function indmoneyUsCandles(sym, range) {
 
 // Quotes for the Indian-equity subset, keyed back by the ORIGINAL yahoo symbol.
 async function fyersHouseQuotes(ySyms) {
+  if (!EQUITY_HOUSE_FEED) return {};   // non-connected users fall back to Yahoo
   const token = await fyersHouseToken();
   if (!token) return {};
   const appId = process.env.FYERS_APP_ID || "";
@@ -924,6 +937,7 @@ async function fyersHouseQuotes(ySyms) {
 const FY_RES = { "1m": "1", "2m": "2", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "60m": "60", "1h": "60", "90m": "90", "1d": "D", "1D": "D" };
 const FY_RANGE_DAYS = { "1d": 2, "5d": 7, "1mo": 31, "3mo": 93, "6mo": 186, "1y": 370, "2y": 740 };
 async function fyersHouseHistory(ySym, range, interval) {
+  if (!EQUITY_HOUSE_FEED) return null;   // gated: fall back to Yahoo candles
   const fy = yahooToFyers(ySym);
   const res = FY_RES[interval];
   const days = FY_RANGE_DAYS[range];
@@ -1964,20 +1978,39 @@ setInterval(() => {
   for (const [id, s] of brokerSessions) if (now - s.at > SESSION_TTL) brokerSessions.delete(id);
 }, 30 * 60 * 1000).unref?.();
 
+/* ── Bring-your-own-app credential cache ───────────────────────────────────────────────
+   Each user can connect their OWN broker API app (app_id + secret + optional PIN), stored
+   ENCRYPTED in db.broker_apps. The synchronous key()/secret() below need those values, so
+   we keep a decrypted copy in memory, keyed "userId|broker". Warmed from the DB on boot
+   (warmAppCredCache, called after initDb) and updated whenever a user connects.
+   This is what replaces the env-var-per-user idea: no restart, no Render coupling. */
+const appCredCache = new Map();
+function appCredKey(userId, broker) { return `${storageKeyFor(userId)}|${broker}`; }
+function getUserAppCred(broker, userId) {
+  if (!userId) return null;
+  return appCredCache.get(appCredKey(userId, broker)) || null;
+}
+function setUserAppCred(userId, broker, cred) {
+  appCredCache.set(appCredKey(userId, broker), cred);
+}
+
 const BROKERS = {
   zerodha: {
     name: "Zerodha",
-    // Per-user first (KITE_API_KEY_<userId>), then the global KITE_API_KEY fallback.
-    key: (userId) => envKey(...perUser("KITE_API_KEY", userId)),
-    secret: (userId) => envKey(...perUser("KITE_API_SECRET", userId)),
+    // Per-user BYOA app (db.broker_apps) first, then env (KITE_API_KEY_<userId>), then global.
+    key: (userId) => getUserAppCred("zerodha", userId)?.appId || envKey(...perUser("KITE_API_KEY", userId)),
+    secret: (userId) => getUserAppCred("zerodha", userId)?.secret || envKey(...perUser("KITE_API_SECRET", userId)),
     loginUrl: (key) => `https://kite.zerodha.com/connect/login?v=3&api_key=${key}`,
   },
   fyers: {
     name: "FYERS",
-    // Per-user first (FYERS_APP_ID_<userId>), then the global FYERS_APP_ID fallback. This is
-    // what lets two users connect with their OWN FYERS apps: set FYERS_APP_ID_MAT1 etc.
-    key: (userId) => envKey(...perUser("FYERS_APP_ID", userId)),
-    secret: (userId) => envKey(...perUser("FYERS_SECRET_ID", userId)),
+    /* Resolution order, so ONE code path serves every setup:
+       1. The user's OWN app (BYOA) stored encrypted in db.broker_apps — this is what lets
+          two users each connect their own FYERS app and have trades land in their own account.
+       2. A per-user env var (FYERS_APP_ID_<userId>) — legacy manual config.
+       3. The global FYERS_APP_ID — the server's house app. */
+    key: (userId) => getUserAppCred("fyers", userId)?.appId || envKey(...perUser("FYERS_APP_ID", userId)),
+    secret: (userId) => getUserAppCred("fyers", userId)?.secret || envKey(...perUser("FYERS_SECRET_ID", userId)),
     loginUrl: (key, redirect) =>
       `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code&state=matrix`,
   },
@@ -2241,15 +2274,113 @@ async function schwabToken(sess) {
   return sess.accessToken;
 }
 
+/* The static egress IP the user must whitelist in their FYERS app. All broker order/quote
+   traffic exits through our proxy, so ONE whitelisted IP covers every user. Configure
+   BROKER_STATIC_IP explicitly, or we derive it from the FYERS/Delta proxy URL host. */
+function brokerStaticIp() {
+  const explicit = (process.env.BROKER_STATIC_IP || "").trim();
+  if (explicit) return explicit;
+  const proxy = process.env.FYERS_PROXY_URL || process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY || "";
+  try { if (proxy) return new URL(proxy).hostname; } catch { /* not a URL */ }
+  return null;
+}
+
 /** Which brokers are actually configured on this server. */
 app.get("/api/broker/status", (req, res) => {
-  // Report configuration for THIS user (per-user creds if set, else the global fallback).
+  // Report configuration for THIS user (per-user BYOA app if connected, else the global fallback).
   const userId = req.query.userId || req.get("X-User-Id");
   const out = {};
   Object.entries(BROKERS).forEach(([id, b]) => {
-    out[id] = { name: b.name, configured: Boolean(b.key(userId) && b.secret(userId)) };
+    out[id] = {
+      name: b.name,
+      configured: Boolean(b.key(userId) && b.secret(userId)),
+      // Has THIS user supplied their own app credentials (bring-your-own-app)?
+      appConnected: Boolean(getUserAppCred(id, userId)),
+    };
   });
-  res.json({ brokers: out, tradingEnabled: TRADING_ENABLED });
+  res.json({ brokers: out, tradingEnabled: TRADING_ENABLED, staticIp: brokerStaticIp() });
+});
+
+/* What the user needs to set up their own FYERS app: the redirect URL to register and the
+   static IP to whitelist. The frontend shows these before the user pastes App ID + Secret. */
+app.get("/api/broker/connect-info", (req, res) => {
+  res.json({ staticIp: brokerStaticIp() });
+});
+
+/* BRING-YOUR-OWN-APP: the user supplies their OWN broker API app credentials (app_id +
+   secret, and an OPTIONAL trading PIN used only to auto-refresh the daily token). Stored
+   AES-256-GCM encrypted in db.broker_apps and cached in memory so the OAuth login + token
+   exchange (which reuse b.key()/b.secret()) work for this user. The plaintext secret never
+   goes to the browser after this and never lands in an env var. */
+app.post("/api/broker/app-creds", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
+  const { broker } = req.body || {};
+  const b = BROKERS[broker];
+  if (!b) return res.status(400).json({ error: "unknown broker" });
+  if (b.noOAuth || b.userCreds) return res.status(400).json({ error: `${b.name} does not use an app id/secret.` });
+  const appId = String((req.body.appId || "")).trim();
+  const secret = String((req.body.secret || "")).trim();
+  const pin = String((req.body.pin || "")).trim();   // optional — enables daily auto-refresh
+  if (!appId || !secret) return res.status(400).json({ error: "App ID and Secret are required." });
+  try {
+    const cred = { appId, secret, pin: pin || null };
+    await db.saveBrokerApp(userId, broker, encryptCred(cred));
+    setUserAppCred(userId, broker, cred);
+    res.json({ ok: true, staticIp: brokerStaticIp() });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/* ── Global admin-controlled app settings ──────────────────────────────────────────────
+   Two gates the admin flips for the whole app:
+     allowRealMode          — may non-admin users switch to Real trading at all?
+     allowBrokerConnect{mkt} — may non-admin users connect their own broker for that market?
+   Both default to FALSE (locked down): a fresh deploy does NOT let members trade real money
+   or connect brokers until the admin explicitly turns it on. Admins are never gated by these. */
+const MARKETS = ["IN", "US", "Crypto", "Commodity"];
+const DEFAULT_APP_SETTINGS = {
+  allowRealMode: false,
+  allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = false; return o; }, {}),
+};
+function mergeAppSettings(stored) {
+  const s = stored || {};
+  const abc = (s.allowBrokerConnect && typeof s.allowBrokerConnect === "object") ? s.allowBrokerConnect : {};
+  return {
+    allowRealMode: Boolean(s.allowRealMode),
+    allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = Boolean(abc[m]); return o; }, {}),
+  };
+}
+
+// Public read — every client needs this to know what to show. No secrets here.
+app.get("/api/app-settings", async (_req, res) => {
+  try { res.json({ settings: mergeAppSettings(await db.getAppSettings()) }); }
+  catch { res.json({ settings: DEFAULT_APP_SETTINGS }); }
+});
+
+// Admin write — locked behind isAdmin (ADMIN_USER_IDS + X-Admin-Key), like the other admin routes.
+app.post("/api/app-settings", async (req, res) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: "admin only" });
+  try {
+    const next = mergeAppSettings(req.body && req.body.settings);
+    await db.saveAppSettings(next);
+    res.json({ ok: true, settings: next });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+/* Right-to-erasure: a user permanently deletes their OWN account and all associated data.
+   Auth is taken from the verified token — you can only delete yourself. Also clears any live
+   broker sessions and cached app credentials so nothing survives in memory. */
+app.post("/api/account/delete", requireAuth, async (req, res) => {
+  const phone = req.authUserId;
+  const userId = storageKeyFor(phone);
+  try {
+    await db.deleteAccount(userId, phone);
+    // Purge in-memory state for this user.
+    for (const [id, s] of brokerSessions) if (s.userId === String(userId)) brokerSessions.delete(id);
+    for (const k of appCredCache.keys()) if (k.startsWith(`${userId}|`)) appCredCache.delete(k);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 /** Step 1 of OAuth: where the user logs in. */
@@ -3958,6 +4089,66 @@ app.get("/api/autobuy", async (req, res) => {
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
+
+/* ── Bring-your-own-app: cache warm-up + daily token refresh ────────────────────────────
+   On boot we decrypt every stored app cred into memory so key()/secret() resolve without a
+   DB round-trip. Then, for users who supplied a PIN, a periodic job mints a fresh daily
+   FYERS access token from their 15-day refresh token — so a connected user stays live for
+   ~15 days with only an occasional interactive re-login, instead of every morning. Users
+   who DIDN'T give a PIN simply reconnect daily (the token just expires; nothing breaks). */
+async function warmAppCredCache() {
+  try {
+    const rows = await db.getAllBrokerApps();
+    let n = 0;
+    for (const row of rows) {
+      const c = decryptCred(row.data);
+      if (c && c.appId) { setUserAppCred(row.userId, row.broker, c); n++; }
+    }
+    if (n) console.log(`[byoa] warmed ${n} app credential(s) into cache`);
+  } catch (e) { console.error("[byoa] cache warm-up failed:", e.message); }
+}
+
+/* Refresh ONE user's FYERS daily token from their stored refresh token + PIN. Reuses the same
+   validate-refresh-token flow (and static-IP proxy) as the house feed. Returns true on success. */
+async function refreshFyersUserToken(userId, app) {
+  if (!app || !app.appId || !app.secret || !app.pin) return false;   // no PIN => cannot auto-refresh
+  const blob = await db.getBrokerCred(userId, "fyers");
+  const cur = decryptCred(blob);
+  if (!cur || !cur.refreshToken) return false;                       // nothing to refresh from
+  try {
+    const appIdHash = crypto.createHash("sha256").update(`${app.appId}:${app.secret}`).digest("hex");
+    const r = await pfetch(`${FY_HOST}/api/v3/validate-refresh-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ grant_type: "refresh_token", appIdHash, refresh_token: cur.refreshToken, pin: app.pin }),
+      ...fyFetchOpts,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.access_token) {
+      await db.saveBrokerCred(userId, "fyers", encryptCred({ accessToken: d.access_token, refreshToken: cur.refreshToken, extra: cur.extra || null }));
+      return true;
+    }
+    console.error(`[byoa] fyers refresh failed for ${userId}:`, d.message || d.s || r.status);
+    return false;
+  } catch (e) { console.error(`[byoa] fyers refresh error for ${userId}:`, e.message); return false; }
+}
+
+async function refreshAllBrokerTokens() {
+  try {
+    const rows = await db.getAllBrokerApps();
+    let ok = 0;
+    for (const row of rows) {
+      const c = decryptCred(row.data);
+      if (row.broker === "fyers" && c && c.pin) { if (await refreshFyersUserToken(row.userId, c)) ok++; }
+    }
+    if (ok) console.log(`[byoa] refreshed ${ok} FYERS token(s)`);
+  } catch (e) { console.error("[byoa] token refresh sweep failed:", e.message); }
+}
+
+// Warm the cache shortly after boot (give initDb a moment), then refresh tokens every 6h.
+setTimeout(warmAppCredCache, 3000).unref?.();
+setTimeout(refreshAllBrokerTokens, 15000).unref?.();
+setInterval(refreshAllBrokerTokens, 6 * 60 * 60 * 1000).unref?.();
 
 /* WARN on missing/weak critical secrets (audit P1-12). A random per-boot JWT secret silently
    logs everyone out on restart; a missing CRED_KEY weakens broker-credential encryption. We log

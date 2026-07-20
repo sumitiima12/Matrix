@@ -76,6 +76,20 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS broker_creds (
     user_id TEXT, broker TEXT, data JSONB, updated_at BIGINT,
     PRIMARY KEY (user_id, broker))`);
+  /* BRING-YOUR-OWN-APP credentials. Unlike broker_creds (which holds the short-lived
+     access/refresh TOKENS), this holds the user's own API APP identity — app_id, secret and
+     an optional trading PIN used to auto-refresh the daily token. Same AES-256-GCM blob shape,
+     encrypted in server.js; plaintext never touches this table. One row per user+broker.
+     Kept SEPARATE from broker_creds because app creds are long-lived (they don't expire daily)
+     and the daily token-refresh cron reads them without needing a live session. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS broker_apps (
+    user_id TEXT, broker TEXT, data JSONB, updated_at BIGINT,
+    PRIMARY KEY (user_id, broker))`);
+  /* Global admin-controlled app settings — a single row (id=1). Holds gates like
+     "allow users in Real mode" and per-market "allow users to connect brokers". Read by every
+     client to decide what to show; written only by an admin. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS app_settings (
+    id INT PRIMARY KEY, data JSONB, updated_at BIGINT)`);
   /* Managed real positions the engine is watching for an exit (SL/TP/trailing + strategy
      signal). `data` holds the exit rule and entry context; `status` is open|closing|closed. */
   await pool.query(`CREATE TABLE IF NOT EXISTS managed_positions (
@@ -98,6 +112,8 @@ const FILES = {
   public: process.env.PUBLIC_STRATS_FILE || path.join(__dirname, "public_strategies.json"),
   ideas: process.env.IDEAS_FILE || path.join(__dirname, "ideas.json"),
   creds: process.env.CREDS_FILE || path.join(__dirname, "broker_creds.json"),
+  brokerApps: process.env.BROKER_APPS_FILE || path.join(__dirname, "broker_apps.json"),
+  appSettings: process.env.APP_SETTINGS_FILE || path.join(__dirname, "app_settings.json"),
   managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
   realStrats: process.env.REAL_STRATS_FILE || path.join(__dirname, "real_strategies.json"),
 };
@@ -213,6 +229,33 @@ async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHas
   const users = readJSON(FILES.users);
   users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null, username: username || null, referredBy: referredBy || null };
   writeJSON(FILES.users, users);
+}
+
+/* Permanently delete an account and ALL of its data — the user's own right-to-erasure.
+   `userId` is the per-user storage key (trades/state/creds); `phone` is the login key. */
+async function deleteAccount(userId, phone) {
+  const uid = String(userId), ph = String(phone);
+  if (USING_PG) {
+    await pool.query(`DELETE FROM trades WHERE user_id=$1`, [uid]);
+    await pool.query(`DELETE FROM app_state WHERE user_id=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM broker_creds WHERE user_id=$1`, [uid]);
+    await pool.query(`DELETE FROM broker_apps WHERE user_id=$1`, [uid]);
+    await pool.query(`DELETE FROM managed_positions WHERE user_id=$1`, [uid]);
+    await pool.query(`DELETE FROM real_strategies WHERE user_id=$1`, [uid]);
+    await pool.query(`DELETE FROM ideas WHERE owner=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM public_strategies WHERE owner=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM users WHERE phone=$1`, [ph]);
+    return;
+  }
+  const dropByUser = (file, key = "user_id") => {
+    const d = readJSON(file); let changed = false;
+    for (const k of Object.keys(d)) { const r = d[k]; if (r && (String(r[key]) === uid || String(r.userId) === uid || String(r.owner) === uid)) { delete d[k]; changed = true; } }
+    if (changed) writeJSON(file, d);
+  };
+  dropByUser(FILES.trades); dropByUser(FILES.creds); dropByUser(FILES.brokerApps);
+  dropByUser(FILES.managed); dropByUser(FILES.realStrats); dropByUser(FILES.ideas, "owner"); dropByUser(FILES.public, "owner");
+  const st = readJSON(FILES.state); if (st[uid]) { delete st[uid]; writeJSON(FILES.state, st); }
+  const users = readJSON(FILES.users); if (users[ph]) { delete users[ph]; writeJSON(FILES.users, users); }
 }
 
 /* ---------------------------- public strategies -------------------------- */
@@ -414,6 +457,67 @@ async function deleteBrokerCred(userId, broker) {
   writeJSON(FILES.creds, db);
 }
 
+/* ---------------- bring-your-own-app credentials (app_id/secret/pin) ---------------- */
+async function saveBrokerApp(userId, broker, blob) {
+  const now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO broker_apps (user_id, broker, data, updated_at) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (user_id, broker) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+      [String(userId), broker, blob, now]
+    );
+    return;
+  }
+  const db = readJSON(FILES.brokerApps);
+  db[`${userId}:${broker}`] = { user_id: String(userId), broker, data: blob, updated_at: now };
+  writeJSON(FILES.brokerApps, db);
+}
+async function getBrokerApp(userId, broker) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM broker_apps WHERE user_id=$1 AND broker=$2`, [String(userId), broker]);
+    return r.rows[0] ? r.rows[0].data : null;
+  }
+  const row = readJSON(FILES.brokerApps)[`${userId}:${broker}`];
+  return row ? row.data : null;
+}
+/* Every stored app cred, for cache warm-up on boot and the daily token-refresh cron. */
+async function getAllBrokerApps() {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT user_id, broker, data FROM broker_apps`);
+    return r.rows.map((x) => ({ userId: x.user_id, broker: x.broker, data: x.data }));
+  }
+  return Object.values(readJSON(FILES.brokerApps)).map((x) => ({ userId: x.user_id, broker: x.broker, data: x.data }));
+}
+async function deleteBrokerApp(userId, broker) {
+  if (USING_PG) { await pool.query(`DELETE FROM broker_apps WHERE user_id=$1 AND broker=$2`, [String(userId), broker]); return; }
+  const db = readJSON(FILES.brokerApps);
+  delete db[`${userId}:${broker}`];
+  writeJSON(FILES.brokerApps, db);
+}
+
+/* ------------------------- global admin app settings ------------------------ */
+async function getAppSettings() {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM app_settings WHERE id=1`);
+    return r.rows[0] ? r.rows[0].data : null;
+  }
+  const row = readJSON(FILES.appSettings);
+  return (row && row.data) ? row.data : null;
+}
+async function saveAppSettings(obj) {
+  const now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO app_settings (id, data, updated_at) VALUES (1,$1,$2)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+      [obj, now]
+    );
+    return obj;
+  }
+  writeJSON(FILES.appSettings, { data: obj, updated_at: now });
+  return obj;
+}
+
 /* ------------------------- managed real positions --------------------------- */
 async function saveManagedPosition(pos) {
   const now = Date.now();
@@ -504,4 +608,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, getUserFull, initDb, saveTrade, getTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
