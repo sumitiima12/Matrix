@@ -693,7 +693,9 @@ function newsRelevant(a, sym) {
     // exchange ticker — which used to filter everything out ("no headlines"). So also accept a
     // DISTINCTIVE headline match: require length >= 4 so a short, ambiguous base (HAL, MRF) can't
     // pull in a US namesake's story, while RELIANCE / EICHERMOT / INFOSYS still match by name.
-    if (rt.includes(full) || rt.includes(base + ".NS") || rt.includes(base + ".BO") || rt.includes(base)) return true;
+    // Accept ONLY the exchange-qualified ticker — a bare base match (e.g. "BDL") pulls in a US
+    // namesake's story (Bharat Dynamics BDL.NS ≠ the US "BDL"). Distinctive names still match below.
+    if (rt.includes(full) || rt.includes(base + ".NS") || rt.includes(base + ".BO")) return true;
     return titleHit(4);
   }
   // US / crypto: relatedTickers base match, or the ticker as a whole word in the headline.
