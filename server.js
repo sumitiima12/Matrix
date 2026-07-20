@@ -3815,23 +3815,40 @@ app.get("/api/broker/portfolio", async (req, res) => {
         deltaCall("GET", "/v2/positions/margined", { userId: sess.userId }),
       ]);
 
-      const cash = (w.result || []).reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
+      const bals = w.result || [];
+      // Delta is a LEVERAGED venue: a position's notional (mark × size) is many times the capital
+      // actually committed. The real numbers a trader cares about come from the wallet:
+      //   equity      = total account balance (cash + unrealised P&L)
+      //   available   = free balance not locked as margin
+      //   marginUsed  = capital actually deployed as position/order margin
+      const cash = bals.reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
+      const equity = bals.reduce((a, b) => a + (Number(b.balance) || 0), 0);
+      const marginUsed = bals.reduce((a, b) => a + (Number(b.position_margin) || 0) + (Number(b.order_margin) || 0), 0);
 
       const holdings = (p.result || [])
         .filter((x) => Number(x.size) !== 0)
-        .map((x) => ({
-          sym: x.product_symbol || (x.product && x.product.symbol) || null,
-          qty: Number(x.size),
-          avg: x.entry_price != null ? Number(x.entry_price) : null,
-          ltp: x.mark_price != null ? Number(x.mark_price) : null,
-          value: (x.mark_price != null && x.size != null) ? Number(x.mark_price) * Number(x.size) : null,
-          pnl: x.unrealized_pnl != null ? Number(x.unrealized_pnl) : null,
-          source: "positions",
-          market: "Crypto",
-        }))
+        .map((x) => {
+          const notional = (x.mark_price != null && x.size != null) ? Number(x.mark_price) * Number(x.size) : null;
+          // Actual capital in THIS position: Delta's own `margin` when present, else notional/leverage.
+          const lev = x.leverage != null ? Number(x.leverage) : null;
+          const margin = x.margin != null ? Number(x.margin) : (notional != null && lev ? notional / lev : null);
+          return {
+            sym: x.product_symbol || (x.product && x.product.symbol) || null,
+            qty: Number(x.size),
+            avg: x.entry_price != null ? Number(x.entry_price) : null,
+            ltp: x.mark_price != null ? Number(x.mark_price) : null,
+            notional,                                   // leveraged position size
+            margin,                                     // real capital deployed
+            leverage: lev,
+            value: notional,                            // kept = notional so unit-price math (value/qty = mark) still holds
+            pnl: x.unrealized_pnl != null ? Number(x.unrealized_pnl) : null,
+            source: "positions",
+            market: "Crypto",
+          };
+        })
         .filter((h) => h.sym);
 
-      return res.json({ broker, holdings, cash, currency: "USD" });
+      return res.json({ broker, holdings, cash, equity, marginUsed, currency: "USD", leveraged: true });
     }
 
     if (broker === "schwab") {
