@@ -4240,6 +4240,12 @@ app.post("/api/autobuy/register", async (req, res) => {
   if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
   if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
   try {
+    // IDEMPOTENT: a strategy is identified by (user + brokerSym + name). If it's already armed
+    // (active or paused), don't create a duplicate — return the existing one. This stops a
+    // double-tap on "Go Live" from arming the same strategy two or three times.
+    const already = (await db.getRealStrategiesForUser(String(sess.userId)))
+      .find((x) => x && x.status !== "cancelled" && String(x.brokerSym) === String(brokerSym) && (x.name || "") === (name || (symbol || String(brokerSym))));
+    if (already) return res.status(200).json({ ok: true, id: already.id, live: autoBuyLiveOn(), already: true });
     await persistSessionCred(sess);
     const st = {
       id: crypto.randomBytes(16).toString("hex"),
