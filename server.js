@@ -1140,6 +1140,55 @@ app.post("/api/pattern-scan", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+/* --------------------------- /api/momentum-scan ---------------------------
+   POST { symbols:[...], tf:"5m"|"15m"|"1h"|"4h"|"1d"|"1w", pct:2, dir:"up"|"down", bars? }
+   Returns symbols whose PRICE CHANGE over one `tf` candle passes the threshold — i.e.
+   "which stocks jumped 2% in the last 5 minutes / hour / day". Works on any timeframe:
+   higher tfs Yahoo doesn't serve natively (4h, 1w) are built from a base interval + N bars
+   (4h = four 1h candles, 1w = five 1d candles), so a single code path covers them all.     */
+const MOMO_TF = {
+  "1m":  { interval: "1m",  bars: 1, range: "1d" },
+  "5m":  { interval: "5m",  bars: 1, range: "5d" },
+  "15m": { interval: "15m", bars: 1, range: "5d" },
+  "30m": { interval: "30m", bars: 1, range: "1mo" },
+  "1h":  { interval: "60m", bars: 1, range: "1mo" },
+  "4h":  { interval: "60m", bars: 4, range: "3mo" },
+  "1d":  { interval: "1d",  bars: 1, range: "6mo" },
+  "1w":  { interval: "1d",  bars: 5, range: "1y" },
+};
+app.post("/api/momentum-scan", async (req, res) => {
+  try {
+    let syms = Array.isArray(req.body && req.body.symbols) ? req.body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
+    syms = [...new Set(syms)].slice(0, 80);
+    const pct = Number(req.body && req.body.pct);
+    if (!Number.isFinite(pct) || pct <= 0) return res.status(400).json({ error: "pct (positive number) required" });
+    const dir = String((req.body && req.body.dir) || "up").toLowerCase() === "down" ? "down" : "up";
+    const tf = String((req.body && req.body.tf) || "1d").toLowerCase();
+    const cfg = MOMO_TF[tf] || MOMO_TF["1d"];
+    const bars = Math.max(1, Math.min(50, Number(req.body && req.body.bars) || cfg.bars));
+    const matches = [];
+    const CONC = 6;
+    for (let i = 0; i < syms.length; i += CONC) {
+      const batch = syms.slice(i, i + CONC);
+      const out = await Promise.all(batch.map(async (sym) => {
+        try {
+          const candles = await candlesFor(sym, cfg.range, cfg.interval);
+          if (!candles || candles.length < bars + 1) return null;
+          const last = candles[candles.length - 1];
+          const prev = candles[candles.length - 1 - bars];
+          if (!last || !prev || last.c == null || !prev.c) return null;
+          const chg = (last.c / prev.c - 1) * 100;
+          const hit = dir === "up" ? chg >= pct : chg <= -Math.abs(pct);
+          return hit ? { sym, chg: +chg.toFixed(2), ratio: +(last.c / prev.c).toFixed(4) } : null;
+        } catch { return null; }
+      }));
+      out.forEach((r) => { if (r) matches.push(r); });
+    }
+    matches.sort((a, b) => (dir === "up" ? b.chg - a.chg : a.chg - b.chg));
+    res.json({ tf, pct, dir, bars, scanned: syms.length, matches });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 /* -------------------------------- /api/news ------------------------------- */
 // e.g. /api/news?symbol=RELIANCE.NS  (Yahoo) — swap for NewsAPI if NEWS_API_KEY set
 app.get("/api/news", async (req, res) => {
