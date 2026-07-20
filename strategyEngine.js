@@ -31,6 +31,31 @@ function ADXarr(c, p) {
   const dx = pdi.map((v, i) => { const s = v + mdi[i]; return s ? 100 * Math.abs(v - mdi[i]) / s : 0; });
   return EMAarr(dx, p);
 }
+function DMIarr(c, p) {
+  const n = c.length, pDM = Array(n).fill(0), mDM = Array(n).fill(0), tr = Array(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    const up = c[i].h - c[i - 1].h, dn = c[i - 1].l - c[i].l;
+    pDM[i] = up > dn && up > 0 ? up : 0; mDM[i] = dn > up && dn > 0 ? dn : 0;
+    tr[i] = Math.max(c[i].h - c[i].l, Math.abs(c[i].h - c[i - 1].c), Math.abs(c[i].l - c[i - 1].c));
+  }
+  const atr = EMAarr(tr, p);
+  const plus = EMAarr(pDM, p).map((v, i) => 100 * v / (atr[i] || 1));
+  const minus = EMAarr(mDM, p).map((v, i) => 100 * v / (atr[i] || 1));
+  const dx = plus.map((v, i) => { const s = v + minus[i]; return s ? 100 * Math.abs(v - minus[i]) / s : 0; });
+  return { plus, minus, adx: EMAarr(dx, p) };
+}
+function STOCHarr(c, kLen = 14, kSmooth = 3, dSmooth = 3) {
+  const n = c.length, raw = Array(n).fill(NaN);
+  for (let i = 0; i < n; i++) {
+    if (i < kLen - 1) continue;
+    let hi = -Infinity, lo = Infinity;
+    for (let j = i - kLen + 1; j <= i; j++) { if (c[j].h > hi) hi = c[j].h; if (c[j].l < lo) lo = c[j].l; }
+    raw[i] = hi === lo ? 50 : 100 * (c[i].c - lo) / (hi - lo);
+  }
+  const k = SMAarr(raw.map((v) => (isNaN(v) ? 0 : v)), kSmooth).map((v, i) => (raw[i] == null || isNaN(raw[i]) ? NaN : v));
+  const d = SMAarr(k.map((v) => (isNaN(v) ? 0 : v)), dSmooth).map((v, i) => (isNaN(k[i]) ? NaN : v));
+  return { k, d };
+}
 function STarr(c, p = 10, mult = 3) {
   const n = c.length;
   const atr = ATRarr(c, p);
@@ -123,6 +148,8 @@ function resolveOperand(op, defs, c, closes, vols, cache) {
         case "BB": { const b = BBarr(closes, len); series = b[attr || "middle"]; break; }
         case "KC": { const mid = EMAarr(closes, len), at = ATRarr(c, len); series = attr === "upper" ? mid.map((v, i) => v + 1.5 * at[i]) : attr === "lower" ? mid.map((v, i) => v - 1.5 * at[i]) : mid; break; }
         case "ADX": series = ADXarr(c, len); break;
+        case "DMI": { const dm = DMIarr(c, len); series = attr === "minus" ? dm.minus : attr === "adx" ? dm.adx : dm.plus; break; }
+        case "Stoch": { const st = STOCHarr(c, len, Number(d.smoothK) || 3, Number(d.smoothD) || 3); series = attr === "d" ? st.d : st.k; break; }
         case "Supertrend": { const st = STarr(c, len, Number(d.mult) || 3); series = attr === "dir" ? st.dir : st.line; break; }
         case "DMA": series = SMAarr(closes, len); break;
         case "Volume": series = vols; break;

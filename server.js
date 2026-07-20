@@ -538,11 +538,22 @@ app.get("/api/admin/is-admin-user", async (req, res) => {
 
 
 /* ----------------------------- tiny TTL cache ----------------------------- */
+/* Two-layer: `cache` holds resolved values for ttlMs; `inflight` holds the promise of a fetch
+   that is CURRENTLY running. The inflight layer is the rate-limit saver — without it, N requests
+   for the same symbol arriving before the first fetch resolves would each fire their own upstream
+   call (Yahoo / indianapi), multiplying load exactly when it's busiest. Now they share one call. */
 const cache = new Map();
+const inflight = new Map();
 function memo(key, ttlMs, fn) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.t < ttlMs) return Promise.resolve(hit.v);
-  return Promise.resolve(fn()).then((v) => { cache.set(key, { v, t: Date.now() }); return v; });
+  const pending = inflight.get(key);
+  if (pending) return pending;                    // a fetch for this key is already running — join it
+  const p = Promise.resolve().then(fn)
+    .then((v) => { cache.set(key, { v, t: Date.now() }); inflight.delete(key); return v; })
+    .catch((e) => { inflight.delete(key); throw e; });
+  inflight.set(key, p);
+  return p;
 }
 const FETCH_TIMEOUT_MS = 8000;
 /* Timed fetch: aborts after 8s so a hanging upstream (Yahoo, an LLM provider) fails fast
@@ -629,15 +640,22 @@ function newsRelevant(a, sym) {
   const base = symBase(sym);
   if (!base) return false;
   const rt = (a.relatedTickers || []).map((x) => String(x).toUpperCase());
+  const titleHit = (minLen) => {
+    try { return base.length >= minLen && new RegExp(`(^|[^A-Za-z0-9])${base}([^A-Za-z0-9]|$)`).test(String(a.title || "").toUpperCase()); }
+    catch { return false; }
+  };
   if (/\.(NS|BO)$/i.test(full)) {
-    // INDIAN ticker: an app symbol like "HAL" collides with a US ticker (Halliburton). Require the
-    // EXACT exchange-qualified ticker in relatedTickers so we never show the US namesake's news.
-    return rt.includes(full) || rt.includes(base + ".NS") || rt.includes(base + ".BO");
+    // INDIAN ticker. Strongest signal: the exact .NS/.BO ticker (or its US-less base) in
+    // relatedTickers. But Yahoo frequently returns real Indian headlines WITHOUT tagging the
+    // exchange ticker — which used to filter everything out ("no headlines"). So also accept a
+    // DISTINCTIVE headline match: require length >= 4 so a short, ambiguous base (HAL, MRF) can't
+    // pull in a US namesake's story, while RELIANCE / EICHERMOT / INFOSYS still match by name.
+    if (rt.includes(full) || rt.includes(base + ".NS") || rt.includes(base + ".BO") || rt.includes(base)) return true;
+    return titleHit(4);
   }
   // US / crypto: relatedTickers base match, or the ticker as a whole word in the headline.
   if (rt.includes(base)) return true;
-  try { if (base.length >= 3 && new RegExp(`(^|[^A-Za-z0-9])${base}([^A-Za-z0-9]|$)`).test(String(a.title || "").toUpperCase())) return true; } catch { /* bad regex char */ }
-  return false;
+  return titleHit(3);
 }
 app.get("/api/news/feed", async (req, res) => {
   const syms = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 12);
@@ -1182,6 +1200,17 @@ async function indianApiFundamentals(symbol) {
   const epsG = pk(["ePSChangePercentTTMOverTTM", "ePSGrowthRate5Year"]);
   const de = pk(["totalDebtPerTotalEquityMostRecentQuarter", "totalDebtPerTotalEquityMostRecentFiscalYear"]);
   const dy = pk(["currentDividendYieldCommonStockPrimaryIssueLTM", "dividendYieldIndicatedAnnualDividendDividedByClosingprice", "dividendYield5YearAverage"]);
+  /* PEERS — indianapi's peerCompanyList carries the competitor set. Its RATIOS are unreliable
+     (often 0), but the names, price, %change and market-cap are real, so we keep those and read
+     P/E only when it's a sensible non-zero. Read defensively: field names vary across responses. */
+  const num = (v) => (v != null && v !== "" && !isNaN(+v) ? +v : null);
+  const peers = (Array.isArray(d.peerCompanyList) ? d.peerCompanyList : []).map((p) => ({
+    name: p.companyName || p.name || p.tickerId || "",
+    price: num(p.price),
+    chg: num(p.percentChange ?? p.netChange),
+    pe: (() => { const v = num(p.priceToEarningsValueRatio ?? p.priceToEarnings); return v && v > 0 ? v : null; })(),
+    marketCapCr: num(p.marketCap),
+  })).filter((p) => p.name).slice(0, 8);
   return {
     symbol,
     name: d.companyName,
@@ -1204,6 +1233,7 @@ async function indianApiFundamentals(symbol) {
     high52: d.yearHigh != null ? +d.yearHigh : pk(["yhigh"]),
     low52: d.yearLow != null ? +d.yearLow : pk(["ylow"]),
     sectorPE: pk(["sectorPriceToEarningsValueRatio"]),
+    peers,
     src: "indianapi",
   };
 }
@@ -1227,6 +1257,47 @@ app.get("/api/fundamentals", async (req, res) => {
   if (!data) { try { data = await yahooFundamentals(symbol); } catch (e) { err += " yahoo:" + e.message; } }
   if (data) { _fundCache.set(symbol, { data, at: Date.now() }); return res.json(data); }
   res.json({ symbol, unavailable: true, error: err.trim() });
+});
+
+/* ─────────────────────────── EARNINGS CALENDAR ───────────────────────────
+   US: FMP's earning_calendar (recent + upcoming), which we already have a key for. Indian:
+   indianapi's recent-announcements/results endpoint when a key is set. Both cached 1h; both
+   fail SOFT to an empty list so the section just hides rather than erroring. No invented dates. */
+const ymdUTC = (d) => new Date(d).toISOString().slice(0, 10);
+async function usEarnings() {
+  const key = process.env.FMP_API_KEY;
+  if (!key) return { recent: [], upcoming: [] };
+  const now = Date.now();
+  const from = ymdUTC(now - 7 * 864e5), to = ymdUTC(now + 21 * 864e5);
+  const d = await j(`https://financialmodelingprep.com/api/v3/earning_calendar?from=${from}&to=${to}&apikey=${key}`);
+  const rows = (Array.isArray(d) ? d : [])
+    .filter((x) => x && x.symbol && x.date && /^[A-Z.]{1,6}$/.test(x.symbol))   // US tickers only
+    .map((x) => ({ sym: x.symbol, date: x.date, epsEst: x.epsEstimated ?? null, eps: x.eps ?? null, revEst: x.revenueEstimated ?? null, when: x.time || null }));
+  const today = ymdUTC(now);
+  return {
+    recent: rows.filter((x) => x.date < today).sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 40),
+    upcoming: rows.filter((x) => x.date >= today).sort((a, b) => (a.date < b.date ? -1 : 1)).slice(0, 40),
+  };
+}
+async function indiaEarnings() {
+  const key = process.env.INDIANAPI_KEY;
+  if (!key) return { recent: [], upcoming: [] };
+  try {
+    // indianapi exposes recent results/announcements; shape varies, so we read defensively.
+    const rr = await fetchT(`https://stock.indianapi.in/recent_announcements`, { headers: { "X-Api-Key": key, Accept: "application/json" } });
+    const d = rr.ok ? await rr.json().catch(() => null) : null;
+    const arr = Array.isArray(d) ? d : (d && Array.isArray(d.data) ? d.data : []);
+    const rows = arr.map((x) => ({ sym: x.symbol || x.company || x.name || "", date: (x.date || x.announcementDate || "").slice(0, 10), title: x.subject || x.headline || x.title || "Results" })).filter((x) => x.sym && x.date);
+    const today = ymdUTC(Date.now());
+    return { recent: rows.filter((x) => x.date <= today).slice(0, 40), upcoming: rows.filter((x) => x.date > today).slice(0, 40) };
+  } catch { return { recent: [], upcoming: [] }; }
+}
+app.get("/api/earnings", async (req, res) => {
+  const market = String(req.query.market || "US");
+  try {
+    const out = await memo(`earn:${market}`, 60 * 60 * 1000, () => (market === "IN" ? indiaEarnings() : usEarnings()));
+    res.json(out);
+  } catch (e) { res.json({ recent: [], upcoming: [], error: String(e.message || e) }); }
 });
 
 /* ======================= SERVER-SIDE EXIT MONITOR =========================
@@ -2198,7 +2269,12 @@ function angelHeaders(apiKey, jwt) {
 /* ── Delta request signing ───────────────────────────────────────────────────────
    signature = HMAC_SHA256(secret, method + timestamp + path + query + body)
    Sent as: api-key, timestamp, signature. The secret never leaves this process. */
-const DELTA_BASE = "https://api.india.delta.exchange";
+/* Set DELTA_TESTNET=true (with TESTNET api keys in DELTA_API_KEY/SECRET) to route ALL Delta
+   traffic to the testnet — real API, fake money — so the crypto order + reconciliation path can
+   be exercised end-to-end without real funds. Production (india.delta.exchange) is the default. */
+const DELTA_BASE = String(process.env.DELTA_TESTNET || "").toLowerCase() === "true"
+  ? (process.env.DELTA_TESTNET_BASE || "https://cdn-ind.testnet.deltaex.org")
+  : "https://api.india.delta.exchange";
 
 /* ── Delta outbound proxy ─────────────────────────────────────────────────────────
    Delta whitelists API keys by IP. Render's outbound IP isn't (and can't reliably be)
