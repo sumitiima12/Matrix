@@ -2071,7 +2071,12 @@ LEFT/RIGHT operands you may use:
 - "EMA<n>" / "SMA<n>" e.g. "EMA50","SMA200" (add a def with that name)
 - "CC.open","CC.high","CC.low","CC.close" (current candle), "PC.open".. (previous candle)
 - Chart patterns as a boolean operand compared > 0: "PAT:cup-handle","PAT:double-bottom","PAT:double-top","PAT:head-shoulders","PAT:inv-head-shoulders","PAT:asc-triangle","PAT:desc-triangle","PAT:sym-triangle","PAT:bull-flag","PAT:bear-flag","PAT:rising-wedge","PAT:falling-wedge","PAT:rectangle"
-A def is {"type":"RSI"|"EMA"|"SMA"|"MACD"|"BB"|"ADX"|"CCI"|"VWAP"|"Stoch"|"DMI"|"CurrentCandle"|"PrevCandle","len":"14","name":"RSI"}. Only add defs for operands that need them (RSI/EMA/SMA/BB/ADX/CCI/MACD/candles). Support/Resistance/Price/Volume/PAT: need NO def.
+- Candlestick patterns by name as a boolean operand compared > 0 (preferred over hand-coding CC/PC geometry): "CDL:doji","CDL:hammer","CDL:inverted-hammer","CDL:hanging-man","CDL:shooting-star","CDL:bull-engulfing","CDL:bear-engulfing","CDL:marubozu","CDL:spinning-top","CDL:morning-star","CDL:evening-star". These need NO def.
+A def is {"type":"RSI"|"EMA"|"SMA"|"MACD"|"BB"|"ADX"|"CCI"|"VWAP"|"Stoch"|"DMI"|"CurrentCandle"|"PrevCandle","len":"14","name":"RSI"}. Only add defs for operands that need them (RSI/EMA/SMA/BB/ADX/CCI/MACD/candles). Support/Resistance/Price/Volume/PAT:/CDL: need NO def.
+PARAMETERS IN BRACKETS/NUMBERS — when the user writes indicator settings, put them on the def:
+- "MACD(3,10,16)" -> def {"type":"MACD","name":"MACD","fast":3,"slow":10,"signal":16} (fast,slow,signal in that order).
+- "RSI 21" or "RSI(21)" -> def {"type":"RSI","len":"21","name":"RSI"}. "EMA 21" -> {"type":"EMA","len":"21","name":"EMA21"} (operand "EMA21"). Same for SMA/ADX/CCI.
+- "BB(20,2)" / "Bollinger 20,2" -> def {"type":"BB","len":"20","mult":2,"name":"BB"}. If no numbers are given, use the defaults (MACD 12/26/9, RSI 14, BB 20/2).
 STochastic operands: "Stoch.k","Stoch.d" (add a Stoch def). DMI operands: "DMI.plus","DMI.minus","DMI.adx" (add a DMI def).
 
 TRANSLATION KNOWLEDGE — map common trader language to the operands above:
@@ -2538,18 +2543,27 @@ function brokerStaticIp() {
 }
 
 /** Which brokers are actually configured on this server. */
-app.get("/api/broker/status", (req, res) => {
+app.get("/api/broker/status", async (req, res) => {
   // Report configuration for THIS user (per-user BYOA app if connected, else the global fallback).
   const userId = req.query.userId || req.get("X-User-Id");
+  const storeKey = userId ? storageKeyFor(userId) : null;
   const out = {};
-  Object.entries(BROKERS).forEach(([id, b]) => {
+  for (const [id, b] of Object.entries(BROKERS)) {
+    // hasCreds: the server holds resumable creds for this user → the client can auto-resume the
+    // session on ANY device (e.g. mobile after connecting on laptop) without a fresh reconnect.
+    let hasCreds = false;
+    try {
+      if (id === "delta") hasCreds = Boolean(getUserAppCred("delta", userId)) || isAdminUserId(userId);
+      else if (storeKey) hasCreds = Boolean(await db.getBrokerCred(storeKey, id));
+    } catch { hasCreds = false; }
     out[id] = {
       name: b.name,
       configured: Boolean(b.key(userId) && b.secret(userId)),
       // Has THIS user supplied their own app credentials (bring-your-own-app)?
       appConnected: Boolean(getUserAppCred(id, userId)),
+      hasCreds,
     };
-  });
+  }
   res.json({ brokers: out, tradingEnabled: TRADING_ENABLED, staticIp: brokerStaticIp() });
 });
 

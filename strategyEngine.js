@@ -124,6 +124,38 @@ function patternSeries(c, key, within = 3) {
 }
 function rollExt(c, len, field, max) { const o = Array(c.length).fill(NaN); for (let i = 0; i < c.length; i++) { let v = c[i][field]; for (let j = Math.max(0, i - len + 1); j <= i; j++) v = max ? Math.max(v, c[j][field]) : Math.min(v, c[j][field]); o[i] = v; } return o; }
 
+/* Candlestick patterns by name — mirrors frontend strategyLang.candleSeries so an armed
+   strategy that says "buy on a hammer" fires the same way live as it did in the backtest. */
+const CANDLE_OPERAND_PREFIX = "CDL:";
+function candleSeries(c, key) {
+  const s = new Array(c.length).fill(0);
+  const body = (x) => Math.abs(x.c - x.o);
+  const rng = (x) => (x.h - x.l) || 1e-9;
+  const upW = (x) => x.h - Math.max(x.o, x.c);
+  const loW = (x) => Math.min(x.o, x.c) - x.l;
+  const green = (x) => x.c > x.o, red = (x) => x.c < x.o;
+  for (let i = 0; i < c.length; i++) {
+    const x = c[i], p = i > 0 ? c[i - 1] : null, p2 = i > 1 ? c[i - 2] : null;
+    const b = body(x), r = rng(x); let hit = false;
+    switch (key) {
+      case "doji": hit = b <= 0.1 * r; break;
+      case "hammer": hit = b > 0 && b <= 0.4 * r && loW(x) >= 2 * b && upW(x) <= b; break;
+      case "hanging-man": hit = b > 0 && b <= 0.4 * r && loW(x) >= 2 * b && upW(x) <= b && !!p && green(p); break;
+      case "inverted-hammer": hit = b > 0 && b <= 0.4 * r && upW(x) >= 2 * b && loW(x) <= b; break;
+      case "shooting-star": hit = b > 0 && b <= 0.4 * r && upW(x) >= 2 * b && loW(x) <= b && !!p && green(p); break;
+      case "marubozu": hit = b >= 0.9 * r; break;
+      case "spinning-top": hit = b <= 0.35 * r && upW(x) >= b && loW(x) >= b; break;
+      case "bull-engulfing": hit = !!p && red(p) && green(x) && x.o <= p.c && x.c >= p.o && b > body(p); break;
+      case "bear-engulfing": hit = !!p && green(p) && red(x) && x.o >= p.c && x.c <= p.o && b > body(p); break;
+      case "morning-star": hit = !!p2 && !!p && red(p2) && body(p) <= 0.4 * rng(p) && green(x) && x.c >= (p2.o + p2.c) / 2; break;
+      case "evening-star": hit = !!p2 && !!p && green(p2) && body(p) <= 0.4 * rng(p) && red(x) && x.c <= (p2.o + p2.c) / 2; break;
+      default: hit = false;
+    }
+    if (hit) s[i] = 1;
+  }
+  return s;
+}
+
 function resolveOperand(op, defs, c, closes, vols, cache) {
   if (op in cache) return cache[op];
   let series;
@@ -133,6 +165,7 @@ function resolveOperand(op, defs, c, closes, vols, cache) {
   else if (op === "Support") series = srSeries(c, "support");
   else if (op === "Resistance") series = srSeries(c, "resistance");
   else if (op.startsWith(PATTERN_OPERAND_PREFIX)) series = patternSeries(c, op.slice(PATTERN_OPERAND_PREFIX.length));
+  else if (op.startsWith(CANDLE_OPERAND_PREFIX)) series = candleSeries(c, op.slice(CANDLE_OPERAND_PREFIX.length));
   else {
     const [nm, attr] = op.split(".");
     const d = (defs || []).find((x) => x.name === nm);
