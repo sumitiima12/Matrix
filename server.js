@@ -2217,8 +2217,10 @@ const BROKERS = {
   delta: {
     name: "Delta Exchange",
     noOAuth: true,
-    key: () => envKey("DELTA_API_KEY"),
-    secret: () => envKey("DELTA_API_SECRET"),
+    // Per-user BYOA: the user's own Delta API key/secret (db.broker_apps) so their trades land in
+    // THEIR account; the operator/admin falls back to the server's house env keys.
+    key: (userId) => getUserAppCred("delta", userId)?.appId || envKey("DELTA_API_KEY"),
+    secret: (userId) => getUserAppCred("delta", userId)?.secret || envKey("DELTA_API_SECRET"),
     loginUrl: () => null,
   },
 
@@ -2407,10 +2409,32 @@ const DELTA_BASE = String(process.env.DELTA_TESTNET || "").toLowerCase() === "tr
 const deltaDispatcher = makeProxyDispatcher(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY || "");
 if (deltaDispatcher) console.log("[delta] routing Delta API through the configured proxy");
 
-function deltaHeaders(method, path, query = "", body = "") {
-  const key = envKey("DELTA_API_KEY");
-  const secret = envKey("DELTA_API_SECRET");
-  if (!key || !secret) throw new Error("Delta keys not set on the server");
+/* Is this userId one of the configured operator/admin accounts? Admins may use the server's
+   house Delta keys (env). Everyone else MUST bring their own Delta API key/secret. */
+function isAdminUserId(uid) {
+  const ids = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => stripPh(x.trim())).filter(Boolean);
+  return ids.includes(stripPh(String(uid || "")));
+}
+/* Resolve the Delta API key/secret to sign with for THIS user:
+   - a non-admin who connected their own Delta (BYOA) -> THEIR keys (trades hit THEIR account)
+   - the admin/operator -> the server's house env keys (their own account)
+   - a non-admin WITHOUT their own keys -> null, and signed order calls must refuse (never fall
+     back to the house account, or one user's trade would execute on the operator's account). */
+function deltaCredsFor(userId) {
+  const uc = getUserAppCred("delta", userId);
+  if (uc && uc.appId && uc.secret) return { key: uc.appId, secret: uc.secret, own: true };
+  if (!userId || isAdminUserId(userId)) return { key: envKey("DELTA_API_KEY"), secret: envKey("DELTA_API_SECRET"), own: false };
+  return null;   // non-admin, no BYOA keys -> caller must reject
+}
+/* Throw unless this user is allowed to place a signed Delta order (has own keys, or is admin). */
+function assertDeltaTradable(userId) {
+  if (!deltaCredsFor(userId)) throw new Error("Connect your own Delta account (API key + secret) to trade crypto for real.");
+}
+
+function deltaHeaders(method, path, query = "", body = "", creds = null) {
+  const key = (creds && creds.key) || envKey("DELTA_API_KEY");
+  const secret = (creds && creds.secret) || envKey("DELTA_API_SECRET");
+  if (!key || !secret) throw new Error("Delta keys not set — connect your Delta account first");
 
   const ts = Math.floor(Date.now() / 1000).toString();
   const payload = method + ts + path + query + body;
@@ -2425,10 +2449,14 @@ function deltaHeaders(method, path, query = "", body = "") {
   };
 }
 
-async function deltaCall(method, path, { query = "", body = null, signed = true } = {}) {
+async function deltaCall(method, path, { query = "", body = null, signed = true, userId = null } = {}) {
   const bodyStr = body ? JSON.stringify(body) : "";
+  // For signed calls tied to a user, sign with THAT user's Delta keys (BYOA). Unsigned public
+  // calls (products, candles, tickers) need no creds. When no userId is given, house keys are used.
+  const creds = signed ? (userId != null ? deltaCredsFor(userId) : { key: envKey("DELTA_API_KEY"), secret: envKey("DELTA_API_SECRET") }) : null;
+  if (signed && userId != null && !creds) throw new Error("Connect your own Delta account (API key + secret) to trade crypto for real.");
   const headers = signed
-    ? deltaHeaders(method, path, query, bodyStr)
+    ? deltaHeaders(method, path, query, bodyStr, creds)
     : { "Content-Type": "application/json", "User-Agent": "matrix" };
 
   const r = await pfetch(DELTA_BASE + path + query, {
@@ -2512,11 +2540,12 @@ app.post("/api/broker/app-creds", requireAuth, async (req, res) => {
   const { broker } = req.body || {};
   const b = BROKERS[broker];
   if (!b) return res.status(400).json({ error: "unknown broker" });
-  if (b.noOAuth || b.userCreds) return res.status(400).json({ error: `${b.name} does not use an app id/secret.` });
+  // Delta uses an API key + secret (no OAuth) — allow it here so each user stores their OWN keys.
+  if ((b.noOAuth && broker !== "delta") || b.userCreds) return res.status(400).json({ error: `${b.name} does not use an app id/secret.` });
   const appId = String((req.body.appId || "")).trim();
   const secret = String((req.body.secret || "")).trim();
-  const pin = String((req.body.pin || "")).trim();   // optional — enables daily auto-refresh
-  if (!appId || !secret) return res.status(400).json({ error: "App ID and Secret are required." });
+  const pin = String((req.body.pin || "")).trim();   // optional — enables daily auto-refresh (not used by Delta)
+  if (!appId || !secret) return res.status(400).json({ error: broker === "delta" ? "Delta API Key and Secret are required." : "App ID and Secret are required." });
   try {
     const cred = { appId, secret, pin: pin || null };
     await db.saveBrokerApp(userId, broker, encryptCred(cred));
@@ -2657,10 +2686,12 @@ app.post("/api/broker/session", async (req, res) => {
 
     if (broker === "delta") {
       /* No token to exchange — the keys ARE the credential. So "connecting" has to mean
-         something real: we make a SIGNED call and see if Delta accepts it. Otherwise we
-         would hand back a session id for keys that don't work, and the failure would only
-         surface later, at the worst possible moment: on an order. */
-      const d = await deltaCall("GET", "/v2/wallet/balances");
+         something real: we make a SIGNED call with THIS user's keys and see if Delta accepts it.
+         A non-admin must have connected their own Delta keys first (never the house account). */
+      if (!deltaCredsFor(userId) || (!getUserAppCred("delta", userId) && !isAdminUserId(userId))) {
+        return res.status(400).json({ error: "Enter your own Delta API key and secret first." });
+      }
+      const d = await deltaCall("GET", "/v2/wallet/balances", { userId });
       const bal = (d.result || [])[0] || null;
       const sid = putBrokerSession(userId, broker, "server-signed");   // no per-user token exists
       return res.json({
@@ -2983,7 +3014,7 @@ async function fetchBrokerAccount(sess) {
       // WALLET is essential (funds check) — try it, with one retry, before giving up.
       let w = null;
       for (let attempt = 0; attempt < 2 && !w; attempt++) {
-        try { w = await withTimeout(deltaCall("GET", "/v2/wallet/balances"), 8000); }
+        try { w = await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }), 8000); }
         catch (e) {
           // undici wraps the real reason (DNS/connection/TLS) in e.cause — surface it.
           const cause = e && e.cause ? (e.cause.code || e.cause.message || String(e.cause)) : "";
@@ -2998,7 +3029,7 @@ async function fetchBrokerAccount(sess) {
       // don't block the whole order; proceed with an empty position list.
       let portfolio = [];
       try {
-        const pos = await withTimeout(deltaCall("GET", "/v2/positions/margined"), 8000);
+        const pos = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: sess.userId }), 8000);
         portfolio = (pos.result || []).filter((x) => Number(x.size) !== 0)
           .map((x) => ({ sym: x.product_symbol || (x.product && x.product.symbol) || null, qty: Number(x.size), avg: x.entry_price != null ? Number(x.entry_price) : null, price: x.mark_price != null ? Number(x.mark_price) : null, market: "Crypto" }));
       } catch (e) { console.error("[risk] delta positions fetch failed (non-fatal):", e.message); }
@@ -3067,7 +3098,7 @@ function deltaCoinToContracts(prod, coinQty) {
   const cv = Number(prod && prod.contract_value) || 1;
   return Math.max(1, Math.round(Number(coinQty) / cv));   // exits round to the nearest contract, min 1
 }
-async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct) {
+async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct, userId = null) {
   try {
     if (!(entryRef > 0)) return { placed: false, message: "no entry price to base SL/TP on" };
     const long = String(side).toLowerCase() === "buy";
@@ -3086,7 +3117,7 @@ async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct) {
     // The position may not be visible the instant a market entry returns — one short retry.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await deltaCall("POST", "/v2/orders/bracket", { body });
+        await deltaCall("POST", "/v2/orders/bracket", { body, userId });
         return { placed: true, message: "SL/TP set on Delta", ...legs };
       } catch (e) {
         if (attempt === 0) { await new Promise((r) => setTimeout(r, 1200)); continue; }
@@ -3218,6 +3249,10 @@ app.post("/api/broker/order", async (req, res) => {
     }
 
     if (broker === "delta") {
+      /* Per-user BYOA: this order signs with the user's OWN Delta keys. A non-admin who hasn't
+         connected their own Delta account is refused here — their trade must never route to the
+         operator's house account. */
+      assertDeltaTradable(sess.userId);
       /* Delta orders are signed like everything else. product_id is REQUIRED — the API
          does not take a bare symbol — so we look the product up first and fail if we
          can't find it, rather than posting an order against a guessed id. */
@@ -3233,6 +3268,7 @@ app.post("/api/broker/order", async (req, res) => {
         return res.status(400).json({ ok: false, status: "rejected", broker, reason: `Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.` });
       }
       const d = await deltaCall("POST", "/v2/orders", {
+        userId: sess.userId,
         body: {
           product_id: prod.id,
           size: sendSize,
@@ -3257,7 +3293,7 @@ app.post("/api/broker/order", async (req, res) => {
       let bracket = null;
       if (String(side).toLowerCase() === "buy" && (slPct > 0 || tpPct > 0)) {
         const entryRef = Number(o.average_fill_price) || Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, "Crypto");
-        bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct);
+        bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct, sess.userId);
       }
       const autoExitId = await registerAutoExit();
       return res.json({ ok: true, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, bracket, autoExitId, raw: o });
@@ -3722,8 +3758,8 @@ app.get("/api/broker/portfolio", async (req, res) => {
     if (broker === "delta") {
       // Real balances + real open positions. Signed calls; keys never leave this process.
       const [w, p] = await Promise.all([
-        deltaCall("GET", "/v2/wallet/balances"),
-        deltaCall("GET", "/v2/positions/margined"),
+        deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }),
+        deltaCall("GET", "/v2/positions/margined", { userId: sess.userId }),
       ]);
 
       const cash = (w.result || []).reduce((a, b) => a + (Number(b.available_balance) || 0), 0);
@@ -3870,6 +3906,7 @@ async function placeExitOrder(sess, symbol, qty, market, product) {
     // qty is stored in COIN units — convert back to contracts to close the exact position.
     const size = deltaCoinToContracts(prod, qty);
     const d = await deltaCall("POST", "/v2/orders", {
+      userId: sess.userId,
       body: { product_id: prod.id, size, side: "sell", order_type: "market_order", reduce_only: true },
     });
     return { orderId: d.result?.id ?? null };
@@ -3979,28 +4016,34 @@ async function runAutoExitEngine() {
   try {
     const open = await db.getOpenManagedPositions(500);
 
-    /* RECONCILE (display-truth): fetch Delta's ACTUAL open positions once. Any managed Delta
-       position whose symbol Delta reports as FLAT (size 0 / absent) was closed outside the app
-       — a manual close in the Delta app, or Delta's own bracket SL/TP. Mark it closed so the
-       phantom "in position" P&L disappears from the dashboard. Only acts when we could actually
-       read Delta (deltaHeld !== null); on any fetch error we leave positions untouched. */
-    let deltaHeld = null;
-    if (open.some((p) => p.broker === "delta")) {
+    /* RECONCILE (display-truth): for each user with open Delta positions, fetch THEIR actual
+       Delta positions (signed with their own BYOA keys). Any managed position whose symbol Delta
+       reports as FLAT (size 0 / absent) was closed outside the app — a manual close in the Delta
+       app, or Delta's own bracket SL/TP. Mark it closed so the phantom "in position" P&L clears.
+       Only acts when we could actually read that user's Delta; on any error we leave it untouched. */
+    const deltaHeldByUser = new Map();
+    async function deltaHeldFor(uid) {
+      if (deltaHeldByUser.has(uid)) return deltaHeldByUser.get(uid);
+      let held = null;
       try {
-        const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined"), 8000);
-        deltaHeld = new Set((pr && pr.result || [])
-          .filter((x) => Number(x.size) !== 0)
+        const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: uid }), 8000);
+        held = new Set((pr && pr.result || []).filter((x) => Number(x.size) !== 0)
           .map((x) => String(x.product_symbol || (x.product && x.product.symbol) || "")));
-      } catch { deltaHeld = null; }
+      } catch { held = null; }
+      deltaHeldByUser.set(uid, held);
+      return held;
     }
 
     for (const pos of open) {
       if (pos.status === "closing") continue;         // already being handled
       // Broker says this position is gone -> reconcile it closed and skip the exit check.
-      if (pos.broker === "delta" && deltaHeld && !deltaHeld.has(String(pos.brokerSym))) {
-        await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — closed on Delta" });
-        reconciled++;
-        continue;
+      if (pos.broker === "delta") {
+        const held = await deltaHeldFor(pos.userId);
+        if (held && !held.has(String(pos.brokerSym))) {
+          await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — closed on Delta" });
+          reconciled++;
+          continue;
+        }
       }
       checked++;
       try {
@@ -4114,7 +4157,8 @@ async function placeBuyOrder(sess, symbol, qty, market, product) {
     // so with the real minimum instead of letting the broker bounce it.
     const { cv, contracts } = deltaContracts(dprod, qty);
     if (contracts < 1) throw new Error(`Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.`);
-    const d = await deltaCall("POST", "/v2/orders", { body: { product_id: dprod.id, size: contracts, side: "buy", order_type: "market_order" } });
+    assertDeltaTradable(sess.userId);   // sign with the user's own keys; refuse if they have none
+    const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: { product_id: dprod.id, size: contracts, side: "buy", order_type: "market_order" } });
     // HTTP 200 is NOT a fill — verify, and throw the real reason on a reject/no-fill.
     const o = d.result || {};
     const sizeC = Number(o.size) || contracts;                                   // contracts
