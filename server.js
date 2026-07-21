@@ -849,8 +849,86 @@ const fyFetchOpts = fyersDispatcher ? { dispatcher: fyersDispatcher } : {};
    rejects outright otherwise ("Orders are only allowed from whitelisted IP addresses"). Route them
    all through the proxy dispatcher; when no proxy is configured this is a plain fetch. */
 function fyFetch(url, opts) { return pfetch(url, { ...(opts || {}), ...fyFetchOpts }); }
+
+/* RFC-6238 TOTP (HMAC-SHA1, 30s step, 6 digits) from a base32 secret — the same 6-digit code your
+   authenticator app shows. Dependency-free so we can log into FYERS unattended. */
+function totpCode(secretB32, atMs = Date.now()) {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const ch of String(secretB32 || "").toUpperCase().replace(/[^A-Z2-7]/g, "")) bits += A.indexOf(ch).toString(2).padStart(5, "0");
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  let counter = Math.floor(atMs / 1000 / 30);
+  const cb = Buffer.alloc(8);
+  for (let i = 7; i >= 0; i--) { cb[i] = counter & 0xff; counter = Math.floor(counter / 256); }
+  const h = crypto.createHmac("sha1", Buffer.from(bytes)).update(cb).digest();
+  const o = h[h.length - 1] & 0xf;
+  const code = ((h[o] & 0x7f) << 24) | ((h[o + 1] & 0xff) << 16) | ((h[o + 2] & 0xff) << 8) | (h[o + 3] & 0xff);
+  return (code % 1000000).toString().padStart(6, "0");
+}
+
+/* Fully-automated FYERS login using the TOTP secret + PIN — the ONLY way to keep the house feed
+   alive now that FYERS disabled the refresh-token API (SEBI). Mirrors the manual login: send OTP →
+   verify TOTP → verify PIN → get auth code → exchange for an access token. Needs FYERS_FY_ID,
+   FYERS_TOTP_SECRET, FYERS_PIN, FYERS_APP_ID (full, e.g. 0YCNKL9SRQ-200), FYERS_SECRET_ID,
+   FYERS_REDIRECT_URI. Returns the daily access token, or null if not configured. */
+async function fyersLoginTOTP() {
+  const fyId = (process.env.FYERS_FY_ID || "").trim();
+  const totpSecret = (process.env.FYERS_TOTP_SECRET || "").trim();
+  const pin = (process.env.FYERS_PIN || "").trim();
+  const appId = (process.env.FYERS_APP_ID || "").trim();
+  const secret = (process.env.FYERS_SECRET_ID || "").trim();
+  const redirect = (process.env.FYERS_REDIRECT_URI || "").trim();
+  if (!fyId || !totpSecret || !pin || !appId || !secret || !redirect) return null;
+  const dash = appId.lastIndexOf("-");
+  const appCore = dash > 0 ? appId.slice(0, dash) : appId;
+  const appType = dash > 0 ? appId.slice(dash + 1) : "100";
+  const b64 = (s) => Buffer.from(String(s)).toString("base64");
+  const V = "https://api-t1.fyers.in/vagator/v2";
+  const post = async (url, body, headers) => {
+    const r = await pfetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(headers || {}) }, body: JSON.stringify(body), ...fyFetchOpts });
+    return r.json().catch(() => ({}));
+  };
+  // 1. request an OTP session
+  let r = await post(`${V}/send_login_otp_v2`, { fy_id: b64(fyId), app_id: "2" });
+  if (!r.request_key) throw new Error("send_otp: " + (r.message || JSON.stringify(r)));
+  // 2. verify the TOTP (retry once past the 30s boundary if FYERS says invalid)
+  let key = r.request_key;
+  r = await post(`${V}/verify_otp`, { request_key: key, otp: totpCode(totpSecret) });
+  if (!r.request_key) { await new Promise((res) => setTimeout(res, 1200)); r = await post(`${V}/verify_otp`, { request_key: key, otp: totpCode(totpSecret) }); }
+  if (!r.request_key) throw new Error("verify_otp: " + (r.message || JSON.stringify(r)));
+  // 3. verify the PIN -> short-lived bearer for the token step
+  r = await post(`${V}/verify_pin_v2`, { request_key: r.request_key, identity_type: "pin", identifier: b64(pin) });
+  const vTok = r.data && r.data.access_token;
+  if (!vTok) throw new Error("verify_pin: " + (r.message || JSON.stringify(r)));
+  // 4. exchange for an auth code
+  const tr = await post("https://api-t1.fyers.in/api/v3/token", { fyers_id: fyId, app_id: appCore, redirect_uri: redirect, appType, code_challenge: "", state: "matrix", scope: "", nonce: "", response_type: "code", create_cookie: true }, { Authorization: `Bearer ${vTok}` });
+  const url = tr.Url || tr.url;
+  if (!url) throw new Error("token: " + (tr.message || JSON.stringify(tr)));
+  const authCode = new URL(url).searchParams.get("auth_code");
+  if (!authCode) throw new Error("no auth_code in redirect");
+  // 5. validate the auth code -> the API access token we actually use
+  const appIdHash = crypto.createHash("sha256").update(`${appId}:${secret}`).digest("hex");
+  const vac = await post("https://api-t1.fyers.in/api/v3/validate-authcode", { grant_type: "authorization_code", appIdHash, code: authCode });
+  if (!vac.access_token) throw new Error("validate-authcode: " + (vac.message || JSON.stringify(vac)));
+  return vac.access_token;
+}
+
 async function fyersHouseToken() {
-  if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
+  if (_fyHouse.token && (Date.now() - _fyHouse.at) < 12 * 3600 * 1000) return _fyHouse.token;
+  // PREFERRED now: fully-automated TOTP login (refresh-token API is disabled by SEBI). Cached 12h.
+  if ((process.env.FYERS_TOTP_SECRET || "").trim()) {
+    if (Date.now() < _fyCooldownUntil) return _fyHouse.token || null;
+    try {
+      const tok = await fyersLoginTOTP();
+      if (tok) { _fyHouse = { token: tok, at: Date.now() }; _fyLastError = null; _fyCooldownUntil = 0; return tok; }
+    } catch (e) {
+      _fyLastError = "totp-login: " + e.message;
+      _fyCooldownUntil = Date.now() + 5 * 60 * 1000;   // back off 5 min on failure
+      console.error("[fyers-house]", _fyLastError);
+      // fall through to the manual/refresh paths below in case those are configured
+    }
+  }
   // A directly-provided daily access token WINS — no minting, no refresh-token flow, no rate
   // limit. Set FYERS_ACCESS_TOKEN to bypass the refresh flow entirely (re-set it each day).
   const directTok = (process.env.FYERS_ACCESS_TOKEN || "").trim();
