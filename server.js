@@ -111,6 +111,16 @@ app.get("/api/trades", requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Clear the caller's VIRTUAL (paper) trades across all markets. Real broker trades are never
+   touched. Scoped to the verified token's own userId, so a user can only wipe their own book. */
+app.post("/api/trades/clear-virtual", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);   // from the verified token, NOT the client
+    const removed = await db.clearVirtualTrades(userId);
+    res.json({ ok: true, removed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ----------------------- users (phone + PIN) & state ---------------------- */
 /* PINs are now bcrypt-hashed. Existing users were SHA-256 — we MUST NOT lock them out, so
    verifyPin accepts the old scheme too, and a successful legacy login is transparently
