@@ -25,7 +25,7 @@ const strat = require("./strategyEngine");   // server-side port of the strategy
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
-const { marketOpenIST } = require("./marketHours");   // IST market-open check (auto-buy guard)
+const { marketOpenIST, intradaySquareDue } = require("./marketHours");   // IST market-open + intraday square-off
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
    routes use this — identity is taken from the token when we have it, and we fall back to the
@@ -1644,7 +1644,15 @@ async function runExitMonitor() {
       checked++;
       try {
         const candles = await candlesFor(yahooSymbolFor(trade));
-        const hit = resolveExit(trade, candles);
+        let hit = resolveExit(trade, candles);
+        // INTRADAY square-off: an MIS/intraday position that hasn't hit TP/SL must be closed ~15 min
+        // before the bell (and never carried overnight), mirroring the broker's own auto-square. We
+        // exit at the latest candle close. Non-intraday (delivery/CNC) positions are left to run.
+        const isIntraday = /^(mis|intraday|intra)$/i.test(String(trade.product || "")) || trade.intraday === true;
+        if (!hit && isIntraday && intradaySquareDue(trade.market)) {
+          const last = candles && candles.length ? candles[candles.length - 1].c : trade.entry;
+          hit = { exit: +Number(last).toFixed(2), exitAt: Date.now(), exitType: "Square-off (intraday)" };
+        }
         if (!hit) continue;
         const qty = trade.qty || 1;
         const updated = { ...trade, ...hit, pnl: +((hit.exit - trade.entry) * qty).toFixed(2) };
@@ -4291,6 +4299,10 @@ async function runAutoExitEngine() {
 
         let hit = strat.priceExitFired(pos, candles);
         if (!hit.fired && pos.cfg) { const s = strat.exitSignalFired(pos.cfg, candles); if (s.fired) hit = { fired: true, reason: s.reason }; }
+        // INTRADAY square-off: force a reduce-only exit ~15 min before close so an MIS position never
+        // carries overnight (matches the broker's own square-off). Delivery/CNC positions are exempt.
+        const posIntraday = /^(mis|intraday|intra)$/i.test(String(pos.product || "")) || pos.intraday === true;
+        if (!hit.fired && posIntraday && intradaySquareDue(pos.market)) hit = { fired: true, reason: "Intraday square-off" };
         if (!hit.fired) continue;
 
         // Claim it FIRST so a crash/restart can't sell twice.
