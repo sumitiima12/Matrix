@@ -41,6 +41,23 @@ function softAuth(req, _res, next) {
 }
 /* Identity for broker routes: verified token when we have it, else the (legacy) header. */
 const routeUserId = (req) => req.authUserId ? storageKeyFor(req.authUserId) : (req.get("X-User-Id") || (req.body && req.body.userId) || req.query.userId || null);
+
+/* COMPLIANCE: a personal broker feed is licensed to its owner ONLY — under Indian exchange/broker
+   data rules it must never be redistributed to other users. So the FYERS house feed is served
+   solely to the account whose id equals HOUSE_OWNER_ID (set on Render to the owner's login id).
+   Everyone else gets Yahoo (or their own connected broker). Reads the optional bearer token on
+   otherwise-public data routes; returns false for anonymous/other users. */
+function isHouseOwner(req) {
+  const oid = (process.env.HOUSE_OWNER_ID || "").trim();
+  if (!oid) return false;
+  try {
+    const h = req.get("Authorization") || "";
+    const token = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
+    const v = verifyToken(token);
+    if (!v) return false;
+    return storageKeyFor(v.userId) === storageKeyFor(oid);
+  } catch { return false; }
+}
 const stripPh = (s) => String(s || "").replace(/^ph_/, "");   // "ph_9167..." -> "9167..."   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
@@ -1248,8 +1265,12 @@ app.get("/api/history", async (req, res) => {
   const interval = String(req.query.interval || "1d");
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   try {
-    // FYERS house feed first for Indian equities (real, no ~15-min delay); Yahoo otherwise.
-    let candles = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
+    // FYERS house feed is the OWNER's licensed data — only the owner is served from it (compliance).
+    // Everyone else falls straight through to Yahoo (or their own broker, when that's wired).
+    let candles = null;
+    if (isHouseOwner(req)) {
+      candles = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
+    }
     if (!candles || !candles.length) {
       const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
         j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(symbol))}?range=${range}&interval=${interval}`));
