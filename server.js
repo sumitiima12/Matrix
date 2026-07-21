@@ -55,7 +55,9 @@ function isHouseOwner(req) {
     const token = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
     const v = verifyToken(token);
     if (!v) return false;
-    return storageKeyFor(v.userId) === storageKeyFor(oid);
+    const a = String(storageKeyFor(v.userId) || ""), b = String(storageKeyFor(oid) || "");
+    // Match on the storage key, tolerating a "ph_" prefix difference or a raw-id match.
+    return a === b || stripPh(a) === stripPh(b) || String(v.userId) === String(oid);
   } catch { return false; }
 }
 const stripPh = (s) => String(s || "").replace(/^ph_/, "");   // "ph_9167..." -> "9167..."   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
