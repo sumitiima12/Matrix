@@ -47,17 +47,25 @@ const routeUserId = (req) => req.authUserId ? storageKeyFor(req.authUserId) : (r
    solely to the account whose id equals HOUSE_OWNER_ID (set on Render to the owner's login id).
    Everyone else gets Yahoo (or their own connected broker). Reads the optional bearer token on
    otherwise-public data routes; returns false for anonymous/other users. */
-function isHouseOwner(req) {
+/* True if the id matches HOUSE_OWNER_ID, tolerating ANY phone format: with/without a "ph_"
+   prefix, a country code (91…), spaces, or "+". We compare the trailing 10 digits, which is the
+   phone number itself — so 9167737726, 919167737726 and +91 91677 37726 all match. */
+function idMatchesOwner(id) {
   const oid = (process.env.HOUSE_OWNER_ID || "").trim();
-  if (!oid) return false;
+  if (!oid || id == null) return false;
+  const digits = (x) => String(x || "").replace(/\D/g, "");
+  const a = digits(id), b = digits(oid);
+  if (!a || !b) return false;
+  return a === b || a.slice(-10) === b.slice(-10);
+}
+function isHouseOwner(req) {
+  if (!(process.env.HOUSE_OWNER_ID || "").trim()) return false;
   try {
     const h = req.get("Authorization") || "";
     const token = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
     const v = verifyToken(token);
     if (!v) return false;
-    const a = String(storageKeyFor(v.userId) || ""), b = String(storageKeyFor(oid) || "");
-    // Match on the storage key, tolerating a "ph_" prefix difference or a raw-id match.
-    return a === b || stripPh(a) === stripPh(b) || String(v.userId) === String(oid);
+    return idMatchesOwner(v.userId);
   } catch { return false; }
 }
 const stripPh = (s) => String(s || "").replace(/^ph_/, "");   // "ph_9167..." -> "9167..."   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
@@ -1204,15 +1212,33 @@ const FY_RANGE_DAYS = { "1d": 2, "5d": 7, "1mo": 31, "3mo": 93, "6mo": 186, "1y"
    candles. Shared by the OWNER house feed and each connected user's OWN feed, so the per-user
    (compliant) path reuses the exact same request/parse. */
 async function fetchFyersHistoryRaw(fy, res, days, authHeader) {
+  /* FYERS caps a SINGLE /data/history request at ~366 days (this is why the 1D chart, which asks for
+     2 years, came back empty while intraday timeframes — all well under a year — worked fine). So we
+     split any span longer than a year into ≤365-day windows, fetch each, then merge + de-dupe. Spans
+     under a year (every intraday timeframe) still make exactly one call, so nothing else changes. */
   const fmt = (d) => d.toISOString().slice(0, 10);
-  const from = fmt(new Date(Date.now() - days * 864e5)), to = fmt(new Date());
-  const url = `${FY_HOST}/data/history?symbol=${encodeURIComponent(fy)}&resolution=${res}&date_format=1&range_from=${from}&range_to=${to}&cont_flag=1`;
-  const r = await pfetch(url, { headers: { Authorization: authHeader }, ...fyFetchOpts });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || d.s === "error" || !Array.isArray(d.candles)) return { candles: null, code: d && d.code, message: d && d.message };
-  const candles = d.candles
-    .map((c) => ({ t: c[0] * 1000, o: c[1], h: c[2], l: c[3], c: c[4], v: c[5] }))
-    .filter((x) => x.c != null && x.h != null && x.l != null);
+  const MAX = 365;
+  const now = Date.now();
+  const windows = [];
+  for (let off = days; off > 0; off -= MAX) {
+    const span = Math.min(off, MAX);
+    windows.push({ from: fmt(new Date(now - off * 864e5)), to: fmt(new Date(now - (off - span) * 864e5)) });
+  }
+  const all = [];
+  let lastErr = null;
+  for (const w of windows) {
+    const url = `${FY_HOST}/data/history?symbol=${encodeURIComponent(fy)}&resolution=${res}&date_format=1&range_from=${w.from}&range_to=${w.to}&cont_flag=1`;
+    const r = await pfetch(url, { headers: { Authorization: authHeader }, ...fyFetchOpts });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error" || !Array.isArray(d.candles)) { lastErr = { code: d && d.code, message: d && d.message }; continue; }
+    for (const c of d.candles) all.push({ t: c[0] * 1000, o: c[1], h: c[2], l: c[3], c: c[4], v: c[5] });
+  }
+  if (!all.length) return { candles: null, code: lastErr && lastErr.code, message: lastErr && lastErr.message };
+  const seen = new Set();
+  const candles = all
+    .filter((x) => x.c != null && x.h != null && x.l != null)
+    .filter((x) => (seen.has(x.t) ? false : (seen.add(x.t), true)))
+    .sort((a, b) => a.t - b.t);
   return { candles };
 }
 async function fyersHouseHistory(ySym, range, interval) {
