@@ -826,6 +826,10 @@ function makeProxyDispatcher(url) {
    its exit IP differs and would fail the FYERS whitelist. */
 const fyersDispatcher = makeProxyDispatcher(process.env.FYERS_PROXY_URL || "");
 const fyFetchOpts = fyersDispatcher ? { dispatcher: fyersDispatcher } : {};
+/* Every FYERS API call MUST exit from the whitelisted IP — especially ORDER placement, which FYERS
+   rejects outright otherwise ("Orders are only allowed from whitelisted IP addresses"). Route them
+   all through the proxy dispatcher; when no proxy is configured this is a plain fetch. */
+function fyFetch(url, opts) { return pfetch(url, { ...(opts || {}), ...fyFetchOpts }); }
 async function fyersHouseToken() {
   if (_fyHouse.token && (Date.now() - _fyHouse.at) < 23 * 3600 * 1000) return _fyHouse.token;
   // A directly-provided daily access token WINS — no minting, no refresh-token flow, no rate
@@ -2814,7 +2818,7 @@ app.post("/api/broker/session", async (req, res) => {
     if (broker === "fyers") {
       // FYERS: appIdHash = SHA256(app_id:secret_id)
       const appIdHash = crypto.createHash("sha256").update(`${key}:${secret}`).digest("hex");
-      const r = await fetch("https://api-t1.fyers.in/api/v3/validate-authcode", {
+      const r = await fyFetch("https://api-t1.fyers.in/api/v3/validate-authcode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ grant_type: "authorization_code", appIdHash, code: requestToken }),
@@ -3044,7 +3048,7 @@ app.get("/api/broker/quotes", async (req, res) => {
     }
 
     if (broker === "fyers") {
-      const r = await fetch(`https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(symbols.join(","))}`, {
+      const r = await fyFetch(`https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(symbols.join(","))}`, {
         headers: brokerAuth(broker, token, sess.userId),
       });
       const d = await r.json();
@@ -3138,9 +3142,9 @@ async function fetchBrokerAccount(sess) {
     }
     if (broker === "fyers") {
       const [hRes, pRes, fRes] = await withTimeout(Promise.all([
-        fetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
-        fetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token, sess.userId) }),
-        fetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token, sess.userId) }),
+        fyFetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
+        fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token, sess.userId) }),
+        fyFetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token, sess.userId) }),
       ]));
       const h = await hRes.json(); const p = await pRes.json(); const f = await fRes.json();
       const settled = (h.holdings || []).map((x) => ({ sym: clean(x.symbol), qty: x.quantity ?? 0, avg: x.costPrice ?? null, price: x.ltp ?? null, market: "IN" }));
@@ -3371,7 +3375,7 @@ app.post("/api/broker/order", async (req, res) => {
     }
 
     if (broker === "fyers") {
-      const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+      const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
         method: "POST",
         headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3742,9 +3746,9 @@ app.get("/api/broker/portfolio", async (req, res) => {
          the Positions tab in the FYERS app) showed as "No holdings" here — even though
          it is very much yours. We now fetch both and merge them. */
       const [hRes, pRes, fRes] = await Promise.all([
-        fetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
-        fetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token, sess.userId) }),
-        fetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token, sess.userId) }),
+        fyFetch("https://api-t1.fyers.in/api/v3/holdings", { headers: brokerAuth(broker, token, sess.userId) }),
+        fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth(broker, token, sess.userId) }),
+        fyFetch("https://api-t1.fyers.in/api/v3/funds", { headers: brokerAuth(broker, token, sess.userId) }),
       ]);
       const h = await hRes.json();
       const p = await pRes.json();
@@ -4133,7 +4137,7 @@ async function placeExitOrder(sess, symbol, qty, market, product) {
     return { orderId: d.data.order_id };
   }
   if (broker === "fyers") {
-    const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
       body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: -1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
     });
@@ -4343,7 +4347,7 @@ async function placeBuyOrder(sess, symbol, qty, market, product) {
     return { orderId: d.data.order_id };
   }
   if (broker === "fyers") {
-    const r = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
       body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: 1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
     });
