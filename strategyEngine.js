@@ -22,6 +22,11 @@ function ROLLmedian(a, p) { const o = Array(a.length).fill(NaN); for (let i = p 
 function CCIarr(c, p) { const tp = c.map((x) => (x.h + x.l + x.c) / 3); const sma = SMAarr(tp, p); const o = Array(c.length).fill(NaN); for (let i = p - 1; i < c.length; i++) { let md = 0; for (let j = i - p + 1; j <= i; j++) md += Math.abs(tp[j] - sma[i]); md /= p; o[i] = md === 0 ? 0 : (tp[i] - sma[i]) / (0.015 * md); } return o; }
 function ATRarr(c, p) { const tr = c.map((x, i) => i === 0 ? x.h - x.l : Math.max(x.h - x.l, Math.abs(x.h - c[i - 1].c), Math.abs(x.l - c[i - 1].c))); return EMAarr(tr, p); }
 function VWAParr(c) { let pv = 0, vv = 0; return c.map((x) => { const tp = (x.h + x.l + x.c) / 3, v = x.v || 1; pv += tp * v; vv += v; return pv / vv; }); }
+function STDDEVarr(a, p) { const out = Array(a.length).fill(NaN); for (let i = p - 1; i < a.length; i++) { let m = 0; for (let j = i - p + 1; j <= i; j++) m += a[j]; m /= p; let s = 0; for (let j = i - p + 1; j <= i; j++) s += (a[j] - m) ** 2; out[i] = Math.sqrt(s / p); } return out; }
+function CPRarr(c) { const pivot = Array(c.length).fill(NaN), bc = Array(c.length).fill(NaN), tc = Array(c.length).fill(NaN); for (let i = 1; i < c.length; i++) { const p = c[i - 1], pv = (p.h + p.l + p.c) / 3, b = (p.h + p.l) / 2; pivot[i] = pv; bc[i] = b; tc[i] = pv + (pv - b); } return { pivot, bc, tc }; }
+function PIVOTarr(c) { const P = Array(c.length).fill(NaN), r1 = Array(c.length).fill(NaN), r2 = Array(c.length).fill(NaN), s1 = Array(c.length).fill(NaN), s2 = Array(c.length).fill(NaN); for (let i = 1; i < c.length; i++) { const p = c[i - 1], pv = (p.h + p.l + p.c) / 3, rng = p.h - p.l; P[i] = pv; r1[i] = 2 * pv - p.l; s1[i] = 2 * pv - p.h; r2[i] = pv + rng; s2[i] = pv - rng; } return { p: P, r1, r2, s1, s2 }; }
+function ICHIarr(c, conv = 9, base = 26, spanBp = 52) { const mid = (n, i) => { if (i < n - 1) return NaN; let hh = -Infinity, ll = Infinity; for (let j = i - n + 1; j <= i; j++) { if (c[j].h > hh) hh = c[j].h; if (c[j].l < ll) ll = c[j].l; } return (hh + ll) / 2; }; const tenkan = [], kijun = [], spanA = [], spanB = []; for (let i = 0; i < c.length; i++) { const t = mid(conv, i), k = mid(base, i), b = mid(spanBp, i); tenkan[i] = t; kijun[i] = k; spanB[i] = b; spanA[i] = (isNaN(t) || isNaN(k)) ? NaN : (t + k) / 2; } return { tenkan, kijun, spanA, spanB }; }
+function FIBarr(c, look = 90, ratio = 0.618) { const seg = c.slice(Math.max(0, c.length - look)); if (!seg.length) return c.map(() => NaN); const hi = Math.max(...seg.map((x) => x.h)), lo = Math.min(...seg.map((x) => x.l)); const lvl = hi - (hi - lo) * ratio; return c.map(() => lvl); }
 function ADXarr(c, p) {
   const n = c.length, pDM = Array(n).fill(0), mDM = Array(n).fill(0), tr = Array(n).fill(0);
   for (let i = 1; i < n; i++) {
@@ -149,6 +154,12 @@ function candleSeries(c, key) {
       case "bear-engulfing": hit = !!p && green(p) && red(x) && x.o >= p.c && x.c <= p.o && b > body(p); break;
       case "morning-star": hit = !!p2 && !!p && red(p2) && body(p) <= 0.4 * rng(p) && green(x) && x.c >= (p2.o + p2.c) / 2; break;
       case "evening-star": hit = !!p2 && !!p && green(p2) && body(p) <= 0.4 * rng(p) && red(x) && x.c <= (p2.o + p2.c) / 2; break;
+      case "three-white-soldiers": hit = !!p2 && !!p && green(p2) && green(p) && green(x)
+        && x.c > p.c && p.c > p2.c && x.o > p.o && p.o > p2.o && x.o < p.c && p.o < p2.c
+        && body(x) >= 0.5 * rng(x) && body(p) >= 0.5 * rng(p); break;
+      case "three-black-crows": hit = !!p2 && !!p && red(p2) && red(p) && red(x)
+        && x.c < p.c && p.c < p2.c && x.o < p.o && p.o < p2.o && x.o > p.c && p.o > p2.c
+        && body(x) >= 0.5 * rng(x) && body(p) >= 0.5 * rng(p); break;
       default: hit = false;
     }
     if (hit) s[i] = 1;
@@ -186,6 +197,11 @@ function resolveOperand(op, defs, c, closes, vols, cache) {
         case "DMI": { const dm = DMIarr(c, len); series = attr === "minus" ? dm.minus : attr === "adx" ? dm.adx : dm.plus; break; }
         case "Stoch": { const st = STOCHarr(c, len, Number(d.smoothK) || 3, Number(d.smoothD) || 3); series = attr === "d" ? st.d : st.k; break; }
         case "Supertrend": { const st = STarr(c, len, Number(d.mult) || 3); series = attr === "dir" ? st.dir : st.line; break; }
+        case "StdDev": series = STDDEVarr(closes, len); break;
+        case "CPR": { const cp = CPRarr(c); series = attr === "bc" ? cp.bc : attr === "tc" ? cp.tc : cp.pivot; break; }
+        case "Pivots": { const pv = PIVOTarr(c); series = attr === "r1" ? pv.r1 : attr === "r2" ? pv.r2 : attr === "s1" ? pv.s1 : attr === "s2" ? pv.s2 : pv.p; break; }
+        case "Ichimoku": { const ic = ICHIarr(c); series = attr === "kijun" ? ic.kijun : attr === "spanA" ? ic.spanA : attr === "spanB" ? ic.spanB : ic.tenkan; break; }
+        case "Fib": { const rt = { r236: 0.236, r382: 0.382, r500: 0.5, r618: 0.618, r786: 0.786 }[attr] ?? 0.5; series = FIBarr(c, len || 90, rt); break; }
         case "DMA": series = SMAarr(closes, len); break;
         case "Volume": { const mode = d.mode || "raw"; series = mode === "avg" ? ROLLavg(vols, len) : mode === "median" ? ROLLmedian(vols, len) : vols; break; }
         case "CurrentCandle": case "CurrentDay": { const f = CF[attr] || "c"; series = c.map((x) => x[f]); break; }

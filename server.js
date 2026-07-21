@@ -74,7 +74,14 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8787;
 const YF = "https://query1.finance.yahoo.com";
-const UA = { "User-Agent": "Mozilla/5.0 (MatrixProxy)" };
+/* A REAL browser User-Agent + Accept headers. Yahoo throttles/short-changes obviously-bot agents
+   from datacenter IPs (the old "MatrixProxy" UA came back with ~2 candles, which broke Indian charts
+   and backtests). A normal Chrome UA is served the full history. */
+const UA = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+  "Accept": "application/json,text/plain,*/*",
+  "Accept-Language": "en-US,en;q=0.9",
+};
 db.initDb().catch((e) => console.error("[db] init failed:", e.message));
 
 /* ------------------------------- trade store ------------------------------ */
