@@ -1024,7 +1024,9 @@ async function fyersHouseQuotes(ySyms) {
 const FY_RES = { "1m": "1", "2m": "2", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "60m": "60", "1h": "60", "90m": "90", "1d": "D", "1D": "D" };
 const FY_RANGE_DAYS = { "1d": 2, "5d": 7, "1mo": 31, "3mo": 93, "6mo": 186, "1y": 370, "2y": 740 };
 async function fyersHouseHistory(ySym, range, interval) {
-  if (!EQUITY_HOUSE_FEED) return null;   // gated: fall back to Yahoo candles
+  /* HISTORY comes from FYERS whenever a house token is configured — Yahoo throttles historical
+     candles from datacenter IPs down to a couple of bars, which broke charts and backtests. This
+     is the DELAYED OHLC history, not the live tick feed (that stays gated by EQUITY_HOUSE_FEED). */
   const fy = yahooToFyers(ySym);
   const res = FY_RES[interval];
   const days = FY_RANGE_DAYS[range];
@@ -4366,6 +4368,19 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
   throw new Error(`auto-buy not supported for ${broker}`);
 }
 
+/* Market hours (evaluated in IST). The auto-buy engine must never place an order into a CLOSED
+   market — an Indian order at 8pm or on a weekend would queue/reject and is simply wrong.
+   IN/FNO 9:15–15:30 · Commodity 9:00–23:30 · US 7:00pm–1:30am IST, all Mon–Fri · Crypto 24/7. */
+function marketOpenIST(market) {
+  if (market === "Crypto") return true;
+  const ist = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const day = ist.getDay(), mins = ist.getHours() * 60 + ist.getMinutes();
+  const weekday = day >= 1 && day <= 5;
+  if (market === "IN" || market === "FNO") return weekday && mins >= 555 && mins <= 930;
+  if (market === "Commodity") return weekday && mins >= 540 && mins <= 1410;
+  if (market === "US") return (mins >= 1140 && day >= 1 && day <= 5) || (mins <= 90 && day >= 2 && day <= 6);
+  return true;
+}
 let autoBuyRunning = false;
 let lastAutoBuy = { at: null, checked: 0, bought: 0, live: false };
 /* LIVE flag: the env var (case-insensitive — "TRUE"/"true"/"1" all count) OR a runtime admin
@@ -4383,6 +4398,7 @@ async function runAutoBuyEngine() {
     for (const st of strategies) {
       checked++;
       try {
+        if (!marketOpenIST(st.market)) continue;   // market closed — do not enter
         // One position per strategy: if it still holds an open managed position, do nothing.
         if (st.openPositionId) {
           const pos = (await db.getManagedPositionsForUser(st.userId)).find((p) => p.id === st.openPositionId);
