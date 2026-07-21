@@ -2261,6 +2261,13 @@ app.get("/api/feeds-status", async (req, res) => {
   let fy = {}, de = {};
   try { fy = await fyersHouseQuotes(["RELIANCE.NS"]); } catch (e) { _fyLastError = e.message; }
   try { de = await deltaHouseQuotes(["BTC-USD"]); } catch (e) { _deltaLastError = e.message; }
+  // DIRECT token + history probe — bypasses the EQUITY_HOUSE_FEED quote gate so we can see whether
+  // the FYERS auth (TOTP or access token) actually works and whether history is coming from FYERS.
+  let tokenOk = false, tokenErr = null, histCount = 0, histErr = null;
+  try { const t = await fyersHouseToken(); tokenOk = Boolean(t); } catch (e) { tokenErr = String(e.message || e); }
+  try { const h = await fyersHouseHistory("RELIANCE.NS", "6mo", "1d"); histCount = (h && h.length) || 0; } catch (e) { histErr = String(e.message || e); }
+  const totpEnv = { FYERS_FY_ID: Boolean(process.env.FYERS_FY_ID), FYERS_TOTP_SECRET: Boolean(process.env.FYERS_TOTP_SECRET), FYERS_REDIRECT_URI: Boolean(process.env.FYERS_REDIRECT_URI) };
+  const secLen = (process.env.FYERS_TOTP_SECRET || "").trim().length;
   res.json({
     fyers: {
       envConfigured: {
@@ -2269,7 +2276,13 @@ app.get("/api/feeds-status", async (req, res) => {
         FYERS_REFRESH_TOKEN: Boolean(process.env.FYERS_REFRESH_TOKEN),
         FYERS_PIN: Boolean(process.env.FYERS_PIN),
         FYERS_ACCESS_TOKEN: Boolean(process.env.FYERS_ACCESS_TOKEN),
+        ...totpEnv,
       },
+      // Is the TOTP secret a plausible base32 key (not a 6-digit code)? A 6-digit numeric value is
+      // the classic mistake — flag it so it's obvious.
+      totpSecretLooksValid: secLen >= 16 && !/^\d{6}$/.test((process.env.FYERS_TOTP_SECRET || "").trim()),
+      tokenOk, tokenError: tokenErr,
+      historyCandles: histCount, historyError: histErr,   // >2 means the FYERS house feed is live
       working: Object.keys(fy).length > 0,
       sample: fy["RELIANCE.NS"] || null,
       lastError: _fyLastError,
