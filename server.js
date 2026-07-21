@@ -1200,6 +1200,21 @@ async function mcxHouseQuotes(ySyms) {
    or when the feed isn't configured) so the caller cleanly falls back to Yahoo. */
 const FY_RES = { "1m": "1", "2m": "2", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "60m": "60", "1h": "60", "90m": "90", "1d": "D", "1D": "D" };
 const FY_RANGE_DAYS = { "1d": 2, "5d": 7, "1mo": 31, "3mo": 93, "6mo": 186, "1y": 370, "2y": 740 };
+/* CORE FYERS history fetch. Given a resolved FYERS symbol + an Authorization header, returns the
+   candles. Shared by the OWNER house feed and each connected user's OWN feed, so the per-user
+   (compliant) path reuses the exact same request/parse. */
+async function fetchFyersHistoryRaw(fy, res, days, authHeader) {
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  const from = fmt(new Date(Date.now() - days * 864e5)), to = fmt(new Date());
+  const url = `${FY_HOST}/data/history?symbol=${encodeURIComponent(fy)}&resolution=${res}&date_format=1&range_from=${from}&range_to=${to}&cont_flag=1`;
+  const r = await pfetch(url, { headers: { Authorization: authHeader }, ...fyFetchOpts });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.s === "error" || !Array.isArray(d.candles)) return { candles: null, code: d && d.code, message: d && d.message };
+  const candles = d.candles
+    .map((c) => ({ t: c[0] * 1000, o: c[1], h: c[2], l: c[3], c: c[4], v: c[5] }))
+    .filter((x) => x.c != null && x.h != null && x.l != null);
+  return { candles };
+}
 async function fyersHouseHistory(ySym, range, interval) {
   /* HISTORY comes from FYERS whenever a house token is configured — Yahoo throttles historical
      candles from datacenter IPs down to a couple of bars, which broke charts and backtests. This
@@ -1211,20 +1226,34 @@ async function fyersHouseHistory(ySym, range, interval) {
   const token = await fyersHouseToken();
   if (!token) return null;
   const appId = process.env.FYERS_APP_ID || "";
-  const fmt = (d) => d.toISOString().slice(0, 10);
-  const from = fmt(new Date(Date.now() - days * 864e5)), to = fmt(new Date());
   try {
-    const url = `${FY_HOST}/data/history?symbol=${encodeURIComponent(fy)}&resolution=${res}&date_format=1&range_from=${from}&range_to=${to}&cont_flag=1`;
-    const r = await pfetch(url, { headers: { Authorization: `${appId}:${token}` }, ...fyFetchOpts });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.s === "error" || !Array.isArray(d.candles)) {
-      if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };
-      return null;
-    }
-    // FYERS candle rows are [epoch_s, o, h, l, c, v].
-    return d.candles
-      .map((c) => ({ t: c[0] * 1000, o: c[1], h: c[2], l: c[3], c: c[4], v: c[5] }))
-      .filter((x) => x.c != null && x.h != null && x.l != null);
+    const out = await fetchFyersHistoryRaw(fy, res, days, `${appId}:${token}`);
+    if (!out.candles && (out.code === -16 || /token/i.test(out.message || ""))) _fyHouse = { token: null, at: 0 };
+    return out.candles;
+  } catch { return null; }
+}
+/* A CONNECTED user's OWN FYERS history — their licensed data for their own use (compliant). Uses
+   the user's stored FYERS token, not the house token. Returns null if they aren't connected. */
+async function userFyersHistory(userId, ySym, range, interval) {
+  const fy = yahooToFyers(ySym);
+  const res = FY_RES[interval];
+  const days = FY_RANGE_DAYS[range];
+  if (!fy || !res || !days) return null;
+  try {
+    const sess = await sessionFromCred(userId, "fyers");
+    if (!sess || !sess.accessToken) return null;
+    const auth = brokerAuth("fyers", sess.accessToken, userId).Authorization;
+    const out = await fetchFyersHistoryRaw(fy, res, days, auth);
+    return out.candles;
+  } catch { return null; }
+}
+/* The authenticated user's storage key from an optional bearer token (null if anonymous). */
+function reqUserIdOptional(req) {
+  try {
+    const h = req.get("Authorization") || "";
+    const token = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
+    const v = verifyToken(token);
+    return v ? storageKeyFor(v.userId) : null;
   } catch { return null; }
 }
 
@@ -1267,11 +1296,16 @@ app.get("/api/history", async (req, res) => {
   const interval = String(req.query.interval || "1d");
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   try {
-    // FYERS house feed is the OWNER's licensed data — only the owner is served from it (compliance).
-    // Everyone else falls straight through to Yahoo (or their own broker, when that's wired).
+    // COMPLIANT SOURCING, in order:
+    //  1. OWNER (you) -> your licensed FYERS house feed.
+    //  2. A CONNECTED user -> THEIR OWN broker's history (their data, their use).
+    //  3. Everyone else -> Yahoo (delayed/limited).
     let candles = null;
     if (isHouseOwner(req)) {
       candles = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
+    } else {
+      const uid = reqUserIdOptional(req);
+      if (uid) candles = await memo(`fyu:${uid}:${symbol}:${range}:${interval}`, 60_000, () => userFyersHistory(uid, symbol, range, interval));
     }
     if (!candles || !candles.length) {
       const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
