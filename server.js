@@ -4307,7 +4307,7 @@ const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 10
 
 /* A real BUY to OPEN a position. Same per-broker plumbing as the manual order route, kept
    to the brokers whose order placement is wired. */
-async function placeBuyOrder(sess, symbol, qty, market, product) {
+async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null) {
   const broker = sess.broker, token = sess.accessToken;
   const prod = mapProduct(broker, product);
   if (broker === "delta") {
@@ -4329,8 +4329,17 @@ async function placeBuyOrder(sess, symbol, qty, market, product) {
     if (o.state === "cancelled" || o.state === "rejected" || filledC <= 0) {
       throw new Error(o.cancellation_reason || o.meta_data?.reason || `Order not filled (state: ${o.state || "unknown"}) — likely insufficient balance/margin`);
     }
+    /* Attach the SAME native Delta bracket the manual/Automate order does, so an AUTO-BUY position
+       gets exchange-side SL/TP that fire on Delta itself — not just the server-side exit monitor.
+       Best-effort: the entry has already filled, so a bracket hiccup must not throw. */
+    let bracket = null;
+    if (Number(slPct) > 0 || Number(tpPct) > 0) {
+      const entryRef = o.average_fill_price != null ? Number(o.average_fill_price) : (await liveMarkForOrder(symbol, "Crypto"));
+      try { bracket = await placeDeltaBracket(dprod, "buy", entryRef, slPct, tpPct, sess.userId); }
+      catch (e) { bracket = { placed: false, message: String(e.message || e) }; }
+    }
     // Return COIN units (contracts × contract_value) so the stored position + P&L stay correct.
-    return { orderId: o.id ?? null, filledQty: filledC * cv, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, state: o.state, partial: filledC < sizeC };
+    return { orderId: o.id ?? null, filledQty: filledC * cv, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, state: o.state, partial: filledC < sizeC, bracket };
   }
   if (broker === "coindcx") {
     const { apiKey, apiSecret } = sess.extra || {};
@@ -4433,7 +4442,7 @@ async function runAutoBuyEngine() {
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
         // price, so P&L reflects what really executed, not what we requested.
-        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product);
+        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null);
         const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
         const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : px;
         const pos = await registerManagedPosition({
