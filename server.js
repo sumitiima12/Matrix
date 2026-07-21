@@ -25,6 +25,8 @@ const strat = require("./strategyEngine");   // server-side port of the strategy
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
+const { marketOpenIST } = require("./marketHours");   // IST market-open check (auto-buy guard)
+const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
    routes use this — identity is taken from the token when we have it, and we fall back to the
    X-User-Id header otherwise, so a token-flow hiccup can't hard-block real functionality the way
@@ -1018,6 +1020,67 @@ async function fyersHouseQuotes(ySyms) {
   } catch (e) { _fyLastError = "quotes error: " + e.message; console.error("[fyers-house]", _fyLastError); return {}; }
 }
 
+/* ── MCX (Indian commodity) house feed ──────────────────────────────────────────────────
+   OPT-IN via MCX_HOUSE_FEED. When on (and a FYERS house token exists), commodity quotes come from
+   the near-month MCX futures contract in INR instead of COMEX/NYMEX in USD. MCX contracts roll
+   monthly, so we read FYERS' public symbol master to resolve the current contract per underlying.
+   Everything degrades to COMEX/Yahoo: no token, feed off, master unreachable, or symbol not
+   mappable all simply return {} and the caller prices the instrument the old way. */
+const MCX_MASTER_URL = process.env.MCX_MASTER_URL || "https://public.fyers.in/sym_details/MCX_COM.csv";
+const mcxFeedOn = () => /^(true|1|yes)$/i.test(String(process.env.MCX_HOUSE_FEED || ""));
+let _mcxRows = { rows: null, at: 0 };
+async function mcxSymbolRows() {
+  // Cache the parsed master for 12h — it only changes when contracts roll (monthly).
+  if (_mcxRows.rows && (Date.now() - _mcxRows.at) < 12 * 3600 * 1000) return _mcxRows.rows;
+  try {
+    const r = await pfetch(MCX_MASTER_URL, fyFetchOpts);
+    const txt = await r.text();
+    const rows = mcx.parseSymbolMaster(txt);
+    if (rows.length) { _mcxRows = { rows, at: Date.now() }; return rows; }
+  } catch (e) { _fyLastError = "mcx master: " + e.message; }
+  return _mcxRows.rows || [];
+}
+async function mcxHouseQuotes(ySyms) {
+  if (!mcxFeedOn()) return {};
+  const wanted = (ySyms || []).filter((y) => mcx.COMEX_TO_MCX[y]);
+  if (!wanted.length) return {};
+  const token = await fyersHouseToken();
+  if (!token) return {};
+  const rows = await mcxSymbolRows();
+  if (!rows.length) return {};
+  // Resolve each requested commodity to its near-month contract; keep the mapping both ways.
+  const byTicker = {};
+  const pairs = [];
+  for (const y of wanted) {
+    const c = mcx.resolveFromYahoo(rows, y);
+    if (c) { byTicker[c.ticker] = { y, meta: c }; pairs.push(c.ticker); }
+  }
+  if (!pairs.length) return {};
+  const appId = process.env.FYERS_APP_ID || "";
+  try {
+    const r = await pfetch(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.join(","))}`, {
+      headers: { Authorization: `${appId}:${token}` },
+      ...fyFetchOpts,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") { _fyLastError = "mcx quotes: " + (d.message || ("HTTP " + r.status)); return {}; }
+    const out = {};
+    (d.d || []).forEach((row) => {
+      const hit = byTicker[row.n];
+      const v = row.v || {};
+      if (hit && v.lp != null) {
+        out[hit.y] = {
+          sym: hit.y, name: hit.meta.label || hit.y,
+          price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0,
+          currency: "INR", src: "fyers-mcx",
+          contract: hit.meta.ticker, unit: hit.meta.unit || null, lot: hit.meta.lot || 1,
+        };
+      }
+    });
+    return out;
+  } catch (e) { _fyLastError = "mcx quotes error: " + e.message; return {}; }
+}
+
 /* Historical candles from the FYERS house feed. Returns the SAME shape as the Yahoo path
    ({ t, o, h, l, c, v }), or null for anything FYERS can't serve (non-equity, weekly/monthly,
    or when the feed isn't configured) so the caller cleanly falls back to Yahoo. */
@@ -1058,11 +1121,12 @@ app.get("/api/quote", async (req, res) => {
     const quotes = await memo(`q:${symbols.join(",")}`, 15_000, async () => {
       // Indian equities from the FYERS house feed and crypto from the Delta feed first;
       // Yahoo covers the rest — and anything the house feeds didn't return.
-      let fyMap = {}, dMap = {}, imMap = {};
+      let fyMap = {}, dMap = {}, imMap = {}, mcxMap = {};
       try { fyMap = await fyersHouseQuotes(symbols); } catch { fyMap = {}; }
       try { dMap = await deltaHouseQuotes(symbols); } catch { dMap = {}; }
       try { imMap = await indmoneyHouseQuotes(symbols); } catch { imMap = {}; }   // real-time US via IND Money
-      const houseMap = { ...fyMap, ...dMap, ...imMap };
+      try { mcxMap = await mcxHouseQuotes(symbols); } catch { mcxMap = {}; }        // MCX commodity (INR) when opted in
+      const houseMap = { ...fyMap, ...dMap, ...imMap, ...mcxMap };
       const need = symbols.filter((s) => !houseMap[s]);
       const rows = await mapLimit(need, 6, async (sym) => {
         try {
@@ -4371,16 +4435,6 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
 /* Market hours (evaluated in IST). The auto-buy engine must never place an order into a CLOSED
    market — an Indian order at 8pm or on a weekend would queue/reject and is simply wrong.
    IN/FNO 9:15–15:30 · Commodity 9:00–23:30 · US 7:00pm–1:30am IST, all Mon–Fri · Crypto 24/7. */
-function marketOpenIST(market) {
-  if (market === "Crypto") return true;
-  const ist = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  const day = ist.getDay(), mins = ist.getHours() * 60 + ist.getMinutes();
-  const weekday = day >= 1 && day <= 5;
-  if (market === "IN" || market === "FNO") return weekday && mins >= 555 && mins <= 930;
-  if (market === "Commodity") return weekday && mins >= 540 && mins <= 1410;
-  if (market === "US") return (mins >= 1140 && day >= 1 && day <= 5) || (mins <= 90 && day >= 2 && day <= 6);
-  return true;
-}
 let autoBuyRunning = false;
 let lastAutoBuy = { at: null, checked: 0, bought: 0, live: false };
 /* LIVE flag: the env var (case-insensitive — "TRUE"/"true"/"1" all count) OR a runtime admin
