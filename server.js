@@ -2981,6 +2981,8 @@ const DEFAULT_APP_SETTINGS = {
   // Show the Indian market to users who HAVEN'T connected a broker (on the delayed BSE fallback
   // feed). Default OFF — by default a non-connected member doesn't see the Indian market at all.
   showIndianWithoutBroker: false,
+  // Show the US market tab to non-admin users. Default OFF — US stays admin-only until enabled.
+  showUSMarket: false,
 };
 function mergeAppSettings(stored) {
   const s = stored || {};
@@ -2996,6 +2998,7 @@ function mergeAppSettings(stored) {
     allowBrokerConnect: MARKETS.reduce((o, m) => { o[m] = Boolean(abc[m]); return o; }, {}),
     allowVirtual: { IN: Boolean(av.IN), Global: Boolean(av.Global) },
     showIndianWithoutBroker: Boolean(s.showIndianWithoutBroker),
+    showUSMarket: Boolean(s.showUSMarket),
   };
 }
 
