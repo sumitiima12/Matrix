@@ -1239,7 +1239,10 @@ async function fetchFyersHistoryRaw(fy, res, days, authHeader) {
      split any span longer than a year into ≤365-day windows, fetch each, then merge + de-dupe. Spans
      under a year (every intraday timeframe) still make exactly one call, so nothing else changes. */
   const fmt = (d) => d.toISOString().slice(0, 10);
-  const MAX = 365;
+  /* FYERS caps a single request differently by resolution: ~366 days for DAILY, but only ~100 days
+     for intraday (minute) resolutions. Chunk accordingly, so a months-long intraday backtest pull
+     succeeds instead of coming back empty. */
+  const MAX = (res === "D" || res === "1D") ? 365 : 90;
   const now = Date.now();
   const windows = [];
   for (let off = days; off > 0; off -= MAX) {
