@@ -167,7 +167,81 @@ function candleSeries(c, key) {
   return s;
 }
 
-function resolveOperand(op, defs, c, closes, vols, cache) {
+/* One indicator def -> its value series over WHATEVER OHLC series you pass — so the identical logic
+   can run on the base candles OR on a higher-timeframe aggregate (multi-timeframe support). */
+function computeIndicator(d, attr, c, closes, vols) {
+  const len = Number(d.len) || 14;
+  switch (d.type) {
+    case "EMA": return EMAarr(closes, len);
+    case "SMA": return SMAarr(closes, len);
+    case "RSI": return RSIarr(closes, len);
+    case "CCI": return CCIarr(c, len);
+    case "ATR": return ATRarr(c, len);
+    case "VWAP": return VWAParr(c);
+    case "MACD": { const m = MACDarr(closes, d.fast, d.slow, d.signal); return m[attr || "line"]; }
+    case "BB": { const b = BBarr(closes, len, d.mult); return b[attr || "middle"]; }
+    case "KC": { const mid = EMAarr(closes, len), at = ATRarr(c, len); return attr === "upper" ? mid.map((v, i) => v + 1.5 * at[i]) : attr === "lower" ? mid.map((v, i) => v - 1.5 * at[i]) : mid; }
+    case "ADX": return ADXarr(c, len);
+    case "DMI": { const dm = DMIarr(c, len); return attr === "minus" ? dm.minus : attr === "adx" ? dm.adx : dm.plus; }
+    case "Stoch": { const st = STOCHarr(c, len, Number(d.smoothK) || 3, Number(d.smoothD) || 3); return attr === "d" ? st.d : st.k; }
+    case "Supertrend": { const st = STarr(c, len, Number(d.mult) || 3); return attr === "dir" ? st.dir : st.line; }
+    case "StdDev": return STDDEVarr(closes, len);
+    case "CPR": { const cp = CPRarr(c); return attr === "bc" ? cp.bc : attr === "tc" ? cp.tc : cp.pivot; }
+    case "Pivots": { const pv = PIVOTarr(c); return attr === "r1" ? pv.r1 : attr === "r2" ? pv.r2 : attr === "s1" ? pv.s1 : attr === "s2" ? pv.s2 : pv.p; }
+    case "Ichimoku": { const ic = ICHIarr(c); return attr === "kijun" ? ic.kijun : attr === "spanA" ? ic.spanA : attr === "spanB" ? ic.spanB : ic.tenkan; }
+    case "Fib": { const rt = { r236: 0.236, r382: 0.382, r500: 0.5, r618: 0.618, r786: 0.786 }[attr] ?? 0.5; return FIBarr(c, len || 90, rt); }
+    case "DMA": return SMAarr(closes, len);
+    case "Volume": { const mode = d.mode || "raw"; return mode === "avg" ? ROLLavg(vols, len) : mode === "median" ? ROLLmedian(vols, len) : vols; }
+    case "CurrentCandle": case "CurrentDay": { const f = CF[attr] || "c"; return c.map((x) => x[f]); }
+    case "PrevCandle": case "PrevDay": { const f = CF[attr] || "c"; return c.map((x, i) => i > 0 ? c[i - 1][f] : NaN); }
+    case "LastNCandles": { const f = CF[attr] || "c"; return attr === "high" ? rollExt(c, len, "h", true) : attr === "low" ? rollExt(c, len, "l", false) : c.map((x, i) => (i - len + 1 >= 0 ? c[i - len + 1][f] : x[f])); }
+    case "FirstNCandles": { const f = CF[attr] || "c"; const head = c.slice(0, Math.max(1, len)); const val = attr === "high" ? Math.max(...head.map((x) => x.h)) : attr === "low" ? Math.min(...head.map((x) => x.l)) : (attr === "open" ? head[0].o : head[head.length - 1].c); return closes.map(() => val); }
+    case "ORB": {
+      const mins = Number(d.len) || 15;
+      const out = new Array(c.length);
+      let dayKey = null, hi = -Infinity, lo = Infinity, dayStart = 0;
+      for (let i = 0; i < c.length; i++) {
+        const dt = new Date(c[i].t);
+        const key = dt.getUTCFullYear() + "-" + dt.getUTCMonth() + "-" + dt.getUTCDate();
+        if (key !== dayKey) { dayKey = key; hi = -Infinity; lo = Infinity; dayStart = c[i].t; }
+        if (c[i].t - dayStart < mins * 60000) { if (c[i].h > hi) hi = c[i].h; if (c[i].l < lo) lo = c[i].l; }
+        out[i] = attr === "low" ? lo : hi;
+      }
+      return out;
+    }
+    default: return closes.map(() => NaN);
+  }
+}
+
+const TF_MIN = { "1m": 1, "2m": 2, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30, "45m": 45, "60m": 60, "1h": 60, "90m": 90, "2h": 120, "3h": 180, "4h": 240, "1d": 1440, "1D": 1440, "1w": 10080, "1W": 10080, "1mo": 43200 };
+function tfMinutes(tf) { const k = String(tf || "").trim(); return TF_MIN[k] || TF_MIN[k.toLowerCase()] || TF_MIN[k.toUpperCase()] || 0; }
+
+/* Fold the base OHLC series into higher-tf buckets and, for each base bar, the index of the last
+   CLOSED higher-tf bar (no lookahead). Cached per period on the eval cache. */
+function mtfBuckets(c, periodMin, store) {
+  const key = "__mtf_" + periodMin;
+  if (store[key]) return store[key];
+  const P = periodMin * 60000;
+  const hi = [];
+  let curB = null, cur = null;
+  for (const x of c) {
+    const b = Math.floor(x.t / P);
+    if (b !== curB) { if (cur) hi.push(cur); curB = b; cur = { t: b * P, o: x.o, h: x.h, l: x.l, c: x.c, v: x.v || 0, _b: b }; }
+    else { cur.h = Math.max(cur.h, x.h); cur.l = Math.min(cur.l, x.l); cur.c = x.c; cur.v += (x.v || 0); }
+  }
+  if (cur) hi.push(cur);
+  const idxOf = new Array(c.length);
+  let p = 0;
+  for (let i = 0; i < c.length; i++) {
+    const b = Math.floor(c[i].t / P);
+    while (p < hi.length && hi[p]._b < b) p++;
+    idxOf[i] = p - 1;
+  }
+  const out = { hi, idxOf, hiCloses: hi.map((x) => x.c), hiVols: hi.map((x) => x.v || 0) };
+  store[key] = out; return out;
+}
+
+function resolveOperand(op, defs, c, closes, vols, cache, baseTf = null) {
   if (op in cache) return cache[op];
   let series;
   if (op !== "" && !isNaN(Number(op))) { const n = Number(op); series = closes.map(() => n); }
@@ -182,33 +256,13 @@ function resolveOperand(op, defs, c, closes, vols, cache) {
     const d = (defs || []).find((x) => x.name === nm);
     if (!d) series = closes.map(() => NaN);
     else {
-      const len = Number(d.len) || 14;
-      switch (d.type) {
-        case "EMA": series = EMAarr(closes, len); break;
-        case "SMA": series = SMAarr(closes, len); break;
-        case "RSI": series = RSIarr(closes, len); break;
-        case "CCI": series = CCIarr(c, len); break;
-        case "ATR": series = ATRarr(c, len); break;
-        case "VWAP": series = VWAParr(c); break;
-        case "MACD": { const m = MACDarr(closes, d.fast, d.slow, d.signal); series = m[attr || "line"]; break; }
-        case "BB": { const b = BBarr(closes, len, d.mult); series = b[attr || "middle"]; break; }
-        case "KC": { const mid = EMAarr(closes, len), at = ATRarr(c, len); series = attr === "upper" ? mid.map((v, i) => v + 1.5 * at[i]) : attr === "lower" ? mid.map((v, i) => v - 1.5 * at[i]) : mid; break; }
-        case "ADX": series = ADXarr(c, len); break;
-        case "DMI": { const dm = DMIarr(c, len); series = attr === "minus" ? dm.minus : attr === "adx" ? dm.adx : dm.plus; break; }
-        case "Stoch": { const st = STOCHarr(c, len, Number(d.smoothK) || 3, Number(d.smoothD) || 3); series = attr === "d" ? st.d : st.k; break; }
-        case "Supertrend": { const st = STarr(c, len, Number(d.mult) || 3); series = attr === "dir" ? st.dir : st.line; break; }
-        case "StdDev": series = STDDEVarr(closes, len); break;
-        case "CPR": { const cp = CPRarr(c); series = attr === "bc" ? cp.bc : attr === "tc" ? cp.tc : cp.pivot; break; }
-        case "Pivots": { const pv = PIVOTarr(c); series = attr === "r1" ? pv.r1 : attr === "r2" ? pv.r2 : attr === "s1" ? pv.s1 : attr === "s2" ? pv.s2 : pv.p; break; }
-        case "Ichimoku": { const ic = ICHIarr(c); series = attr === "kijun" ? ic.kijun : attr === "spanA" ? ic.spanA : attr === "spanB" ? ic.spanB : ic.tenkan; break; }
-        case "Fib": { const rt = { r236: 0.236, r382: 0.382, r500: 0.5, r618: 0.618, r786: 0.786 }[attr] ?? 0.5; series = FIBarr(c, len || 90, rt); break; }
-        case "DMA": series = SMAarr(closes, len); break;
-        case "Volume": { const mode = d.mode || "raw"; series = mode === "avg" ? ROLLavg(vols, len) : mode === "median" ? ROLLmedian(vols, len) : vols; break; }
-        case "CurrentCandle": case "CurrentDay": { const f = CF[attr] || "c"; series = c.map((x) => x[f]); break; }
-        case "PrevCandle": case "PrevDay": { const f = CF[attr] || "c"; series = c.map((x, i) => i > 0 ? c[i - 1][f] : NaN); break; }
-        case "LastNCandles": { const f = CF[attr] || "c"; series = attr === "high" ? rollExt(c, len, "h", true) : attr === "low" ? rollExt(c, len, "l", false) : c.map((x, i) => (i - len + 1 >= 0 ? c[i - len + 1][f] : x[f])); break; }
-        case "FirstNCandles": { const f = CF[attr] || "c"; const head = c.slice(0, Math.max(1, len)); const val = attr === "high" ? Math.max(...head.map((x) => x.h)) : attr === "low" ? Math.min(...head.map((x) => x.l)) : (attr === "open" ? head[0].o : head[head.length - 1].c); series = closes.map(() => val); break; }
-        default: series = closes.map(() => NaN);
+      const bm = tfMinutes(baseTf), dm = tfMinutes(d.tf);
+      if (baseTf && bm > 0 && dm > bm) {
+        const agg = mtfBuckets(c, dm, cache);
+        const hiSeries = computeIndicator(d, attr, agg.hi, agg.hiCloses, agg.hiVols);
+        series = agg.idxOf.map((k) => (k >= 0 ? hiSeries[k] : NaN));
+      } else {
+        series = computeIndicator(d, attr, c, closes, vols);
       }
     }
   }
@@ -263,7 +317,7 @@ function exitSignalFired(cfg, rawCandles) {
     const closes = c.map((x) => x.c);
     const vols = c.map((x) => x.v || 0);
     const cache = {};
-    const get = (op) => resolveOperand(op, cfg.defs || [], c, closes, vols, cache);
+    const get = (op) => resolveOperand(op, cfg.defs || [], c, closes, vols, cache, cfg.tf || null);
     const i = c.length - 1;
     const fired = chainEval(cfg.exit, i, get);
     return { fired, reason: fired ? "Strategy exit signal" : undefined };
@@ -285,7 +339,7 @@ function entrySignalFired(cfg, rawCandles) {
     const closes = c.map((x) => x.c);
     const vols = c.map((x) => x.v || 0);
     const cache = {};
-    const get = (op) => resolveOperand(op, cfg.defs || [], c, closes, vols, cache);
+    const get = (op) => resolveOperand(op, cfg.defs || [], c, closes, vols, cache, cfg.tf || null);
     const i = c.length - 1;
     const fired = chainEval(cfg.entry, i, get);
     return { fired, reason: fired ? "Strategy entry signal" : undefined, price: fired ? closes[i] : null };
