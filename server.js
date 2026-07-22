@@ -3075,7 +3075,15 @@ app.get("/api/broker/login-url", async (req, res) => {
 
   const key = b.key(userId);
   if (!key) return res.status(400).json({ error: `${b.name} is not configured on the server (missing API key).` });
-  res.json({ url: b.loginUrl(key, req.query.redirect) });
+  /* REDIRECT MUST MATCH EXACTLY. FYERS rejects the login (and loops the user back to its own login
+     page) if the redirect_uri isn't character-for-character the one registered in the app. The
+     frontend sends the current page URL, which can drift (trailing slash, sub-path). For the SHARED
+     house app we pin it to FYERS_REDIRECT_URI when set, so it always equals what's registered. */
+  let redirect = req.query.redirect;
+  if (id === "fyers" && envKey("FYERS_REDIRECT_URI") && !getUserAppCred("fyers", userId)) {
+    redirect = envKey("FYERS_REDIRECT_URI");   // only for shared-app users; BYOA users keep their own
+  }
+  res.json({ url: b.loginUrl(key, redirect) });
 });
 
 /* Step 2: exchange the short-lived request/auth code for an access token.
