@@ -2633,7 +2633,14 @@ const BROKERS = {
      the connect body". No secrets sit in the server env for these. */
   dhan: {
     name: "Dhan", userCreds: true,
-    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+    /* "Log in with Dhan" (PARTNER consent OAuth) is available when the server holds Matrix's Dhan
+       partner credentials; otherwise the user pastes a token (userCreds path). key()/secret() return
+       the PARTNER id/secret used to generate + consume the consent. loginUrl is null because Dhan
+       needs an async generate-consent call first — that's handled in /api/broker/login-url. */
+    partnerOAuth: () => Boolean(envKey("DHAN_PARTNER_ID") && envKey("DHAN_PARTNER_SECRET")),
+    key: () => envKey("DHAN_PARTNER_ID") || "byo",
+    secret: () => envKey("DHAN_PARTNER_SECRET") || "byo",
+    loginUrl: () => null,
   },
   indmoney: {
     name: "IND Money", userCreds: true,
@@ -3039,11 +3046,33 @@ app.post("/api/admin/delete-user", async (req, res) => {
 });
 
 /** Step 1 of OAuth: where the user logs in. */
-app.get("/api/broker/login-url", (req, res) => {
+app.get("/api/broker/login-url", async (req, res) => {
   const id = String(req.query.broker || "");
   const b = BROKERS[id];
   if (!b) return res.status(400).json({ error: "unknown broker" });
   const userId = req.query.userId || req.get("X-User-Id");   // whose FYERS app to use
+
+  /* DHAN "Log in with Dhan" (PARTNER consent flow). Unlike the plain OAuth brokers, Dhan needs a
+     server-side call FIRST: we generate a consent with Matrix's partner credentials, get a consentId,
+     then send the user to Dhan's own consent-login page. Dhan redirects back to our registered URL
+     with ?tokenId=, which /api/broker/session consumes into an access token. */
+  if (id === "dhan") {
+    const pid = envKey("DHAN_PARTNER_ID"), psec = envKey("DHAN_PARTNER_SECRET");
+    if (!pid || !psec) return res.status(400).json({ error: "Dhan partner login isn't set up on the server. Paste a Dhan access token instead." });
+    try {
+      const r = await fetch("https://api.dhan.co/v2/partner/generate-consent", {
+        method: "GET",
+        headers: { partner_id: pid, partner_secret: psec, "Content-Type": "application/json" },
+      });
+      const d = await r.json().catch(() => ({}));
+      const consentId = d.consentId || d.consentAppId || d.consent_id;
+      if (!r.ok || !consentId) return res.status(400).json({ error: d.errorMessage || d.message || `Dhan couldn't start the login (${r.status}).` });
+      return res.json({ url: `https://auth.dhan.co/consent-login?consentId=${encodeURIComponent(consentId)}` });
+    } catch (e) {
+      return res.status(502).json({ error: `Dhan consent error: ${String(e.message || e)}` });
+    }
+  }
+
   const key = b.key(userId);
   if (!key) return res.status(400).json({ error: `${b.name} is not configured on the server (missing API key).` });
   res.json({ url: b.loginUrl(key, req.query.redirect) });
@@ -3139,8 +3168,25 @@ app.post("/api/broker/session", async (req, res) => {
     }
 
     if (broker === "dhan") {
-      /* Dhan: no OAuth. The user pastes an access token (+ client id) generated on
-         web.dhan.co. We validate by hitting the funds endpoint. */
+      /* TWO ways to connect Dhan:
+         1. PARTNER consent ("Log in with Dhan"): the redirect came back with a tokenId, which we sent
+            as `requestToken`. We consume it with Matrix's partner credentials to receive the user's
+            access token + client id — no token pasting, no expiry juggling for the user.
+         2. PASTE TOKEN (fallback): the user generated an access token on web.dhan.co and typed it in. */
+      const pid = envKey("DHAN_PARTNER_ID"), psec = envKey("DHAN_PARTNER_SECRET");
+      if (requestToken && pid && psec) {
+        const r0 = await fetch(`https://api.dhan.co/v2/partner/consume-consent?tokenId=${encodeURIComponent(requestToken)}`, {
+          method: "GET",
+          headers: { partner_id: pid, partner_secret: psec, "Content-Type": "application/json" },
+        });
+        const d0 = await r0.json().catch(() => ({}));
+        const accessToken = String(d0.accessToken || d0.access_token || "").trim();
+        const clientId = String(d0.dhanClientId || d0.dhan_client_id || "").trim();
+        if (!r0.ok || !accessToken) throw new Error(d0.errorMessage || d0.message || `Dhan login could not be completed (${r0.status}).`);
+        const sid = putBrokerSession(userId, broker, accessToken, null, { clientId });
+        return res.json({ sessionId: sid, user: (d0.dhanClientName || clientId) || null, broker });
+      }
+      /* Fallback: pasted access token (+ client id). Validate by hitting the funds endpoint. */
       const extra = req.body.extra || {};
       const accessToken = String(extra.accessToken || "").trim();
       const clientId = String(extra.clientId || "").trim();
