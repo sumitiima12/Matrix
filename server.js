@@ -1359,8 +1359,21 @@ app.get("/api/history", async (req, res) => {
       if (uid) candles = await memo(`fyu:${uid}:${symbol}:${range}:${interval}`, 60_000, () => userFyersHistory(uid, symbol, range, interval));
     }
     if (!candles || !candles.length) {
+      /* Yahoo caps INTRADAY history (1m ~7d, other minute ~60d, 60m ~730d) and 422s if you ask for
+         more. A backtest may request 6 months of 5m — fine for FYERS, impossible on Yahoo. So for
+         intraday intervals we request an explicit clamped window via period1/period2; non-connected
+         users get Yahoo's max (~60 days) instead of an error/empty chart. Daily keeps the range str. */
+      const YMAX_D = { "1m": 7, "2m": 60, "3m": 60, "5m": 60, "10m": 60, "15m": 60, "30m": 60, "45m": 60, "60m": 730, "90m": 60 };
+      let qs;
+      if (YMAX_D[interval]) {
+        const days = Math.min(FY_RANGE_DAYS[range] || 60, YMAX_D[interval]);
+        const p2 = Math.floor(Date.now() / 1000), p1 = p2 - days * 86400;
+        qs = `period1=${p1}&period2=${p2}&interval=${interval}`;
+      } else {
+        qs = `range=${range}&interval=${interval}`;
+      }
       const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
-        j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(symbol))}?range=${range}&interval=${interval}`));
+        j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(symbol))}?${qs}`));
       const r = data.chart?.result?.[0];
       const ts = r?.timestamp || [];
       const q = r?.indicators?.quote?.[0] || {};
