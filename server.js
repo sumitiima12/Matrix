@@ -532,6 +532,17 @@ app.post("/api/admin/block", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ADMIN: wipe a specific user's VIRTUAL (paper) trade history. Real broker trades are NEVER touched.
+app.post("/api/admin/clear-virtual", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    const removed = await db.clearVirtualTrades(storageKeyFor(phone));
+    res.json({ ok: true, phone, removed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Accounts awaiting approval.
 app.get("/api/admin/pending-users", async (req, res) => {
   if (!requireAdmin(req, res)) return;
