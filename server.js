@@ -189,6 +189,17 @@ const authLimiter = rateLimit({
   message: { error: "Too many attempts. Please wait a few minutes and try again." },
 });
 
+/* The AI endpoints (/api/ask, /api/ai/strategy) call paid LLM providers, so an open, unlimited
+   endpoint is a direct cost-abuse vector: anyone could hammer it and run up the bill. Cap each IP
+   to a sane burst. Real users nowhere near this; a scraper hits the wall fast. */
+const llmLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many AI requests. Please wait a few minutes and try again." },
+});
+
 /* A user-chosen handle: 3–20 chars, must start with a letter, then letters/digits/_ .
    Returns the cleaned handle, or null if it doesn't meet the rules. */
 function cleanUsername(raw) {
@@ -2310,7 +2321,8 @@ app.get("/api/health", (req, res) => {
    came back (and any error). Open in a browser to see WHY a feed is falling back to Yahoo. */
 /* Delta reachability probe. Tells us EXACTLY where signed Delta calls break — public feed vs
    signed-via-proxy — without leaking any balance/keys. Open on purpose (no secrets in output). */
-app.get("/api/diag/delta", async (_req, res) => {
+app.get("/api/diag/delta", async (req, res) => {
+  if (!requireAdmin(req, res)) return;   // internal diagnostics — admin only, not public
   const T = (p, ms = 18000) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error("timed out")), ms))]);
   const cap = (e) => ({ ok: false, error: e && e.message, cause: e && e.cause ? (e.cause.code || e.cause.message || String(e.cause)) : undefined });
   const out = { base: DELTA_BASE, proxyConfigured: Boolean(deltaDispatcher) };
@@ -2352,6 +2364,7 @@ app.get("/api/diag/delta", async (_req, res) => {
 });
 
 app.get("/api/feeds-status", async (req, res) => {
+  if (!requireAdmin(req, res)) return;   // internal feed/config diagnostics — admin only
   let fy = {}, de = {};
   try { fy = await fyersHouseQuotes(["RELIANCE.NS"]); } catch (e) { _fyLastError = e.message; }
   try { de = await deltaHouseQuotes(["BTC-USD"]); } catch (e) { _deltaLastError = e.message; }
@@ -2390,7 +2403,7 @@ app.get("/api/feeds-status", async (req, res) => {
   });
 });
 
-app.post("/api/ask", async (req, res) => {
+app.post("/api/ask", llmLimiter, async (req, res) => {
   const { messages = [], context = "", system: sysOverride, max_tokens = 1000 } = req.body || {};
   const DEFAULT = `You are Matrix — the world's sharpest stock-market research assistant, fluent in fundamental, technical and macro analysis. Be crisp and structured; give bull case, bear case and key levels rather than a bare command. End with a one-line reminder that this is educational research, not financial advice.`;
   const system = sysOverride ? sysOverride : (DEFAULT + (context ? "\n\nCONTEXT:\n" + context : ""));
@@ -2479,7 +2492,7 @@ function sanitizeAiConds(arr) {
       return cond;
     }).slice(0, 8);
 }
-app.post("/api/ai/strategy", async (req, res) => {
+app.post("/api/ai/strategy", llmLimiter, async (req, res) => {
   const text = String((req.body && req.body.text) || "").slice(0, 500);
   if (!text.trim()) return res.status(400).json({ error: "text required" });
   const chain = providers();
