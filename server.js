@@ -1432,6 +1432,104 @@ app.post("/api/pattern-scan", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+/* --------------------------- /api/idea-scan ---------------------------
+   POST { symbols:[...] } -> Neo's daily IDEAS from REAL price action. For each symbol we scan the 1-day
+   and 1-hour candles for a BULLISH chart pattern (double bottom, inverse H&S, ascending triangle,
+   falling wedge, bull flag, cup & handle) OR a bullish CANDLESTICK (hammer, engulfing, piercing,
+   morning star, three white soldiers), and derive entry / target / stop from the pattern's own
+   projection (or a 2-ATR push). Cached ~30 min per symbol set so the homepage stays cheap.        */
+function atrOf(c, len = 14) {
+  const n = c.length; if (n < 2) return 0;
+  let s = 0, k = 0;
+  for (let i = Math.max(1, n - len); i < n; i++) {
+    s += Math.max(c[i].h - c[i].l, Math.abs(c[i].h - c[i - 1].c), Math.abs(c[i].l - c[i - 1].c)); k++;
+  }
+  return k ? s / k : 0;
+}
+async function scanOneIdea(sym) {
+  for (const [interval, range, tf] of [["1d", "6mo", "1d"], ["60m", "1mo", "1h"]]) {
+    let candles;
+    try { candles = await candlesFor(sym, range, interval); } catch { continue; }
+    if (!candles || candles.length < 30) continue;
+    const px = candles[candles.length - 1].c;
+    if (!(px > 0)) continue;
+    const chart = patterns.detectPatterns(candles).find((p) => p.dir === "bull");
+    const cndl = patterns.bullishCandle(candles);
+    if (!chart && !cndl) continue;
+    const atr = atrOf(candles) || px * 0.02;
+    const swingLow = Math.min(...candles.slice(-10).map((x) => x.l));
+    const target = (chart && chart.target && chart.target > px && chart.target < px * 1.6) ? chart.target : px + 2 * atr;
+    const stop = (swingLow < px && swingLow > px * 0.85) ? swingLow : px - 1.2 * atr;
+    const tpPct = +(((target / px) - 1) * 100).toFixed(1);
+    const slPct = +((1 - stop / px) * 100).toFixed(1);
+    if (!(tpPct >= 1 && tpPct <= 40 && slPct > 0.2 && slPct <= 25)) continue;
+    return {
+      sym, tf, pattern: chart ? chart.key : cndl.key, name: chart ? chart.name : cndl.name,
+      candlestick: cndl ? cndl.name : null,
+      entry: +px.toFixed(2), target: +target.toFixed(2), stop: +stop.toFixed(2),
+      tpPct, slPct, rr: slPct > 0 ? +(tpPct / slPct).toFixed(1) : null,
+      strength: (chart ? 2 : 0) + (cndl ? (cndl.strength || 1) : 0),
+    };
+  }
+  return null;
+}
+app.post("/api/idea-scan", async (req, res) => {
+  try {
+    let syms = Array.isArray(req.body && req.body.symbols) ? req.body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
+    syms = [...new Set(syms)].slice(0, 60);
+    if (!syms.length) return res.json({ ideas: [] });
+    const cacheKey = "ideascan:" + syms.slice().sort().join(",");
+    const ideas = await memo(cacheKey, 30 * 60_000, async () => {
+      const out = [];
+      const CONC = 5;
+      for (let i = 0; i < syms.length; i += CONC) {
+        const rs = await Promise.all(syms.slice(i, i + CONC).map((s) => scanOneIdea(s).catch(() => null)));
+        rs.forEach((r) => { if (r) out.push(r); });
+      }
+      out.sort((a, b) => b.strength - a.strength || (b.rr || 0) - (a.rr || 0));
+      return out;
+    });
+    res.json({ ideas, scanned: syms.length });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+/* --------------------------- /api/screener-scan ---------------------------
+   POST { symbols:[...], defs, entry, tf } -> which of these symbols' LATEST closed candle satisfies the
+   screener's ENTRY chain right now (evaluated by the same engine that runs live strategies). Powers the
+   homepage "Popular Screeners" carousels: a symbol appears only while it meets the entry trigger.
+   Cached ~2 min since the underlying is 5-minute candles.                                            */
+app.post("/api/screener-scan", async (req, res) => {
+  try {
+    const body = req.body || {};
+    let syms = Array.isArray(body.symbols) ? body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
+    syms = [...new Set(syms)].slice(0, 60);
+    const cfg = { defs: body.defs || [], entry: body.entry || [], tf: body.tf || "5m" };
+    if (!syms.length || !cfg.entry.length) return res.json({ matches: [] });
+    const interval = ({ "3m": "2m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d" })[cfg.tf] || "5m";
+    const range = cfg.tf === "1d" ? "1y" : "5d";
+    const cacheKey = "scrscan:" + (body.key || "") + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    const matches = await memo(cacheKey, 2 * 60_000, async () => {
+      const out = [];
+      const CONC = 5;
+      for (let i = 0; i < syms.length; i += CONC) {
+        const rs = await Promise.all(syms.slice(i, i + CONC).map(async (sym) => {
+          try {
+            const candles = await candlesFor(sym, range, interval);
+            if (!candles || candles.length < 30) return null;
+            const r = strat.entrySignalFired(cfg, candles);
+            if (!r || !r.fired) return null;
+            const last = candles[candles.length - 1];
+            return { sym, price: +Number(last.c).toFixed(2), entryPrice: +Number(last.c).toFixed(2), entryAt: last.t };
+          } catch { return null; }
+        }));
+        rs.forEach((r) => { if (r) out.push(r); });
+      }
+      return out;
+    });
+    res.json({ matches, scanned: syms.length });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 /* --------------------------- /api/momentum-scan ---------------------------
    POST { symbols:[...], tf:"5m"|"15m"|"1h"|"4h"|"1d"|"1w", pct:2, dir:"up"|"down", bars? }
    Returns symbols whose PRICE CHANGE over one `tf` candle passes the threshold — i.e.

@@ -154,4 +154,32 @@ function detectPatterns(candles) {
 }
 function detectPattern(candles) { return detectPatterns(candles)[0] || null; }
 
-module.exports = { pivots, detectPatterns, detectPattern };
+/* Bullish CANDLESTICK patterns on the most-recent candles (hammer, bullish engulfing, piercing,
+   morning star, three white soldiers). Returns the strongest one found, or null. `c` = [{o,h,l,c}]. */
+function bullishCandle(candles) {
+  const c = (candles || []).filter((x) => x && x.o != null && x.c != null && x.h != null && x.l != null);
+  const n = c.length; if (n < 3) return null;
+  const a = c[n - 3], b = c[n - 2], d = c[n - 1];   // d = latest closed candle
+  const body = (x) => Math.abs(x.c - x.o);
+  const green = (x) => x.c > x.o, red = (x) => x.c < x.o;
+  const mid = (x) => (x.o + x.c) / 2;
+  // Three white soldiers — three rising green candles, each opening inside the prior body.
+  if (green(a) && green(b) && green(d) && b.c > a.c && d.c > b.c && b.o > a.o && b.o < a.c && d.o > b.o && d.o < b.c)
+    return { key: "three-soldiers", name: "Three White Soldiers", dir: "bull", strength: 3 };
+  // Morning star — big red, small-bodied star, strong green closing above the first candle's midpoint.
+  if (red(a) && body(b) < body(a) * 0.5 && green(d) && d.c > mid(a))
+    return { key: "morning-star", name: "Morning Star", dir: "bull", strength: 3 };
+  // Bullish engulfing — green candle whose body fully engulfs the prior red body.
+  if (red(b) && green(d) && d.c >= b.o && d.o <= b.c && body(d) > body(b))
+    return { key: "bull-engulfing", name: "Bullish Engulfing", dir: "bull", strength: 2 };
+  // Piercing line — opens below prior low, closes back above the prior candle's midpoint.
+  if (red(b) && green(d) && d.o < b.l && d.c > mid(b) && d.c < b.o)
+    return { key: "piercing", name: "Piercing Line", dir: "bull", strength: 2 };
+  // Hammer — long lower wick, small body near the top, after a down move.
+  { const lw = Math.min(d.o, d.c) - d.l, uw = d.h - Math.max(d.o, d.c), bd = body(d);
+    if (bd > 0 && lw >= 2 * bd && uw <= bd * 0.7 && b.c < a.c)
+      return { key: "hammer", name: "Hammer", dir: "bull", strength: 1 }; }
+  return null;
+}
+
+module.exports = { pivots, detectPatterns, detectPattern, bullishCandle };
