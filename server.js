@@ -1103,8 +1103,8 @@ const INDM_US = "https://apixt-us.indmoney.com/us-stock-broker/us/catalog/get-st
 let _indmLastError = null;
 const isUsTicker = (s) => /^[A-Z]{1,5}$/.test(String(s || ""));
 const ymd = (ms) => new Date(ms).toISOString().slice(0, 10);
-async function indmoneyHouseQuotes(ySyms) {
-  if (!EQUITY_HOUSE_FEED) return {};   // non-connected users fall back to Yahoo
+async function indmoneyHouseQuotes(ySyms, owner = false) {
+  if (!EQUITY_HOUSE_FEED && !owner) return {};   // gated off unless the global feed is on OR this is the house owner
   const us = (ySyms || []).filter(isUsTicker);
   if (!us.length) return {};
   const today = ymd(Date.now());
@@ -1123,8 +1123,8 @@ async function indmoneyHouseQuotes(ySyms) {
   if (Object.keys(out).length) _indmLastError = null;
   return out;
 }
-async function indmoneyUsCandles(sym, range) {
-  if (!EQUITY_HOUSE_FEED) return null;   // gated: fall back to Yahoo candles
+async function indmoneyUsCandles(sym, range, owner = false) {
+  if (!EQUITY_HOUSE_FEED && !owner) return null;   // gated unless the global feed is on OR this is the house owner
   const label = ({ "5d": "1W", "1mo": "1M", "3mo": "3M", "6mo": "6M", "1y": "1Y" })[range] || "1M";
   const end = ymd(Date.now());
   const start = ymd(Date.now() - rangeToSeconds(range) * 1000);
@@ -1312,13 +1312,16 @@ app.get("/api/quote", async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
-    const quotes = await memo(`q:${symbols.join(",")}`, 15_000, async () => {
+    // The house OWNER (you) gets the live IND Money US feed; the cache key is owner-scoped so that
+    // owner-only data is NEVER served to another user out of the shared quote cache.
+    const owner = isHouseOwner(req);
+    const quotes = await memo(`q:${symbols.join(",")}:${owner ? "o" : ""}`, 15_000, async () => {
       // Indian equities from the FYERS house feed and crypto from the Delta feed first;
       // Yahoo covers the rest — and anything the house feeds didn't return.
       let fyMap = {}, dMap = {}, imMap = {}, mcxMap = {};
       try { fyMap = await fyersHouseQuotes(symbols); } catch { fyMap = {}; }
       try { dMap = await deltaHouseQuotes(symbols); } catch { dMap = {}; }
-      try { imMap = await indmoneyHouseQuotes(symbols); } catch { imMap = {}; }   // real-time US via IND Money
+      try { imMap = await indmoneyHouseQuotes(symbols, owner); } catch { imMap = {}; }   // real-time US via IND Money (owner-only)
       try { mcxMap = await mcxHouseQuotes(symbols); } catch { mcxMap = {}; }        // MCX commodity (INR) when opted in
       const houseMap = { ...fyMap, ...dMap, ...imMap, ...mcxMap };
       const need = symbols.filter((s) => !houseMap[s]);
@@ -1353,7 +1356,10 @@ app.get("/api/history", async (req, res) => {
     //  3. Everyone else -> Yahoo (delayed/limited).
     let candles = null;
     if (isHouseOwner(req)) {
-      candles = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
+      // US tickers have no FYERS feed — the owner gets IND Money's live US candles (owner-scoped cache).
+      candles = isUsTicker(symbol)
+        ? await memo(`imc:${symbol}:${range}:o`, 60_000, () => indmoneyUsCandles(symbol, range, true))
+        : await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
     } else {
       const uid = reqUserIdOptional(req);
       if (uid) candles = await memo(`fyu:${uid}:${symbol}:${range}:${interval}`, 60_000, () => userFyersHistory(uid, symbol, range, interval));
@@ -3137,6 +3143,20 @@ app.post("/api/broker/session", async (req, res) => {
   const b = BROKERS[broker];
   if (!b) return res.status(400).json({ error: "unknown broker" });
   if (!userId) return res.status(400).json({ error: "userId required" });
+
+  /* OWNER "server session" for FYERS (option 1 — connect like Delta): no OAuth redirect, no request
+     token. FYERS is already logged in server-side via the daily TOTP auto-login, so we hand the owner
+     a session backed by that house token. Owner-only, and only when the TOTP env is configured. */
+  if (broker === "fyers" && req.body && req.body.extra && req.body.extra.house) {
+    if (!isHouseOwner(req)) return res.status(403).json({ error: "The server session is owner-only." });
+    try {
+      const token = await fyersHouseToken();
+      if (!token) return res.status(400).json({ error: "FYERS server session isn't configured — set FYERS_FY_ID / FYERS_TOTP_SECRET / FYERS_PIN / FYERS_APP_ID / FYERS_SECRET_ID / FYERS_REDIRECT_URI on the server." });
+      const sid = putBrokerSession(userId, "fyers", token, null, null);
+      return res.json({ sessionId: sid, broker, user: "house" });
+    } catch (e) { return res.status(400).json({ error: "FYERS server session failed: " + (e.message || e) }); }
+  }
+
   // Delta has no OAuth redirect (server keys). userCreds brokers carry credentials in
   // `extra` instead of a requestToken. Everyone else must present a requestToken.
   if (!b.noOAuth && !b.userCreds && !requestToken) return res.status(400).json({ error: "requestToken required" });
