@@ -104,6 +104,10 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS real_strategies (
     id TEXT PRIMARY KEY, user_id TEXT, status TEXT, updated_at BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS real_strats_status ON real_strategies (status)`);
+  /* User-built screeners ("My Screeners") — one JSON array per user, so a saved screener survives
+     logout / a new device. Small, so stored whole like app_state rather than row-per-screener. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS user_screeners (
+    user_id TEXT PRIMARY KEY, updated_at BIGINT, data JSONB)`);
   console.log("[db] Postgres ready");
 }
 
@@ -119,6 +123,7 @@ const FILES = {
   appSettings: process.env.APP_SETTINGS_FILE || path.join(__dirname, "app_settings.json"),
   managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
   realStrats: process.env.REAL_STRATS_FILE || path.join(__dirname, "real_strategies.json"),
+  screeners: process.env.SCREENERS_FILE || path.join(__dirname, "user_screeners.json"),
 };
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return {}; } };
 const writeJSON = (f, d) => { try { fs.writeFileSync(f, JSON.stringify(d)); } catch (e) { console.error("[db] write failed", e.message); } };
@@ -375,6 +380,24 @@ async function saveState(userId, state) {
   const all = readJSON(FILES.state);
   all[userId] = payload;
   writeJSON(FILES.state, all);
+}
+
+/* ----------------------- user screeners ("My Screeners") ------------------- */
+async function getScreeners(userId) {
+  if (USING_PG) { const r = await pool.query(`SELECT data FROM user_screeners WHERE user_id=$1`, [userId]); return (r.rows[0] && Array.isArray(r.rows[0].data)) ? r.rows[0].data : []; }
+  const v = readJSON(FILES.screeners)[userId]; return Array.isArray(v) ? v : [];
+}
+async function saveScreeners(userId, list) {
+  const arr = Array.isArray(list) ? list : [];
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO user_screeners (user_id, updated_at, data) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id) DO UPDATE SET updated_at=$2, data=$3`,
+      [userId, Date.now(), JSON.stringify(arr)]
+    );
+    return;
+  }
+  const all = readJSON(FILES.screeners); all[userId] = arr; writeJSON(FILES.screeners, all);
 }
 
 /* ----------------------- open positions (exit monitor) --------------------- */
@@ -640,4 +663,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, getUser, createUser, updateUserPin, getState, saveState, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

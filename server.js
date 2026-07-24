@@ -496,6 +496,20 @@ app.get("/api/state", requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Per-user saved screeners ("My Screeners") — survive logout / new device. The client sends its
+   whole list; we store it whole (small). */
+app.get("/api/screeners", requireAuth, async (req, res) => {
+  try { res.json({ screeners: await db.getScreeners(storageKeyFor(req.authUserId)) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/screeners", requireAuth, async (req, res) => {
+  try {
+    const list = Array.isArray(req.body && req.body.screeners) ? req.body.screeners.slice(0, 100) : [];
+    await db.saveScreeners(storageKeyFor(req.authUserId), list);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ================================ ADMIN ================================== */
 /* Locked behind TWO checks: the caller's userId must be in ADMIN_USER_IDS, AND they must
    present the ADMIN_KEY secret. Both are required — a leaked key alone, or a known admin
@@ -1446,11 +1460,49 @@ function atrOf(c, len = 14) {
   }
   return k ? s / k : 0;
 }
+function emaLast(arr, n) { if (!arr.length) return null; const k = 2 / (n + 1); let e = arr[0]; for (let i = 1; i < arr.length; i++) e = arr[i] * k + e * (1 - k); return e; }
+function rsiLast(closes, n = 14) {
+  if (closes.length < n + 1) return null;
+  let gain = 0, loss = 0;
+  for (let i = closes.length - n; i < closes.length; i++) { const d = closes[i] - closes[i - 1]; if (d >= 0) gain += d; else loss -= d; }
+  if (loss === 0) return 100;
+  const rs = gain / loss; return 100 - 100 / (1 + rs);
+}
+/* TECHNICAL fallback idea (1-day) — used when no chart/candlestick pattern fires, so every market
+   still surfaces momentum / reversal / bullish-trend candidates. Lower strength than pattern ideas. */
+function techIdea(sym, c) {
+  const closes = c.map((x) => x.c); const n = closes.length; const px = closes[n - 1];
+  if (!(px > 0) || n < 30) return null;
+  const rsiV = rsiLast(closes, 14);
+  const e20 = emaLast(closes, 20), e50 = emaLast(closes, 50);
+  const chg5 = n > 6 ? (px / closes[n - 6] - 1) * 100 : 0;
+  const prev = closes[n - 2];
+  let name, strength;
+  if (rsiV != null && rsiV < 40 && px > prev) { name = "Oversold reversal"; strength = 1.6; }
+  else if (e20 != null && e50 != null && px > e20 && e20 > e50) { name = "Bullish trend"; strength = 1.5; }
+  else if (chg5 >= 4) { name = "Momentum"; strength = 1.3; }
+  else if (e20 != null && px > e20) { name = "Above 20-day trend"; strength = 0.9; }
+  else { name = "On watch"; strength = 0.5; }
+  const atr = atrOf(c) || px * 0.02;
+  const swingLow = Math.min(...c.slice(-10).map((x) => x.l));
+  const target = px + 2 * atr;
+  const stop = (swingLow < px && swingLow > px * 0.85) ? swingLow : px - 1.2 * atr;
+  const tpPct = +(((target / px) - 1) * 100).toFixed(1);
+  const slPct = +((1 - stop / px) * 100).toFixed(1);
+  if (!(tpPct >= 1 && slPct > 0.2)) return null;
+  return {
+    sym, tf: "1d", pattern: "technical", name, candlestick: null,
+    entry: +px.toFixed(2), target: +target.toFixed(2), stop: +stop.toFixed(2),
+    tpPct, slPct, rr: slPct > 0 ? +(tpPct / slPct).toFixed(1) : null, strength,
+  };
+}
 async function scanOneIdea(sym) {
+  let daily = null;
   for (const [interval, range, tf] of [["1d", "6mo", "1d"], ["60m", "1mo", "1h"]]) {
     let candles;
     try { candles = await candlesFor(sym, range, interval); } catch { continue; }
     if (!candles || candles.length < 30) continue;
+    if (interval === "1d") daily = candles;
     const px = candles[candles.length - 1].c;
     if (!(px > 0)) continue;
     const chart = patterns.detectPatterns(candles).find((p) => p.dir === "bull");
@@ -1471,6 +1523,8 @@ async function scanOneIdea(sym) {
       strength: (chart ? 2 : 0) + (cndl ? (cndl.strength || 1) : 0),
     };
   }
+  // No pattern fired — fall back to a 1-day technical idea so the market still has candidates.
+  if (daily) { try { return techIdea(sym, daily); } catch { return null; } }
   return null;
 }
 app.post("/api/idea-scan", async (req, res) => {
@@ -1486,8 +1540,10 @@ app.post("/api/idea-scan", async (req, res) => {
         const rs = await Promise.all(syms.slice(i, i + CONC).map((s) => scanOneIdea(s).catch(() => null)));
         rs.forEach((r) => { if (r) out.push(r); });
       }
+      // Pattern ideas rank first (higher strength); technical fallbacks fill up so each market shows a
+      // healthy set. Cap at 12 to keep the strongest without flooding the carousel.
       out.sort((a, b) => b.strength - a.strength || (b.rr || 0) - (a.rr || 0));
-      return out;
+      return out.slice(0, 12);
     });
     res.json({ ideas, scanned: syms.length });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
