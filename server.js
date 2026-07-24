@@ -1538,6 +1538,7 @@ app.post("/api/screener-scan", async (req, res) => {
    (4h = four 1h candles, 1w = five 1d candles), so a single code path covers them all.     */
 const MOMO_TF = {
   "1m":  { interval: "1m",  bars: 1, range: "1d" },
+  "3m":  { interval: "1m",  bars: 3, range: "1d" },   // 3-min move = three 1-min candles
   "5m":  { interval: "5m",  bars: 1, range: "5d" },
   "15m": { interval: "15m", bars: 1, range: "5d" },
   "30m": { interval: "30m", bars: 1, range: "1mo" },
