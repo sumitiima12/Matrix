@@ -209,6 +209,18 @@ function computeIndicator(d, attr, c, closes, vols) {
       }
       return out;
     }
+    case "PriceChange": { const n = Math.max(1, len); return closes.map((v, i) => (i >= n && closes[i - n]) ? (v / closes[i - n] - 1) * 100 : NaN); }
+    case "DayChange": {
+      const out = new Array(c.length);
+      let dayKey = null, dayOpen = NaN;
+      for (let i = 0; i < c.length; i++) {
+        const dt = new Date(c[i].t);
+        const key = dt.getUTCFullYear() + "-" + dt.getUTCMonth() + "-" + dt.getUTCDate();
+        if (key !== dayKey) { dayKey = key; dayOpen = c[i].o; }
+        out[i] = dayOpen ? (c[i].c / dayOpen - 1) * 100 : NaN;
+      }
+      return out;
+    }
     default: return closes.map(() => NaN);
   }
 }
