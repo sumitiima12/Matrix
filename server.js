@@ -1623,23 +1623,32 @@ function collectEntries(cfg, raw) {
   return out;
 }
 function evalExitPair(sl, tp, events, maxBars = 200) {
-  let n = 0, wins = 0, losses = 0, sumWin = 0, sumLoss = 0, sumRet = 0;
+  let n = 0, wins = 0, sumWin = 0, sumLoss = 0, sumRet = 0, slHit = 0, tpHit = 0, pnlAbs = 0;
   for (const ev of events) {
     const c = ev.c, e = ev.e, px = c[e].c; if (!(px > 0)) continue;
     const target = px * (1 + tp / 100), stop = px * (1 - sl / 100);
     const end = Math.min(e + maxBars, c.length - 1);
-    let ret = null;
+    let ret = null, exitPx = null;
     for (let j = e + 1; j <= end; j++) {
-      if (c[j].l <= stop) { ret = -sl; break; }          // stop first on a same-bar tie
-      if (c[j].h >= target) { ret = tp; break; }
+      if (c[j].l <= stop) { ret = -sl; exitPx = stop; slHit++; break; }        // stop first on a same-bar tie
+      if (c[j].h >= target) { ret = tp; exitPx = target; tpHit++; break; }
     }
-    if (ret === null) ret = (c[end].c / px - 1) * 100;    // no level hit -> exit at window end
-    n++; sumRet += ret; if (ret > 0) { wins++; sumWin += ret; } else { losses++; sumLoss += ret; }
+    if (ret === null) { exitPx = c[end].c; ret = (exitPx / px - 1) * 100; }     // no level hit -> exit at window end
+    n++; sumRet += ret; pnlAbs += (exitPx - px);                               // P&L per 1 unit / contract
+    if (ret > 0) { wins++; sumWin += ret; } else { sumLoss += ret; }
   }
   if (!n) return null;
   const pf = sumLoss !== 0 ? Math.abs(sumWin / sumLoss) : (sumWin > 0 ? Infinity : 0);
-  return { sl, tp, trades: n, winRate: +((wins / n) * 100).toFixed(1), retPct: +sumRet.toFixed(1),
+  return { sl, tp, trades: n, wins, slHit, tpHit,
+    winRate: +((wins / n) * 100).toFixed(1), retPct: +sumRet.toFixed(1), pnl: +pnlAbs.toFixed(2),
     expectancy: +(sumRet / n).toFixed(3), profitFactor: isFinite(pf) ? +pf.toFixed(2) : null };
+}
+/* Ranking comparators for the two user objectives. "winrate" maximises % of winning trades (tie-break
+   by total return); "pnl" maximises total return (tie-break by win rate). */
+function optRanker(objective) {
+  return objective === "winrate"
+    ? (a, b) => b.winRate - a.winRate || b.retPct - a.retPct
+    : (a, b) => b.retPct - a.retPct || b.winRate - a.winRate;
 }
 /* METRIC-based entries (My Screeners): the entry conditions are daily-snapshot metrics (RSI, EMA20,
    day-change %, …). We map each to a candle series and evaluate the chain per candle so the same SL/TP
@@ -1680,7 +1689,7 @@ function collectMetricEntries(conds, raw) {
   for (let i = 30; i < c.length - 1; i++) { const fired = firesAt(i); if (fired && !prev) out.push({ c, e: i }); prev = fired; }
   return out;
 }
-function optimizeExits(cfg, candleSets, cur) {
+function optimizeExits(cfg, candleSets, cur, objective = "pnl") {
   const collect = cfg.mode === "metric" ? (raw) => collectMetricEntries(cfg.entry, raw) : (raw) => collectEntries(cfg, raw);
   let events = [];
   for (const raw of candleSets) events = events.concat(collect(raw));
@@ -1693,13 +1702,15 @@ function optimizeExits(cfg, candleSets, cur) {
   for (const sl of OPT_SLS) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS); if (r) results.push(r); }
   if (!results.length) return { entries: events.length };
   const minTrades = Math.min(8, Math.max(3, Math.floor(inS.length * 0.05)));
-  const ranked = results.filter((r) => r.trades >= minTrades).sort((a, b) => b.expectancy - a.expectancy || (b.profitFactor || 0) - (a.profitFactor || 0));
-  const bp = ranked[0] || results.slice().sort((a, b) => b.expectancy - a.expectancy)[0];
+  const rank = optRanker(objective);
+  const pool = results.filter((r) => r.trades >= minTrades);
+  const ranked = (pool.length ? pool : results).slice().sort(rank);
+  const bp = ranked[0];
   // Report best + current on the FULL event set (fair prev-vs-new); validate best out-of-sample.
   const best = evalExitPair(bp.sl, bp.tp, events);
   const oos = outS.length ? evalExitPair(bp.sl, bp.tp, outS) : null;
   const current = (cur && cur.sl > 0 && cur.tp > 0) ? evalExitPair(cur.sl, cur.tp, events) : null;
-  return { entries: events.length, best, oos, current, top: ranked.slice(0, 5) };
+  return { entries: events.length, best, oos, current, objective, top: ranked.slice(0, 5) };
 }
 app.post("/api/optimize-exits", async (req, res) => {
   try {
@@ -1708,12 +1719,15 @@ app.post("/api/optimize-exits", async (req, res) => {
     let syms = Array.isArray(body.symbols) ? body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
     syms = [...new Set(syms)].slice(0, 6);
     if (!cfg.entry.length || !syms.length) return res.json({ entries: 0 });
+    if (body.mode === "metric") cfg.mode = "metric";
+    const objective = body.objective === "winrate" ? "winrate" : "pnl";
+    const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
     const interval = OPT_INTERVAL[cfg.tf] || "5m", range = OPT_RANGE[cfg.tf] || "1mo";
-    const key = "optexit:" + JSON.stringify({ e: cfg.entry, d: cfg.defs, t: cfg.tf }).length + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    const key = "optexit:" + JSON.stringify({ e: cfg.entry, d: cfg.defs, t: cfg.tf, o: objective, c: cur }).length + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const sets = [];
       for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
-      return optimizeExits(cfg, sets);
+      return optimizeExits(cfg, sets, cur, objective);
     });
     res.json(out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -5194,6 +5208,65 @@ app.post("/api/autobuy/cancel", async (req, res) => {
   if (!mine) return res.status(404).json({ error: "not found" });
   await db.updateRealStrategy(id, { status: "cancelled" });
   res.json({ ok: true });
+});
+
+/* Helper: find a strategy's currently OPEN managed position (by stamped id, else by instrument). */
+async function openPositionForStrategy(userId, strat) {
+  const managed = await db.getManagedPositionsForUser(userId).catch(() => []);
+  const isOpen = (p) => p && (p.status === "open" || p.status === "closing");
+  let pos = strat.openPositionId ? managed.find((p) => String(p.id) === String(strat.openPositionId) && isOpen(p)) : null;
+  if (!pos) pos = managed.find((p) => isOpen(p) && String(p.brokerSym || "") === String(strat.brokerSym || "") && (p.market || "") === (strat.market || "") && Number(p.entry) > 0);
+  return pos || null;
+}
+
+/* CLOSE NOW — flatten an auto-buy strategy's open position with a reduce-only MARKET sell, then stop
+   the strategy from re-entering. Real money moves. Honors AUTO_EXIT_LIVE: in dry-run it marks the
+   position closed WITHOUT placing a broker order (matching the exit engine's own gating). */
+app.post("/api/autobuy/close", async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const { id } = req.body || {};
+    if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
+    const strat = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
+    if (!strat) return res.status(404).json({ error: "not found" });
+    const pos = await openPositionForStrategy(userId, strat);
+    // No open position — nothing to sell; just stop the strategy.
+    if (!pos) { await db.updateRealStrategy(id, { status: "cancelled" }); return res.json({ ok: true, closed: false, note: "no open position — strategy stopped" }); }
+    const live = String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true";
+    if (!live) {
+      // Dry-run: simulate the close so the UI clears, but place no real order.
+      await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close (dry-run)" });
+      await db.updateRealStrategy(id, { status: "cancelled" });
+      return res.json({ ok: true, closed: true, dryRun: true });
+    }
+    const sess = await sessionFromCred(userId, pos.broker || strat.broker);
+    if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
+    await db.updateManagedPosition(pos.id, { status: "closing" });
+    const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product);
+    await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close", exitOrderId: r.orderId || null });
+    await db.updateRealStrategy(id, { status: "cancelled" });
+    res.json({ ok: true, closed: true, orderId: r.orderId || null });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+/* UPDATE SL/TP — change the strategy's stop-loss / take-profit and push the new levels onto its open
+   managed position so the exit engine acts on them. */
+app.post("/api/autobuy/update", async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const { id, sl, tp } = req.body || {};
+    if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
+    const strat = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
+    if (!strat) return res.status(404).json({ error: "not found" });
+    const patch = {};
+    if (sl !== undefined) patch.sl = Number(sl) > 0 ? Number(sl) : null;
+    if (tp !== undefined) patch.tp = Number(tp) > 0 ? Number(tp) : null;
+    if (!Object.keys(patch).length) return res.status(400).json({ error: "nothing to update" });
+    await db.updateRealStrategy(id, patch);
+    const pos = await openPositionForStrategy(userId, strat);
+    if (pos) await db.updateManagedPosition(pos.id, patch);
+    res.json({ ok: true, updated: true, position: pos ? pos.id : null });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 /* Admin flips the whole auto-buy engine LIVE / dry-run at runtime (no redeploy). */
 app.post("/api/autobuy/live", async (req, res) => {
