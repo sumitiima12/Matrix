@@ -1723,7 +1723,11 @@ app.post("/api/optimize-exits", async (req, res) => {
     const objective = body.objective === "winrate" ? "winrate" : "pnl";
     const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
     const interval = OPT_INTERVAL[cfg.tf] || "5m", range = OPT_RANGE[cfg.tf] || "1mo";
-    const key = "optexit:" + JSON.stringify({ e: cfg.entry, d: cfg.defs, t: cfg.tf, o: objective, c: cur }).length + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    // Content hash of the whole request so two different strategies never share a cache entry (the old
+    // length-based key could collide and return another strategy's optimisation).
+    const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
+    let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
+    const key = "optexit:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const sets = [];
       for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
