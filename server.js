@@ -568,6 +568,21 @@ app.post("/api/admin/clear-virtual", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* ADMIN: wipe ONE trade type's VIRTUAL history for a user — Manual / Auto Buy / Screener Auto Buy /
+   Automate. Real broker trades are NEVER touched. Lets the admin reset a single bucket's dashboard. */
+const CLEARABLE_TYPES = new Set(["Manual", "Auto Buy", "Screener Auto Buy", "Automate"]);
+app.post("/api/admin/clear-trades", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    const tradeType = String((req.body && req.body.tradeType) || "");
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    if (!CLEARABLE_TYPES.has(tradeType)) return res.status(400).json({ error: "invalid tradeType" });
+    const removed = await db.clearTradesByType(storageKeyFor(phone), tradeType);
+    res.json({ ok: true, phone, tradeType, removed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Accounts awaiting approval.
 app.get("/api/admin/pending-users", async (req, res) => {
   if (!requireAdmin(req, res)) return;
@@ -1583,6 +1598,124 @@ app.post("/api/screener-scan", async (req, res) => {
       return out;
     });
     res.json({ matches, scanned: syms.length });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+/* --------------------------- /api/optimize-exits ---------------------------
+   POST { defs, entry, tf, symbols } -> the SL/TP pair that would have MAXIMISED expectancy on the
+   strategy's OWN past entry signals (a grid sweep over real candles), plus an out-of-sample check so
+   the number isn't just curve-fit. Long-only; ties inside a bar assume the stop (conservative). */
+const OPT_RANGE = { "3m": "1mo", "5m": "1mo", "15m": "2mo", "30m": "3mo", "1h": "6mo", "1d": "2y" };
+const OPT_INTERVAL = { "3m": "2m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d" };
+const OPT_SLS = [0.3, 0.5, 0.75, 1, 1.5, 2, 3];
+const OPT_TPS = [0.5, 1, 1.5, 2, 3, 4, 5];
+function collectEntries(cfg, raw) {
+  const c = strat.closedCandles((raw || []).filter((x) => x && x.c != null));
+  if (!c || c.length < 40) return [];
+  const closes = c.map((x) => x.c), vols = c.map((x) => x.v || 0), cache = {};
+  const get = (op) => strat.resolveOperand(op, cfg.defs || [], c, closes, vols, cache, cfg.tf || null);
+  const out = []; let prev = false;
+  for (let i = 30; i < c.length - 1; i++) {
+    let fired = false; try { fired = strat.chainEval(cfg.entry, i, get); } catch { fired = false; }
+    if (fired && !prev) out.push({ c, e: i });
+    prev = fired;
+  }
+  return out;
+}
+function evalExitPair(sl, tp, events, maxBars = 200) {
+  let n = 0, wins = 0, losses = 0, sumWin = 0, sumLoss = 0, sumRet = 0;
+  for (const ev of events) {
+    const c = ev.c, e = ev.e, px = c[e].c; if (!(px > 0)) continue;
+    const target = px * (1 + tp / 100), stop = px * (1 - sl / 100);
+    const end = Math.min(e + maxBars, c.length - 1);
+    let ret = null;
+    for (let j = e + 1; j <= end; j++) {
+      if (c[j].l <= stop) { ret = -sl; break; }          // stop first on a same-bar tie
+      if (c[j].h >= target) { ret = tp; break; }
+    }
+    if (ret === null) ret = (c[end].c / px - 1) * 100;    // no level hit -> exit at window end
+    n++; sumRet += ret; if (ret > 0) { wins++; sumWin += ret; } else { losses++; sumLoss += ret; }
+  }
+  if (!n) return null;
+  const pf = sumLoss !== 0 ? Math.abs(sumWin / sumLoss) : (sumWin > 0 ? Infinity : 0);
+  return { sl, tp, trades: n, winRate: +((wins / n) * 100).toFixed(1), retPct: +sumRet.toFixed(1),
+    expectancy: +(sumRet / n).toFixed(3), profitFactor: isFinite(pf) ? +pf.toFixed(2) : null };
+}
+/* METRIC-based entries (My Screeners): the entry conditions are daily-snapshot metrics (RSI, EMA20,
+   day-change %, …). We map each to a candle series and evaluate the chain per candle so the same SL/TP
+   sweep works. An unavailable metric never blocks (matches the live screener). */
+function metricSeries(m, c, closes, vols) {
+  switch (m) {
+    case "price": return closes;
+    case "vol": return vols;
+    case "rsi": return strat.RSIarr(closes, 14);
+    case "ema20": return strat.EMAarr(closes, 20);
+    case "ema50": return strat.EMAarr(closes, 50);
+    case "sma50": return strat.SMAarr(closes, 50);
+    case "sma200": return strat.SMAarr(closes, 200);
+    case "macd": { const mm = strat.MACDarr(closes); return (mm && mm.line) ? mm.line : mm; }
+    case "adx": return strat.ADXarr(c, 14);
+    case "cci": return strat.CCIarr(c, 20);
+    case "atr": return strat.ATRarr(c, 14);
+    case "vwap": return strat.VWAParr(c);
+    case "bbPctB": { const b = strat.BBarr(closes, 20); return closes.map((v, i) => (b.upper[i] - b.lower[i]) ? (v - b.lower[i]) / (b.upper[i] - b.lower[i]) * 100 : NaN); }
+    case "chg": { const out = new Array(c.length); let dk = null, dopen = NaN; for (let i = 0; i < c.length; i++) { const dt = new Date(c[i].t); const k = dt.getUTCFullYear() + "-" + dt.getUTCMonth() + "-" + dt.getUTCDate(); if (k !== dk) { dk = k; dopen = c[i].o; } out[i] = dopen ? (c[i].c / dopen - 1) * 100 : NaN; } return out; }
+    case "pchg": return closes.map((v, i) => i ? (v / closes[i - 1] - 1) * 100 : NaN);
+    default: return null;
+  }
+}
+function collectMetricEntries(conds, raw) {
+  const c = strat.closedCandles((raw || []).filter((x) => x && x.c != null));
+  if (!c || c.length < 40) return [];
+  const closes = c.map((x) => x.c), vols = c.map((x) => x.v || 0), sc = {};
+  const ser = (m) => { if (!(m in sc)) sc[m] = metricSeries(m, c, closes, vols); return sc[m]; };
+  const firesAt = (i) => (conds || []).every((f) => {
+    const L = ser(f.m); if (!L) return true;
+    const x = L[i]; const R = f.rhsType === "indicator" ? ser(f.rhs) : null;
+    const y = f.rhsType === "indicator" ? (R ? R[i] : NaN) : parseFloat(f.v);
+    if (x == null || isNaN(x) || y == null || isNaN(y)) return true;
+    return f.o === ">" ? x > y : f.o === "<" ? x < y : f.o === ">=" ? x >= y : f.o === "<=" ? x <= y : Math.abs(x - y) < 1e-9;
+  });
+  const out = []; let prev = false;
+  for (let i = 30; i < c.length - 1; i++) { const fired = firesAt(i); if (fired && !prev) out.push({ c, e: i }); prev = fired; }
+  return out;
+}
+function optimizeExits(cfg, candleSets, cur) {
+  const collect = cfg.mode === "metric" ? (raw) => collectMetricEntries(cfg.entry, raw) : (raw) => collectEntries(cfg, raw);
+  let events = [];
+  for (const raw of candleSets) events = events.concat(collect(raw));
+  if (!events.length) return { entries: 0 };
+  if (events.length > 800) { const step = Math.ceil(events.length / 800); events = events.filter((_, k) => k % step === 0); }
+  const cut = Math.floor(events.length * 0.7);
+  const inS = cut >= 10 ? events.slice(0, cut) : events;
+  const outS = cut >= 10 ? events.slice(cut) : [];
+  const results = [];
+  for (const sl of OPT_SLS) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS); if (r) results.push(r); }
+  if (!results.length) return { entries: events.length };
+  const minTrades = Math.min(8, Math.max(3, Math.floor(inS.length * 0.05)));
+  const ranked = results.filter((r) => r.trades >= minTrades).sort((a, b) => b.expectancy - a.expectancy || (b.profitFactor || 0) - (a.profitFactor || 0));
+  const bp = ranked[0] || results.slice().sort((a, b) => b.expectancy - a.expectancy)[0];
+  // Report best + current on the FULL event set (fair prev-vs-new); validate best out-of-sample.
+  const best = evalExitPair(bp.sl, bp.tp, events);
+  const oos = outS.length ? evalExitPair(bp.sl, bp.tp, outS) : null;
+  const current = (cur && cur.sl > 0 && cur.tp > 0) ? evalExitPair(cur.sl, cur.tp, events) : null;
+  return { entries: events.length, best, oos, current, top: ranked.slice(0, 5) };
+}
+app.post("/api/optimize-exits", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m") };
+    let syms = Array.isArray(body.symbols) ? body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
+    syms = [...new Set(syms)].slice(0, 6);
+    if (!cfg.entry.length || !syms.length) return res.json({ entries: 0 });
+    const interval = OPT_INTERVAL[cfg.tf] || "5m", range = OPT_RANGE[cfg.tf] || "1mo";
+    const key = "optexit:" + JSON.stringify({ e: cfg.entry, d: cfg.defs, t: cfg.tf }).length + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    const out = await memo(key, 30 * 60_000, async () => {
+      const sets = [];
+      for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
+      return optimizeExits(cfg, sets);
+    });
+    res.json(out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 

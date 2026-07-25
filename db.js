@@ -178,6 +178,26 @@ async function clearVirtualTrades(userId) {
   return before - db[userId].length;
 }
 
+/* Clear only ONE trade type's VIRTUAL (paper) history for a user — Manual / Auto Buy / Screener Auto
+   Buy / Automate. Real broker trades are never touched. Lets the admin reset one bucket's dashboard
+   without wiping the others. */
+async function clearTradesByType(userId, tradeType) {
+  const tt = String(tradeType || "");
+  if (USING_PG) {
+    const r = await pool.query(
+      `DELETE FROM trades WHERE user_id=$1 AND COALESCE((data->>'real')::boolean, false) = false AND COALESCE(data->>'tradeType','Manual') = $2`,
+      [userId, tt]
+    );
+    return r.rowCount || 0;
+  }
+  const db = readJSON(FILES.trades);
+  const arr = db[userId] || [];
+  const before = arr.length;
+  db[userId] = arr.filter((t) => t && (t.real === true || (t.tradeType || "Manual") !== tt));
+  writeJSON(FILES.trades, db);
+  return before - db[userId].length;
+}
+
 /* --------------------------------- users --------------------------------- */
 async function getUser(phone) {
   if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by, email, last_login, created_at, blocked, approved FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) { row.referredBy = row.referred_by; row.lastLogin = row.last_login ? Number(row.last_login) : null; row.createdAt = row.created_at ? Number(row.created_at) : null; } return row || null; }
@@ -663,4 +683,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
