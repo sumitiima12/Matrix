@@ -1,0 +1,90 @@
+"use strict";
+/* Correctness tests for the optimiser scoring math (optimizerCore.js) — the numbers reported by
+   "Optimize SL & TP" and "Optimize Indicators" (win rate, SL hit, TP hit, P&L, return) all come from
+   evalExitPair, so these hand-computed cases pin those numbers down. */
+const test = require("node:test");
+const assert = require("node:assert");
+const { evalExitPair, optRanker, lenOptions } = require("../optimizerCore");
+
+// A candle. Only o/h/l/c matter to the evaluator.
+const bar = (o, h, l, c) => ({ o, h, l, c });
+// One entry event: enter at the close of index 0, walk forward from index 1.
+const ev = (candles) => ({ c: candles, e: 0 });
+
+test("TP hit: entry 100, TP 2% → +2% return, exit at 102, P&L +2", () => {
+  const r = evalExitPair(1, 2, [ev([bar(100, 100, 100, 100), bar(101, 103, 99.5, 101)])]);
+  assert.equal(r.trades, 1);
+  assert.equal(r.tpHit, 1);
+  assert.equal(r.slHit, 0);
+  assert.equal(r.wins, 1);
+  assert.equal(r.winRate, 100);
+  assert.equal(r.retPct, 2);      // +tp%
+  assert.equal(r.pnl, 2);         // 102 - 100
+});
+
+test("SL hit: entry 100, SL 1% → -1% return, exit at 99, P&L -1", () => {
+  const r = evalExitPair(1, 5, [ev([bar(100, 100, 100, 100), bar(100, 101, 98, 99)])]);
+  assert.equal(r.slHit, 1);
+  assert.equal(r.tpHit, 0);
+  assert.equal(r.wins, 0);
+  assert.equal(r.winRate, 0);
+  assert.equal(r.retPct, -1);
+  assert.equal(r.pnl, -1);        // 99 - 100
+});
+
+test("No level touched → exits at the window's last close", () => {
+  const r = evalExitPair(10, 10, [ev([bar(100, 100, 100, 100), bar(100, 101, 99, 100.5)])]);
+  assert.equal(r.slHit, 0);
+  assert.equal(r.tpHit, 0);
+  assert.equal(r.retPct, 0.5);    // (100.5/100 - 1)*100
+  assert.equal(r.pnl, 0.5);       // 100.5 - 100
+  assert.equal(r.wins, 1);
+});
+
+test("Same-bar tie resolves to the STOP (conservative)", () => {
+  // Bar reaches both stop(98) and target(102); the evaluator must book the stop.
+  const r = evalExitPair(2, 2, [ev([bar(100, 100, 100, 100), bar(100, 103, 97, 100)])]);
+  assert.equal(r.slHit, 1);
+  assert.equal(r.tpHit, 0);
+  assert.equal(r.pnl, -2);        // exit at stop 98
+});
+
+test("Aggregate of 3 events: win rate, SL/TP hit counts, summed return & P&L", () => {
+  const events = [
+    ev([bar(100, 100, 100, 100), bar(101, 103, 99.5, 101)]),   // TP hit  +2, pnl +2
+    ev([bar(100, 100, 100, 100), bar(100, 101, 98, 99)]),      // SL hit  -1, pnl -1
+    ev([bar(200, 200, 200, 200), bar(201, 205, 199, 204)]),    // TP hit  +2, pnl +4 (200→204)
+  ];
+  const r = evalExitPair(1, 2, events);
+  assert.equal(r.trades, 3);
+  assert.equal(r.wins, 2);
+  assert.equal(r.tpHit, 2);
+  assert.equal(r.slHit, 1);
+  assert.equal(r.winRate, 66.7);          // 2/3
+  assert.equal(r.retPct, 3);              // +2 -1 +2
+  assert.equal(r.pnl, 5);                 // +2 -1 +4
+  assert.equal(r.expectancy, 1);          // 3 / 3
+});
+
+test("optRanker(winrate) prefers higher win rate, then return", () => {
+  const a = { winRate: 70, retPct: 5 };
+  const b = { winRate: 60, retPct: 50 };
+  assert.ok(optRanker("winrate")(a, b) < 0);   // a ranks first
+});
+
+test("optRanker(pnl) prefers higher return, then win rate", () => {
+  const a = { winRate: 70, retPct: 5 };
+  const b = { winRate: 60, retPct: 50 };
+  assert.ok(optRanker("pnl")(b, a) < 0);        // b ranks first
+});
+
+test("lenOptions sweeps sensible candidate lengths, floored at 2", () => {
+  assert.deepEqual(lenOptions(13), [7, 9, 13, 18, 26]);   // 0.5,0.7,1,1.4,2 ×13 rounded
+  assert.deepEqual(lenOptions(3), [2, 3, 4, 6]);          // floor at 2, de-duped
+  assert.equal(lenOptions(""), null);                     // non-numeric (MACD/VWAP) untouched
+  assert.equal(lenOptions(0), null);
+});
+
+test("No events → null (nothing to report)", () => {
+  assert.equal(evalExitPair(1, 2, []), null);
+});

@@ -22,6 +22,7 @@ const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
 const strat = require("./strategyEngine");   // server-side port of the strategy exit engine
+const { evalExitPair, optRanker, lenOptions } = require("./optimizerCore");   // pure optimiser scoring math (unit-tested)
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
@@ -1622,34 +1623,6 @@ function collectEntries(cfg, raw) {
   }
   return out;
 }
-function evalExitPair(sl, tp, events, maxBars = 200) {
-  let n = 0, wins = 0, sumWin = 0, sumLoss = 0, sumRet = 0, slHit = 0, tpHit = 0, pnlAbs = 0;
-  for (const ev of events) {
-    const c = ev.c, e = ev.e, px = c[e].c; if (!(px > 0)) continue;
-    const target = px * (1 + tp / 100), stop = px * (1 - sl / 100);
-    const end = Math.min(e + maxBars, c.length - 1);
-    let ret = null, exitPx = null;
-    for (let j = e + 1; j <= end; j++) {
-      if (c[j].l <= stop) { ret = -sl; exitPx = stop; slHit++; break; }        // stop first on a same-bar tie
-      if (c[j].h >= target) { ret = tp; exitPx = target; tpHit++; break; }
-    }
-    if (ret === null) { exitPx = c[end].c; ret = (exitPx / px - 1) * 100; }     // no level hit -> exit at window end
-    n++; sumRet += ret; pnlAbs += (exitPx - px);                               // P&L per 1 unit / contract
-    if (ret > 0) { wins++; sumWin += ret; } else { sumLoss += ret; }
-  }
-  if (!n) return null;
-  const pf = sumLoss !== 0 ? Math.abs(sumWin / sumLoss) : (sumWin > 0 ? Infinity : 0);
-  return { sl, tp, trades: n, wins, slHit, tpHit,
-    winRate: +((wins / n) * 100).toFixed(1), retPct: +sumRet.toFixed(1), pnl: +pnlAbs.toFixed(2),
-    expectancy: +(sumRet / n).toFixed(3), profitFactor: isFinite(pf) ? +pf.toFixed(2) : null };
-}
-/* Ranking comparators for the two user objectives. "winrate" maximises % of winning trades (tie-break
-   by total return); "pnl" maximises total return (tie-break by win rate). */
-function optRanker(objective) {
-  return objective === "winrate"
-    ? (a, b) => b.winRate - a.winRate || b.retPct - a.retPct
-    : (a, b) => b.retPct - a.retPct || b.winRate - a.winRate;
-}
 /* METRIC-based entries (My Screeners): the entry conditions are daily-snapshot metrics (RSI, EMA20,
    day-change %, …). We map each to a candle series and evaluate the chain per candle so the same SL/TP
    sweep works. An unavailable metric never blocks (matches the live screener). */
@@ -1745,13 +1718,6 @@ app.post("/api/optimize-exits", async (req, res) => {
    strategy's current pair, so the comparison isolates entry quality. A greedy coordinate descent keeps
    the search bounded: pick the best timeframe, then tune each indicator's length one at a time. */
 const IND_TFS = ["3m", "5m", "15m", "30m", "1h"];   // never above 1h, by product rule
-function lenOptions(len) {
-  const n = Number(len);
-  if (!Number.isFinite(n) || n <= 0) return null;   // MACD/VWAP/CurrentCandle carry no numeric length
-  const s = new Set();
-  for (const m of [0.5, 0.7, 1, 1.4, 2]) { let v = Math.round(n * m); if (v < 2) v = 2; s.add(v); }
-  return [...s].sort((a, b) => a - b);
-}
 function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5) {
   const cfg = { defs, entry, tf, mode };
   let events = [];
@@ -1765,14 +1731,16 @@ function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5) {
   if (r.trades < minTrades) return null;      // too few signals to trust — treat as no result
   return r;
 }
-function optimizeIndicators(cfg, tfSets, cur, objective = "pnl") {
+function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) {
   const sl = cur.sl > 0 ? cur.sl : 1;
   const tp = cur.tp > 0 ? cur.tp : 2;
   const rank = optRanker(objective);
   const better = (a, b) => { if (!a) return false; if (!b) return true; return rank(a, b) < 0; };
   const baseDefs = (cfg.defs || []).map((d) => ({ ...d }));
+  // When the user LOCKS a timeframe, only tune lengths on that tf; otherwise sweep all tfs ≤ 1h.
+  const tfList = (lockTf && IND_TFS.includes(lockTf)) ? [lockTf] : IND_TFS;
   let globalBest = null;      // { defs, tf, metrics }
-  for (const tf of IND_TFS) {
+  for (const tf of tfList) {
     const sets = tfSets[tf];
     if (!sets || !sets.length) continue;
     let curDefs = baseDefs.map((d) => ({ ...d, tf }));
@@ -1817,19 +1785,23 @@ app.post("/api/optimize-indicators", async (req, res) => {
     // Nothing to optimise if no indicator carries a numeric length (pure MACD/VWAP strategies).
     if (!(cfg.defs || []).some((d) => Number(d && d.len) > 0)) return res.json({ entries: 0, noNumeric: true });
     const objective = body.objective === "winrate" ? "winrate" : "pnl";
+    // Optional: LOCK the timeframe — only tune indicator lengths, keep this tf fixed.
+    const lockTf = (body.lockTf && IND_TFS.includes(String(body.lockTf))) ? String(body.lockTf) : null;
     const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
     const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
     let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
-    const key = "optind:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    const key = "optind:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (lockTf || "all") + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const tfSets = {};
-      for (const tf of IND_TFS) {
+      // Only fetch the timeframes we'll actually search — a locked tf fetches ONE, not all five.
+      const tfsToFetch = lockTf ? [lockTf] : IND_TFS;
+      for (const tf of tfsToFetch) {
         const interval = OPT_INTERVAL[tf], range = OPT_RANGE[tf];
         const sets = [];
         for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
         tfSets[tf] = sets;
       }
-      return optimizeIndicators(cfg, tfSets, cur, objective);
+      return optimizeIndicators(cfg, tfSets, cur, objective, lockTf);
     });
     res.json(out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -2283,8 +2255,12 @@ async function runExitMonitor() {
     lastMonitor = { at: Date.now(), checked, closed };
   }
 }
+/* Cadence is env-tunable so a small DB plan can trade a little exit-latency for much less egress. The
+   VIRTUAL exit monitor is a backstop only — the app also resolves paper exits client-side while it's
+   open — so a 3-minute default (was 60s) cuts this sweep's Neon reads ~3× with no real-money impact. */
+const EXIT_MONITOR_MS = Math.max(30_000, Number(process.env.EXIT_MONITOR_MS) || 180_000);
 if (process.env.EXIT_MONITOR !== "off") {
-  setInterval(runExitMonitor, 60_000);
+  setInterval(runExitMonitor, EXIT_MONITOR_MS);
   setTimeout(runExitMonitor, 10_000);           // first sweep shortly after boot
 }
 app.get("/api/monitor", (req, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", last: lastMonitor }));
@@ -2739,7 +2715,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "optimizer-cachefix-1",   // bump on deploy so we can confirm which build is live
+    build: "neo-nlp-egress-1",   // bump on deploy so we can confirm which build is live
   });
 });
 
@@ -2831,7 +2807,10 @@ app.get("/api/feeds-status", async (req, res) => {
 
 app.post("/api/ask", llmLimiter, async (req, res) => {
   const { messages = [], context = "", system: sysOverride, max_tokens = 1000 } = req.body || {};
-  const DEFAULT = `You are Matrix — the world's sharpest stock-market research assistant, fluent in fundamental, technical and macro analysis. Be crisp and structured; give bull case, bear case and key levels rather than a bare command. End with a one-line reminder that this is educational research, not financial advice.`;
+  const DEFAULT = `You are Neo — Matrix One's stock-market and trading assistant, fluent in fundamental, technical and macro analysis of stocks, crypto, commodities, options, and how to use this app's features (strategies, screeners, backtests, automation).
+SCOPE — STRICT: You ONLY discuss markets, trading, investing, and this app. If the user asks about anything unrelated (essays, general knowledge, coding help, homework, personal/life advice, recipes, politics, etc.), politely DECLINE in one sentence and steer back — e.g. "I can only help with stocks, trading and Matrix One. Ask me about a symbol, sector, or strategy." Do NOT answer the off-topic request even partially, and do not write essays or creative content.
+ACCURACY: Never invent prices, figures, fundamentals, or news. If you don't have a current number, say you don't have live data for it rather than guessing. Prefer explaining method and what to look at over fabricating specifics.
+Be crisp and structured; where relevant give bull case, bear case and key levels rather than a bare command. End market answers with a one-line reminder that this is educational research, not financial advice.`;
   const system = sysOverride ? sysOverride : (DEFAULT + (context ? "\n\nCONTEXT:\n" + context : ""));
   const chain = providers();
   if (!chain.length) return res.status(500).json({ error: "No LLM key set. Add GROQ_API_KEY (free) in your Render environment." });
@@ -2865,8 +2844,10 @@ app.post("/api/ask", llmLimiter, async (req, res) => {
    The deterministic parser (frontend) is the fast path; when it can't fully read a prompt, the
    app calls this. We prompt the LLM to output STRICT JSON in the engine's own condition grammar,
    then validate every field against the known operands/ops so a hallucinated rule can't slip in. */
-const AI_STRAT_SYS = `You convert a trader's plain-English strategy into JSON the trading engine can run. Output ONLY compact JSON, no prose, no markdown, shaped exactly:
-{"entry":[cond,...],"exit":[cond,...],"defs":[def,...]}
+const AI_STRAT_SYS = `You convert a trader's plain-English strategy into JSON the trading engine can run. You handle ONLY trading strategy rules — never answer general questions. Output ONLY compact JSON, no prose, no markdown, shaped exactly:
+{"entry":[cond,...],"exit":[cond,...],"defs":[def,...],"sl":number?,"tp":number?}
+"sl" and "tp" are OPTIONAL stop-loss / take-profit PERCENTAGES (plain numbers, e.g. 2 for 2%). Include them when the user states a target/stop/exit-at-return: "exit at 5% return"/"take profit 5%"/"target 5%" -> tp:5; "stop loss 2%"/"cut at 2%" -> sl:2. Omit if not mentioned.
+If the user asks you to SUGGEST/RECOMMEND a strategy without giving rules, propose a sensible one: default to a momentum/trend entry (EMA20 crosses_above EMA50 AND RSI>55) unless they hint "reversal/oversold/mean reversion" (then RSI<30 entry, RSI>55 exit). Fill sl/tp from any return/stop they mention.
 A cond is {"la":LEFT,"op":OP,"b":RIGHT,"bType":"num"|"ind","gate":"AND"|"OR"?}. gate is omitted on the first cond in a list.
 OP is one of: ">","<",">=","<=","crosses_above","crosses_below".
 bType "num" means RIGHT is a number as a string (e.g. "50"). bType "ind" means RIGHT is another operand name.
@@ -2877,6 +2858,9 @@ LEFT/RIGHT operands you may use:
 - "BB.upper","BB.middle","BB.lower"
 - "EMA<n>" / "SMA<n>" e.g. "EMA50","SMA200" (add a def with that name)
 - "CC.open","CC.high","CC.low","CC.close" (current candle), "PC.open".. (previous candle)
+- "DayChange" = % move since TODAY'S OPEN (add def {"type":"DayChange","name":"DayChange"}). Use for "up X% today / on the day / intraday".
+- "DayChangePrevClose" = % move vs the PREVIOUS DAY'S CLOSE (add def {"type":"DayChangePrevClose","name":"DayChangePrevClose"}). Use for "up X% from last/previous day close", "gapped up X%".
+- "PriceChange" = % move over a recent window (add def {"type":"PriceChange","name":"PriceChange","winMin":N}). Use for "up X% in the last N minutes/hours". winMin is the window in MINUTES (5 mins -> winMin:5, 1 hour -> winMin:60). For down-moves make the number negative (op "<"): "down 3% in 10 min" -> {"la":"PriceChange","op":"<","b":"-3","bType":"num"} with def winMin:10.
 - Chart patterns as a boolean operand compared > 0: "PAT:cup-handle","PAT:double-bottom","PAT:double-top","PAT:head-shoulders","PAT:inv-head-shoulders","PAT:asc-triangle","PAT:desc-triangle","PAT:sym-triangle","PAT:bull-flag","PAT:bear-flag","PAT:rising-wedge","PAT:falling-wedge","PAT:rectangle"
 - Candlestick patterns by name as a boolean operand compared > 0 (preferred over hand-coding CC/PC geometry): "CDL:doji","CDL:hammer","CDL:inverted-hammer","CDL:hanging-man","CDL:shooting-star","CDL:bull-engulfing","CDL:bear-engulfing","CDL:marubozu","CDL:spinning-top","CDL:morning-star","CDL:evening-star". These need NO def.
 A def is {"type":"RSI"|"EMA"|"SMA"|"MACD"|"BB"|"ADX"|"CCI"|"VWAP"|"Stoch"|"DMI"|"CurrentCandle"|"PrevCandle","len":"14","name":"RSI"}. Only add defs for operands that need them (RSI/EMA/SMA/BB/ADX/CCI/MACD/candles). Support/Resistance/Price/Volume/PAT:/CDL: need NO def.
@@ -2906,6 +2890,9 @@ Examples:
 "bullish engulfing above the 50 EMA" -> {"entry":[{"la":"CC.close","op":">","b":"PC.open","bType":"ind"},{"la":"CC.open","op":"<","b":"PC.close","bType":"ind","gate":"AND"},{"la":"Price","op":">","b":"EMA50","bType":"ind","gate":"AND"}],"exit":[],"defs":[{"type":"CurrentCandle","name":"CC"},{"type":"PrevCandle","name":"PC"},{"type":"EMA","len":"50","name":"EMA50"}]}
 "bollinger bounce off the lower band, exit at the middle" -> {"entry":[{"la":"Price","op":"crosses_above","b":"BB.lower","bType":"ind"}],"exit":[{"la":"Price","op":"crosses_above","b":"BB.middle","bType":"ind"}],"defs":[{"type":"BB","len":"20","name":"BB"}]}
 "sell when rsi crosses above 80" -> {"entry":[],"exit":[{"la":"RSI","op":"crosses_above","b":"80","bType":"num"}],"defs":[{"type":"RSI","len":"14","name":"RSI"}]}
+"enter when the stock is up at least 10% from the last day close" -> {"entry":[{"la":"DayChangePrevClose","op":">=","b":"10","bType":"num"}],"exit":[],"defs":[{"type":"DayChangePrevClose","name":"DayChangePrevClose"}]}
+"buy when price is up 2% in the last 5 minutes" -> {"entry":[{"la":"PriceChange","op":">","b":"2","bType":"num"}],"exit":[],"defs":[{"type":"PriceChange","name":"PriceChange","winMin":5}]}
+"suggest a strategy, exit at 5% return" -> {"entry":[{"la":"EMA20","op":"crosses_above","b":"EMA50","bType":"ind"},{"la":"RSI","op":">","b":"55","bType":"num","gate":"AND"}],"exit":[],"defs":[{"type":"EMA","len":"20","name":"EMA20"},{"type":"EMA","len":"50","name":"EMA50"},{"type":"RSI","len":"14","name":"RSI"}],"tp":5}
 If a part is genuinely impossible to express, omit it. Never invent operands outside the list above.`;
 
 const AI_OPS = new Set([">", "<", ">=", "<=", "crosses_above", "crosses_below"]);
@@ -2933,7 +2920,10 @@ app.post("/api/ai/strategy", llmLimiter, async (req, res) => {
       const entry = sanitizeAiConds(parsed.entry);
       const exit = sanitizeAiConds(parsed.exit);
       const defs = Array.isArray(parsed.defs) ? parsed.defs.filter((d) => d && d.type && d.name).slice(0, 8) : [];
-      if (entry.length || exit.length) return res.json({ entry, exit, defs, engine: "Neo" });
+      // Pass through optional SL/TP percentages when the model extracted them (0 < x <= 100).
+      const okPct = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 && n <= 100 ? +n : null; };
+      const sl = okPct(parsed.sl), tp = okPct(parsed.tp);
+      if (entry.length || exit.length) return res.json({ entry, exit, defs, ...(sl ? { sl } : {}), ...(tp ? { tp } : {}), engine: "Neo" });
     } catch (e) { console.error("[ai/strategy]", p.name, e.message); }
   }
   res.status(502).json({ error: "couldn't interpret" });
@@ -5033,8 +5023,11 @@ async function runAutoExitEngine() {
   } catch (e) { console.error("[autoexit] sweep failed:", e.message); }
   finally { autoExitRunning = false; lastAutoExit = { at: Date.now(), checked, exited, reconciled, live }; }
 }
+/* REAL-money managed-exit engine. Kept responsive (60s default) since it guards live positions, but
+   still env-tunable. It only reads OPEN managed positions, so egress is small when nothing is live. */
+const AUTO_EXIT_MS = Math.max(30_000, Number(process.env.AUTO_EXIT_MS) || 60_000);
 if (process.env.EXIT_MONITOR !== "off") {
-  setInterval(runAutoExitEngine, 60_000);
+  setInterval(runAutoExitEngine, AUTO_EXIT_MS);
   setTimeout(runAutoExitEngine, 15_000);
 }
 
@@ -5171,6 +5164,14 @@ async function runAutoBuyEngine() {
   autoBuyRunning = true;
   const live = autoBuyLiveOn();
   let checked = 0, bought = 0;
+  /* One DB read of a user's managed positions per SWEEP, not per strategy. The loop previously called
+     db.getManagedPositionsForUser up to 3× for every strategy — the single biggest source of repeated
+     Neon egress. We fetch once, cache for the tick, and invalidate only after we open a new position. */
+  const posCache = new Map();
+  const positionsFor = async (uid) => {
+    if (!posCache.has(uid)) posCache.set(uid, await db.getManagedPositionsForUser(uid).catch(() => []));
+    return posCache.get(uid);
+  };
   try {
     const strategies = await db.getActiveRealStrategies(500);
     for (const st of strategies) {
@@ -5179,7 +5180,7 @@ async function runAutoBuyEngine() {
         if (!marketOpenIST(st.market)) continue;   // market closed — do not enter
         // One position per strategy: if it still holds an open managed position, do nothing.
         if (st.openPositionId) {
-          const pos = (await db.getManagedPositionsForUser(st.userId)).find((p) => p.id === st.openPositionId);
+          const pos = (await positionsFor(st.userId)).find((p) => p.id === st.openPositionId);
           if (pos && (pos.status === "open" || pos.status === "closing")) continue;
           await db.updateRealStrategy(st.id, { openPositionId: null });   // position closed -> may re-enter
           st.openPositionId = null;
@@ -5191,7 +5192,7 @@ async function runAutoBuyEngine() {
            reconcile window, skip (the order is in-flight or just filled) rather than double-buy;
            only after the window with no trace do we clear it and flag for manual verification. */
         if (st.pendingSince) {
-          const openMatch = (await db.getManagedPositionsForUser(st.userId)).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(st.brokerSym) && Number(p.entry) > 0);
+          const openMatch = (await positionsFor(st.userId)).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(st.brokerSym) && Number(p.entry) > 0);
           if (openMatch) { await db.updateRealStrategy(st.id, { openPositionId: openMatch.id, pendingSince: null }); st.openPositionId = openMatch.id; continue; }
           if (Date.now() - st.pendingSince < AB_RECONCILE_MS) continue;   // in-flight — never double-submit
           await db.updateRealStrategy(st.id, { pendingSince: null, lastError: "previous order status unknown — cleared; verify with your broker before it re-enters", lastOrderStatus: "unknown" });
@@ -5209,7 +5210,7 @@ async function runAutoBuyEngine() {
         if (!sig.fired) continue;
 
         // Cap: total open real positions for this user.
-        const openCount = (await db.getManagedPositionsForUser(st.userId)).filter((p) => p.status === "open" || p.status === "closing").length;
+        const openCount = (await positionsFor(st.userId)).filter((p) => p.status === "open" || p.status === "closing").length;
         if (openCount >= AB_MAX_POSITIONS) { await db.updateRealStrategy(st.id, { lastError: `open-position cap (${AB_MAX_POSITIONS}) reached` }); continue; }
 
         const px = sig.price || await liveMarkForOrder(st.brokerSym, st.market) || null;
@@ -5244,6 +5245,7 @@ async function runAutoBuyEngine() {
           sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product,
         });
         await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null });
+        posCache.delete(st.userId);   // this user's positions changed — re-read next time it's needed
         bought++;
         console.log(`[autobuy] ${r.partial ? "PARTIAL" : "FILLED"} ${fillQty}/${qty} ${st.symbol} for ${st.userId} via ${st.broker} — ${sig.reason} (order ${r.orderId})`);
       } catch (e) {
@@ -5256,8 +5258,11 @@ async function runAutoBuyEngine() {
   } catch (e) { console.error("[autobuy] sweep failed:", e.message); }
   finally { autoBuyRunning = false; lastAutoBuy = { at: Date.now(), checked, bought, live }; }
 }
+/* Auto-BUY entry engine. 120s default (was 60s) halves its Neon reads; a 2-minute entry check is fine
+   for the 5m+ strategies it runs, and it early-outs (one small query) when no strategy is armed. */
+const AUTO_BUY_MS = Math.max(30_000, Number(process.env.AUTO_BUY_MS) || 120_000);
 if (process.env.EXIT_MONITOR !== "off") {
-  setInterval(runAutoBuyEngine, 60_000);
+  setInterval(runAutoBuyEngine, AUTO_BUY_MS);
   setTimeout(runAutoBuyEngine, 20_000);
 }
 

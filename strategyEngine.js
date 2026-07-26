@@ -209,7 +209,14 @@ function computeIndicator(d, attr, c, closes, vols) {
       }
       return out;
     }
-    case "PriceChange": { const n = Math.max(1, len); return closes.map((v, i) => (i >= n && closes[i - n]) ? (v / closes[i - n] - 1) * 100 : NaN); }
+    case "PriceChange": {
+      let n = Math.max(1, len);
+      if (d.winMin && c.length > 2) {
+        const barMin = Math.max(1, Math.round((c[c.length - 1].t - c[0].t) / (c.length - 1) / 60000));
+        n = Math.max(1, Math.round(Number(d.winMin) / barMin));
+      }
+      return closes.map((v, i) => (i >= n && closes[i - n]) ? (v / closes[i - n] - 1) * 100 : NaN);
+    }
     case "DayChange": {
       const out = new Array(c.length);
       let dayKey = null, dayOpen = NaN;
@@ -218,6 +225,18 @@ function computeIndicator(d, attr, c, closes, vols) {
         const key = dt.getUTCFullYear() + "-" + dt.getUTCMonth() + "-" + dt.getUTCDate();
         if (key !== dayKey) { dayKey = key; dayOpen = c[i].o; }
         out[i] = dayOpen ? (c[i].c / dayOpen - 1) * 100 : NaN;
+      }
+      return out;
+    }
+    case "DayChangePrevClose": {
+      const out = new Array(c.length);
+      let dayKey = null, prevClose = NaN, runningLast = NaN;
+      for (let i = 0; i < c.length; i++) {
+        const dt = new Date(c[i].t);
+        const key = dt.getUTCFullYear() + "-" + dt.getUTCMonth() + "-" + dt.getUTCDate();
+        if (key !== dayKey) { dayKey = key; prevClose = Number.isFinite(runningLast) ? runningLast : c[i].o; }
+        out[i] = prevClose ? (c[i].c / prevClose - 1) * 100 : NaN;
+        runningLast = c[i].c;
       }
       return out;
     }
