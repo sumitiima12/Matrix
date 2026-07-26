@@ -1737,6 +1737,104 @@ app.post("/api/optimize-exits", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+/* --------------------------- /api/optimize-indicators ---------------------------
+   POST { defs, entry, tf, symbols, currentSl, currentTp, objective } -> the indicator LENGTHS and a
+   shared TIMEFRAME (capped at 1h) that would have MAXIMISED win rate or P&L on the strategy's own past
+   entry signals. Same real-candle backtest as the SL/TP optimiser, but here we sweep the INDICATOR
+   parameters (e.g. Fast EMA 13 -> 8, Slow EMA 39 -> 55, tf 3m -> 15m) while holding SL/TP fixed at the
+   strategy's current pair, so the comparison isolates entry quality. A greedy coordinate descent keeps
+   the search bounded: pick the best timeframe, then tune each indicator's length one at a time. */
+const IND_TFS = ["3m", "5m", "15m", "30m", "1h"];   // never above 1h, by product rule
+function lenOptions(len) {
+  const n = Number(len);
+  if (!Number.isFinite(n) || n <= 0) return null;   // MACD/VWAP/CurrentCandle carry no numeric length
+  const s = new Set();
+  for (const m of [0.5, 0.7, 1, 1.4, 2]) { let v = Math.round(n * m); if (v < 2) v = 2; s.add(v); }
+  return [...s].sort((a, b) => a - b);
+}
+function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5) {
+  const cfg = { defs, entry, tf, mode };
+  let events = [];
+  for (const raw of sets) {
+    const ev = mode === "metric" ? collectMetricEntries(entry, raw) : collectEntries(cfg, raw);
+    events = events.concat(ev);
+  }
+  if (events.length > 800) { const step = Math.ceil(events.length / 800); events = events.filter((_, k) => k % step === 0); }
+  const r = evalExitPair(sl, tp, events);
+  if (!r) return null;
+  if (r.trades < minTrades) return null;      // too few signals to trust — treat as no result
+  return r;
+}
+function optimizeIndicators(cfg, tfSets, cur, objective = "pnl") {
+  const sl = cur.sl > 0 ? cur.sl : 1;
+  const tp = cur.tp > 0 ? cur.tp : 2;
+  const rank = optRanker(objective);
+  const better = (a, b) => { if (!a) return false; if (!b) return true; return rank(a, b) < 0; };
+  const baseDefs = (cfg.defs || []).map((d) => ({ ...d }));
+  let globalBest = null;      // { defs, tf, metrics }
+  for (const tf of IND_TFS) {
+    const sets = tfSets[tf];
+    if (!sets || !sets.length) continue;
+    let curDefs = baseDefs.map((d) => ({ ...d, tf }));
+    let curMetrics = evalIndicatorCfg(curDefs, cfg.entry, tf, cfg.mode, sets, sl, tp);
+    for (let i = 0; i < curDefs.length; i++) {          // tune each indicator's length in turn
+      const opts = lenOptions(curDefs[i].len);
+      if (!opts) continue;
+      let bestDefs = curDefs, bestMetrics = curMetrics;
+      for (const L of opts) {
+        if (String(L) === String(curDefs[i].len)) continue;
+        const trial = curDefs.map((d, j) => j === i ? { ...d, len: String(L) } : d);
+        const m = evalIndicatorCfg(trial, cfg.entry, tf, cfg.mode, sets, sl, tp);
+        if (better(m, bestMetrics)) { bestDefs = trial; bestMetrics = m; }
+      }
+      curDefs = bestDefs; curMetrics = bestMetrics;
+    }
+    if (better(curMetrics, globalBest && globalBest.metrics)) globalBest = { defs: curDefs, tf, metrics: curMetrics };
+  }
+  const curTf = cfg.tf || "5m";
+  const curSets = tfSets[curTf] || tfSets[IND_TFS.find((t) => tfSets[t] && tfSets[t].length)] || [];
+  const current = curSets.length ? evalIndicatorCfg(baseDefs.map((d) => ({ ...d, tf: curTf })), cfg.entry, curTf, cfg.mode, curSets, sl, tp, 1) : null;
+  if (!globalBest || !globalBest.metrics) return { entries: current ? current.trades : 0, current: current ? { ...current, tf: curTf } : null };
+  const changes = globalBest.defs.map((d, i) => {
+    const o = baseDefs[i] || {};
+    return { name: d.name || d.type, type: d.type, fromLen: o.len, toLen: d.len, fromTf: o.tf || curTf, toTf: globalBest.tf };
+  }).filter((c) => String(c.fromLen) !== String(c.toLen) || String(c.fromTf) !== String(c.toTf));
+  return {
+    entries: globalBest.metrics.trades, objective, tf: globalBest.tf,
+    best: { ...globalBest.metrics, sl, tp, tf: globalBest.tf, defs: globalBest.defs.map((d) => ({ ...d, tf: globalBest.tf })) },
+    current: current ? { ...current, tf: curTf } : null,
+    changes,
+  };
+}
+app.post("/api/optimize-indicators", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m") };
+    if (body.mode === "metric") cfg.mode = "metric";
+    let syms = Array.isArray(body.symbols) ? body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
+    syms = [...new Set(syms)].slice(0, 4);
+    if (!cfg.entry.length || !syms.length || !(cfg.defs || []).length) return res.json({ entries: 0 });
+    // Nothing to optimise if no indicator carries a numeric length (pure MACD/VWAP strategies).
+    if (!(cfg.defs || []).some((d) => Number(d && d.len) > 0)) return res.json({ entries: 0, noNumeric: true });
+    const objective = body.objective === "winrate" ? "winrate" : "pnl";
+    const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
+    const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
+    let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
+    const key = "optind:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    const out = await memo(key, 30 * 60_000, async () => {
+      const tfSets = {};
+      for (const tf of IND_TFS) {
+        const interval = OPT_INTERVAL[tf], range = OPT_RANGE[tf];
+        const sets = [];
+        for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
+        tfSets[tf] = sets;
+      }
+      return optimizeIndicators(cfg, tfSets, cur, objective);
+    });
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 /* --------------------------- /api/momentum-scan ---------------------------
    POST { symbols:[...], tf:"5m"|"15m"|"1h"|"4h"|"1d"|"1w", pct:2, dir:"up"|"down", bars? }
    Returns symbols whose PRICE CHANGE over one `tf` candle passes the threshold — i.e.
