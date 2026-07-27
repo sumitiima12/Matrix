@@ -1606,7 +1606,10 @@ app.post("/api/screener-scan", async (req, res) => {
    POST { defs, entry, tf, symbols } -> the SL/TP pair that would have MAXIMISED expectancy on the
    strategy's OWN past entry signals (a grid sweep over real candles), plus an out-of-sample check so
    the number isn't just curve-fit. Long-only; ties inside a bar assume the stop (conservative). */
-const OPT_RANGE = { "3m": "1mo", "5m": "1mo", "15m": "2mo", "30m": "3mo", "1h": "6mo", "1d": "2y" };
+/* Optimisers backtest over the LONGEST practical history so there are plenty of signals — the same
+   spirit as the backtest tab, not a tiny recent window. Intraday intervals cap at ~60d on the data
+   source, so those use the max (~2mo); hourly/daily reach much further. */
+const OPT_RANGE = { "3m": "2mo", "5m": "2mo", "15m": "2mo", "30m": "2mo", "1h": "1y", "1d": "5y" };
 const OPT_INTERVAL = { "3m": "2m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d" };
 const OPT_SLS = [0.3, 0.5, 0.75, 1, 1.5, 2, 3];
 const OPT_TPS = [0.5, 1, 1.5, 2, 3, 4, 5];
@@ -2715,7 +2718,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "neo-nlp-egress-1",   // bump on deploy so we can confirm which build is live
+    build: "longshort-bulk-optwindow-1",   // bump on deploy so we can confirm which build is live
   });
 });
 
