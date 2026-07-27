@@ -132,6 +132,7 @@ app.post("/api/trades", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "symbol too long" });
     const rec = { id: trade.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...trade };
     await db.saveTrade(userId, rec);
+    rcBust(`trades:${userId}`);
     res.json({ ok: true, trade: rec });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -142,7 +143,8 @@ app.get("/api/trades", requireAuth, async (req, res) => {
     const userId = storageKeyFor(req.authUserId);   // from the verified token
     const from = req.query.from ? +req.query.from : 0;
     const to = req.query.to ? +req.query.to : Date.now();
-    res.json({ trades: await db.getTrades(userId, from, to) });
+    const trades = await rcWrap(`trades:${userId}:${from}:${to}`, () => db.getTrades(userId, from, to));
+    res.json({ trades });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -152,6 +154,7 @@ app.post("/api/trades/clear-virtual", requireAuth, async (req, res) => {
   try {
     const userId = storageKeyFor(req.authUserId);   // from the verified token, NOT the client
     const removed = await db.clearVirtualTrades(userId);
+    rcBust(`trades:${userId}`);
     res.json({ ok: true, removed });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -487,13 +490,15 @@ app.post("/api/state", requireAuth, async (req, res) => {
     const { state } = req.body || {};
     const userId = storageKeyFor(req.authUserId);   // from the verified token
     await db.saveState(userId, state || {});
+    rcBust(`state:${userId}`);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get("/api/state", requireAuth, async (req, res) => {
   try {
     const userId = storageKeyFor(req.authUserId);   // from the verified token
-    res.json({ state: await db.getState(userId) });
+    const state = await rcWrap(`state:${userId}`, () => db.getState(userId));
+    res.json({ state });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -687,6 +692,19 @@ function memo(key, ttlMs, fn) {
   inflight.set(key, p);
   return p;
 }
+/* ------------------------------ read cache ------------------------------
+   The app polls a handful of per-user GET endpoints (autoexit, autobuy, state, trades) on a timer.
+   This tiny in-memory cache collapses repeated reads within a short TTL so they don't each hit
+   Postgres — the main lever for keeping DB data-transfer low. Writes for a user bust that user's keys,
+   and the TTL is short enough that background engine changes still surface quickly. */
+const READ_CACHE = new Map();                       // key -> { at, data }
+const READ_TTL_MS = Math.max(3000, Number(process.env.READ_CACHE_MS) || 8000);
+function rcGet(key) { const e = READ_CACHE.get(key); return (e && Date.now() - e.at < READ_TTL_MS) ? e.data : undefined; }
+function rcSet(key, data) { READ_CACHE.set(key, { at: Date.now(), data }); return data; }
+function rcBust(prefix) { for (const k of READ_CACHE.keys()) { if (k === prefix || k.startsWith(prefix + ":")) READ_CACHE.delete(k); } }
+/* Wrap a read: return the cached value if fresh, else run fn(), cache and return it. */
+async function rcWrap(key, fn) { const hit = rcGet(key); if (hit !== undefined) return hit; return rcSet(key, await fn()); }
+
 const FETCH_TIMEOUT_MS = 8000;
 /* Timed fetch: aborts after 8s so a hanging upstream (Yahoo, an LLM provider) fails fast
    instead of stalling the whole request behind it. */
@@ -2718,7 +2736,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "longshort-bulk-optwindow-1",   // bump on deploy so we can confirm which build is live
+    build: "egress-cache-cardopt-1",   // bump on deploy so we can confirm which build is live
   });
 });
 
@@ -3447,7 +3465,7 @@ function mergeAppSettings(stored) {
 
 // Public read — every client needs this to know what to show. No secrets here.
 app.get("/api/app-settings", async (_req, res) => {
-  try { res.json({ settings: mergeAppSettings(await db.getAppSettings()) }); }
+  try { res.json({ settings: mergeAppSettings(await rcWrap("app-settings", () => db.getAppSettings())) }); }
   catch { res.json({ settings: DEFAULT_APP_SETTINGS }); }
 });
 
@@ -3457,6 +3475,7 @@ app.post("/api/app-settings", async (req, res) => {
   try {
     const next = mergeAppSettings(req.body && req.body.settings);
     await db.saveAppSettings(next);
+    rcBust("app-settings");
     res.json({ ok: true, settings: next });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
