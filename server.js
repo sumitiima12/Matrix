@@ -1627,7 +1627,10 @@ app.post("/api/screener-scan", async (req, res) => {
 /* Optimisers backtest over the LONGEST practical history so there are plenty of signals — the same
    spirit as the backtest tab, not a tiny recent window. Intraday intervals cap at ~60d on the data
    source, so those use the max (~2mo); hourly/daily reach much further. */
-const OPT_RANGE = { "3m": "2mo", "5m": "2mo", "15m": "2mo", "30m": "2mo", "1h": "1y", "1d": "5y" };
+// Ranges MUST be keys the FYERS house feed understands (see FY_RANGE_DAYS) — "2mo" was NOT one, so the
+// house feed returned nothing and we fell back to Yahoo, which has no intraday data for indices like
+// NIFTY50 → "0 signals". "3mo" is recognised, so intraday optimisation now gets real candles.
+const OPT_RANGE = { "3m": "3mo", "5m": "3mo", "15m": "3mo", "30m": "3mo", "1h": "1y", "1d": "2y" };
 const OPT_INTERVAL = { "3m": "2m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d" };
 const OPT_SLS = [0.3, 0.5, 0.75, 1, 1.5, 2, 3];
 const OPT_TPS = [0.5, 1, 1.5, 2, 3, 4, 5];
@@ -2743,7 +2746,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "rr-floor-optexit-1",   // bump on deploy so we can confirm which build is live
+    build: "opt-range-fyers-fix-1",   // bump on deploy so we can confirm which build is live
   });
 });
 
