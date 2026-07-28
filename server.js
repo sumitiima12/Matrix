@@ -2769,7 +2769,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "fyers-index-symbols-3",   // bump on deploy so we can confirm which build is live
+    build: "fyers-index-diag-4",   // bump on deploy so we can confirm which build is live
   });
 });
 
@@ -2787,9 +2787,19 @@ app.get("/api/diag/candles", async (req, res) => {
     const tf = String(req.query.tf || "5m");
     const range = OPT_RANGE[tf] || "3mo", interval = OPT_INTERVAL[tf] || "5m";
     const fyersSymbol = (typeof yahooToFyers === "function") ? yahooToFyers(ySym) : null;
-    let fyersHouseCount = 0, fyErr = null;
+    let fyersHouseCount = 0, fyErr = null, fyRaw = null;
     try { const fh = await fyersHouseHistory(ySym, range, interval); fyersHouseCount = Array.isArray(fh) ? fh.length : 0; }
     catch (e) { fyErr = String(e && e.message); }
+    // Surface the RAW FYERS history response (code/message) so we can see WHY an index returns 0.
+    try {
+      const resn = FY_RES[interval], days = FY_RANGE_DAYS[range], tok = await fyersHouseToken();
+      if (fyersSymbol && resn && days && tok) {
+        const raw = await fetchFyersHistoryRaw(fyersSymbol, resn, days, `${process.env.FYERS_APP_ID || ""}:${tok}`);
+        fyRaw = { count: (raw && raw.candles) ? raw.candles.length : 0, code: raw && raw.code, message: raw && raw.message };
+      } else {
+        fyRaw = { note: "missing resolution / range-days / house token", hasToken: !!tok };
+      }
+    } catch (e) { fyRaw = { error: String(e && e.message) }; }
     let all = [];
     try { all = await candlesFor(ySym, range, interval); } catch (e) { fyErr = fyErr || String(e && e.message); }
     res.json({
@@ -2797,7 +2807,7 @@ app.get("/api/diag/candles", async (req, res) => {
       fyersHouseCount, candlesForCount: (all || []).length,
       firstAt: (all || [])[0] ? new Date(all[0].t).toISOString() : null,
       lastAt: (all || []).length ? new Date(all[all.length - 1].t).toISOString() : null,
-      fyErr,
+      fyErr, fyRaw,
     });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
