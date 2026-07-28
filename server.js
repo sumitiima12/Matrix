@@ -981,9 +981,12 @@ async function fyersLoginTOTP() {
   const appCore = dash > 0 ? appId.slice(0, dash) : appId;
   const appType = dash > 0 ? appId.slice(dash + 1) : "100";
   const b64 = (s) => Buffer.from(String(s)).toString("base64");
-  const V = "https://api-t1.fyers.in/vagator/v2";
+  // OTP steps live on api-t2 vagator/v2; the auth-code exchange is on api.fyers.in/api/v2/token
+  // (both confirmed against the current working FYERS TOTP flow — api-t1 vagator now 404s).
+  const V = "https://api-t2.fyers.in/vagator/v2";
+  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
   const post = async (url, body, headers) => {
-    const r = await pfetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(headers || {}) }, body: JSON.stringify(body), ...fyFetchOpts });
+    const r = await pfetch(url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA, ...(headers || {}) }, body: JSON.stringify(body), ...fyFetchOpts });
     // Capture status + raw body so a geo-block/HTML page (non-JSON) is visible in _fyDebug
     // instead of collapsing to an opaque {}. __status / __raw are stripped before use.
     const text = await r.text().catch(() => "");
@@ -1007,12 +1010,24 @@ async function fyersLoginTOTP() {
   r = await post(`${V}/verify_pin_v2`, { request_key: r.request_key, identity_type: "pin", identifier: b64(pin) });
   const vTok = r.data && r.data.access_token;
   if (!vTok) throw new Error("verify_pin: " + (r.message || JSON.stringify(r)));
-  // 4. exchange for an auth code
-  const tr = await post("https://api-t1.fyers.in/api/v3/token", { fyers_id: fyId, app_id: appCore, redirect_uri: redirect, appType, code_challenge: "", state: "matrix", scope: "", nonce: "", response_type: "code", create_cookie: true }, { Authorization: `Bearer ${vTok}` });
-  const url = tr.Url || tr.url;
-  if (!url) throw new Error("token: " + (tr.message || JSON.stringify(tr)));
-  const authCode = new URL(url).searchParams.get("auth_code");
-  if (!authCode) throw new Error("no auth_code in redirect");
+  // 4. exchange for an auth code. FYERS answers on api.fyers.in/api/v2/token with a 308 whose
+  //    JSON body carries { Url: "<redirect_uri>?auth_code=..." }; after the redirect is followed
+  //    the final response URL also carries the auth_code — read whichever we can get.
+  const tokenBody = { fyers_id: fyId, app_id: appCore, redirect_uri: redirect, appType, code_challenge: "", state: "matrix", scope: "", nonce: "", response_type: "code", create_cookie: true };
+  const tres = await pfetch("https://api.fyers.in/api/v2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA, Authorization: `Bearer ${vTok}` },
+    body: JSON.stringify(tokenBody),
+    ...fyFetchOpts,
+  });
+  let authCode = null;
+  const tText = await tres.text().catch(() => "");
+  try { const tj = tText ? JSON.parse(tText) : {}; const u = tj.Url || tj.url; if (u) authCode = new URL(u).searchParams.get("auth_code"); } catch { /* not JSON — try the redirected URL */ }
+  if (!authCode) { try { authCode = new URL(tres.url).searchParams.get("auth_code"); } catch { /* no query */ } }
+  if (!authCode) {
+    _fyDebug = { step: "token", status: tres.status, finalUrl: (tres.url || "").slice(0, 200), raw: (tText || "").slice(0, 300) };
+    throw new Error("token: HTTP " + tres.status + " — no auth_code (" + ((tText || "").slice(0, 120) || "empty body") + ")");
+  }
   // 5. validate the auth code -> the API access token we actually use
   const appIdHash = crypto.createHash("sha256").update(`${appId}:${secret}`).digest("hex");
   const vac = await post("https://api-t1.fyers.in/api/v3/validate-authcode", { grant_type: "authorization_code", appIdHash, code: authCode });
@@ -2778,7 +2793,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "fyers-totp-rawdebug-5",   // bump on deploy so we can confirm which build is live
+    build: "fyers-totp-t2-endpoints-6",   // bump on deploy so we can confirm which build is live
   });
 });
 
