@@ -984,11 +984,20 @@ async function fyersLoginTOTP() {
   const V = "https://api-t1.fyers.in/vagator/v2";
   const post = async (url, body, headers) => {
     const r = await pfetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(headers || {}) }, body: JSON.stringify(body), ...fyFetchOpts });
-    return r.json().catch(() => ({}));
+    // Capture status + raw body so a geo-block/HTML page (non-JSON) is visible in _fyDebug
+    // instead of collapsing to an opaque {}. __status / __raw are stripped before use.
+    const text = await r.text().catch(() => "");
+    let j = {}; try { j = text ? JSON.parse(text) : {}; } catch { j = {}; }
+    return { ...j, __status: r.status, __raw: (text || "").slice(0, 300) };
   };
   // 1. request an OTP session
   let r = await post(`${V}/send_login_otp_v2`, { fy_id: b64(fyId), app_id: "2" });
-  if (!r.request_key) throw new Error("send_otp: " + (r.message || JSON.stringify(r)));
+  if (!r.request_key) {
+    // Surface exactly what FYERS returned (status + first 300 chars) — usually a geo/IP block
+    // shows as HTTP 403/503 with an HTML or empty body; a real API error carries a JSON message.
+    _fyDebug = { step: "send_login_otp_v2", proxied: Boolean(fyersDispatcher), fyIdLen: fyId.length, status: r.__status, raw: r.__raw };
+    throw new Error("send_otp: " + (r.message || (r.__status ? `HTTP ${r.__status} ${r.__raw || "(empty body)"}` : JSON.stringify(r))));
+  }
   // 2. verify the TOTP (retry once past the 30s boundary if FYERS says invalid)
   let key = r.request_key;
   r = await post(`${V}/verify_otp`, { request_key: key, otp: totpCode(totpSecret) });
@@ -2769,7 +2778,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "fyers-index-diag-4",   // bump on deploy so we can confirm which build is live
+    build: "fyers-totp-rawdebug-5",   // bump on deploy so we can confirm which build is live
   });
 });
 
