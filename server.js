@@ -1071,8 +1071,19 @@ async function fyersHouseToken() {
 
 // Yahoo symbol -> FYERS symbol. Only cash equities map cleanly; indices/others return null
 // (and therefore stay on Yahoo).
+// Yahoo index tickers -> FYERS index symbols, so indices (NIFTY50, BANKNIFTY, …) go through the FYERS
+// house feed instead of falling back to Yahoo. FYERS lists indices as "<EXCH>:<NAME>-INDEX".
+const FYERS_INDEX = {
+  "^NSEI": "NSE:NIFTY50-INDEX",
+  "^NSEBANK": "NSE:NIFTYBANK-INDEX",
+  "^NSEFIN": "NSE:FINNIFTY-INDEX",
+  "^CNXFIN": "NSE:FINNIFTY-INDEX",
+  "^INDIAVIX": "NSE:INDIAVIX-INDEX",
+  "^BSESN": "BSE:SENSEX-INDEX",
+};
 function yahooToFyers(ySym) {
   const s = String(ySym || "");
+  if (FYERS_INDEX[s]) return FYERS_INDEX[s];
   if (s.endsWith(".NS")) return `NSE:${s.slice(0, -3)}-EQ`;
   if (s.endsWith(".BO")) return `BSE:${s.slice(0, -3)}-EQ`;
   return null;
@@ -2758,7 +2769,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "opt-intraday-candles-2",   // bump on deploy so we can confirm which build is live
+    build: "fyers-index-symbols-3",   // bump on deploy so we can confirm which build is live
   });
 });
 
