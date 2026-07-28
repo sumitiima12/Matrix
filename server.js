@@ -1013,7 +1013,11 @@ async function fyersLoginTOTP() {
   // 4. exchange for an auth code. FYERS answers on api.fyers.in/api/v2/token with a 308 whose
   //    JSON body carries { Url: "<redirect_uri>?auth_code=..." }; after the redirect is followed
   //    the final response URL also carries the auth_code — read whichever we can get.
-  const tokenBody = { fyers_id: fyId, app_id: appCore, redirect_uri: redirect, appType, code_challenge: "", state: "matrix", scope: "", nonce: "", response_type: "code", create_cookie: true };
+  //    NOTE: appType here is the PLATFORM type for the login flow and is ALWAYS "100" — it is NOT
+  //    the app-id suffix. A "-200" app still logs in with appType "100"; the -200 suffix only
+  //    matters for the appIdHash (full appId:secret) used in the validate-authcode step below.
+  const LOGIN_APP_TYPE = "100";
+  const tokenBody = { fyers_id: fyId, app_id: appCore, redirect_uri: redirect, appType: LOGIN_APP_TYPE, code_challenge: "", state: "matrix", scope: "", nonce: "", response_type: "code", create_cookie: true };
   const tres = await pfetch("https://api.fyers.in/api/v2/token", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA, Authorization: `Bearer ${vTok}` },
@@ -1025,7 +1029,7 @@ async function fyersLoginTOTP() {
   try { const tj = tText ? JSON.parse(tText) : {}; const u = tj.Url || tj.url; if (u) authCode = new URL(u).searchParams.get("auth_code"); } catch { /* not JSON — try the redirected URL */ }
   if (!authCode) { try { authCode = new URL(tres.url).searchParams.get("auth_code"); } catch { /* no query */ } }
   if (!authCode) {
-    _fyDebug = { step: "token", status: tres.status, sentAppId: appCore, sentAppType: appType, appIdSuffix: appId.slice(-6), raw: (tText || "").slice(0, 300) };
+    _fyDebug = { step: "token", status: tres.status, sentAppId: appCore, sentAppType: LOGIN_APP_TYPE, appIdSuffix: appId.slice(-6), raw: (tText || "").slice(0, 300) };
     throw new Error("token: HTTP " + tres.status + " — no auth_code (" + ((tText || "").slice(0, 120) || "empty body") + ")");
   }
   // 5. validate the auth code -> the API access token we actually use
@@ -2793,7 +2797,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "fyers-totp-apptype-dbg-7",   // bump on deploy so we can confirm which build is live
+    build: "fyers-totp-apptype100-8",   // bump on deploy so we can confirm which build is live
   });
 });
 
