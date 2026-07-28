@@ -2209,8 +2209,20 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   // FYERS house feed first for Indian equities; Yahoo otherwise / on any gap.
   const fy = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
   if (fy && fy.length) return fy;
+  /* YAHOO INTRADAY IS CAPPED (1m ~7d, other minute ~60d). Requesting `range=3mo&interval=5m` makes Yahoo
+     422 and return nothing — which was leaving the optimiser with 0 candles when the FYERS feed missed.
+     For intraday, request an explicit clamped period window instead (same trick /api/history uses). */
+  const YMAX_D = { "1m": 7, "2m": 60, "3m": 60, "5m": 60, "10m": 60, "15m": 60, "30m": 60, "45m": 60, "60m": 730, "90m": 60 };
+  let qs;
+  if (YMAX_D[interval]) {
+    const days = Math.min(FY_RANGE_DAYS[range] || 60, YMAX_D[interval]);
+    const p2 = Math.floor(Date.now() / 1000), p1 = p2 - days * 86400;
+    qs = `period1=${p1}&period2=${p2}&interval=${interval}`;
+  } else {
+    qs = `range=${range}&interval=${interval}`;
+  }
   const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
-    j(`${YF}/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`));
+    j(`${YF}/v8/finance/chart/${encodeURIComponent(symbol)}?${qs}`));
   const r = data.chart?.result?.[0];
   const ts = r?.timestamp || [];
   const q = r?.indicators?.quote?.[0] || {};
@@ -2746,7 +2758,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "opt-range-fyers-fix-1",   // bump on deploy so we can confirm which build is live
+    build: "opt-intraday-candles-2",   // bump on deploy so we can confirm which build is live
   });
 });
 
@@ -2754,6 +2766,30 @@ app.get("/api/health", (req, res) => {
    came back (and any error). Open in a browser to see WHY a feed is falling back to Yahoo. */
 /* Delta reachability probe. Tells us EXACTLY where signed Delta calls break — public feed vs
    signed-via-proxy — without leaking any balance/keys. Open on purpose (no secrets in output). */
+/* Candle-source diagnostic: how many candles the OPTIMISER actually gets for a symbol/timeframe, and
+   from where. Pass the YAHOO symbol (e.g. RELIANCE.NS, ^NSEI, BAJAJ-AUTO.NS). Tells us instantly whether
+   a "0 signals" is a DATA gap (0 candles) or an engine issue (candles present but no entries). */
+app.get("/api/diag/candles", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const ySym = String(req.query.symbol || "").trim();
+    const tf = String(req.query.tf || "5m");
+    const range = OPT_RANGE[tf] || "3mo", interval = OPT_INTERVAL[tf] || "5m";
+    const fyersSymbol = (typeof yahooToFyers === "function") ? yahooToFyers(ySym) : null;
+    let fyersHouseCount = 0, fyErr = null;
+    try { const fh = await fyersHouseHistory(ySym, range, interval); fyersHouseCount = Array.isArray(fh) ? fh.length : 0; }
+    catch (e) { fyErr = String(e && e.message); }
+    let all = [];
+    try { all = await candlesFor(ySym, range, interval); } catch (e) { fyErr = fyErr || String(e && e.message); }
+    res.json({
+      symbol: ySym, fyersSymbol, tf, range, interval,
+      fyersHouseCount, candlesForCount: (all || []).length,
+      firstAt: (all || [])[0] ? new Date(all[0].t).toISOString() : null,
+      lastAt: (all || []).length ? new Date(all[all.length - 1].t).toISOString() : null,
+      fyErr,
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
 app.get("/api/diag/delta", async (req, res) => {
   if (!requireAdmin(req, res)) return;   // internal diagnostics — admin only, not public
   const T = (p, ms = 18000) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error("timed out")), ms))]);
