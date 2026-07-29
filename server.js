@@ -1725,7 +1725,7 @@ function collectMetricEntries(conds, raw) {
   for (let i = 30; i < c.length - 1; i++) { const fired = firesAt(i); if (fired && !prev) out.push({ c, e: i }); prev = fired; }
   return out;
 }
-function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5) {
+function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, maxSl = 0) {
   const collect = cfg.mode === "metric" ? (raw) => collectMetricEntries(cfg.entry, raw) : (raw) => collectEntries(cfg, raw);
   let events = [];
   for (const raw of candleSets) events = events.concat(collect(raw));
@@ -1738,9 +1738,13 @@ function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5) {
   // RISK/REWARD FLOOR: only consider SL/TP pairs where the target is at least `rrMin`× the stop, so the
   // optimiser never recommends a setup whose reward is below the user's minimum RR (default 1:1.5).
   const RR_MIN = Number(rrMin) > 0 ? Number(rrMin) : 0;
-  for (const sl of OPT_SLS) for (const tp of OPT_TPS) { if (RR_MIN > 0 && tp < sl * RR_MIN) continue; const r = evalExitPair(sl, tp, inS); if (r) results.push(r); }
-  // If the floor was so strict nothing qualified, fall back to the full grid rather than returning empty.
-  if (!results.length && RR_MIN > 0) { for (const sl of OPT_SLS) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS); if (r) results.push(r); } }
+  // MAX-SL CAP: when set, never propose a stop wider than the user's cap (e.g. maxSl=1 → SL ≤ 1%).
+  const SL_MAX = Number(maxSl) > 0 ? Number(maxSl) : 0;
+  const sls = SL_MAX > 0 ? OPT_SLS.filter((sl) => sl <= SL_MAX + 1e-9) : OPT_SLS;
+  const slGrid = sls.length ? sls : [Math.min(...OPT_SLS)];   // if the cap is below every candidate, keep the smallest
+  for (const sl of slGrid) for (const tp of OPT_TPS) { if (RR_MIN > 0 && tp < sl * RR_MIN) continue; const r = evalExitPair(sl, tp, inS); if (r) results.push(r); }
+  // If the floor was so strict nothing qualified, fall back to the full grid (still honouring the SL cap).
+  if (!results.length && RR_MIN > 0) { for (const sl of slGrid) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS); if (r) results.push(r); } }
   if (!results.length) return { entries: events.length };
   const minTrades = Math.min(8, Math.max(3, Math.floor(inS.length * 0.05)));
   const rank = optRanker(objective);
@@ -1764,17 +1768,19 @@ app.post("/api/optimize-exits", async (req, res) => {
     const objective = body.objective === "winrate" ? "winrate" : "pnl";
     // Minimum reward/risk the optimiser must respect (TP ≥ rrMin × SL). User-tunable; default 1.5.
     const rrMin = (body.rrMin != null && Number(body.rrMin) >= 0) ? Number(body.rrMin) : 1.5;
+    // Optional max stop-loss cap (%). When >0 the optimiser won't propose an SL above it.
+    const maxSl = (body.maxSl != null && Number(body.maxSl) > 0) ? Number(body.maxSl) : 0;
     const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
     const interval = OPT_INTERVAL[cfg.tf] || "5m", range = OPT_RANGE[cfg.tf] || "1mo";
     // Content hash of the whole request so two different strategies never share a cache entry (the old
     // length-based key could collide and return another strategy's optimisation).
     const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
     let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
-    const key = "optexit:" + h.toString(36) + ":" + objective + ":rr" + rrMin + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    const key = "optexit:" + h.toString(36) + ":" + objective + ":rr" + rrMin + ":mx" + maxSl + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const sets = [];
       for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
-      return optimizeExits(cfg, sets, cur, objective, rrMin);
+      return optimizeExits(cfg, sets, cur, objective, rrMin, maxSl);
     });
     res.json(out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -2797,7 +2803,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "fyers-totp-apptype100-8",   // bump on deploy so we can confirm which build is live
+    build: "opt-maxsl-9",   // bump on deploy so we can confirm which build is live
   });
 });
 
