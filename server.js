@@ -897,6 +897,8 @@ let _fyLastError = null;      // surfaced by /api/feeds-status for debugging
 let _deltaLastError = null;
 let _fyDebug = null;          // safe (no secrets): shapes + raw FYERS response
 let _fyCooldownUntil = 0;     // don't retry the mint until this time (avoids hammering FYERS -> 429)
+let _fyLoginInflight = null;  // single-flight: the in-progress TOTP login promise (prevents concurrent
+                              // logins racing and invalidating each other's single-use auth code)
 
 /* The standalone undici (from package.json). We must use ITS fetch when routing through a
    ProxyAgent it created — mixing a standalone-undici dispatcher with Node's built-in fetch
@@ -1045,7 +1047,27 @@ async function fyersHouseToken() {
   if ((process.env.FYERS_TOTP_SECRET || "").trim()) {
     if (Date.now() < _fyCooldownUntil) return _fyHouse.token || null;
     try {
-      const tok = await fyersLoginTOTP();
+      // SINGLE-FLIGHT: if a login is already running (e.g. a quote poll and a history request both
+      // wake up cold at the same time), await THAT one instead of starting a second. Two concurrent
+      // TOTP logins each mint an auth code and FYERS invalidates the loser — the classic intermittent
+      // "validate-authcode: invalid auth code". One login at a time removes that race entirely.
+      if (!_fyLoginInflight) {
+        _fyLoginInflight = (async () => {
+          try { return await fyersLoginTOTP(); }
+          catch (e) {
+            const msg = String((e && e.message) || e);
+            // Retry ONCE on the transient errors: a single-use auth code that lost a race, or a soft
+            // Cloudflare rate-limit (429/1015). Wait past the 30s TOTP window so the retry uses a
+            // fresh 6-digit code + a fresh auth code.
+            if (/invalid auth code|rate.?limit|error 1015|\b1015\b|send_otp/i.test(msg)) {
+              await new Promise((r) => setTimeout(r, 2000));
+              return await fyersLoginTOTP();
+            }
+            throw e;
+          }
+        })().finally(() => { _fyLoginInflight = null; });
+      }
+      const tok = await _fyLoginInflight;
       if (tok) { _fyHouse = { token: tok, at: Date.now() }; _fyLastError = null; _fyCooldownUntil = 0; return tok; }
     } catch (e) {
       _fyLastError = "totp-login: " + e.message;
@@ -2803,7 +2825,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "opt-maxsl-9",   // bump on deploy so we can confirm which build is live
+    build: "fyers-login-singleflight-10",   // bump on deploy so we can confirm which build is live
   });
 });
 
