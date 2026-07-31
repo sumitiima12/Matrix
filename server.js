@@ -2262,11 +2262,17 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   // optimiser & backtest need (1mo+), its handful of candles isn't enough and the optimiser reports
   // "couldn't fetch enough price history". So for those long ranges we skip Delta and use Yahoo's far
   // wider intraday window (~60d of 5m); Delta still serves the short, live ranges (charts / exits).
-  const cx = String(symbol).match(/^([A-Z0-9]+)-USD$/);
+  // Resolve the symbol to its market form ONCE. Crypto strategies carry a bare ticker ("BTC", "ETH"),
+  // but Delta needs "BTCUSD" and Yahoo needs "BTC-USD" — Y_SPECIAL maps the bare ticker to the Yahoo
+  // form. Without this the optimiser/backtest fed a bare "BTC" straight to Yahoo, which rejects it and
+  // returns 0 candles → "couldn't fetch enough price history". (The frontend maps before /api/history,
+  // so charts worked while the optimiser didn't.) US/Indian tickers aren't in Y_SPECIAL, so unchanged.
+  const yMapped = Y_SPECIAL[String(symbol)] || String(symbol);
+  const cx = yMapped.match(/^([A-Z0-9]+)-USD$/);
   const LONG_RANGE = new Set(["1mo", "3mo", "6mo", "1y", "2y"]);
   if (cx && !LONG_RANGE.has(range)) {
     try {
-      const dc = await memo(`dc:${symbol}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, interval, range));
+      const dc = await memo(`dc:${cx[1]}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, interval, range));
       if (dc && dc.length) return dc;
     } catch (e) { /* fall through to Yahoo */ }
   }
@@ -2292,8 +2298,8 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   } else {
     qs = `range=${range}&interval=${interval}`;
   }
-  const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
-    j(`${YF}/v8/finance/chart/${encodeURIComponent(symbol)}?${qs}`));
+  const data = await memo(`h:${yMapped}:${range}:${interval}`, 60_000, () =>
+    j(`${YF}/v8/finance/chart/${encodeURIComponent(yMapped)}?${qs}`));
   const r = data.chart?.result?.[0];
   const ts = r?.timestamp || [];
   const q = r?.indicators?.quote?.[0] || {};
@@ -2829,7 +2835,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "crypto-opt-history-11",   // bump on deploy so we can confirm which build is live
+    build: "crypto-opt-symbolmap-12",   // bump on deploy so we can confirm which build is live
   });
 });
 
