@@ -2272,7 +2272,7 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   const LONG_RANGE = new Set(["1mo", "3mo", "6mo", "1y", "2y"]);
   if (cx && !LONG_RANGE.has(range)) {
     try {
-      const dc = await memo(`dc:${cx[1]}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, interval, range));
+      const dc = await memo(`dc:${cx[1]}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, deltaResolution(interval), range));
       if (dc && dc.length) return dc;
     } catch (e) { /* fall through to Yahoo */ }
   }
@@ -2283,10 +2283,15 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   // niche ones (Yahoo has no pair for most), so return its candles. Empty probe → fall through to the
   // US / Indian / Yahoo path below. (Symbols with a "." / "^" / "=" suffix skip the probe entirely.)
   if (!cx && /^[A-Z0-9]{2,15}$/.test(yMapped)) {
-    try {
-      const dc = await memo(`dcprobe:${yMapped}:${range}:${interval}`, 60_000, () => deltaCandles(`${yMapped}USD`, interval, range));
-      if (dc && dc.length) return dc;
-    } catch (e) { /* not a Delta contract → fall through */ }
+    // Use the SAME resolver + resolution the (working) chart path uses: deltaPerpFromAny knows the real
+    // contract symbol, deltaResolution converts the Yahoo interval to Delta's ("60m" -> "1h", etc.).
+    const dsym = deltaPerpFromAny(yMapped);
+    if (dsym) {
+      try {
+        const dc = await memo(`dcprobe:${dsym}:${range}:${interval}`, 60_000, () => deltaCandles(dsym, deltaResolution(interval), range));
+        if (dc && dc.length) return dc;
+      } catch (e) { /* not a Delta contract → fall through */ }
+    }
   }
   // US equities: IND Money's own candles (real-time) before Yahoo (15-min delayed).
   if (isUsTicker(symbol)) {
@@ -2327,10 +2332,12 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
 const _RANGE_ORDER = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y"];   // ascending
 function rangeLadder(range) {
   const i = _RANGE_ORDER.indexOf(range);
-  const floor = _RANGE_ORDER.indexOf("1mo");           // never step shorter than 1 month
+  // Floor at 5 days: Delta caps candles per request, so an intraday coin (e.g. LAB at 5m) returns
+  // nothing for a 1-3 month window but ~a few thousand candles for 5 days — enough to optimise on.
+  const floor = _RANGE_ORDER.indexOf("5d");
   if (i < 0 || i < floor) return [range];
   const out = [];
-  for (let k = i; k >= floor; k--) out.push(_RANGE_ORDER[k]);   // requested → … → 1mo
+  for (let k = i; k >= floor; k--) out.push(_RANGE_ORDER[k]);   // requested → … → 5d
   return out;
 }
 async function candlesForOpt(symbol, range = "3mo", interval = "5m") {
@@ -2874,7 +2881,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "crypto-opt-rangeladder-14",   // bump on deploy so we can confirm which build is live
+    build: "crypto-delta-reso-ladder-15",   // bump on deploy so we can confirm which build is live
   });
 });
 
