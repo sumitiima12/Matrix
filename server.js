@@ -1801,7 +1801,7 @@ app.post("/api/optimize-exits", async (req, res) => {
     const key = "optexit:" + h.toString(36) + ":" + objective + ":rr" + rrMin + ":mx" + maxSl + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const sets = [];
-      for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
+      for (const sym of syms) { try { const c = await candlesForOpt(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
       return optimizeExits(cfg, sets, cur, objective, rrMin, maxSl);
     });
     res.json(out);
@@ -1896,7 +1896,7 @@ app.post("/api/optimize-indicators", async (req, res) => {
       for (const tf of tfsToFetch) {
         const interval = OPT_INTERVAL[tf], range = OPT_RANGE[tf];
         const sets = [];
-        for (const sym of syms) { try { const c = await candlesFor(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
+        for (const sym of syms) { try { const c = await candlesForOpt(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
         tfSets[tf] = sets;
       }
       return optimizeIndicators(cfg, tfSets, cur, objective, lockTf);
@@ -2317,6 +2317,33 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   const q = r?.indicators?.quote?.[0] || {};
   return ts.map((t, i) => ({ t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i] }))
            .filter((d) => d.c != null && d.h != null && d.l != null);
+}
+
+/* CANDLES WITH PERIOD FALLBACK — for the optimiser / backtest. A long look-back on a thin or niche
+   contract (e.g. LAB's 5-minute history) can come back near-empty because the source only holds a
+   little history. So we step the window DOWN — the requested range, then 6mo → 3mo → 1mo — and keep the
+   deepest set we can actually get, stopping as soon as one range returns a usable sample. This means a
+   6-month optimise that finds nothing automatically retries at 3 months, then 1 month. */
+const _RANGE_ORDER = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y"];   // ascending
+function rangeLadder(range) {
+  const i = _RANGE_ORDER.indexOf(range);
+  const floor = _RANGE_ORDER.indexOf("1mo");           // never step shorter than 1 month
+  if (i < 0 || i < floor) return [range];
+  const out = [];
+  for (let k = i; k >= floor; k--) out.push(_RANGE_ORDER[k]);   // requested → … → 1mo
+  return out;
+}
+async function candlesForOpt(symbol, range = "3mo", interval = "5m") {
+  const MIN = 30;                                       // below this a range effectively "failed"
+  let best = [];
+  for (const r of rangeLadder(range)) {
+    try {
+      const c = await candlesFor(symbol, r, interval);
+      if (c && c.length > best.length) best = c;
+      if (best.length >= MIN) break;                    // got a usable sample — stop stepping down
+    } catch { /* try the next-shorter range */ }
+  }
+  return best;
 }
 
 // Same rules as the in-app engine: TP / hard SL / trailing SL, worst-case on ties.
@@ -2847,7 +2874,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "crypto-delta-probe-13",   // bump on deploy so we can confirm which build is live
+    build: "crypto-opt-rangeladder-14",   // bump on deploy so we can confirm which build is live
   });
 });
 
