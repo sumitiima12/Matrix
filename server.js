@@ -2257,10 +2257,14 @@ async function deltaCandles(deltaSym, resolution, range) {
 }
 
 async function candlesFor(symbol, range = "5d", interval = "5m") {
-  // Crypto: use Delta's own candles so the exit engine and charts match the perpetual mark
-  // the position is actually held against. Fall back to Yahoo if Delta returns nothing.
+  // Crypto: use Delta's own candles so the exit engine and charts match the perpetual mark the
+  // position is held against. BUT Delta's intraday history is short — for the deep look-backs the
+  // optimiser & backtest need (1mo+), its handful of candles isn't enough and the optimiser reports
+  // "couldn't fetch enough price history". So for those long ranges we skip Delta and use Yahoo's far
+  // wider intraday window (~60d of 5m); Delta still serves the short, live ranges (charts / exits).
   const cx = String(symbol).match(/^([A-Z0-9]+)-USD$/);
-  if (cx) {
+  const LONG_RANGE = new Set(["1mo", "3mo", "6mo", "1y", "2y"]);
+  if (cx && !LONG_RANGE.has(range)) {
     try {
       const dc = await memo(`dc:${symbol}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, interval, range));
       if (dc && dc.length) return dc;
@@ -2825,7 +2829,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "fyers-login-singleflight-10",   // bump on deploy so we can confirm which build is live
+    build: "crypto-opt-history-11",   // bump on deploy so we can confirm which build is live
   });
 });
 
