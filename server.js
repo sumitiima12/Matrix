@@ -2276,6 +2276,18 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
       if (dc && dc.length) return dc;
     } catch (e) { /* fall through to Yahoo */ }
   }
+  // GENERAL CRYPTO PROBE. A bare ticker (BTC, ETH, LAB, PEPE…) collides with US stock tickers by shape
+  // — isUsTicker matches any 1-5 letters — so we can't tell a Delta coin from a stock by name alone, and
+  // Y_SPECIAL only lists the majors. So for any bare symbol that didn't resolve as a "-USD" pair, PROBE
+  // Delta: if {SYM}USD returns candles it's a real Delta contract, and Delta is the ONLY source for the
+  // niche ones (Yahoo has no pair for most), so return its candles. Empty probe → fall through to the
+  // US / Indian / Yahoo path below. (Symbols with a "." / "^" / "=" suffix skip the probe entirely.)
+  if (!cx && /^[A-Z0-9]{2,15}$/.test(yMapped)) {
+    try {
+      const dc = await memo(`dcprobe:${yMapped}:${range}:${interval}`, 60_000, () => deltaCandles(`${yMapped}USD`, interval, range));
+      if (dc && dc.length) return dc;
+    } catch (e) { /* not a Delta contract → fall through */ }
+  }
   // US equities: IND Money's own candles (real-time) before Yahoo (15-min delayed).
   if (isUsTicker(symbol)) {
     try {
@@ -2835,7 +2847,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "crypto-opt-symbolmap-12",   // bump on deploy so we can confirm which build is live
+    build: "crypto-delta-probe-13",   // bump on deploy so we can confirm which build is live
   });
 });
 
