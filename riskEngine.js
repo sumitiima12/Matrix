@@ -9,12 +9,14 @@
  * Keep the two in sync when limits change. This file is intentionally dependency-free.
  */
 
+/* Limits are effectively OFF by default (the app owner asked to remove the caps for real trading).
+   They remain as knobs so a value can be dialed back down later without code changes. */
 const DEFAULT_LIMITS = {
-  maxPositionPct: 25,      // max % of that market's equity in a single position
-  maxOpenPositions: 15,    // per market
-  maxTradesPerDay: 30,     // per market
-  maxDailyLossPct: 5,      // stop trading after losing this % of start-of-day equity
-  cooldownMs: 60_000,      // min gap between two orders in the same symbol
+  maxPositionPct: 100,      // max % of that market's equity in a single position
+  maxOpenPositions: 100000, // per market
+  maxTradesPerDay: 100000,  // per market
+  maxDailyLossPct: 100,     // stop trading after losing this % of start-of-day equity
+  cooldownMs: 0,            // min gap between two orders in the same symbol
 };
 
 const startOfDay = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
