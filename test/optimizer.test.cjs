@@ -8,11 +8,12 @@ const { evalExitPair, optRanker, lenOptions } = require("../optimizerCore");
 
 // A candle. Only o/h/l/c matter to the evaluator.
 const bar = (o, h, l, c) => ({ o, h, l, c });
-// One entry event: enter at the close of index 0, walk forward from index 1.
+// One entry event: the SIGNAL is on bar 0 (its close). CAUSAL execution fills the entry at bar 1's
+// OPEN — never bar 0's close — so every fixture puts the entry bar at index 1.
 const ev = (candles) => ({ c: candles, e: 0 });
 
-test("TP hit: entry 100, TP 2% → +2% return, exit at 102, P&L +2", () => {
-  const r = evalExitPair(1, 2, [ev([bar(100, 100, 100, 100), bar(101, 103, 99.5, 101)])]);
+test("TP hit: entry 100 (next-bar open), TP 2% → +2% return, exit at 102, P&L +2", () => {
+  const r = evalExitPair(1, 2, [ev([bar(90, 90, 90, 90), bar(100, 103, 99.5, 101)])]);
   assert.equal(r.trades, 1);
   assert.equal(r.tpHit, 1);
   assert.equal(r.slHit, 0);
@@ -22,8 +23,8 @@ test("TP hit: entry 100, TP 2% → +2% return, exit at 102, P&L +2", () => {
   assert.equal(r.pnl, 2);         // 102 - 100
 });
 
-test("SL hit: entry 100, SL 1% → -1% return, exit at 99, P&L -1", () => {
-  const r = evalExitPair(1, 5, [ev([bar(100, 100, 100, 100), bar(100, 101, 98, 99)])]);
+test("SL hit: entry 100 (next-bar open), SL 1% → -1% return, exit at 99, P&L -1", () => {
+  const r = evalExitPair(1, 5, [ev([bar(90, 90, 90, 90), bar(100, 101, 98, 99)])]);
   assert.equal(r.slHit, 1);
   assert.equal(r.tpHit, 0);
   assert.equal(r.wins, 0);
@@ -33,8 +34,8 @@ test("SL hit: entry 100, SL 1% → -1% return, exit at 99, P&L -1", () => {
 });
 
 test("SHORT TP hit: entry 100, TP 2% → target 98 hit on a drop, P&L +2 (price fell)", () => {
-  // Short profits when price falls; TP sits BELOW at 98. A bar dipping to 97 books the win.
-  const r = evalExitPair(1, 2, [ev([bar(100, 100, 100, 100), bar(99, 100, 97, 98)])], 200, true);
+  // Short profits when price falls; TP sits BELOW at 98. The entry bar dips to 97 and books the win.
+  const r = evalExitPair(1, 2, [ev([bar(110, 110, 110, 110), bar(100, 100, 97, 98)])], 200, true);
   assert.equal(r.tpHit, 1);
   assert.equal(r.slHit, 0);
   assert.equal(r.winRate, 100);
@@ -43,8 +44,8 @@ test("SHORT TP hit: entry 100, TP 2% → target 98 hit on a drop, P&L +2 (price 
 });
 
 test("SHORT SL hit: entry 100, SL 1% → stop 101 hit on a rise, P&L -1 (price rose)", () => {
-  // Short's stop sits ABOVE at 101. A bar rising to 102 stops it out for a loss.
-  const r = evalExitPair(1, 5, [ev([bar(100, 100, 100, 100), bar(100, 102, 99, 101)])], 200, true);
+  // Short's stop sits ABOVE at 101. The entry bar rises to 102 and stops it out.
+  const r = evalExitPair(1, 5, [ev([bar(90, 90, 90, 90), bar(100, 102, 99, 101)])], 200, true);
   assert.equal(r.slHit, 1);
   assert.equal(r.tpHit, 0);
   assert.equal(r.winRate, 0);
@@ -53,7 +54,7 @@ test("SHORT SL hit: entry 100, SL 1% → stop 101 hit on a rise, P&L -1 (price r
 });
 
 test("No level touched → exits at the window's last close", () => {
-  const r = evalExitPair(10, 10, [ev([bar(100, 100, 100, 100), bar(100, 101, 99, 100.5)])]);
+  const r = evalExitPair(10, 10, [ev([bar(90, 90, 90, 90), bar(100, 101, 99, 100.5)])]);
   assert.equal(r.slHit, 0);
   assert.equal(r.tpHit, 0);
   assert.equal(r.retPct, 0.5);    // (100.5/100 - 1)*100
@@ -62,8 +63,8 @@ test("No level touched → exits at the window's last close", () => {
 });
 
 test("Same-bar tie resolves to the STOP (conservative)", () => {
-  // Bar reaches both stop(98) and target(102); the evaluator must book the stop.
-  const r = evalExitPair(2, 2, [ev([bar(100, 100, 100, 100), bar(100, 103, 97, 100)])]);
+  // Entry bar reaches both stop(98) and target(102); the evaluator must book the stop.
+  const r = evalExitPair(2, 2, [ev([bar(90, 90, 90, 90), bar(100, 103, 97, 100)])]);
   assert.equal(r.slHit, 1);
   assert.equal(r.tpHit, 0);
   assert.equal(r.pnl, -2);        // exit at stop 98
@@ -71,9 +72,9 @@ test("Same-bar tie resolves to the STOP (conservative)", () => {
 
 test("Aggregate of 3 events: win rate, SL/TP hit counts, summed return & P&L", () => {
   const events = [
-    ev([bar(100, 100, 100, 100), bar(101, 103, 99.5, 101)]),   // TP hit  +2, pnl +2
-    ev([bar(100, 100, 100, 100), bar(100, 101, 98, 99)]),      // SL hit  -1, pnl -1
-    ev([bar(200, 200, 200, 200), bar(201, 205, 199, 204)]),    // TP hit  +2, pnl +4 (200→204)
+    ev([bar(90, 90, 90, 90), bar(100, 103, 99.5, 101)]),      // TP hit  +2, pnl +2 (entry 100)
+    ev([bar(90, 90, 90, 90), bar(100, 101, 98, 99)]),         // SL hit  -1, pnl -1 (entry 100)
+    ev([bar(190, 190, 190, 190), bar(200, 205, 199, 204)]),   // TP hit  +2, pnl +4 (entry 200→204)
   ];
   const r = evalExitPair(1, 2, events);
   assert.equal(r.trades, 3);

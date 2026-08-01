@@ -24,14 +24,20 @@
 function evalExitPair(sl, tp, events, maxBars = 200, short = false) {
   let n = 0, wins = 0, sumWin = 0, sumLoss = 0, sumRet = 0, slHit = 0, tpHit = 0, pnlAbs = 0;
   for (const ev of events) {
-    const c = ev.c, e = ev.e, px = c[e].c;
+    const c = ev.c, e = ev.e;
+    // CAUSAL: the entry SIGNAL is on closed bar `e`; a trader fills at the NEXT bar's OPEN, never at
+    // bar e's own close (that would be same-bar look-ahead). SL/TP then trigger INTRABAR (OHLC) from
+    // the entry bar onward, matching the backtest engine exactly.
+    const entryIdx = e + 1;
+    if (entryIdx >= c.length) continue;
+    const px = c[entryIdx].o != null ? c[entryIdx].o : c[entryIdx].c;
     if (!(px > 0)) continue;
     // A SHORT mirrors the levels: TP sits BELOW entry, stop ABOVE, and it profits when price falls.
     const target = short ? px * (1 - tp / 100) : px * (1 + tp / 100);
     const stop = short ? px * (1 + sl / 100) : px * (1 - sl / 100);
-    const end = Math.min(e + maxBars, c.length - 1);
+    const end = Math.min(entryIdx + maxBars, c.length - 1);
     let ret = null, exitPx = null;
-    for (let j = e + 1; j <= end; j++) {
+    for (let j = entryIdx; j <= end; j++) {
       if (short ? c[j].h >= stop : c[j].l <= stop) { ret = -sl; exitPx = stop; slHit++; break; }   // stop first on a same-bar tie
       if (short ? c[j].l <= target : c[j].h >= target) { ret = tp; exitPx = target; tpHit++; break; }
     }

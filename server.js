@@ -376,7 +376,10 @@ app.get("/api/ideas", async (req, res) => {
     /* APPROVAL GATE: everyone sees APPROVED ideas. An admin sees everything (to review).
        A signed-in author sees their own still-pending ideas so they know it's awaiting review. */
     const admin = isAdmin(req);
-    const me = req.get("X-User-Id") ? stripPh(req.get("X-User-Id")) : null;
+    // Author identity for "see my own pending ideas" must come from a VERIFIED token, not a header a
+    // caller can forge to view someone else's unapproved posts.
+    let me = req.authUserId ? stripPh(req.authUserId) : null;
+    if (!me) { const h = req.get("Authorization") || ""; const tok = h.startsWith("Bearer ") ? h.slice(7) : ""; const v = verifyToken(tok); if (v) me = stripPh(v.userId); }
     if (!admin) list = list.filter((i) => (i.status || "approved") === "approved" || (me && i.owner === me));
     res.json({ ideas: list });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -546,10 +549,18 @@ app.post("/api/screeners", requireAuth, async (req, res) => {
 function isAdmin(req) {
   const adminIds = String(process.env.ADMIN_USER_IDS || "").split(",").map((x) => stripPh(x.trim())).filter(Boolean);
   const adminKey = process.env.ADMIN_KEY || "";
-  const uid = stripPh(req.get("X-User-Id") || req.query.userId || "");
   const key = req.get("X-Admin-Key") || req.query.key || "";
   if (!adminKey || !adminIds.length) return false;       // admin not configured -> no access
-  return adminIds.includes(uid) && key === adminKey;
+  // IDENTITY MUST COME FROM A VERIFIED TOKEN, never the spoofable X-User-Id header. Two factors are
+  // required: (1) the token's subject is in the admin list AND (2) the shared admin key matches.
+  let uid = req.authUserId ? stripPh(req.authUserId) : null;
+  if (!uid) {
+    const h = req.get("Authorization") || "";
+    const tok = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
+    const v = verifyToken(tok);
+    if (v) uid = stripPh(v.userId);
+  }
+  return !!uid && adminIds.includes(uid) && key === adminKey;
 }
 function requireAdmin(req, res) {
   if (!isAdmin(req)) { res.status(403).json({ error: "Forbidden" }); return false; }

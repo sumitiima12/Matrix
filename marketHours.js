@@ -19,13 +19,24 @@ function istParts(nowMs = Date.now()) {
   return { day: ist.getDay(), mins: ist.getHours() * 60 + ist.getMinutes() };
 }
 
+/* Wall-clock day/minutes in US EASTERN time (handles EST/EDT via Intl). US market hours must be defined
+   in ET, not a fixed IST window — 9:30 ET is 19:00 IST in summer (EDT) but 20:00 IST in winter (EST), so
+   a hardcoded IST window is wrong for ~4 months a year. */
+function etParts(nowMs = Date.now()) {
+  const p = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false })
+    .formatToParts(new Date(nowMs)).reduce((a, x) => (a[x.type] = x.value, a), {});
+  const day = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[p.weekday];
+  const mins = (parseInt(p.hour, 10) % 24) * 60 + parseInt(p.minute, 10);
+  return { day, mins };
+}
+
 function marketOpenIST(market, nowMs = Date.now()) {
   if (market === "Crypto") return true;
+  if (market === "US") { const { day, mins } = etParts(nowMs); return day >= 1 && day <= 5 && mins >= 570 && mins <= 960; }  // 09:30–16:00 ET (DST-correct)
   const { day, mins } = istParts(nowMs);
   const weekday = day >= 1 && day <= 5;
   if (market === "IN" || market === "FNO") return weekday && mins >= 555 && mins <= 930;      // 09:15–15:30
   if (market === "Commodity") return weekday && mins >= 540 && mins <= 1410;                  // 09:00–23:30
-  if (market === "US") return (mins >= 1140 && day >= 1 && day <= 5) || (mins <= 90 && day >= 2 && day <= 6); // 19:00–01:30 IST
   return true;
 }
 
@@ -37,10 +48,7 @@ function minsToCloseIST(market, nowMs = Date.now()) {
   const { mins } = istParts(nowMs);
   if (market === "IN" || market === "FNO") return 930 - mins;        // close 15:30
   if (market === "Commodity") return 1410 - mins;                    // close 23:30
-  if (market === "US") {                                             // close 01:30 IST
-    if (mins >= 1140) return (1440 - mins) + 90;                     // evening -> next-day 01:30
-    return 90 - mins;                                                // early morning tail
-  }
+  if (market === "US") return 960 - etParts(nowMs).mins;             // minutes to 16:00 ET (DST-correct)
   return null;
 }
 
