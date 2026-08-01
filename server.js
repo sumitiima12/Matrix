@@ -2881,7 +2881,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "crypto-delta-reso-ladder-15",   // bump on deploy so we can confirm which build is live
+    build: "autobuy-nocap-16",   // bump on deploy so we can confirm which build is live
   });
 });
 
@@ -5285,7 +5285,7 @@ app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT
      • COOLDOWN so a still-true signal can't fire twice inside one candle.
    Exits are handed to the auto-exit engine (SL/TP/trailing + the strategy's own exit signal). */
 
-const AB_MAX_POSITIONS = Number(process.env.AUTO_BUY_MAX_POSITIONS) || 5;
+const AB_MAX_POSITIONS = Number(process.env.AUTO_BUY_MAX_POSITIONS) || 100000;   // effectively no cap (user asked to remove real limits)
 const AB_MAX_NOTIONAL = Number(process.env.AUTO_BUY_MAX_NOTIONAL) || 0;   // 0 = only the user's amount
 const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 1000;   // in-flight window: never re-submit while a pending order is unresolved
 
