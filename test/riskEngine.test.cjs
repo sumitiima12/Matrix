@@ -23,15 +23,23 @@ test("a buy exceeding available funds is blocked", () => {
   assert.match(r.reasons[0], /funds/i);
 });
 
-test("a position larger than the 25% cap is blocked", () => {
+// Caps are OFF by default (the user opts in from Profile). These tests set an explicit limit to
+// prove the ENFORCEMENT LOGIC still works when a user turns a cap on.
+test("a position larger than the 25% cap is blocked (when the user sets a 25% cap)", () => {
   // 20 * 2000 = 40,000 = 40% of a 100k wallet-only equity.
-  const r = validateOrder({ sym: "RELIANCE", side: "BUY", qty: 20, price: 2000, market: "IN" }, acct());
+  const r = validateOrder({ sym: "RELIANCE", side: "BUY", qty: 20, price: 2000, market: "IN" }, acct({ limits: { maxPositionPct: 25 } }));
   assert.strictEqual(r.ok, false);
   assert.match(r.reasons.join(" "), /Position size/i);
 });
 
-test("a position under the cap is allowed", () => {
-  const r = validateOrder({ sym: "RELIANCE", side: "BUY", qty: 10, price: 2000, market: "IN" }, acct());
+test("a position under the cap is allowed (with a 25% cap set)", () => {
+  const r = validateOrder({ sym: "RELIANCE", side: "BUY", qty: 10, price: 2000, market: "IN" }, acct({ limits: { maxPositionPct: 25 } }));
+  assert.strictEqual(r.ok, true);
+});
+
+test("with caps OFF (default), a large position is allowed", () => {
+  // Same 40% position, but no limits set -> the default-off config lets it through.
+  const r = validateOrder({ sym: "RELIANCE", side: "BUY", qty: 20, price: 2000, market: "IN" }, acct());
   assert.strictEqual(r.ok, true);
 });
 
@@ -60,23 +68,23 @@ test("a buy WITHOUT a price is blocked (never buy blind)", () => {
   assert.match(r.reasons.join(" "), /price/i);
 });
 
-test("exceeding the max open positions cap is blocked", () => {
+test("exceeding the max open positions cap is blocked (when the user sets it to 15)", () => {
   const portfolio = Array.from({ length: 15 }, (_, i) => ({ sym: "S" + i, qty: 1, market: "IN", price: 10 }));
-  const a = acct({ wallet: 1e9, portfolio });
+  const a = acct({ wallet: 1e9, portfolio, limits: { maxOpenPositions: 15 } });
   const r = validateOrder({ sym: "NEW", side: "BUY", qty: 1, price: 10, market: "IN" }, a);
   assert.strictEqual(r.ok, false);
   assert.match(r.reasons.join(" "), /positions/i);
 });
 
-test("daily-loss cap is based on start-of-day equity, not current wallet", () => {
+test("daily-loss cap is based on start-of-day equity, not current wallet (with a 5% cap set)", () => {
   // Started at 100k. maxDailyLossPct 5% -> cap -5000.
   // A 4,000 loss should NOT trip it (cap must not shrink with the wallet).
-  const under = acct({ wallet: 96000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -4000 }] });
+  const under = acct({ wallet: 96000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -4000 }], limits: { maxDailyLossPct: 5 } });
   const r1 = validateOrder({ sym: "X", side: "BUY", qty: 1, price: 100, market: "IN" }, under);
   assert.ok(!r1.reasons.some((x) => /loss limit/i.test(x)), "4k loss should not trip the 5k cap");
 
   // A 6,000 loss should trip it.
-  const over = acct({ wallet: 94000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -6000 }] });
+  const over = acct({ wallet: 94000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -6000 }], limits: { maxDailyLossPct: 5 } });
   const r2 = validateOrder({ sym: "X", side: "BUY", qty: 1, price: 100, market: "IN" }, over);
   assert.ok(r2.reasons.some((x) => /loss limit/i.test(x)), "6k loss should trip the 5k cap");
 });

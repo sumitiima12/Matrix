@@ -4432,9 +4432,17 @@ app.post("/api/broker/order", async (req, res) => {
     // Market order, new position: no limit price and nothing held. Fetch a live mark so the
     // risk engine can size the order instead of refusing it for "No live price".
     if (rkPrice == null) rkPrice = await liveMarkForOrder(symbol, rkMarket);
+    // User-configured risk caps (opt-in from Profile; OFF by default). Only clean positive numbers are
+    // honoured, and since the server default is unlimited, a client value can only TIGHTEN — never loosen.
+    const rl = req.body?.riskLimits && typeof req.body.riskLimits === "object" ? req.body.riskLimits : null;
+    const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : undefined; };
+    const userLimits = rl ? Object.fromEntries(Object.entries({
+      maxPositionPct: num(rl.maxPositionPct), maxOpenPositions: num(rl.maxOpenPositions),
+      maxTradesPerDay: num(rl.maxTradesPerDay), maxDailyLossPct: num(rl.maxDailyLossPct), cooldownMs: num(rl.cooldownMs),
+    }).filter(([, v]) => v !== undefined)) : null;
     const check = serverValidateOrder(
       { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket },
-      { wallet: account.wallet, portfolio: account.portfolio, trades: rkTrades || [] },
+      { wallet: account.wallet, portfolio: account.portfolio, trades: rkTrades || [], ...(userLimits ? { limits: userLimits } : {}) },
     );
     if (!check.ok) {
       return res.status(422).json({ error: "Order blocked by risk checks: " + (check.reasons[0] || "not allowed"), reasons: check.reasons });
