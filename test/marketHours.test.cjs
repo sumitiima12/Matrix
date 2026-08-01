@@ -93,3 +93,13 @@ test("intradaySquareDue: true once the market is closed (never carry overnight)"
 test("intradaySquareDue: crypto never squares off", () => {
   assert.equal(intradaySquareDue("Crypto", istEpoch(SAT, 3, 0)), false);
 });
+
+// R3-#7: the Indian calendar now extends past 2026. Republic Day 2027-01-26 is a recognised holiday,
+// and the market is reported closed even though it's a weekday (Tuesday).
+test("Indian holiday calendar covers 2027 (Republic Day)", () => {
+  const republicDay2027 = istEpoch("2027-01-26", 12, 0);
+  assert.equal(isMarketHoliday("IN", republicDay2027), true);
+  assert.equal(marketOpenIST("IN", republicDay2027), false);
+  // A plain 2027 trading Tuesday (2027-01-19) is NOT a holiday.
+  assert.equal(isMarketHoliday("IN", istEpoch("2027-01-19", 12, 0)), false);
+});

@@ -39,7 +39,13 @@ function evalExitPair(sl, tp, events, maxBars = 200, short = false, costPct = 0)
     const end = Math.min(entryIdx + maxBars, c.length - 1);
     let ret = null, exitPx = null;
     for (let j = entryIdx; j <= end; j++) {
-      if (short ? c[j].h >= stop : c[j].l <= stop) { ret = -sl; exitPx = stop; slHit++; break; }   // stop first on a same-bar tie
+      if (short ? c[j].h >= stop : c[j].l <= stop) {   // stop first on a same-bar tie
+        // R3-#5: a stop is stop-MARKET — a bar that GAPS through it fills at the (worse) open, not the
+        // stop price. Fill at whichever is worse for the position so gaps don't understate the loss.
+        const o = c[j].o != null ? c[j].o : stop;
+        exitPx = short ? Math.max(stop, o) : Math.min(stop, o);
+        ret = (short ? -1 : 1) * (exitPx / px - 1) * 100; slHit++; break;
+      }
       if (short ? c[j].l <= target : c[j].h >= target) { ret = tp; exitPx = target; tpHit++; break; }
     }
     if (ret === null) { exitPx = c[end].c; ret = (short ? -1 : 1) * (exitPx / px - 1) * 100; }   // no level hit -> exit at window end

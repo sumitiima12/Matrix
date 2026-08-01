@@ -3902,11 +3902,14 @@ app.post("/api/admin/delete-user", async (req, res) => {
 });
 
 /** Step 1 of OAuth: where the user logs in. */
-app.get("/api/broker/login-url", async (req, res) => {
+app.get("/api/broker/login-url", requireAuth, async (req, res) => {
   const id = String(req.query.broker || "");
   const b = BROKERS[id];
   if (!b) return res.status(400).json({ error: "unknown broker" });
-  const userId = req.query.userId || req.get("X-User-Id");   // whose FYERS app to use
+  // R3-#2: identity comes ONLY from the verified token — never a query/header the caller controls.
+  // Otherwise an unauthenticated caller could mint an OAuth state (and start a connect) for someone
+  // else's account. storageKeyFor matches how BYOA creds + the session step key this user.
+  const userId = storageKeyFor(req.authUserId);   // whose FYERS/Delta app to use
 
   /* DHAN "Log in with Dhan" (PARTNER consent flow). Unlike the plain OAuth brokers, Dhan needs a
      server-side call FIRST: we generate a consent with Matrix's partner credentials, get a consentId,
@@ -3942,7 +3945,7 @@ app.get("/api/broker/login-url", async (req, res) => {
   // CSRF: mint a single-use state nonce bound to this login (verified back at /api/broker/session).
   // Normalise the id the SAME way routeUserId will at session (storageKeyFor adds the "ph_" prefix),
   // so the user-binding check compares like-for-like instead of raw-vs-prefixed.
-  const stateNonce = issueOAuthState(userId ? storageKeyFor(userId) : null, id);
+  const stateNonce = issueOAuthState(userId, id);   // userId is already the verified, storageKeyFor'd id
   res.json({ url: b.loginUrl(key, redirect, stateNonce), state: stateNonce });
 });
 
@@ -5529,7 +5532,7 @@ const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 10
 
 /* A real order to OPEN a position. `short` opens a SELL (Delta perpetual only) instead of a buy;
    spot brokers can't short, so they always buy. Same per-broker plumbing as the manual order route. */
-async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null, short = false) {
+async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null, short = false, clientOrderId = null) {
   const broker = sess.broker, token = sess.accessToken;
   const prod = mapProduct(broker, product);
   if (broker === "delta") {
@@ -5543,7 +5546,11 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     if (contracts < 1) throw new Error(`Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.`);
     assertDeltaTradable(sess.userId);   // sign with the user's own keys; refuse if they have none
     const entrySide = short ? "sell" : "buy";
-    const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: { product_id: dprod.id, size: contracts, side: entrySide, order_type: "market_order" } });
+    // R3-#1: stamp our own client_order_id so a timed-out order can be found in Delta's order book
+    // later (the durable dedupe key). Delta echoes it back on both live and historical orders.
+    const orderBody = { product_id: dprod.id, size: contracts, side: entrySide, order_type: "market_order" };
+    if (clientOrderId) orderBody.client_order_id = String(clientOrderId).slice(0, 64);
+    const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: orderBody });
     // HTTP 200 is NOT a fill — verify, and throw the real reason on a reject/no-fill.
     const o = d.result || {};
     const sizeC = Number(o.size) || contracts;                                   // contracts
@@ -5617,6 +5624,28 @@ app.post("/api/automation/entry-halt", requireAuth, async (req, res) => {
   res.json({ ok: true, halted: halt });
 });
 
+/* R3-#1 DURABLE RECONCILIATION. When an order times out we can't tell if the broker accepted it.
+   Before we ever clear the pending marker (which would let the signal re-enter and DUPLICATE the
+   trade), ask the broker's own order book whether our stamped client_order_id is there.
+     true  = the order reached the broker (found in live or historical orders) → do NOT re-enter.
+     false = the broker has NO record of it → nothing executed, safe to reset and evaluate afresh.
+     null  = we couldn't check (broker we don't query yet, or the query itself failed) → treat as
+             unresolved and block, never re-enter.
+   Only Delta (the supported real-crypto broker) is queryable today; other brokers return null and
+   are handled conservatively (paused for manual review) by the caller. */
+async function brokerOrderProbe(st) {
+  if (st.broker !== "delta" || !st.pendingClientId) return null;
+  const cid = String(st.pendingClientId);
+  const has = (resp) => Array.isArray(resp && resp.result) && resp.result.some((o) => String(o && o.client_order_id || "") === cid);
+  try {
+    // Live/working orders first, then the closed/cancelled history. A just-placed market order that
+    // is still working shows in /v2/orders; a filled/cancelled one moves to /v2/orders/history.
+    if (has(await deltaCall("GET", "/v2/orders", { query: "?page_size=100", userId: st.userId }))) return true;
+    if (has(await deltaCall("GET", "/v2/orders/history", { query: "?page_size=100", userId: st.userId }))) return true;
+    return false;   // both endpoints answered cleanly and neither carries our id → it never landed
+  } catch { return null; }   // any failure → unknown; caller must NOT re-enter on an unknown
+}
+
 async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
   autoBuyRunning = true;
@@ -5651,10 +5680,25 @@ async function runAutoBuyEngine() {
            only after the window with no trace do we clear it and flag for manual verification. */
         if (st.pendingSince) {
           const openMatch = (await positionsFor(st.userId)).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(st.brokerSym) && Number(p.entry) > 0);
-          if (openMatch) { await db.updateRealStrategy(st.id, { openPositionId: openMatch.id, pendingSince: null }); st.openPositionId = openMatch.id; continue; }
+          if (openMatch) { await db.updateRealStrategy(st.id, { openPositionId: openMatch.id, pendingSince: null, pendingClientId: null }); st.openPositionId = openMatch.id; st.pendingSince = null; continue; }
           if (Date.now() - st.pendingSince < AB_RECONCILE_MS) continue;   // in-flight — never double-submit
-          await db.updateRealStrategy(st.id, { pendingSince: null, lastError: "previous order status unknown — cleared; verify with your broker before it re-enters", lastOrderStatus: "unknown" });
-          st.pendingSince = null;
+          /* R3-#1: window elapsed and NO managed position appeared. Never blindly clear-and-re-enter
+             (a timed-out-but-accepted order would become a duplicate). Consult the broker's order book. */
+          const probe = await brokerOrderProbe(st);
+          if (probe === false) {
+            // Verified absent at the broker — nothing executed. Reset and let it evaluate a fresh signal.
+            await db.updateRealStrategy(st.id, { pendingSince: null, pendingClientId: null, lastOrderStatus: "no-order", lastError: "Previous order never reached the broker (verified absent) — cleared." });
+            st.pendingSince = null; st.pendingClientId = null;
+          } else {
+            // Order EXISTS at the broker (probe===true) or we couldn't verify (null) → BLOCK resubmission.
+            // Pause for manual review and KEEP the marker. The exit engine is separate, so any real
+            // position stays managed; Resume (one tap) clears the marker once the user has checked.
+            await db.updateRealStrategy(st.id, { status: "paused", needsReview: true, lastOrderStatus: "unknown", lastError: probe === true
+              ? "An order for this strategy reached your broker but MatrixOne couldn't link the position. Paused to avoid a duplicate — check the position on your broker, then Resume."
+              : "Previous order outcome couldn't be verified with your broker. Paused to avoid a duplicate — verify on your broker, then Resume." });
+            logFinancial("autobuy.review", { userId: st.userId, broker: st.broker, symbol: st.symbol, probe: String(probe) });
+            continue;
+          }
         }
         // KILL SWITCH: the user paused NEW real entries. Reconciliation above still ran, and the exit
         // engine is SEPARATE — so open positions keep their stop-loss/target managed; we only skip
@@ -5693,20 +5737,23 @@ async function runAutoBuyEngine() {
         // STAMP THE INTENT before we touch the broker. If we crash after the fill but before we
         // persist the position, the pending marker (reconciled at the top of the loop) prevents a
         // duplicate order on the next sweep. lastOrderAt is set now too, so the cooldown also holds.
-        await db.updateRealStrategy(st.id, { pendingSince: Date.now(), lastOrderAt: Date.now() });
-        st.pendingSince = Date.now(); st.lastOrderAt = Date.now();
+        // R3-#1: a unique client_order_id stamped WITH the pending marker is the durable dedupe key —
+        // if this order times out, the reconciler finds it in the broker's order book by this id.
+        const pendingClientId = `mx_${st.id}_${Date.now()}`;
+        await db.updateRealStrategy(st.id, { pendingSince: Date.now(), pendingClientId, lastOrderAt: Date.now() });
+        st.pendingSince = Date.now(); st.pendingClientId = pendingClientId; st.lastOrderAt = Date.now();
 
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
         // price, so P&L reflects what really executed, not what we requested.
-        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null, !!st.short);
+        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null, !!st.short, pendingClientId);
         const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
         const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : px;
         const pos = await registerManagedPosition({
           sess, symbol: st.symbol, brokerSym: st.brokerSym, qty: fillQty, entry: fillPx, market: st.market,
           sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: !!st.short,
         });
-        await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null });
+        await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null, pendingClientId: null });
         posCache.delete(st.userId);   // this user's positions changed — re-read next time it's needed
         bought++;
         logFinancial(r.partial ? "autobuy.partial" : "autobuy.filled", { userId: st.userId, broker: st.broker, symbol: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty, reqQty: qty, price: fillPx, orderId: r.orderId, reason: sig.reason });
@@ -5722,7 +5769,7 @@ async function runAutoBuyEngine() {
            never auto-resubmits an unknown order. */
         const confirmedReject = /reject|insufficient|not filled|unfilled|cancell?ed|invalid|margin|too small|min(?:imum)? size|not enough|balance|bad request|400/i.test(msg);
         if (confirmedReject) {
-          await db.updateRealStrategy(st.id, { lastError: msg, lastOrderStatus: "rejected", lastRejectAt: Date.now(), pendingSince: null });
+          await db.updateRealStrategy(st.id, { lastError: msg, lastOrderStatus: "rejected", lastRejectAt: Date.now(), pendingSince: null, pendingClientId: null });
           logFinancial("autobuy.rejected", { userId: st.userId, broker: st.broker, symbol: st.symbol, reason: msg });
           console.error(`[autobuy] REJECTED ${st.symbol} (${st.broker}):`, msg);
         } else {
@@ -5782,7 +5829,12 @@ app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
   const mine = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
   if (!mine) return res.status(404).json({ error: "not found" });
-  await db.updateRealStrategy(id, { status: paused ? "paused" : "active" });
+  // R3-#1: RESUMING is the user's explicit "I've verified with my broker" — clear any unknown-order
+  // review marker so the strategy restarts clean instead of immediately re-pausing itself.
+  const patch = paused
+    ? { status: "paused" }
+    : { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null };
+  await db.updateRealStrategy(id, patch);
   res.json({ ok: true });
 });
 app.post("/api/autobuy/cancel", requireAuth, async (req, res) => {

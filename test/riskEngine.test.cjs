@@ -107,3 +107,18 @@ test("a zero or negative quantity is rejected", () => {
   assert.strictEqual(validateOrder({ sym: "X", side: "BUY", qty: 0, price: 100, market: "IN" }, acct()).ok, false);
   assert.strictEqual(validateOrder({ sym: "X", side: "BUY", qty: -5, price: 100, market: "IN" }, acct()).ok, false);
 });
+
+// R3-#6: a short consumes MARGIN. An uncovered short whose estimated margin exceeds the wallet is
+// rejected (before the broker would), while a normal leveraged short passes.
+test("a short beyond available margin is blocked (R3-#6)", () => {
+  // $10 wallet, shorting 10 units @ $1000 = $10,000 notional. Crypto margin ≈ 4% = $400 > $10 → reject.
+  const r = validateOrder({ sym: "BTCUSD", side: "SELL", qty: 10, price: 1000, market: "Crypto" }, acct({ wallet: 10 }));
+  assert.strictEqual(r.ok, false);
+  assert.match(r.reasons.join(" "), /margin/i);
+});
+
+test("a normal leveraged short within margin is allowed (R3-#6)", () => {
+  // $1,000 wallet, shorting 1 unit @ $1,000 = $1,000 notional. Crypto margin ≈ 4% = $40 ≤ $1,000 → ok.
+  const r = validateOrder({ sym: "BTCUSD", side: "SELL", qty: 1, price: 1000, market: "Crypto" }, acct({ wallet: 1000 }));
+  assert.ok(!r.reasons.some((x) => /margin/i.test(x)), "a $40 margin short should pass on a $1000 wallet");
+});

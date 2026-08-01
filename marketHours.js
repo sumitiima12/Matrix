@@ -59,18 +59,29 @@ function usMarketHolidays(y) {
   s.add(observedFixed(y, 12, 25));                      // Christmas
   _usHolidayCache[y] = s; return s;
 }
-/* NSE/MCX full-day equity closures — VERIFY ANNUALLY against the official exchange circular. 2026 is
-   the high-confidence subset (fixed national + announced dates); lunar-calendar holidays not listed
-   here just fall through to a broker rejection, never a wrong trade. */
+/* NSE/MCX full-day equity closures — VERIFY ANNUALLY against the official exchange circular. Each year
+   is the high-confidence subset (fixed national holidays + computable Good Friday); lunar-calendar
+   holidays (Diwali, Holi, Eid, etc.) not listed here just fall through to a broker rejection, never a
+   wrong trade. When trading spills into a year with NO table below, isMarketHoliday() warns ONCE (see
+   below) so the omission is loud, not silent — add that year's circular dates before it arrives. */
 const IN_HOLIDAYS = {
   2026: ["2026-01-26", "2026-04-03", "2026-05-01", "2026-06-26", "2026-09-14", "2026-10-02", "2026-12-25"],
+  // 2027 date-certain subset (Republic Day, Good Friday 2027-03-26 via Easter computus, Maharashtra/Labour
+  // Day, Independence Day, Gandhi Jayanti, Christmas). Lunar dates still TBD from the 2027 NSE circular.
+  2027: ["2027-01-26", "2027-03-26", "2027-05-01", "2027-08-15", "2027-10-02", "2027-12-25"],
 };
+const _warnedHolidayYears = new Set();
 function zoneDateKey(nowMs, tz) { return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(nowMs)); }
 function isMarketHoliday(market, nowMs = Date.now()) {
   if (market === "Crypto") return false;
   if (market === "US") { const k = zoneDateKey(nowMs, "America/New_York"); return usMarketHolidays(Number(k.slice(0, 4))).has(k); }
   const k = zoneDateKey(nowMs, "Asia/Kolkata");                    // IN / FNO / Commodity use the IST calendar date
-  return (IN_HOLIDAYS[Number(k.slice(0, 4))] || []).includes(k);
+  const yr = Number(k.slice(0, 4));
+  if (!IN_HOLIDAYS[yr] && !_warnedHolidayYears.has(yr)) {          // no table for this year → warn once, not per call
+    _warnedHolidayYears.add(yr);
+    console.warn(`[marketHours] No Indian holiday calendar for ${yr} — update IN_HOLIDAYS from the NSE circular. Weekday exchange holidays will not be recognised until then (orders fall through to a broker rejection, never a wrong fill).`);
+  }
+  return (IN_HOLIDAYS[yr] || []).includes(k);
 }
 
 function marketOpenIST(market, nowMs = Date.now()) {

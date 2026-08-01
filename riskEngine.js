@@ -25,6 +25,14 @@ const DEFAULT_LIMITS = {
 
 const startOfDay = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
 
+/* R3-#6: a short consumes MARGIN, and the engine doesn't know the account's exact leverage. These are
+   CONSERVATIVE (generous-leverage) per-market initial-margin fractions of notional — deliberately low so
+   we only ever reject a short the account clearly can't afford (e.g. $10 wallet shorting $10k notional),
+   never a normal leveraged short. The broker still does the exact margin math; this just stops the
+   obvious "insufficient margin" rejection before it reaches the broker. */
+const SHORT_MARGIN_FRACTION = { Crypto: 0.04, FNO: 0.15, IN: 0.20, US: 0.30, Commodity: 0.10 };
+const shortMarginFraction = (market) => SHORT_MARGIN_FRACTION[market] != null ? SHORT_MARGIN_FRACTION[market] : 0.20;
+
 /**
  * Validate an order against account state.
  * @param order   { sym, side:"BUY"|"SELL", qty, price, market }
@@ -80,8 +88,13 @@ function validateOrder(order, account) {
       const px = price || (held && (held.price || held.avg)) || 0;
       if (px > 0) {
         const equity = wallet + portfolio.reduce((a, h) => a + Math.abs(h.qty || 0) * (h.price || h.avg || 0), 0);
-        const pct = equity > 0 ? ((shortQty * px) / equity) * 100 : 100;
+        const shortValue = shortQty * px;
+        const pct = equity > 0 ? (shortValue / equity) * 100 : 100;
         if (pct > limits.maxPositionPct) reasons.push(`Short size ${pct.toFixed(1)}% of ${market} equity exceeds the ${limits.maxPositionPct}% cap.`);
+        // R3-#6: actually validate MARGIN — a short the wallet can't margin gets rejected by the broker,
+        // so catch it here first. Uses a conservative (generous-leverage) initial-margin estimate.
+        const reqMargin = shortValue * shortMarginFraction(market);
+        if (reqMargin > wallet) reasons.push(`Insufficient margin to short: needs ≈ ${reqMargin.toFixed(2)} but ${wallet.toFixed(2)} is available.`);
       }
       if (!held && openInMarket.length >= limits.maxOpenPositions) {
         reasons.push(`Already holding ${openInMarket.length} positions in ${market} (cap ${limits.maxOpenPositions}).`);
