@@ -3841,7 +3841,7 @@ app.get("/api/broker/login-url", async (req, res) => {
 
 /* Step 2: exchange the short-lived request/auth code for an access token.
    This is the ONLY place the api_secret is used, and it never leaves the server. */
-app.post("/api/broker/session", async (req, res) => {
+app.post("/api/broker/session", requireAuth, async (req, res) => {
   const { broker, requestToken } = req.body || {};
   const userId = routeUserId(req);   // verified token when present, else the client-supplied id
   const b = BROKERS[broker];
@@ -4063,7 +4063,7 @@ app.post("/api/broker/session", async (req, res) => {
    reconnect. This is what makes a connection survive the app being closed on mobile or the
    free-tier server restarting: the browser keeps the broker id in localStorage, and on a dead
    session it calls this to mint a fresh session id from the stored creds. */
-app.post("/api/broker/resume", async (req, res) => {
+app.post("/api/broker/resume", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
   const broker = req.body && req.body.broker;
   if (!userId || !broker) return res.status(400).json({ error: "userId and broker required" });
@@ -4361,7 +4361,7 @@ async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct, userId = nu
 /* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
    the client must send X-Confirm-Live: yes. Two locks, because the failure mode
    here is real money moving without the user meaning it. */
-app.post("/api/broker/order", async (req, res) => {
+app.post("/api/broker/order", requireAuth, async (req, res) => {
   if (!TRADING_ENABLED) {
     return res.status(403).json({
       error: "Live trading is disabled on this server. Set BROKER_TRADING_ENABLED=true to allow real orders.",
@@ -4804,7 +4804,7 @@ app.get("/api/broker/optionchain", async (req, res) => {
   }
 });
 
-app.get("/api/broker/portfolio", async (req, res) => {
+app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
   const { broker, accessToken: token } = sess;
@@ -5353,14 +5353,14 @@ if (process.env.EXIT_MONITOR !== "off") {
 }
 
 /* The user's own managed positions (to show + cancel in the app). */
-app.get("/api/autoexit", async (req, res) => {
+app.get("/api/autoexit", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
   const list = await db.getManagedPositionsForUser(userId).catch(() => []);
   res.json({ engineLive: String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true", last: lastAutoExit, positions: list });
 });
 /* Cancel auto-exit for a position (stops the engine watching it; does NOT touch the position
    at the broker). The user must own it. */
-app.post("/api/autoexit/cancel", async (req, res) => {
+app.post("/api/autoexit/cancel", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
   const { id } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
@@ -5374,7 +5374,7 @@ app.post("/api/autoexit/cancel", async (req, res) => {
    one the user already owns, not one we just bought. Registers a managed position so the exit
    engine watches it and places a reduce-only SELL when SL/TP is hit. Entry defaults to the
    holding's average cost, so "SL 2%" means 2% below what they paid. Requires stored creds. */
-app.post("/api/autoexit/register", async (req, res) => {
+app.post("/api/autoexit/register", requireAuth, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { broker, symbol, brokerSym, qty, entry, market, sl, tp, tsl, product } = req.body || {};
@@ -5590,7 +5590,7 @@ if (process.env.EXIT_MONITOR !== "off") {
 
 /* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
    the creds the engine will act with). Supported brokers only. */
-app.post("/api/autobuy/register", async (req, res) => {
+app.post("/api/autobuy/register", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "connect the broker first" });
   const b = sess.broker;
@@ -5621,7 +5621,7 @@ app.post("/api/autobuy/register", async (req, res) => {
     res.json({ ok: true, id: st.id, live: autoBuyLiveOn() });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
-app.post("/api/autobuy/pause", async (req, res) => {
+app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
   const { id, paused } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
@@ -5630,7 +5630,7 @@ app.post("/api/autobuy/pause", async (req, res) => {
   await db.updateRealStrategy(id, { status: paused ? "paused" : "active" });
   res.json({ ok: true });
 });
-app.post("/api/autobuy/cancel", async (req, res) => {
+app.post("/api/autobuy/cancel", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
   const { id } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
@@ -5652,7 +5652,7 @@ async function openPositionForStrategy(userId, strat) {
 /* CLOSE NOW — flatten an auto-buy strategy's open position with a reduce-only MARKET sell, then stop
    the strategy from re-entering. Real money moves. Honors AUTO_EXIT_LIVE: in dry-run it marks the
    position closed WITHOUT placing a broker order (matching the exit engine's own gating). */
-app.post("/api/autobuy/close", async (req, res) => {
+app.post("/api/autobuy/close", requireAuth, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { id } = req.body || {};
@@ -5681,7 +5681,7 @@ app.post("/api/autobuy/close", async (req, res) => {
 
 /* UPDATE SL/TP — change the strategy's stop-loss / take-profit and push the new levels onto its open
    managed position so the exit engine acts on them. */
-app.post("/api/autobuy/update", async (req, res) => {
+app.post("/api/autobuy/update", requireAuth, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { id, sl, tp } = req.body || {};
@@ -5704,7 +5704,7 @@ app.post("/api/autobuy/live", async (req, res) => {
   autoBuyLiveOverride = !!(req.body && req.body.on);
   res.json({ ok: true, live: autoBuyLiveOn() });
 });
-app.get("/api/autobuy", async (req, res) => {
+app.get("/api/autobuy", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
   const list = (await db.getRealStrategiesForUser(userId).catch(() => [])).filter((s) => s.status !== "cancelled");
   // Enrich each with its open position's unrealised P&L (if it holds one right now).
