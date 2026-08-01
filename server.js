@@ -839,17 +839,24 @@ function newsTextMatch(text, name, base) {
   return false;
 }
 app.get("/api/news/feed", async (req, res) => {
-  const syms = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 30);
+  // Each entry may be "SYM|Company Name". The NAME is what makes Indian coverage work: most Indian
+  // headlines say the company name ("Infosys"), not the ticker ("INFY"), so a ticker-only match
+  // collapsed the whole feed to the handful of stocks whose base literally appears in headlines
+  // (RELIANCE). With the name we search Yahoo by name and match headlines by name too.
+  const entries = String(req.query.symbols || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 30)
+    .map((e) => { const i = e.indexOf("|"); return i === -1 ? { sym: e, name: "" } : { sym: e.slice(0, i), name: e.slice(i + 1).trim() }; });
   const onlyTagged = String(req.query.tagged || "") === "1";
-  if (!syms.length) return res.status(400).json({ error: "symbols required" });
+  if (!entries.length) return res.status(400).json({ error: "symbols required" });
 
   try {
-    const per = await Promise.all(syms.map(async (sym) => {
+    const per = await Promise.all(entries.map(async ({ sym, name }) => {
       try {
-        const items = await memo(`nf:${sym}`, 300_000, async () => {
-          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symBase(sym))}&newsCount=20&quotesCount=0`;
+        const base = symBase(sym);
+        const q = (name && name.length >= 3) ? name : base;   // search by company name when we have it
+        const items = await memo(`nf:${sym}:${q}`, 300_000, async () => {
+          const u = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&newsCount=20&quotesCount=0`;
           const d = await j(u);
-          return (d.news || []).filter((a) => newsRelevant(a, sym)).map((a) => ({
+          return (d.news || []).filter((a) => newsRelevant(a, sym) || newsTextMatch(a.title, name, base)).map((a) => ({
             sym,
             t: a.title,
             d: a.providerPublishTime ? a.providerPublishTime * 1000 : null,
@@ -2881,7 +2888,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "autobuy-nocap-16",   // bump on deploy so we can confirm which build is live
+    build: "news-by-name-17",   // bump on deploy so we can confirm which build is live
   });
 });
 
