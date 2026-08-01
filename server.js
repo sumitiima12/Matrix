@@ -928,7 +928,7 @@ function makeProxyDispatcher(url) {
        (1) IPv6 trap: if the proxy host has an AAAA record, undici tries IPv6 first, but Render
            has no IPv6 egress, so the SYN times out (ETIMEDOUT) — while `curl` succeeds because
            it does Happy Eyeballs. `autoSelectFamily` makes undici race v4/v6 like curl.
-       (2) US->Mumbai proxy handshake can exceed undici's default 10s connect timeout on a cold
+       (2) Render(US)->proxy handshake can exceed undici's default 10s connect timeout on a cold
            socket, so give it more room. */
     /* Force IPv4 to the proxy. Render has IPv4 egress but not reliable IPv6; if undici tries the
        host's AAAA record it hangs -> ETIMEDOUT, while curl (Happy Eyeballs) falls back to v4.
@@ -2939,7 +2939,7 @@ app.get("/api/diag/delta", async (req, res) => {
   const out = { base: DELTA_BASE, proxyConfigured: Boolean(deltaDispatcher) };
   /* Raw reachability probe of the proxy itself — tells us whether Render can even open a TCP
      socket to the proxy host (independent of undici / auth). If dns resolves but tcp4 fails,
-     the proxy is dropping our IP (AlgoIP client-IP allowlist) rather than a code/tunnel bug. */
+     the proxy (our Oracle Cloud Always-Free instance) is refusing our IP rather than a code/tunnel bug. */
   const proxyUrl = process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY || "";
   if (proxyUrl) {
     try {
@@ -2961,8 +2961,8 @@ app.get("/api/diag/delta", async (req, res) => {
       out.proxyProbe = probe;
     } catch (e) { out.proxyProbe = { error: e.message }; }
   }
-  /* Render's DIRECT outbound IP (NOT through the proxy). THIS is the "trading server / algo source
-     IP" to unblock in AlgoIP — the IP Render connects to the proxy FROM. */
+  /* Render's DIRECT outbound IP (NOT through the proxy). This is the IP Render connects to the
+     Oracle Cloud proxy FROM — allow it in the proxy's ingress security list / firewall. */
   try { const dr = await T(fetch("https://api.ipify.org?format=json"), 8000); out.directOutboundIp = (await dr.json()).ip; } catch (e) { out.directOutboundIp = "unknown (" + (e && e.message) + ")"; }
   // The IP Delta sees for signed calls = this server's outbound IP (via the proxy if configured).
   // Whitelist THIS on your Delta API key — not your phone's IP.
@@ -3448,8 +3448,10 @@ const DELTA_BASE = String(process.env.DELTA_TESTNET || "").toLowerCase() === "tr
    Delta whitelists API keys by IP. Render's outbound IP isn't (and can't reliably be)
    whitelisted, so Delta rejects our calls with `ip_not_whitelisted_for_api_key`.
    The fix is to route ONLY the Delta requests through a static, whitelisted proxy.
-   Set DELTA_PROXY_URL on the server, e.g.
-     http://<user>:<pass>@dc46-mum-01.algoip.in:443
+   Here that proxy is our own Oracle Cloud Always-Free instance, which holds a reserved
+   static public IP — THAT is the IP whitelisted on the Delta API key. Set DELTA_PROXY_URL
+   to it, e.g.
+     http://<user>:<pass>@<oracle-instance-public-ip>:<port>
    Credentials are pulled out of the URL and sent as a Proxy-Authorization header
    (the most reliable way for undici's ProxyAgent). If the var is unset, Delta calls
    go out directly, exactly as before. */
