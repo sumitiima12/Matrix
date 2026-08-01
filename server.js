@@ -3506,12 +3506,47 @@ async function deltaCall(method, path, { query = "", body = null, signed = true,
     ? deltaHeaders(method, path, query, bodyStr, creds)
     : { "Content-Type": "application/json", "User-Agent": "matrix" };
 
-  const r = await pfetch(DELTA_BASE + path + query, {
-    method,
-    headers,
-    ...(bodyStr ? { body: bodyStr } : {}),
-    ...(deltaDispatcher ? { dispatcher: deltaDispatcher } : {}),   // route via whitelisted proxy when configured
-  });
+  /* One fetch, wrapped with an explicit abort so a hung proxy leg fails in bounded time
+     instead of hanging until the platform cancels it (which surfaces as the cryptic
+     "fetch failed (request was cancelled)"). */
+  const doFetch = async () => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      return await pfetch(DELTA_BASE + path + query, {
+        method,
+        headers,
+        signal: ctrl.signal,
+        ...(bodyStr ? { body: bodyStr } : {}),
+        ...(deltaDispatcher ? { dispatcher: deltaDispatcher } : {}),   // route via whitelisted proxy when configured
+      });
+    } finally { clearTimeout(timer); }
+  };
+
+  /* Retry ONCE on a transport failure — but ONLY for idempotent GETs. The Delta signed leg
+     goes through a third-party Mumbai proxy (IP-whitelist requirement); a cold Render dyno or
+     a briefly-unreachable proxy drops the first request, and a second attempt a moment later
+     almost always succeeds. POSTs (orders) are never retried — a duplicate order is far worse
+     than one clear failure. */
+  const transportErr = (e) => {
+    const s = `${e && e.message} ${e && e.cause && (e.cause.code || e.cause.message)}`.toLowerCase();
+    return /fetch failed|cancel|abort|timeout|econnreset|etimedout|socket|closed|network/.test(s);
+  };
+  let r;
+  try {
+    r = await doFetch();
+  } catch (e) {
+    if (method === "GET" && transportErr(e)) {
+      await new Promise((res2) => setTimeout(res2, 1200));
+      try { r = await doFetch(); }
+      catch (e2) {
+        const why = (e2 && e2.cause && (e2.cause.code || e2.cause.message)) || (e2 && e2.message) || "unreachable";
+        throw new Error(`Couldn't reach Delta through the trading proxy (${why}). The server may have been asleep or the proxy is briefly unreachable — try connecting again in a few seconds.`);
+      }
+    } else {
+      throw e;
+    }
+  }
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d.success === false) {
     throw new Error((d.error && (d.error.code || d.error)) || d.message || `delta ${r.status}`);
