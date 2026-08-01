@@ -7,7 +7,7 @@
  */
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { signToken, verifyToken, storageKeyFor } = require("../auth");
+const { signToken, verifyToken, storageKeyFor, secretConfigError } = require("../auth");
 
 const SECRET = "test-secret-do-not-use-in-prod";
 
@@ -52,4 +52,21 @@ test("storageKeyFor adds the ph_ prefix only when missing", () => {
   assert.strictEqual(storageKeyFor("9167737726"), "ph_9167737726");
   assert.strictEqual(storageKeyFor("ph_9167737726"), "ph_9167737726");
   assert.strictEqual(storageKeyFor(""), "ph_");
+});
+
+/* P2-05 — the boot guard. In production a missing/weak JWT_SECRET must block startup (a random
+   per-boot secret logs everyone out on deploy; a short/known one is forgeable). In dev it's allowed. */
+test("secretConfigError: production blocks a missing or short secret", () => {
+  assert.match(secretConfigError("", true), /not set/);
+  assert.match(secretConfigError(undefined, true), /not set/);
+  assert.match(secretConfigError("short", true), /too short/);
+  assert.match(secretConfigError("a".repeat(31), true), /too short/);
+  assert.strictEqual(secretConfigError("a".repeat(32), true), null);   // exactly the minimum
+  assert.strictEqual(secretConfigError("x".repeat(64), true), null);
+});
+
+test("secretConfigError: dev never blocks (random fallback is fine)", () => {
+  assert.strictEqual(secretConfigError("", false), null);
+  assert.strictEqual(secretConfigError(undefined, false), null);
+  assert.strictEqual(secretConfigError("short", false), null);
 });

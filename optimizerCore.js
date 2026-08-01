@@ -21,7 +21,8 @@
  *  - retPct   = SUM of per-trade % returns (not the average)
  *  - pnl      = SUM of per-trade absolute moves (exitPx - entryPx), i.e. P&L per 1 unit/contract
  */
-function evalExitPair(sl, tp, events, maxBars = 200, short = false) {
+function evalExitPair(sl, tp, events, maxBars = 200, short = false, costPct = 0) {
+  const cost = Math.max(0, +costPct || 0);           // round-trip cost as % of notional, netted per trade
   let n = 0, wins = 0, sumWin = 0, sumLoss = 0, sumRet = 0, slHit = 0, tpHit = 0, pnlAbs = 0;
   for (const ev of events) {
     const c = ev.c, e = ev.e;
@@ -42,7 +43,8 @@ function evalExitPair(sl, tp, events, maxBars = 200, short = false) {
       if (short ? c[j].l <= target : c[j].h >= target) { ret = tp; exitPx = target; tpHit++; break; }
     }
     if (ret === null) { exitPx = c[end].c; ret = (short ? -1 : 1) * (exitPx / px - 1) * 100; }   // no level hit -> exit at window end
-    n++; sumRet += ret; pnlAbs += (short ? (px - exitPx) : (exitPx - px));
+    ret -= cost;                                      // net the round-trip cost off the % return …
+    n++; sumRet += ret; pnlAbs += (short ? (px - exitPx) : (exitPx - px)) - cost / 100 * px;      // … and off the absolute P&L
     if (ret > 0) { wins++; sumWin += ret; } else { sumLoss += ret; }
   }
   if (!n) return null;
@@ -74,4 +76,9 @@ function lenOptions(len) {
   return [...s].sort((a, b) => a - b);
 }
 
-module.exports = { evalExitPair, optRanker, lenOptions };
+/* Round-trip trading cost (% of notional) by market — mirrors frontend backtest.MARKET_COST_DEFAULTS,
+   i.e. 2×(slipPct + brokeragePct), so the optimiser's numbers line up with the backtest table. */
+const MARKET_COST_PCT = { IN: 0.10, FNO: 0.12, US: 0.04, Crypto: 0.13, Commodity: 0.12 };   // Crypto: fees 0.07% RT (maker buy 0.05% + taker sell 0.02%) + slip 2×0.03% = 0.13%
+function costPctFor(market) { return MARKET_COST_PCT[market] != null ? MARKET_COST_PCT[market] : 0.10; }
+
+module.exports = { evalExitPair, optRanker, lenOptions, costPctFor, MARKET_COST_PCT };

@@ -22,11 +22,12 @@ const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
 const strat = require("./strategyEngine");   // server-side port of the strategy exit engine
-const { evalExitPair, optRanker, lenOptions } = require("./optimizerCore");   // pure optimiser scoring math (unit-tested)
+const { evalExitPair, optRanker, lenOptions, costPctFor } = require("./optimizerCore");   // pure optimiser scoring math (unit-tested)
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
 const { marketOpenIST, intradaySquareDue } = require("./marketHours");   // IST market-open + intraday square-off
+const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
    routes use this — identity is taken from the token when we have it, and we fall back to the
@@ -98,7 +99,23 @@ app.use(cors({
 
 app.use(compression());     // gzip JSON responses — big win on the indicators/quotes payloads
 // (was: app.use(cors());  wide openpp.com" })
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));   // explicit bounded body size (P2-10) — generous enough for base64 idea screenshots, not unbounded
+
+/* API versioning contract (P3-08). The wire API is v1; APP_VERSION comes from the deploy (Render sets
+   it, else "dev"). Every response carries X-App-Version so a client/log can tell which build answered,
+   and /api/version exposes it for health/debugging. Bumping the API contract → introduce /api/v2 paths. */
+const APP_VERSION = process.env.APP_VERSION || process.env.RENDER_GIT_COMMIT || "dev";
+const API_VERSION = "v1";
+app.use((req, res, next) => { res.set("X-App-Version", APP_VERSION); res.set("X-Api-Version", API_VERSION); next(); });
+
+/* Structured, machine-readable log for FINANCIAL actions (P3-10) — one JSON line per money event
+   (real order placed/filled/rejected/unknown, auto-buy/-exit fills). Grep-able and shippable to a log
+   drain, unlike the free-text console lines. Best-effort; never throws into a trade path. */
+function logFinancial(event, fields) {
+  try { console.log(JSON.stringify({ ts: new Date().toISOString(), lvl: "fin", evt: event, ...fields })); }
+  catch { try { console.log("[fin]", event); } catch { /* noop */ } }
+}
+app.get("/api/version", (req, res) => res.json({ name: "matrixone-api", version: APP_VERSION, apiVersion: API_VERSION }));
 
 const PORT = process.env.PORT || 8787;
 const YF = "https://query1.finance.yahoo.com";
@@ -130,11 +147,11 @@ app.post("/api/trades", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "price must be a non-negative number" });
     if (String(trade.sym).length > 64)
       return res.status(400).json({ error: "symbol too long" });
-    const rec = { id: trade.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...trade };
+    const rec = { id: trade.id || crypto.randomUUID(), ...trade };   // collision-proof id (P3-09), not time+short-random
     await db.saveTrade(userId, rec);
     rcBust(`trades:${userId}`);
     res.json({ ok: true, trade: rec });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // Fetch trade history:  GET /api/trades?userId=&from=<ms>&to=<ms>
@@ -145,7 +162,7 @@ app.get("/api/trades", requireAuth, async (req, res) => {
     const to = req.query.to ? +req.query.to : Date.now();
     const trades = await rcWrap(`trades:${userId}:${from}:${to}`, () => db.getTrades(userId, from, to));
     res.json({ trades });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* Clear the caller's VIRTUAL (paper) trades across all markets. Real broker trades are never
@@ -156,7 +173,7 @@ app.post("/api/trades/clear-virtual", requireAuth, async (req, res) => {
     const removed = await db.clearVirtualTrades(userId);
     rcBust(`trades:${userId}`);
     res.json({ ok: true, removed });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ----------------------- users (phone + PIN) & state ---------------------- */
@@ -204,6 +221,37 @@ const llmLimiter = rateLimit({
   message: { error: "Too many AI requests. Please wait a few minutes and try again." },
 });
 
+/* COMPUTE endpoints (/api/optimize-exits, /api/optimize-indicators, /api/momentum-scan) each fan out to
+   several real-candle fetches + grid searches. They're deliberately reachable in guest mode (browsing
+   Top Picks / backtests without an account), so we can't require auth — but they were UNBOUNDED, an
+   abuse/DoS vector (P1-11). Cap the burst per IP; the memo cache absorbs repeats, so a real user never
+   hits this while a scraper does. */
+const computeLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many analysis requests. Please wait a minute and try again." },
+});
+
+/* P2-11 — don't leak raw upstream/internal error text (stack fragments, DB driver messages, provider
+   payloads) to the client. Log the full detail server-side; return a generic message. Routes that need
+   to surface a SPECIFIC user-facing reason (e.g. "insufficient balance") still send their own message
+   explicitly with the appropriate status — this only replaces the catch-all 500 handlers. */
+function serverError(res, e, msg = "Something went wrong on our end. Please try again.") {
+  try { console.error("[error]", (e && (e.stack || e.message)) || e); } catch { /* noop */ }
+  if (!res.headersSent) res.status(500).json({ error: msg });
+}
+
+/* Per-ACCOUNT PIN brute-force lockout (P1-12/13). The per-IP authLimiter alone is dodgeable by rotating
+   IPs, and /api/pin/verify (the Real-mode step-up) had no limit at all — a 4-digit PIN is only 10k
+   guesses. After 5 wrong PINs for ONE account, further attempts are refused for 15 min; a correct PIN
+   clears the counter. Logic lives in pinLock.js so it's unit-tested in isolation. */
+const _pinLock = createPinLock({ maxFails: 5, lockMs: 15 * 60 * 1000 });
+const pinLockState = (key) => _pinLock.state(key);
+const recordPinFail = (key) => _pinLock.fail(key);
+const clearPinFails = (key) => _pinLock.clear(key);
+
 /* A user-chosen handle: 3–20 chars, must start with a letter, then letters/digits/_ .
    Returns the cleaned handle, or null if it doesn't meet the rules. */
 function cleanUsername(raw) {
@@ -246,7 +294,7 @@ app.post("/api/register", authLimiter, async (req, res) => {
     }
     // Pending: NO token is issued, so the client shows a "waiting for approval" screen.
     res.json({ ok: true, pending: true, userId: phone, name, username, message: "Account created. An admin will review and activate it shortly." });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 /* Is this phone one of the configured admins? Admins bypass the approval gate. */
 function isAdminPhone(phone) {
@@ -257,11 +305,14 @@ function isAdminPhone(phone) {
 app.post("/api/login", authLimiter, async (req, res) => {
   try {
     const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin;
+    const lock = pinLockState(phone);
+    if (lock.locked) return res.status(429).json({ error: `Too many wrong PINs. Try again in ${Math.ceil(lock.retrySec / 60)} min.` });
     const u = await db.getUser(phone);
     // Unified Login / Sign-up: if there's no account for this number, tell the client so
     // it can switch to the "looks like you're new" sign-up step instead of showing an error.
     if (!u) return res.status(404).json({ ok: false, newAccount: true, error: "No account for this number." });
-    if (!verifyPin(pin, u.pin)) return res.status(401).json({ error: "Wrong PIN for this number." });
+    if (!verifyPin(pin, u.pin)) { recordPinFail(phone); return res.status(401).json({ error: "Wrong PIN for this number." }); }
+    clearPinFails(phone);
 
     // Blocked users are turned away even with a correct PIN.
     if (typeof db.isUserBlocked === "function" && await db.isUserBlocked(phone)) {
@@ -279,7 +330,7 @@ app.post("/api/login", authLimiter, async (req, res) => {
     }
     if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
     res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, email: u.email || null, createdAt: u.createdAt || null, token: signToken(phone) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ------------------------------- EMAIL ------------------------------------
@@ -294,7 +345,7 @@ app.post("/api/email", requireAuth, async (req, res) => {
     }
     if (typeof db.setEmail === "function") await db.setEmail(phone, email);
     res.json({ ok: true, email });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ---------------------------- USER ID (username) ---------------------------
@@ -306,7 +357,7 @@ app.get("/api/username/available", authLimiter, async (req, res) => {
     if (!username) return res.json({ ok: true, valid: false, available: false });
     const taken = typeof db.getUserByUsername === "function" ? await db.getUserByUsername(username) : null;
     res.json({ ok: true, valid: true, available: !taken });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 app.post("/api/username", requireAuth, async (req, res) => {
@@ -318,7 +369,7 @@ app.post("/api/username", requireAuth, async (req, res) => {
     if (owner && stripPh(owner) !== phone) return res.status(409).json({ error: "That user ID is taken — try another." });
     await db.setUsername(phone, username);
     res.json({ ok: true, username });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ---------------------------- PUBLIC STRATEGIES ---------------------------
@@ -333,7 +384,7 @@ app.get("/api/public-strategies", async (req, res) => {
     if (sym) list = list.filter((s) => (s.symbols || []).includes(sym));
     if (by) list = list.filter((s) => String(s.owner_name || "").toLowerCase() === by);
     res.json({ strategies: list });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 app.post("/api/public-strategies", requireAuth, async (req, res) => {
@@ -349,7 +400,7 @@ app.post("/api/public-strategies", requireAuth, async (req, res) => {
     });
     cache.delete("pubstrats:list");
     res.json({ ok: true, strategy: row });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 app.delete("/api/public-strategies/:id", requireAuth, async (req, res) => {
@@ -359,7 +410,7 @@ app.delete("/api/public-strategies/:id", requireAuth, async (req, res) => {
     await db.unpublishStrategy(req.params.id, isAdm ? "" : phone);
     cache.delete("pubstrats:list");
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ------------------------------ COMMUNITY IDEAS ------------------------------
@@ -382,7 +433,7 @@ app.get("/api/ideas", async (req, res) => {
     if (!me) { const h = req.get("Authorization") || ""; const tok = h.startsWith("Bearer ") ? h.slice(7) : ""; const v = verifyToken(tok); if (v) me = stripPh(v.userId); }
     if (!admin) list = list.filter((i) => (i.status || "approved") === "approved" || (me && i.owner === me));
     res.json({ ideas: list });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 app.post("/api/ideas", requireAuth, async (req, res) => {
@@ -407,7 +458,7 @@ app.post("/api/ideas", requireAuth, async (req, res) => {
     });
     cache.delete("ideas:list");   // new idea → refresh the cached list on the next read
     res.json({ ok: true, idea: row });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* Lazy screenshot fetch — the list omits the heavy base64 blob; the client requests each image only
@@ -432,7 +483,7 @@ app.post("/api/ideas/:id/review", requireAuth, async (req, res) => {
     if (typeof db.reviewIdea === "function") await db.reviewIdea(req.params.id, status);
     cache.delete("ideas:list");
     res.json({ ok: true, status });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 app.delete("/api/ideas/:id", requireAuth, async (req, res) => {
@@ -441,7 +492,7 @@ app.delete("/api/ideas/:id", requireAuth, async (req, res) => {
     await db.deleteIdea(req.params.id, isAdmin(req) ? "" : phone);
     cache.delete("ideas:list"); cache.delete("ideashot:" + req.params.id);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ---------------------------- FORGOT PIN (recovery) ---------------------------
@@ -461,7 +512,7 @@ app.get("/api/forgot/question", authLimiter, async (req, res) => {
       return res.json({ ok: false, reason: "no_recovery", message: "No security question is set for this number. If this is your account, an admin can reset your PIN." });
     }
     res.json({ ok: true, question: q });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 app.post("/api/forgot/reset", authLimiter, async (req, res) => {
@@ -472,16 +523,23 @@ app.post("/api/forgot/reset", authLimiter, async (req, res) => {
     if (!phone || !answer || !newPin) return res.status(400).json({ error: "phone, answer and newPin are required." });
     if (String(newPin).length < 4) return res.status(400).json({ error: "PIN must be at least 4 digits." });
 
+    // Per-account lockout on the recovery ANSWER too (P1-13) — a separate namespace from the PIN so a
+    // failed answer can't lock the login and vice-versa.
+    const ansKey = "ans:" + phone;
+    const lock = pinLockState(ansKey);
+    if (lock.locked) return res.status(429).json({ error: `Too many wrong answers. Try again in ${Math.ceil(lock.retrySec / 60)} min.` });
+
     const hash = typeof db.getSecurityAnswerHash === "function" ? await db.getSecurityAnswerHash(phone) : null;
     if (!hash) return res.status(400).json({ error: "No recovery is set up for this number." });
     // verifyPin works for any bcrypt/legacy hash — reuse it to check the answer.
-    if (!verifyPin(answer, hash)) return res.status(401).json({ error: "That answer doesn't match." });
+    if (!verifyPin(answer, hash)) { recordPinFail(ansKey); return res.status(401).json({ error: "That answer doesn't match." }); }
+    clearPinFails(ansKey);
 
     await db.updateUserPin(phone, hashPin(newPin));
     // Log them straight in with a fresh token.
     const u = await db.getUser(phone);
     res.json({ ok: true, userId: phone, name: (u && u.name) || "", token: signToken(phone) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ---------------------- SECURITY QUESTION (logged-in user) ----------------------
@@ -493,7 +551,7 @@ app.get("/api/security-question", requireAuth, async (req, res) => {
     const phone = stripPh(req.authUserId);   // token subject -> bare phone
     const q = typeof db.getSecurityQuestion === "function" ? await db.getSecurityQuestion(phone) : null;
     res.json({ ok: true, hasQuestion: !!q, question: q || null });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 app.post("/api/security-question", requireAuth, async (req, res) => {
@@ -507,7 +565,7 @@ app.post("/api/security-question", requireAuth, async (req, res) => {
     const answerHash = hashPin(answer.toLowerCase());
     await db.updateSecurityQuestion(phone, question, answerHash);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // Save/load a user's app state blob (automations, watchlists, wallets, profile).
@@ -518,28 +576,28 @@ app.post("/api/state", requireAuth, async (req, res) => {
     await db.saveState(userId, state || {});
     rcBust(`state:${userId}`);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 app.get("/api/state", requireAuth, async (req, res) => {
   try {
     const userId = storageKeyFor(req.authUserId);   // from the verified token
     const state = await rcWrap(`state:${userId}`, () => db.getState(userId));
     res.json({ state });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* Per-user saved screeners ("My Screeners") — survive logout / new device. The client sends its
    whole list; we store it whole (small). */
 app.get("/api/screeners", requireAuth, async (req, res) => {
   try { res.json({ screeners: await db.getScreeners(storageKeyFor(req.authUserId)) }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  catch (e) { serverError(res, e); }
 });
 app.post("/api/screeners", requireAuth, async (req, res) => {
   try {
     const list = Array.isArray(req.body && req.body.screeners) ? req.body.screeners.slice(0, 100) : [];
     await db.saveScreeners(storageKeyFor(req.authUserId), list);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ================================ ADMIN ================================== */
@@ -571,7 +629,7 @@ function requireAdmin(req, res) {
 app.get("/api/admin/users", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try { res.json({ users: await db.listUsers() }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  catch (e) { serverError(res, e); }
 });
 
 // Full detail on one user: profile, saved state (strategies + onboarding answers), trades.
@@ -582,7 +640,7 @@ app.get("/api/admin/user", async (req, res) => {
     const full = await db.getUserFull(phone);
     if (!full) return res.status(404).json({ error: "user not found" });
     res.json(full);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // Block or unblock a user.
@@ -594,7 +652,7 @@ app.post("/api/admin/block", async (req, res) => {
     if (!phone) return res.status(400).json({ error: "phone required" });
     await db.setUserBlocked(phone, blocked);
     res.json({ ok: true, phone, blocked });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // ADMIN: wipe a specific user's VIRTUAL (paper) trade history. Real broker trades are NEVER touched.
@@ -605,7 +663,7 @@ app.post("/api/admin/clear-virtual", async (req, res) => {
     if (!phone) return res.status(400).json({ error: "phone required" });
     const removed = await db.clearVirtualTrades(storageKeyFor(phone));
     res.json({ ok: true, phone, removed });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* ADMIN: wipe ONE trade type's VIRTUAL history for a user — Manual / Auto Buy / Screener Auto Buy /
@@ -620,14 +678,14 @@ app.post("/api/admin/clear-trades", async (req, res) => {
     if (!CLEARABLE_TYPES.has(tradeType)) return res.status(400).json({ error: "invalid tradeType" });
     const removed = await db.clearTradesByType(storageKeyFor(phone), tradeType);
     res.json({ ok: true, phone, tradeType, removed });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // Accounts awaiting approval.
 app.get("/api/admin/pending-users", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try { res.json({ users: typeof db.listPendingUsers === "function" ? await db.listPendingUsers() : [] }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  catch (e) { serverError(res, e); }
 });
 // Approve (activate) or un-approve a signup.
 app.post("/api/admin/approve", async (req, res) => {
@@ -638,7 +696,7 @@ app.post("/api/admin/approve", async (req, res) => {
     if (!phone) return res.status(400).json({ error: "phone required" });
     await db.setUserApproved(phone, approved);
     res.json({ ok: true, phone, approved });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* Verify the login PIN for a step-up action (e.g. entering Real mode / placing a real order).
@@ -648,10 +706,14 @@ app.post("/api/pin/verify", requireAuth, async (req, res) => {
     const phone = stripPh(req.authUserId);
     const pin = req.body && req.body.pin;
     if (!pin) return res.status(400).json({ error: "PIN required" });
+    const lock = pinLockState(phone);
+    if (lock.locked) return res.status(429).json({ error: `Too many wrong PINs. Try again in ${Math.ceil(lock.retrySec / 60)} min.` });
     const u = await db.getUser(phone);
     if (!u) return res.status(404).json({ error: "user not found" });
-    res.json({ ok: verifyPin(pin, u.pin) === true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const ok = verifyPin(pin, u.pin) === true;
+    if (ok) clearPinFails(phone); else recordPinFail(phone);
+    res.json({ ok });
+  } catch (e) { serverError(res, e); }
 });
 
 /* Change your OWN login PIN — requires the CURRENT PIN (so a stolen session can't silently
@@ -664,12 +726,15 @@ app.post("/api/pin/change", requireAuth, async (req, res) => {
     if (!currentPin || !newPin) return res.status(400).json({ error: "Current and new PIN are both required." });
     if (!/^\d{4,6}$/.test(String(newPin))) return res.status(400).json({ error: "New PIN must be 4–6 digits." });
     if (String(newPin) === String(currentPin)) return res.status(400).json({ error: "New PIN must be different from the current one." });
+    const lock = pinLockState(phone);
+    if (lock.locked) return res.status(429).json({ error: `Too many wrong PINs. Try again in ${Math.ceil(lock.retrySec / 60)} min.` });
     const u = await db.getUser(phone);
     if (!u) return res.status(404).json({ error: "user not found" });
-    if (!verifyPin(currentPin, u.pin)) return res.status(401).json({ error: "Your current PIN is incorrect." });
+    if (!verifyPin(currentPin, u.pin)) { recordPinFail(phone); return res.status(401).json({ error: "Your current PIN is incorrect." }); }
+    clearPinFails(phone);
     await db.updateUserPin(phone, hashPin(newPin));
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // Admin backstop: reset any user's PIN. The last-resort recovery when a user can't answer
@@ -683,7 +748,7 @@ app.post("/api/admin/reset-pin", async (req, res) => {
     if (!(await db.getUser(phone))) return res.status(404).json({ error: "user not found" });
     await db.updateUserPin(phone, hashPin(newPin));
     res.json({ ok: true, phone });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // Full admin check (userId + key) — used before actually opening the panel.
@@ -1790,7 +1855,7 @@ function collectMetricEntries(conds, raw) {
   for (let i = 30; i < c.length - 1; i++) { const fired = firesAt(i); if (fired && !prev) out.push({ c, e: i }); prev = fired; }
   return out;
 }
-function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, maxSl = 0) {
+function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, maxSl = 0, costPct = 0) {
   const short = !!(cfg && (cfg.side === "SELL" || cfg.short === true));   // score a sell-mirror as a SHORT
   const collect = cfg.mode === "metric" ? (raw) => collectMetricEntries(cfg.entry, raw) : (raw) => collectEntries(cfg, raw);
   let events = [];
@@ -1808,9 +1873,9 @@ function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, max
   const SL_MAX = Number(maxSl) > 0 ? Number(maxSl) : 0;
   const sls = SL_MAX > 0 ? OPT_SLS.filter((sl) => sl <= SL_MAX + 1e-9) : OPT_SLS;
   const slGrid = sls.length ? sls : [Math.min(...OPT_SLS)];   // if the cap is below every candidate, keep the smallest
-  for (const sl of slGrid) for (const tp of OPT_TPS) { if (RR_MIN > 0 && tp < sl * RR_MIN) continue; const r = evalExitPair(sl, tp, inS, 200, short); if (r) results.push(r); }
+  for (const sl of slGrid) for (const tp of OPT_TPS) { if (RR_MIN > 0 && tp < sl * RR_MIN) continue; const r = evalExitPair(sl, tp, inS, 200, short, costPct); if (r) results.push(r); }
   // If the floor was so strict nothing qualified, fall back to the full grid (still honouring the SL cap).
-  if (!results.length && RR_MIN > 0) { for (const sl of slGrid) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS, 200, short); if (r) results.push(r); } }
+  if (!results.length && RR_MIN > 0) { for (const sl of slGrid) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS, 200, short, costPct); if (r) results.push(r); } }
   if (!results.length) return { entries: events.length };
   const minTrades = Math.min(8, Math.max(3, Math.floor(inS.length * 0.05)));
   const rank = optRanker(objective);
@@ -1818,12 +1883,12 @@ function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, max
   const ranked = (pool.length ? pool : results).slice().sort(rank);
   const bp = ranked[0];
   // Report best + current on the FULL event set (fair prev-vs-new); validate best out-of-sample.
-  const best = evalExitPair(bp.sl, bp.tp, events, 200, short);
-  const oos = outS.length ? evalExitPair(bp.sl, bp.tp, outS, 200, short) : null;
-  const current = (cur && cur.sl > 0 && cur.tp > 0) ? evalExitPair(cur.sl, cur.tp, events, 200, short) : null;
+  const best = evalExitPair(bp.sl, bp.tp, events, 200, short, costPct);
+  const oos = outS.length ? evalExitPair(bp.sl, bp.tp, outS, 200, short, costPct) : null;
+  const current = (cur && cur.sl > 0 && cur.tp > 0) ? evalExitPair(cur.sl, cur.tp, events, 200, short, costPct) : null;
   return { entries: events.length, best, oos, current, objective, top: ranked.slice(0, 5) };
 }
-app.post("/api/optimize-exits", async (req, res) => {
+app.post("/api/optimize-exits", computeLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m"), side: body.side || (body.short ? "SELL" : null) };
@@ -1837,16 +1902,17 @@ app.post("/api/optimize-exits", async (req, res) => {
     // Optional max stop-loss cap (%). When >0 the optimiser won't propose an SL above it.
     const maxSl = (body.maxSl != null && Number(body.maxSl) > 0) ? Number(body.maxSl) : 0;
     const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
+    const costPct = body.costPct != null ? Math.max(0, +body.costPct || 0) : costPctFor(body.market);   // client may pass exact costs; else market default
     const interval = OPT_INTERVAL[cfg.tf] || "5m", range = OPT_RANGE[cfg.tf] || "1mo";
     // Content hash of the whole request so two different strategies never share a cache entry (the old
     // length-based key could collide and return another strategy's optimisation).
     const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
     let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
-    const key = "optexit:" + h.toString(36) + ":" + objective + ":rr" + rrMin + ":mx" + maxSl + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (cfg.side === "SELL" ? "S" : "L") + ":" + syms.slice().sort().join(",");
+    const key = "optexit:" + h.toString(36) + ":" + objective + ":rr" + rrMin + ":mx" + maxSl + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (cfg.side === "SELL" ? "S" : "L") + ":c" + costPct + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const sets = [];
       for (const sym of syms) { try { const c = await candlesForOpt(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
-      return optimizeExits(cfg, sets, cur, objective, rrMin, maxSl);
+      return optimizeExits(cfg, sets, cur, objective, rrMin, maxSl, costPct);
     });
     res.json(out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -1860,7 +1926,7 @@ app.post("/api/optimize-exits", async (req, res) => {
    strategy's current pair, so the comparison isolates entry quality. A greedy coordinate descent keeps
    the search bounded: pick the best timeframe, then tune each indicator's length one at a time. */
 const IND_TFS = ["3m", "5m", "15m", "30m", "1h"];   // never above 1h, by product rule
-function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5, short = false) {
+function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5, short = false, costPct = 0) {
   const cfg = { defs, entry, tf, mode };
   let events = [];
   for (const raw of sets) {
@@ -1868,12 +1934,12 @@ function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5, sh
     events = events.concat(ev);
   }
   if (events.length > 800) { const step = Math.ceil(events.length / 800); events = events.filter((_, k) => k % step === 0); }
-  const r = evalExitPair(sl, tp, events, 200, short);
+  const r = evalExitPair(sl, tp, events, 200, short, costPct);
   if (!r) return null;
   if (r.trades < minTrades) return null;      // too few signals to trust — treat as no result
   return r;
 }
-function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) {
+function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null, costPct = 0) {
   const short = !!(cfg && (cfg.side === "SELL" || cfg.short === true));   // score a sell-mirror as a SHORT
   const sl = cur.sl > 0 ? cur.sl : 1;
   const tp = cur.tp > 0 ? cur.tp : 2;
@@ -1887,7 +1953,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
     const sets = tfSets[tf];
     if (!sets || !sets.length) continue;
     let curDefs = baseDefs.map((d) => ({ ...d, tf }));
-    let curMetrics = evalIndicatorCfg(curDefs, cfg.entry, tf, cfg.mode, sets, sl, tp, 5, short);
+    let curMetrics = evalIndicatorCfg(curDefs, cfg.entry, tf, cfg.mode, sets, sl, tp, 5, short, costPct);
     for (let i = 0; i < curDefs.length; i++) {          // tune each indicator's length in turn
       const opts = lenOptions(curDefs[i].len);
       if (!opts) continue;
@@ -1895,7 +1961,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
       for (const L of opts) {
         if (String(L) === String(curDefs[i].len)) continue;
         const trial = curDefs.map((d, j) => j === i ? { ...d, len: String(L) } : d);
-        const m = evalIndicatorCfg(trial, cfg.entry, tf, cfg.mode, sets, sl, tp, 5, short);
+        const m = evalIndicatorCfg(trial, cfg.entry, tf, cfg.mode, sets, sl, tp, 5, short, costPct);
         if (better(m, bestMetrics)) { bestDefs = trial; bestMetrics = m; }
       }
       curDefs = bestDefs; curMetrics = bestMetrics;
@@ -1904,7 +1970,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
   }
   const curTf = cfg.tf || "5m";
   const curSets = tfSets[curTf] || tfSets[IND_TFS.find((t) => tfSets[t] && tfSets[t].length)] || [];
-  const current = curSets.length ? evalIndicatorCfg(baseDefs.map((d) => ({ ...d, tf: curTf })), cfg.entry, curTf, cfg.mode, curSets, sl, tp, 1, short) : null;
+  const current = curSets.length ? evalIndicatorCfg(baseDefs.map((d) => ({ ...d, tf: curTf })), cfg.entry, curTf, cfg.mode, curSets, sl, tp, 1, short, costPct) : null;
   if (!globalBest || !globalBest.metrics) return { entries: current ? current.trades : 0, current: current ? { ...current, tf: curTf } : null };
   const changes = globalBest.defs.map((d, i) => {
     const o = baseDefs[i] || {};
@@ -1917,7 +1983,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
     changes,
   };
 }
-app.post("/api/optimize-indicators", async (req, res) => {
+app.post("/api/optimize-indicators", computeLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m"), side: body.side || (body.short ? "SELL" : null) };
@@ -1931,9 +1997,10 @@ app.post("/api/optimize-indicators", async (req, res) => {
     // Optional: LOCK the timeframe — only tune indicator lengths, keep this tf fixed.
     const lockTf = (body.lockTf && IND_TFS.includes(String(body.lockTf))) ? String(body.lockTf) : null;
     const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
+    const costPct = body.costPct != null ? Math.max(0, +body.costPct || 0) : costPctFor(body.market);   // client costs, else market default
     const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
     let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
-    const key = "optind:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (lockTf || "all") + ":" + (cfg.side === "SELL" ? "S" : "L") + ":" + syms.slice().sort().join(",");
+    const key = "optind:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (lockTf || "all") + ":" + (cfg.side === "SELL" ? "S" : "L") + ":c" + costPct + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const tfSets = {};
       // Only fetch the timeframes we'll actually search — a locked tf fetches ONE, not all five.
@@ -1944,7 +2011,7 @@ app.post("/api/optimize-indicators", async (req, res) => {
         for (const sym of syms) { try { const c = await candlesForOpt(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
         tfSets[tf] = sets;
       }
-      return optimizeIndicators(cfg, tfSets, cur, objective, lockTf);
+      return optimizeIndicators(cfg, tfSets, cur, objective, lockTf, costPct);
     });
     res.json(out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -1967,7 +2034,7 @@ const MOMO_TF = {
   "1d":  { interval: "1d",  bars: 1, range: "6mo" },
   "1w":  { interval: "1d",  bars: 5, range: "1y" },
 };
-app.post("/api/momentum-scan", async (req, res) => {
+app.post("/api/momentum-scan", computeLimiter, async (req, res) => {
   try {
     let syms = Array.isArray(req.body && req.body.symbols) ? req.body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
     syms = [...new Set(syms)].slice(0, 80);
@@ -3298,6 +3365,31 @@ function setUserAppCred(userId, broker, cred) {
   appCredCache.set(appCredKey(userId, broker), cred);
 }
 
+/* OAUTH CSRF STATE — a random, single-use, short-lived nonce per login attempt (RFC 6749 §10.12).
+   Issued at /api/broker/login-url, echoed by the broker on the redirect, and verified once at
+   /api/broker/session. Prevents an attacker's auth_code (from a login THEY started) being planted
+   into a victim's session — the old hardcoded `state=matrix` gave no such protection. In-memory is
+   fine: an unfinished login just restarts. */
+const oauthStates = new Map();               // nonce -> { userId, broker, exp }
+const OAUTH_STATE_TTL = 10 * 60_000;         // 10 minutes to complete the broker login
+function issueOAuthState(userId, broker) {
+  const now = Date.now();
+  for (const [k, v] of oauthStates) if (v.exp < now) oauthStates.delete(k);   // prune expired
+  const nonce = crypto.randomBytes(24).toString("hex");
+  oauthStates.set(nonce, { userId: userId != null ? String(userId) : null, broker, exp: now + OAUTH_STATE_TTL });
+  return nonce;
+}
+function consumeOAuthState(nonce, broker, userId) {
+  if (!nonce) return { ok: false, reason: "missing state — start the broker login again" };
+  const s = oauthStates.get(nonce);
+  oauthStates.delete(nonce);                 // one-time use, even on failure
+  if (!s) return { ok: false, reason: "unknown or expired state — start the broker login again" };
+  if (s.exp < Date.now()) return { ok: false, reason: "the login expired — please try again" };
+  if (s.broker !== broker) return { ok: false, reason: "broker mismatch" };
+  if (s.userId && userId && String(s.userId) !== String(userId)) return { ok: false, reason: "this login belongs to a different account" };
+  return { ok: true };
+}
+
 const BROKERS = {
   zerodha: {
     name: "Zerodha",
@@ -3315,8 +3407,8 @@ const BROKERS = {
        3. The global FYERS_APP_ID — the server's house app. */
     key: (userId) => getUserAppCred("fyers", userId)?.appId || envKey(...perUser("FYERS_APP_ID", userId)),
     secret: (userId) => getUserAppCred("fyers", userId)?.secret || envKey(...perUser("FYERS_SECRET_ID", userId)),
-    loginUrl: (key, redirect) =>
-      `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code&state=matrix`,
+    loginUrl: (key, redirect, state) =>
+      `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code&state=${encodeURIComponent(state || "matrix")}`,
   },
 
   /* DELTA EXCHANGE — no OAuth.
@@ -3346,8 +3438,8 @@ const BROKERS = {
     name: "Charles Schwab",
     key: () => envKey("SCHWAB_APP_KEY"),
     secret: () => envKey("SCHWAB_APP_SECRET"),
-    loginUrl: (key, redirect) =>
-      `https://api.schwabapi.com/v1/oauth/authorize?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code`,
+    loginUrl: (key, redirect, state) =>
+      `https://api.schwabapi.com/v1/oauth/authorize?client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect || "")}&response_type=code${state ? `&state=${encodeURIComponent(state)}` : ""}`,
   },
 
   /* BRING-YOUR-OWN-CREDENTIAL brokers. Unlike the OAuth brokers, these don't send the user
@@ -3847,7 +3939,11 @@ app.get("/api/broker/login-url", async (req, res) => {
   if (id === "fyers" && envKey("FYERS_REDIRECT_URI") && !getUserAppCred("fyers", userId)) {
     redirect = envKey("FYERS_REDIRECT_URI");   // only for shared-app users; BYOA users keep their own
   }
-  res.json({ url: b.loginUrl(key, redirect) });
+  // CSRF: mint a single-use state nonce bound to this login (verified back at /api/broker/session).
+  // Normalise the id the SAME way routeUserId will at session (storageKeyFor adds the "ph_" prefix),
+  // so the user-binding check compares like-for-like instead of raw-vs-prefixed.
+  const stateNonce = issueOAuthState(userId ? storageKeyFor(userId) : null, id);
+  res.json({ url: b.loginUrl(key, redirect, stateNonce), state: stateNonce });
 });
 
 /* Step 2: exchange the short-lived request/auth code for an access token.
@@ -3858,6 +3954,15 @@ app.post("/api/broker/session", requireAuth, async (req, res) => {
   const b = BROKERS[broker];
   if (!b) return res.status(400).json({ error: "unknown broker" });
   if (!userId) return res.status(400).json({ error: "userId required" });
+
+  /* CSRF: OAuth-redirect brokers must present the single-use `state` nonce we minted at login-url and
+     the broker echoed back. This binds the returned auth_code to a login THIS user actually started —
+     without it, an attacker's auth_code could be planted into someone else's connect. Verified only
+     for the redirect brokers (fyers/schwab); Delta/userCreds/house sessions have no OAuth redirect. */
+  if ((broker === "fyers" || broker === "schwab") && !(req.body && req.body.extra && req.body.extra.house)) {
+    const chk = consumeOAuthState(req.body && req.body.state, broker, userId);
+    if (!chk.ok) return res.status(400).json({ error: "Login could not be verified (" + chk.reason + ")." });
+  }
 
   /* OWNER "server session" for FYERS (option 1 — connect like Delta): no OAuth redirect, no request
      token. FYERS is already logged in server-side via the daily TOTP auto-login, so we hand the owner
@@ -4111,7 +4216,7 @@ function brokerAuth(broker, token, userId) {
 /* REAL-TIME QUOTES. This is the point of the whole exercise: Yahoo is ~15 minutes
    delayed on NSE; a broker feed is live. Symbols arrive already in broker format
    (see domain/brokerSymbols.js) — the server does not guess at symbol names. */
-app.get("/api/broker/quotes", async (req, res) => {
+app.get("/api/broker/quotes", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   /* 401 = the session is genuinely gone (expired, or wiped by a server restart — sessions
      live in memory on the free tier). The client should reconnect. This is DISTINCT from a
@@ -4722,7 +4827,7 @@ const optMemo = async (k, ms, fn) => {
   return v;
 };
 
-app.get("/api/broker/optionchain", async (req, res) => {
+app.get("/api/broker/optionchain", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
   const { broker, accessToken: token } = sess;
@@ -5093,9 +5198,11 @@ app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
 });
 
 /** Drop a broker session (logout, or the user disconnecting). */
-app.post("/api/broker/logout", (req, res) => {
+app.post("/api/broker/logout", requireAuth, (req, res) => {
   const id = req.get("X-Broker-Session");
-  if (id) brokerSessions.delete(id);
+  const s = id ? brokerSessions.get(id) : null;
+  // Only the session's OWNER may drop it — otherwise a leaked/guessed session id could DoS another user.
+  if (s && s.userId === storageKeyFor(req.authUserId)) brokerSessions.delete(id);
   res.json({ ok: true });
 });
 
@@ -5492,6 +5599,24 @@ let lastAutoBuy = { at: null, checked: 0, bought: 0, live: false };
    redeploy; unset falls back to the env default. */
 let autoBuyLiveOverride = null;
 const autoBuyLiveOn = () => autoBuyLiveOverride != null ? autoBuyLiveOverride : /^(true|1|yes)$/i.test(String(process.env.AUTO_BUY_LIVE || ""));
+
+/* KILL SWITCH — per-user pause of NEW real entries. In-memory Set for zero-cost engine reads, seeded
+   from the DB at boot so a halt SURVIVES a restart (a kill switch that forgets on restart is worse
+   than useless). Exits are a separate engine, so a halted account still gets protected. */
+const haltedEntries = new Set();
+(async () => { try { (await db.getHaltedEntryUsers()).forEach((u) => haltedEntries.add(String(u))); if (haltedEntries.size) console.log(`[killswitch] ${haltedEntries.size} account(s) have new entries paused`); } catch (e) { console.error("[killswitch] load failed:", e.message); } })();
+app.get("/api/automation/entry-halt", requireAuth, (req, res) => {
+  res.json({ halted: haltedEntries.has(String(storageKeyFor(req.authUserId))) });
+});
+app.post("/api/automation/entry-halt", requireAuth, async (req, res) => {
+  const uid = String(storageKeyFor(req.authUserId));
+  const halt = !!(req.body && req.body.halt);
+  if (halt) haltedEntries.add(uid); else haltedEntries.delete(uid);
+  try { await db.setEntryHalt(uid, halt); } catch (e) { return res.status(500).json({ error: "Could not save — try again." }); }
+  logFinancial(halt ? "killswitch.halt" : "killswitch.resume", { userId: uid });
+  res.json({ ok: true, halted: halt });
+});
+
 async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
   autoBuyRunning = true;
@@ -5531,6 +5656,10 @@ async function runAutoBuyEngine() {
           await db.updateRealStrategy(st.id, { pendingSince: null, lastError: "previous order status unknown — cleared; verify with your broker before it re-enters", lastOrderStatus: "unknown" });
           st.pendingSince = null;
         }
+        // KILL SWITCH: the user paused NEW real entries. Reconciliation above still ran, and the exit
+        // engine is SEPARATE — so open positions keep their stop-loss/target managed; we only skip
+        // placing any new entry. Resume is instant (one tap), no re-connect / re-login.
+        if (haltedEntries.has(String(st.userId))) continue;
         // Cooldown: don't re-fire a still-true signal inside the same candle.
         const intervalMs = (st.interval === "1d" ? 86400 : (Number((st.interval || "5m").replace(/[^\d]/g, "")) || 5) * 60) * 1000;
         if (st.lastOrderAt && Date.now() - st.lastOrderAt < intervalMs) continue;
@@ -5580,12 +5709,27 @@ async function runAutoBuyEngine() {
         await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null });
         posCache.delete(st.userId);   // this user's positions changed — re-read next time it's needed
         bought++;
+        logFinancial(r.partial ? "autobuy.partial" : "autobuy.filled", { userId: st.userId, broker: st.broker, symbol: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty, reqQty: qty, price: fillPx, orderId: r.orderId, reason: sig.reason });
         console.log(`[autobuy] ${r.partial ? "PARTIAL" : "FILLED"} ${fillQty}/${qty} ${st.symbol} for ${st.userId} via ${st.broker} — ${sig.reason} (order ${r.orderId})`);
       } catch (e) {
-        // Rejected / unfilled — record the reason and status, clear the pending marker, and do
-        // NOT open a position. (A thrown error here means the order did not fill.)
-        await db.updateRealStrategy(st.id, { lastError: String(e.message || e), lastOrderStatus: "rejected", lastRejectAt: Date.now(), pendingSince: null });
-        console.error(`[autobuy] REJECTED ${st.symbol} (${st.broker}):`, e.message);
+        const msg = String((e && (e.message || e)) || "error");
+        /* P2-03 / R2: distinguish a CONFIRMED rejection from an AMBIGUOUS failure. A rejection (the
+           broker said no — insufficient margin, invalid, too small…) means nothing executed, so it's
+           safe to clear the pending marker and let it re-enter. A timeout / network error is NOT proof
+           of rejection — the order may have been ACCEPTED — so we KEEP the pending marker and record
+           the outcome as "unknown". The reconciliation at the top of the loop then matches it to a real
+           position, or, after AB_RECONCILE_MS, clears it with a "verify with your broker" warning. It
+           never auto-resubmits an unknown order. */
+        const confirmedReject = /reject|insufficient|not filled|unfilled|cancell?ed|invalid|margin|too small|min(?:imum)? size|not enough|balance|bad request|400/i.test(msg);
+        if (confirmedReject) {
+          await db.updateRealStrategy(st.id, { lastError: msg, lastOrderStatus: "rejected", lastRejectAt: Date.now(), pendingSince: null });
+          logFinancial("autobuy.rejected", { userId: st.userId, broker: st.broker, symbol: st.symbol, reason: msg });
+          console.error(`[autobuy] REJECTED ${st.symbol} (${st.broker}):`, msg);
+        } else {
+          await db.updateRealStrategy(st.id, { lastError: "order outcome unknown (no broker confirmation) — reconciling, not resubmitting: " + msg, lastOrderStatus: "unknown" });
+          logFinancial("autobuy.unknown", { userId: st.userId, broker: st.broker, symbol: st.symbol, reason: msg });
+          console.error(`[autobuy] UNKNOWN outcome ${st.symbol} (${st.broker}) — keeping pending marker for reconciliation:`, msg);
+        }
       }
     }
   } catch (e) { console.error("[autobuy] sweep failed:", e.message); }

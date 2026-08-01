@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { marketOpenIST, minsToCloseIST, intradaySquareDue } = require("../marketHours");
+const { marketOpenIST, minsToCloseIST, intradaySquareDue, isMarketHoliday, usMarketHolidays } = require("../marketHours");
 
 /* Build a UTC epoch that corresponds to a given IST wall-clock on a given weekday.
    IST = UTC+5:30, so IST 09:15 == UTC 03:45. We anchor to known dates whose weekday we control:
@@ -17,6 +17,25 @@ const SUN = "2025-07-27";   // Sunday
 test("Crypto is always open", () => {
   assert.equal(marketOpenIST("Crypto", istEpoch(SAT, 3, 0)), true);
   assert.equal(marketOpenIST("Crypto", istEpoch(SUN, 23, 59)), true);
+});
+
+/* P1-04 — exchange holidays close a market even on a weekday. */
+test("US market holidays are computed correctly (2026)", () => {
+  const h = usMarketHolidays(2026);
+  assert.ok(h.has("2026-01-01"));   // New Year
+  assert.ok(h.has("2026-04-03"));   // Good Friday (Easter 5 Apr 2026)
+  assert.ok(h.has("2026-05-25"));   // Memorial Day (last Mon May)
+  assert.ok(h.has("2026-11-26"));   // Thanksgiving (4th Thu Nov)
+  assert.ok(h.has("2026-12-25"));   // Christmas
+  assert.equal(h.has("2026-12-24"), false);   // Christmas Eve trades
+});
+
+test("IN equity is closed on a listed holiday, open the next trading day", () => {
+  // Republic Day 2026-01-26 (Monday), 11:00 IST → holiday, shut despite being a weekday in session hours.
+  assert.equal(marketOpenIST("IN", istEpoch("2026-01-26", 11, 0)), false);
+  assert.equal(isMarketHoliday("IN", istEpoch("2026-01-26", 11, 0)), true);
+  // 2026-01-27 (Tuesday) 11:00 IST → normal trading day.
+  assert.equal(marketOpenIST("IN", istEpoch("2026-01-27", 11, 0)), true);
 });
 
 test("Indian equity open only 09:15-15:30 on weekdays", () => {

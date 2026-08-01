@@ -108,6 +108,11 @@ async function initDb() {
      logout / a new device. Small, so stored whole like app_state rather than row-per-screener. */
   await pool.query(`CREATE TABLE IF NOT EXISTS user_screeners (
     user_id TEXT PRIMARY KEY, updated_at BIGINT, data JSONB)`);
+  /* KILL SWITCH — per-user pause of NEW real ENTRIES (auto-buy). Protective exits keep running, so a
+     halted account still gets its stop-loss/target managed. Its own tiny table so it is never clobbered
+     by an app_settings save or the user-state blob (both of which overwrite wholesale). */
+  await pool.query(`CREATE TABLE IF NOT EXISTS automation_flags (
+    user_id TEXT PRIMARY KEY, halt_entries BOOLEAN DEFAULT false, updated_at BIGINT)`);
   console.log("[db] Postgres ready");
 }
 
@@ -124,6 +129,7 @@ const FILES = {
   managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
   realStrats: process.env.REAL_STRATS_FILE || path.join(__dirname, "real_strategies.json"),
   screeners: process.env.SCREENERS_FILE || path.join(__dirname, "user_screeners.json"),
+  autoFlags: process.env.AUTO_FLAGS_FILE || path.join(__dirname, "automation_flags.json"),
 };
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return {}; } };
 const writeJSON = (f, d) => { try { fs.writeFileSync(f, JSON.stringify(d)); } catch (e) { console.error("[db] write failed", e.message); } };
@@ -432,6 +438,24 @@ async function saveScreeners(userId, list) {
   const all = readJSON(FILES.screeners); all[userId] = arr; writeJSON(FILES.screeners, all);
 }
 
+/* ----------------------- kill switch (halt new real entries) ---------------- */
+async function setEntryHalt(userId, halt) {
+  const u = String(userId), on = !!halt, now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO automation_flags (user_id, halt_entries, updated_at) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id) DO UPDATE SET halt_entries=$2, updated_at=$3`,
+      [u, on, now]
+    );
+    return;
+  }
+  const all = readJSON(FILES.autoFlags); all[u] = { halt_entries: on, updated_at: now }; writeJSON(FILES.autoFlags, all);
+}
+async function getHaltedEntryUsers() {
+  if (USING_PG) { const r = await pool.query(`SELECT user_id FROM automation_flags WHERE halt_entries=true`); return r.rows.map((x) => x.user_id); }
+  const all = readJSON(FILES.autoFlags); return Object.keys(all).filter((u) => all[u] && all[u].halt_entries);
+}
+
 /* ----------------------- open positions (exit monitor) --------------------- */
 // All still-open trades across users that carry a target/stop (so the server-side
 // monitor can close them at real prices even when nobody has the app open).
@@ -695,4 +719,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

@@ -9,14 +9,18 @@
  * Keep the two in sync when limits change. This file is intentionally dependency-free.
  */
 
-/* Limits are effectively OFF by default (the app owner asked to remove the caps for real trading).
-   They remain as knobs so a value can be dialed back down later without code changes. */
+/* Default SAFETY FLOOR (P1-02). Previously all caps were effectively OFF (100% loss, unlimited
+   trades/positions), so a bug or runaway strategy could drain an account. These defaults keep single
+   positions permissive (a one-symbol crypto/equity position can legitimately be 100% of that sleeve)
+   but add the three controls that actually stop a disaster: a daily-loss circuit breaker, a per-symbol
+   cooldown that kills resubmission loops, and sane count caps. All remain fully overridable per user in
+   Profile → Risk limits, so anyone who wants them off can set them off. */
 const DEFAULT_LIMITS = {
-  maxPositionPct: 100,      // max % of that market's equity in a single position
-  maxOpenPositions: 100000, // per market
-  maxTradesPerDay: 100000,  // per market
-  maxDailyLossPct: 100,     // stop trading after losing this % of start-of-day equity
-  cooldownMs: 0,            // min gap between two orders in the same symbol
+  maxPositionPct: 100,      // max % of that market's equity in a single position (kept permissive)
+  maxOpenPositions: 50,     // per market — stops a runaway opening hundreds of positions
+  maxTradesPerDay: 100,     // per market
+  maxDailyLossPct: 25,      // circuit breaker: halt a market after −25% realised on the day
+  cooldownMs: 15000,        // 15s min gap between two entries in the same symbol
 };
 
 const startOfDay = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
@@ -66,8 +70,23 @@ function validateOrder(order, account) {
   }
 
   if (side === "SELL") {
-    if (!held || (held.qty || 0) < qty) {
-      reasons.push(`Cannot sell ${qty} ${sym} — you hold ${held ? held.qty : 0}.`);
+    /* P1-03 — reconcile with the frontend, which allows a SELL to OPEN a short. The portion covered by
+       an existing long is a plain reduce/close (always allowed, no funds check). Any UNCOVERED portion
+       opens a short, which consumes margin like a buy — so it gets the same position-size / count caps
+       (and a warning that the market/broker must permit shorting; the broker rejects an illegal short). */
+    const heldQty = held ? (held.qty || 0) : 0;
+    if (heldQty < qty) {
+      const shortQty = qty - heldQty;
+      const px = price || (held && (held.price || held.avg)) || 0;
+      if (px > 0) {
+        const equity = wallet + portfolio.reduce((a, h) => a + Math.abs(h.qty || 0) * (h.price || h.avg || 0), 0);
+        const pct = equity > 0 ? ((shortQty * px) / equity) * 100 : 100;
+        if (pct > limits.maxPositionPct) reasons.push(`Short size ${pct.toFixed(1)}% of ${market} equity exceeds the ${limits.maxPositionPct}% cap.`);
+      }
+      if (!held && openInMarket.length >= limits.maxOpenPositions) {
+        reasons.push(`Already holding ${openInMarket.length} positions in ${market} (cap ${limits.maxOpenPositions}).`);
+      }
+      warnings.push(`Opening a short of ${shortQty} ${sym} (uncovered) — needs margin; ensure this market/broker permits shorting.`);
     }
   }
 

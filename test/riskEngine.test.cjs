@@ -37,17 +37,31 @@ test("a position under the cap is allowed (with a 25% cap set)", () => {
   assert.strictEqual(r.ok, true);
 });
 
-test("with caps OFF (default), a large position is allowed", () => {
-  // Same 40% position, but no limits set -> the default-off config lets it through.
+test("default safety-floor keeps maxPositionPct permissive (a 40% position passes)", () => {
+  // Default maxPositionPct is 100, so a single 40% position is fine — the floor guards loss/cooldown/counts.
   const r = validateOrder({ sym: "RELIANCE", side: "BUY", qty: 20, price: 2000, market: "IN" }, acct());
   assert.strictEqual(r.ok, true);
 });
 
-test("selling more than held is blocked", () => {
+test("P1-03: selling more than held OPENS a short (allowed, with a warning)", () => {
   const a = acct({ portfolio: [{ sym: "RELIANCE", qty: 2, market: "IN", price: 2000 }] });
   const r = validateOrder({ sym: "RELIANCE", side: "SELL", qty: 5, price: 2000, market: "IN" }, a);
+  assert.strictEqual(r.ok, true);                                  // 3-unit uncovered short, ~5.8% of equity
+  assert.match(r.warnings.join(" "), /short/i);
+});
+
+test("P1-03: a naked short larger than 100% of equity is blocked by default", () => {
+  const a = acct({ wallet: 1000, portfolio: [] });                 // equity 1000
+  const r = validateOrder({ sym: "X", side: "SELL", qty: 10, price: 2000, market: "IN" }, a);  // 20,000 short
   assert.strictEqual(r.ok, false);
-  assert.match(r.reasons.join(" "), /Cannot sell/i);
+  assert.match(r.reasons.join(" "), /Short size/i);
+});
+
+test("P1-02: default daily-loss circuit breaker (25%) halts after a big loss", () => {
+  const over = acct({ wallet: 70000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -30000 }] });   // −30% of 100k start
+  assert.ok(validateOrder({ sym: "X", side: "BUY", qty: 1, price: 100, market: "IN" }, over).reasons.some((x) => /loss limit/i.test(x)));
+  const under = acct({ wallet: 80000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -20000 }] });   // −20%
+  assert.ok(!validateOrder({ sym: "X", side: "BUY", qty: 1, price: 100, market: "IN" }, under).reasons.some((x) => /loss limit/i.test(x)));
 });
 
 test("selling exactly what is held is allowed", () => {

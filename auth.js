@@ -7,8 +7,23 @@
  */
 const crypto = require("crypto");
 
-// Default secret from env; if unset, a random per-boot secret (tokens then invalidate on
-// restart — fine for dev, but set JWT_SECRET in production).
+/* Why a secret matters: it both SIGNS tokens (a weak/known secret lets anyone forge a session) and
+   keeps them stable across restarts (a random per-boot secret logs everyone out on every deploy).
+   In production we therefore FAIL FAST — a missing or short secret is a security hole, not a warning
+   to scroll past. In dev we keep the convenient random fallback. `MIN_SECRET_LEN` guards against a
+   trivially short value; 32 chars ≈ 128 bits of entropy if random. Returns an error string, or null. */
+const MIN_SECRET_LEN = 32;
+function secretConfigError(rawSecret, isProd) {
+  if (!isProd) return null;                                   // dev: random fallback is fine
+  const s = String(rawSecret || "");
+  if (!s) return "JWT_SECRET is not set";
+  if (s.length < MIN_SECRET_LEN) return `JWT_SECRET is too short (${s.length} chars; need ≥ ${MIN_SECRET_LEN})`;
+  return null;
+}
+const _secretErr = secretConfigError(process.env.JWT_SECRET, process.env.NODE_ENV === "production");
+if (_secretErr) throw new Error(`[auth] ${_secretErr}. Refusing to start in production — set a strong JWT_SECRET.`);
+
+// Default secret from env; if unset (dev only, per the check above), a random per-boot secret.
 const DEFAULT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
 if (!process.env.JWT_SECRET) {
   console.warn("[auth] JWT_SECRET not set — using a random per-boot secret; users will be logged out on each restart. Set JWT_SECRET in production.");
@@ -68,4 +83,4 @@ const storageKeyFor = (userId) => {
    bare phone but the app sends the prefixed id (or vice-versa). */
 const stripPh = (s) => String(s || "").replace(/^ph_/, "");
 
-module.exports = { signToken, verifyToken, requireAuth, storageKeyFor, stripPh, DEFAULT_SECRET, TOKEN_TTL_MS };
+module.exports = { signToken, verifyToken, requireAuth, storageKeyFor, stripPh, secretConfigError, DEFAULT_SECRET, TOKEN_TTL_MS };

@@ -30,8 +30,52 @@ function etParts(nowMs = Date.now()) {
   return { day, mins };
 }
 
+/* ── EXCHANGE HOLIDAYS (P1-04) ────────────────────────────────────────────────────────────────
+   A weekday can still be a full-day CLOSURE. US market holidays are rule-based, so we COMPUTE them
+   (no annual maintenance). NSE/MCX holidays follow announced/lunar calendars, so they're a data
+   table that MUST be verified against the official exchange circular each year. Deliberately
+   conservative: a MISSING entry only makes the app attempt an order the broker then rejects (market
+   shut), whereas a WRONG entry would skip a real session — so we list only high-confidence dates. */
+const pad2 = (n) => String(n).padStart(2, "0");
+const keyOf = (dt) => `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+const ymd = (y, m, d) => `${y}-${pad2(m)}-${pad2(d)}`;
+function nthWeekday(y, m, weekday, n) { let c = 0; for (let d = 1; d <= 31; d++) { const dt = new Date(Date.UTC(y, m - 1, d)); if (dt.getUTCMonth() !== m - 1) break; if (dt.getUTCDay() === weekday && ++c === n) return d; } return null; }
+function lastWeekday(y, m, weekday) { for (let d = 31; d >= 1; d--) { const dt = new Date(Date.UTC(y, m - 1, d)); if (dt.getUTCMonth() !== m - 1) continue; if (dt.getUTCDay() === weekday) return d; } return null; }
+function easterSunday(y) { const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, mm = Math.floor((a + 11 * h + 22 * l) / 451), month = Math.floor((h + l - 7 * mm + 114) / 31), day = ((h + l - 7 * mm + 114) % 31) + 1; return { month, day }; }
+function observedFixed(y, m, d) { const dt = new Date(Date.UTC(y, m - 1, d)); const dow = dt.getUTCDay(); if (dow === 6) dt.setUTCDate(dt.getUTCDate() - 1); else if (dow === 0) dt.setUTCDate(dt.getUTCDate() + 1); return keyOf(dt); }
+const _usHolidayCache = {};
+function usMarketHolidays(y) {
+  if (_usHolidayCache[y]) return _usHolidayCache[y];
+  const s = new Set();
+  s.add(observedFixed(y, 1, 1));                        // New Year's Day
+  s.add(ymd(y, 1, nthWeekday(y, 1, 1, 3)));             // MLK — 3rd Mon Jan
+  s.add(ymd(y, 2, nthWeekday(y, 2, 1, 3)));             // Washington's Birthday — 3rd Mon Feb
+  const e = easterSunday(y); const gf = new Date(Date.UTC(y, e.month - 1, e.day)); gf.setUTCDate(gf.getUTCDate() - 2); s.add(keyOf(gf)); // Good Friday
+  s.add(ymd(y, 5, lastWeekday(y, 5, 1)));               // Memorial Day — last Mon May
+  s.add(observedFixed(y, 6, 19));                       // Juneteenth
+  s.add(observedFixed(y, 7, 4));                        // Independence Day
+  s.add(ymd(y, 9, nthWeekday(y, 9, 1, 1)));             // Labor Day — 1st Mon Sep
+  s.add(ymd(y, 11, nthWeekday(y, 11, 4, 4)));           // Thanksgiving — 4th Thu Nov
+  s.add(observedFixed(y, 12, 25));                      // Christmas
+  _usHolidayCache[y] = s; return s;
+}
+/* NSE/MCX full-day equity closures — VERIFY ANNUALLY against the official exchange circular. 2026 is
+   the high-confidence subset (fixed national + announced dates); lunar-calendar holidays not listed
+   here just fall through to a broker rejection, never a wrong trade. */
+const IN_HOLIDAYS = {
+  2026: ["2026-01-26", "2026-04-03", "2026-05-01", "2026-06-26", "2026-09-14", "2026-10-02", "2026-12-25"],
+};
+function zoneDateKey(nowMs, tz) { return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(nowMs)); }
+function isMarketHoliday(market, nowMs = Date.now()) {
+  if (market === "Crypto") return false;
+  if (market === "US") { const k = zoneDateKey(nowMs, "America/New_York"); return usMarketHolidays(Number(k.slice(0, 4))).has(k); }
+  const k = zoneDateKey(nowMs, "Asia/Kolkata");                    // IN / FNO / Commodity use the IST calendar date
+  return (IN_HOLIDAYS[Number(k.slice(0, 4))] || []).includes(k);
+}
+
 function marketOpenIST(market, nowMs = Date.now()) {
   if (market === "Crypto") return true;
+  if (isMarketHoliday(market, nowMs)) return false;                // exchange holiday — shut even on a weekday
   if (market === "US") { const { day, mins } = etParts(nowMs); return day >= 1 && day <= 5 && mins >= 570 && mins <= 960; }  // 09:30–16:00 ET (DST-correct)
   const { day, mins } = istParts(nowMs);
   const weekday = day >= 1 && day <= 5;
@@ -63,4 +107,4 @@ function intradaySquareDue(market, nowMs = Date.now(), bufferMin = 15) {
   return m != null && m <= bufferMin;
 }
 
-module.exports = { istParts, marketOpenIST, minsToCloseIST, intradaySquareDue };
+module.exports = { istParts, marketOpenIST, minsToCloseIST, intradaySquareDue, isMarketHoliday, usMarketHolidays };

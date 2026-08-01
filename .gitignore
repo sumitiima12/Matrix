@@ -1,0 +1,22 @@
+# Dependencies — rebuilt with `npm install`, never committed (this repo had ~7MB of node_modules tracked)
+node_modules/
+
+# Secrets & environment — must never be committed
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor cruft
+.DS_Store
+.fuse_hidden*
+*.swp
+*~
+
+# Test / coverage output
+coverage/

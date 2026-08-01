@@ -129,10 +129,17 @@ function srSeries(c, kind) {
    formation pivot, which is look-ahead. Only computed when a strategy actually uses a PAT: operand. */
 function patternSeries(c, key, within = 3) {
   const s = new Array(c.length).fill(0);
+  // ONE formation must fire ONCE — de-dupe by formation identity (its `at` pivot index). detectPatterns
+  // keeps returning the same recent formation for many slices, so without this an old formation re-fired
+  // every few bars forever (R2-P1-03). Mirrors frontend strategyLang.patternSeries.
+  let lastAt = -1;
   for (let i = 12; i < c.length; i++) {
-    if (s[i]) continue;                                   // already held from a prior confirmation
     const pats = detectPatterns(c.slice(0, i + 1)).filter((p) => p.key === key);
-    if (pats.length) for (let j = i; j <= Math.min(c.length - 1, i + within); j++) s[j] = 1;
+    if (!pats.length) continue;
+    const at = pats[pats.length - 1].at;
+    if (at === lastAt) continue;                          // same formation still detected — don't re-fire
+    lastAt = at;
+    for (let j = i; j <= Math.min(c.length - 1, i + within); j++) s[j] = 1;
   }
   return s;
 }
@@ -176,6 +183,28 @@ function candleSeries(c, key) {
   return s;
 }
 
+/* True where bar i begins a new trading SESSION. Used by the opening-range operands (ORB, FirstN) and
+   the day-relative ones (DayChange). A session boundary is: the first bar; a change of UTC calendar
+   date (every equity session — IN/US/MCX — falls on a distinct UTC date, so this segments them
+   correctly, and crypto resets at 00:00 UTC by convention); OR a time gap between consecutive bars
+   far larger than the normal bar spacing (so a feed that starts mid-session, or an intraday halt,
+   still opens a fresh session rather than fusing two). Mirrors frontend strategyLang.sessionStarts. */
+function sessionStarts(c) {
+  const n = c.length, out = new Array(n).fill(false);
+  if (!n) return out;
+  out[0] = true;
+  // typical bar spacing (median-ish via the smallest positive gap seen) to size the "big gap" test
+  let base = Infinity;
+  for (let i = 1; i < n; i++) { const g = c[i].t - c[i - 1].t; if (g > 0 && g < base) base = g; }
+  if (!Number.isFinite(base) || base <= 0) base = 60000;
+  const bigGap = Math.max(4 * base, 30 * 60000);       // > 4 bars AND at least 30 min ⇒ overnight/halt
+  const utcDay = (t) => { const d = new Date(t); return d.getUTCFullYear() + "-" + d.getUTCMonth() + "-" + d.getUTCDate(); };
+  for (let i = 1; i < n; i++) {
+    if (utcDay(c[i].t) !== utcDay(c[i - 1].t) || (c[i].t - c[i - 1].t) >= bigGap) out[i] = true;
+  }
+  return out;
+}
+
 /* One indicator def -> its value series over WHATEVER OHLC series you pass — so the identical logic
    can run on the base candles OR on a higher-timeframe aggregate (multi-timeframe support). */
 function computeIndicator(d, attr, c, closes, vols) {
@@ -204,15 +233,26 @@ function computeIndicator(d, attr, c, closes, vols) {
     case "CurrentCandle": case "CurrentDay": { const f = CF[attr] || "c"; return c.map((x) => x[f]); }
     case "PrevCandle": case "PrevDay": { const f = CF[attr] || "c"; return c.map((x, i) => i > 0 ? c[i - 1][f] : NaN); }
     case "LastNCandles": { const f = CF[attr] || "c"; return attr === "high" ? rollExt(c, len, "h", true) : attr === "low" ? rollExt(c, len, "l", false) : c.map((x, i) => (i - len + 1 >= 0 ? c[i - len + 1][f] : x[f])); }
-    case "FirstNCandles": { const f = CF[attr] || "c"; const head = c.slice(0, Math.max(1, len)); const val = attr === "high" ? Math.max(...head.map((x) => x.h)) : attr === "low" ? Math.min(...head.map((x) => x.l)) : (attr === "open" ? head[0].o : head[head.length - 1].c); return closes.map(() => val); }
+    case "FirstNCandles": {
+      // The opening range of the CURRENT session (first `len` candles of the day), reset each session
+      // and built CAUSALLY: at bar i the value covers only session bars up to min(i, start+len-1), so a
+      // backtest never sees the completed range before those bars have printed. The old code took the
+      // first N bars of the whole fetched window and held that one number forever — wrong across days.
+      const n = Math.max(1, len), sf = sessionStarts(c), out = new Array(c.length);
+      let start = 0, hi = -Infinity, lo = Infinity, openV = NaN, lastClose = NaN, count = 0;
+      for (let i = 0; i < c.length; i++) {
+        if (sf[i]) { start = i; hi = -Infinity; lo = Infinity; openV = c[i].o; count = 0; }
+        if (i - start < n) { if (c[i].h > hi) hi = c[i].h; if (c[i].l < lo) lo = c[i].l; lastClose = c[i].c; count++; }
+        out[i] = attr === "high" ? hi : attr === "low" ? lo : attr === "open" ? openV : lastClose;
+      }
+      return out;
+    }
     case "ORB": {
       const mins = Number(d.len) || 15;
-      const out = new Array(c.length);
-      let dayKey = null, hi = -Infinity, lo = Infinity, dayStart = 0;
+      const sf = sessionStarts(c), out = new Array(c.length);
+      let hi = -Infinity, lo = Infinity, dayStart = 0;
       for (let i = 0; i < c.length; i++) {
-        const dt = new Date(c[i].t);
-        const key = dt.getUTCFullYear() + "-" + dt.getUTCMonth() + "-" + dt.getUTCDate();
-        if (key !== dayKey) { dayKey = key; hi = -Infinity; lo = Infinity; dayStart = c[i].t; }
+        if (sf[i]) { hi = -Infinity; lo = Infinity; dayStart = c[i].t; }
         if (c[i].t - dayStart < mins * 60000) { if (c[i].h > hi) hi = c[i].h; if (c[i].l < lo) lo = c[i].l; }
         out[i] = attr === "low" ? lo : hi;
       }
