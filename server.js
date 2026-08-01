@@ -1480,7 +1480,9 @@ app.get("/api/history", async (req, res) => {
       const uid = reqUserIdOptional(req);
       if (uid) candles = await memo(`fyu:${uid}:${symbol}:${range}:${interval}`, 60_000, () => userFyersHistory(uid, symbol, range, interval));
     }
-    if (!candles || !candles.length) {
+    // A THIN house response (sometimes FYERS returns just today's 1 candle for a name) must not block the
+    // Yahoo fallback — otherwise the chart says "unavailable" for a stock that has full history on Yahoo.
+    if (!candles || candles.length < 5) {
       /* Yahoo caps INTRADAY history (1m ~7d, other minute ~60d, 60m ~730d) and 422s if you ask for
          more. A backtest may request 6 months of 5m — fine for FYERS, impossible on Yahoo. So for
          intraday intervals we request an explicit clamped window via period1/period2; non-connected
@@ -2309,7 +2311,7 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   }
   // FYERS house feed first for Indian equities; Yahoo otherwise / on any gap.
   const fy = await memo(`fyh:${symbol}:${range}:${interval}`, 60_000, () => fyersHouseHistory(symbol, range, interval));
-  if (fy && fy.length) return fy;
+  if (fy && fy.length >= 5) return fy;   // a thin (e.g. 1-candle) house response falls through to Yahoo
   /* YAHOO INTRADAY IS CAPPED (1m ~7d, other minute ~60d). Requesting `range=3mo&interval=5m` makes Yahoo
      422 and return nothing — which was leaving the optimiser with 0 candles when the FYERS feed missed.
      For intraday, request an explicit clamped period window instead (same trick /api/history uses). */
@@ -2888,7 +2890,7 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
-    build: "news-by-name-17",   // bump on deploy so we can confirm which build is live
+    build: "history-thin-fyers-18",   // bump on deploy so we can confirm which build is live
   });
 });
 
