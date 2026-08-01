@@ -373,13 +373,25 @@ async function deleteIdea(id, owner) {
   const all = readJSON(FILES.ideas);
   if (all[id] && (!owner || all[id].owner === owner)) { delete all[id]; writeJSON(FILES.ideas, all); }
 }
+/* The list NEVER returns the base64 `screenshot` blob — that was the single biggest source of DB
+   egress (up to 1000 data-URLs per request). Instead it returns a `has_screenshot` flag; the client
+   lazy-loads each image from /api/ideas/:id/screenshot only for the cards it actually renders. */
 async function listIdeas() {
   if (USING_PG) {
-    const r = await pool.query(`SELECT id, owner, owner_name, symbol, direction, note, target, stop, created_at, tags, screenshot, status FROM ideas ORDER BY created_at DESC LIMIT 1000`);
-    return r.rows.map((x) => ({ ...x, created_at: Number(x.created_at), tags: x.tags || [], status: x.status || "approved" }));
+    const r = await pool.query(`SELECT id, owner, owner_name, symbol, direction, note, target, stop, created_at, tags, status, (screenshot IS NOT NULL) AS has_screenshot FROM ideas ORDER BY created_at DESC LIMIT 400`);
+    return r.rows.map((x) => ({ ...x, created_at: Number(x.created_at), tags: x.tags || [], status: x.status || "approved", hasScreenshot: !!x.has_screenshot }));
   }
   const all = readJSON(FILES.ideas);
-  return Object.values(all).map((x) => ({ ...x, tags: x.tags || [], status: x.status || "approved" })).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  return Object.values(all).map((x) => { const { screenshot, ...rest } = x; return { ...rest, tags: x.tags || [], status: x.status || "approved", hasScreenshot: !!screenshot }; }).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+}
+/* Fetch ONE idea's screenshot on demand (data-URL string or null). Keeps the heavy blob out of the list. */
+async function getIdeaScreenshot(id) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT screenshot FROM ideas WHERE id=$1`, [String(id)]);
+    return r.rows[0] ? (r.rows[0].screenshot || null) : null;
+  }
+  const all = readJSON(FILES.ideas);
+  return all[id] ? (all[id].screenshot || null) : null;
 }
 
 /* --------------------------------- state --------------------------------- */
@@ -683,4 +695,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

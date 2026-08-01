@@ -32,6 +32,26 @@ test("SL hit: entry 100, SL 1% → -1% return, exit at 99, P&L -1", () => {
   assert.equal(r.pnl, -1);        // 99 - 100
 });
 
+test("SHORT TP hit: entry 100, TP 2% → target 98 hit on a drop, P&L +2 (price fell)", () => {
+  // Short profits when price falls; TP sits BELOW at 98. A bar dipping to 97 books the win.
+  const r = evalExitPair(1, 2, [ev([bar(100, 100, 100, 100), bar(99, 100, 97, 98)])], 200, true);
+  assert.equal(r.tpHit, 1);
+  assert.equal(r.slHit, 0);
+  assert.equal(r.winRate, 100);
+  assert.equal(r.retPct, 2);      // +tp% in the short's favour
+  assert.equal(r.pnl, 2);         // entry 100 - exit 98
+});
+
+test("SHORT SL hit: entry 100, SL 1% → stop 101 hit on a rise, P&L -1 (price rose)", () => {
+  // Short's stop sits ABOVE at 101. A bar rising to 102 stops it out for a loss.
+  const r = evalExitPair(1, 5, [ev([bar(100, 100, 100, 100), bar(100, 102, 99, 101)])], 200, true);
+  assert.equal(r.slHit, 1);
+  assert.equal(r.tpHit, 0);
+  assert.equal(r.winRate, 0);
+  assert.equal(r.retPct, -1);
+  assert.equal(r.pnl, -1);        // entry 100 - exit 101
+});
+
 test("No level touched → exits at the window's last close", () => {
   const r = evalExitPair(10, 10, [ev([bar(100, 100, 100, 100), bar(100, 101, 99, 100.5)])]);
   assert.equal(r.slHit, 0);

@@ -213,3 +213,37 @@ test("priceExitFired: nothing fires when no level is touched", () => {
   const after = [mk(100, 101, 99, 100.5, 1, 1)];
   assert.equal(E.priceExitFired(pos, after).fired, false);
 });
+
+test("priceExitFired SHORT: stop-loss fires when price RISES into the stop", () => {
+  // Short at 100, sl 1% → stop is ABOVE at 101. A rising bar (high 101.2) hits the stop = a loss.
+  const pos = { entry: 100, sl: 1, tp: 3, entryAt: 0, short: true };
+  const after = [mk(100, 101.2, 100.5, 100.8, 1, 1)];
+  const r = E.priceExitFired(pos, after);
+  assert.equal(r.fired, true);
+  assert.equal(r.reason, "Stop loss");
+  assert.ok(approx(r.price, 101));
+});
+
+test("priceExitFired SHORT: take-profit fires when price FALLS to the target", () => {
+  // Short at 100, tp 3% → target is BELOW at 97. A falling bar (low 96.5) books the profit.
+  const pos = { entry: 100, sl: 1, tp: 3, entryAt: 0, short: true };
+  const after = [mk(100, 100.2, 96.5, 97, 1, 1)];
+  const r = E.priceExitFired(pos, after);
+  assert.equal(r.fired, true);
+  assert.equal(r.reason, "Take profit");
+  assert.ok(approx(r.price, 97));
+});
+
+test("priceExitFired SHORT via side:SELL: same as short flag", () => {
+  const pos = { entry: 100, sl: 1, tp: 3, entryAt: 0, side: "SELL" };
+  const r = E.priceExitFired(pos, [mk(100, 101.5, 100.5, 101, 1, 1)]);
+  assert.equal(r.fired, true);
+  assert.equal(r.reason, "Stop loss");
+});
+
+test("priceExitFired SHORT: a price DROP does not trigger the stop (would for a long)", () => {
+  // A long at 100 sl 1% would stop at 99 on this drop; a short must NOT stop out on a favorable drop.
+  const pos = { entry: 100, sl: 1, tp: 10, entryAt: 0, short: true };
+  const after = [mk(100, 100.1, 98.5, 98.7, 1, 1)];
+  assert.equal(E.priceExitFired(pos, after).fired, false);
+});

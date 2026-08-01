@@ -387,10 +387,29 @@ function entrySignalFired(cfg, rawCandles) {
 function priceExitFired(pos, rawCandles) {
   const { tp, sl, tsl, entry, entryAt } = pos || {};
   if (!(entry > 0) || (!tp && !sl && !tsl)) return { fired: false };
+  const short = String(pos && pos.side).toUpperCase() === "SELL" || pos?.short === true;
+  const after = (rawCandles || []).filter((c) => c && c.t > (entryAt || 0) && c.c != null);
+  if (short) {
+    // Short: profit when price FALLS. TP below entry, stops above. Trailing stop tracks the low.
+    const target = tp ? entry * (1 - Number(tp) / 100) : null;
+    const hardStop = sl ? entry * (1 + Number(sl) / 100) : null;
+    let trough = entry;
+    for (const c of after) {
+      const trailStop = tsl ? trough * (1 + Number(tsl) / 100) : null;
+      const stop = Math.min(hardStop == null ? Infinity : hardStop, trailStop == null ? Infinity : trailStop);
+      const hasStop = stop < Infinity;
+      if (hasStop && c.h >= stop) {
+        const label = (trailStop != null && stop === trailStop) ? "Trailing stop" : "Stop loss";
+        return { fired: true, price: +stop.toFixed(6), reason: label };
+      }
+      if (target != null && c.l <= target) return { fired: true, price: +target.toFixed(6), reason: "Take profit" };
+      if (c.l < trough) trough = c.l;
+    }
+    return { fired: false };
+  }
   const target = tp ? entry * (1 + Number(tp) / 100) : null;
   const hardStop = sl ? entry * (1 - Number(sl) / 100) : null;
   let peak = entry;
-  const after = (rawCandles || []).filter((c) => c && c.t > (entryAt || 0) && c.c != null);
   for (const c of after) {
     const trailStop = tsl ? peak * (1 - Number(tsl) / 100) : null;
     const stop = Math.max(hardStop == null ? -Infinity : hardStop, trailStop == null ? -Infinity : trailStop);

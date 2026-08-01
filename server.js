@@ -325,7 +325,9 @@ app.post("/api/username", requireAuth, async (req, res) => {
    Anyone signed in can publish their own strategy; everyone can browse them. */
 app.get("/api/public-strategies", async (req, res) => {
   try {
-    let list = typeof db.listPublicStrategies === "function" ? await db.listPublicStrategies() : [];
+    // Cache the shared list for a couple of minutes so the Automate "Public" tab loading doesn't
+    // re-scan the whole table per visitor — another egress lever with no UX impact (list changes rarely).
+    let list = typeof db.listPublicStrategies === "function" ? await memo("pubstrats:list", 120_000, () => db.listPublicStrategies()) : [];
     const sym = (req.query.symbol || "").trim();
     const by = (req.query.by || "").trim().toLowerCase();
     if (sym) list = list.filter((s) => (s.symbols || []).includes(sym));
@@ -345,6 +347,7 @@ app.post("/api/public-strategies", requireAuth, async (req, res) => {
       id, owner: phone, owner_name: ownerName,
       name: s.name || "Strategy", symbols: s.symbols || [], data: s.cfg || s.data || {}, created_at: Date.now(),
     });
+    cache.delete("pubstrats:list");
     res.json({ ok: true, strategy: row });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -354,6 +357,7 @@ app.delete("/api/public-strategies/:id", requireAuth, async (req, res) => {
     const phone = stripPh(req.authUserId);
     const isAdm = isAdmin(req);
     await db.unpublishStrategy(req.params.id, isAdm ? "" : phone);
+    cache.delete("pubstrats:list");
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -362,7 +366,9 @@ app.delete("/api/public-strategies/:id", requireAuth, async (req, res) => {
    Any signed-in user can post an idea; everyone can browse them. */
 app.get("/api/ideas", async (req, res) => {
   try {
-    let list = typeof db.listIdeas === "function" ? await db.listIdeas() : [];
+    // Ideas change rarely and the payload is now screenshot-free, so cache the whole list for a few
+    // minutes and serve every request from memory — collapses the app's ideas polling to ~1 DB read.
+    let list = typeof db.listIdeas === "function" ? await memo("ideas:list", 180_000, () => db.listIdeas()) : [];
     const sym = (req.query.symbol || "").trim();
     const by = (req.query.by || "").trim().toLowerCase();
     if (sym) list = list.filter((i) => i.symbol === sym);
@@ -396,8 +402,23 @@ app.post("/api/ideas", requireAuth, async (req, res) => {
       note: String(b.note || "").slice(0, 600), target: String(b.target || "").slice(0, 24), stop: String(b.stop || "").slice(0, 24),
       tags, screenshot, status: "pending", created_at: Date.now(),
     });
+    cache.delete("ideas:list");   // new idea → refresh the cached list on the next read
     res.json({ ok: true, idea: row });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* Lazy screenshot fetch — the list omits the heavy base64 blob; the client requests each image only
+   for the cards it renders. Screenshots are immutable once posted, so cache hard (memory + browser). */
+app.get("/api/ideas/:id/screenshot", async (req, res) => {
+  try {
+    const dataUrl = await memo("ideashot:" + req.params.id, 3_600_000, () => db.getIdeaScreenshot(req.params.id));
+    if (!dataUrl || typeof dataUrl !== "string") return res.status(404).end();
+    const m = /^data:(image\/[a-zA-Z+.-]+);base64,(.*)$/.exec(dataUrl);
+    if (!m) return res.status(404).end();
+    res.set("Cache-Control", "public, max-age=86400, immutable");   // browser caches for a day
+    res.type(m[1]);
+    res.send(Buffer.from(m[2], "base64"));
+  } catch (e) { res.status(500).end(); }
 });
 
 /* Admin approves or rejects a pending idea before it becomes public. */
@@ -406,6 +427,7 @@ app.post("/api/ideas/:id/review", requireAuth, async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: "admin only" });
     const status = req.body && req.body.status === "approved" ? "approved" : "rejected";
     if (typeof db.reviewIdea === "function") await db.reviewIdea(req.params.id, status);
+    cache.delete("ideas:list");
     res.json({ ok: true, status });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -414,6 +436,7 @@ app.delete("/api/ideas/:id", requireAuth, async (req, res) => {
   try {
     const phone = stripPh(req.authUserId);
     await db.deleteIdea(req.params.id, isAdmin(req) ? "" : phone);
+    cache.delete("ideas:list"); cache.delete("ideashot:" + req.params.id);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1757,6 +1780,7 @@ function collectMetricEntries(conds, raw) {
   return out;
 }
 function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, maxSl = 0) {
+  const short = !!(cfg && (cfg.side === "SELL" || cfg.short === true));   // score a sell-mirror as a SHORT
   const collect = cfg.mode === "metric" ? (raw) => collectMetricEntries(cfg.entry, raw) : (raw) => collectEntries(cfg, raw);
   let events = [];
   for (const raw of candleSets) events = events.concat(collect(raw));
@@ -1773,9 +1797,9 @@ function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, max
   const SL_MAX = Number(maxSl) > 0 ? Number(maxSl) : 0;
   const sls = SL_MAX > 0 ? OPT_SLS.filter((sl) => sl <= SL_MAX + 1e-9) : OPT_SLS;
   const slGrid = sls.length ? sls : [Math.min(...OPT_SLS)];   // if the cap is below every candidate, keep the smallest
-  for (const sl of slGrid) for (const tp of OPT_TPS) { if (RR_MIN > 0 && tp < sl * RR_MIN) continue; const r = evalExitPair(sl, tp, inS); if (r) results.push(r); }
+  for (const sl of slGrid) for (const tp of OPT_TPS) { if (RR_MIN > 0 && tp < sl * RR_MIN) continue; const r = evalExitPair(sl, tp, inS, 200, short); if (r) results.push(r); }
   // If the floor was so strict nothing qualified, fall back to the full grid (still honouring the SL cap).
-  if (!results.length && RR_MIN > 0) { for (const sl of slGrid) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS); if (r) results.push(r); } }
+  if (!results.length && RR_MIN > 0) { for (const sl of slGrid) for (const tp of OPT_TPS) { const r = evalExitPair(sl, tp, inS, 200, short); if (r) results.push(r); } }
   if (!results.length) return { entries: events.length };
   const minTrades = Math.min(8, Math.max(3, Math.floor(inS.length * 0.05)));
   const rank = optRanker(objective);
@@ -1783,15 +1807,15 @@ function optimizeExits(cfg, candleSets, cur, objective = "pnl", rrMin = 1.5, max
   const ranked = (pool.length ? pool : results).slice().sort(rank);
   const bp = ranked[0];
   // Report best + current on the FULL event set (fair prev-vs-new); validate best out-of-sample.
-  const best = evalExitPair(bp.sl, bp.tp, events);
-  const oos = outS.length ? evalExitPair(bp.sl, bp.tp, outS) : null;
-  const current = (cur && cur.sl > 0 && cur.tp > 0) ? evalExitPair(cur.sl, cur.tp, events) : null;
+  const best = evalExitPair(bp.sl, bp.tp, events, 200, short);
+  const oos = outS.length ? evalExitPair(bp.sl, bp.tp, outS, 200, short) : null;
+  const current = (cur && cur.sl > 0 && cur.tp > 0) ? evalExitPair(cur.sl, cur.tp, events, 200, short) : null;
   return { entries: events.length, best, oos, current, objective, top: ranked.slice(0, 5) };
 }
 app.post("/api/optimize-exits", async (req, res) => {
   try {
     const body = req.body || {};
-    const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m") };
+    const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m"), side: body.side || (body.short ? "SELL" : null) };
     let syms = Array.isArray(body.symbols) ? body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
     syms = [...new Set(syms)].slice(0, 6);
     if (!cfg.entry.length || !syms.length) return res.json({ entries: 0 });
@@ -1807,7 +1831,7 @@ app.post("/api/optimize-exits", async (req, res) => {
     // length-based key could collide and return another strategy's optimisation).
     const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
     let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
-    const key = "optexit:" + h.toString(36) + ":" + objective + ":rr" + rrMin + ":mx" + maxSl + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
+    const key = "optexit:" + h.toString(36) + ":" + objective + ":rr" + rrMin + ":mx" + maxSl + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (cfg.side === "SELL" ? "S" : "L") + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const sets = [];
       for (const sym of syms) { try { const c = await candlesForOpt(sym, range, interval); if (c && c.length) sets.push(c); } catch { /* skip */ } }
@@ -1825,7 +1849,7 @@ app.post("/api/optimize-exits", async (req, res) => {
    strategy's current pair, so the comparison isolates entry quality. A greedy coordinate descent keeps
    the search bounded: pick the best timeframe, then tune each indicator's length one at a time. */
 const IND_TFS = ["3m", "5m", "15m", "30m", "1h"];   // never above 1h, by product rule
-function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5) {
+function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5, short = false) {
   const cfg = { defs, entry, tf, mode };
   let events = [];
   for (const raw of sets) {
@@ -1833,12 +1857,13 @@ function evalIndicatorCfg(defs, entry, tf, mode, sets, sl, tp, minTrades = 5) {
     events = events.concat(ev);
   }
   if (events.length > 800) { const step = Math.ceil(events.length / 800); events = events.filter((_, k) => k % step === 0); }
-  const r = evalExitPair(sl, tp, events);
+  const r = evalExitPair(sl, tp, events, 200, short);
   if (!r) return null;
   if (r.trades < minTrades) return null;      // too few signals to trust — treat as no result
   return r;
 }
 function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) {
+  const short = !!(cfg && (cfg.side === "SELL" || cfg.short === true));   // score a sell-mirror as a SHORT
   const sl = cur.sl > 0 ? cur.sl : 1;
   const tp = cur.tp > 0 ? cur.tp : 2;
   const rank = optRanker(objective);
@@ -1851,7 +1876,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
     const sets = tfSets[tf];
     if (!sets || !sets.length) continue;
     let curDefs = baseDefs.map((d) => ({ ...d, tf }));
-    let curMetrics = evalIndicatorCfg(curDefs, cfg.entry, tf, cfg.mode, sets, sl, tp);
+    let curMetrics = evalIndicatorCfg(curDefs, cfg.entry, tf, cfg.mode, sets, sl, tp, 5, short);
     for (let i = 0; i < curDefs.length; i++) {          // tune each indicator's length in turn
       const opts = lenOptions(curDefs[i].len);
       if (!opts) continue;
@@ -1859,7 +1884,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
       for (const L of opts) {
         if (String(L) === String(curDefs[i].len)) continue;
         const trial = curDefs.map((d, j) => j === i ? { ...d, len: String(L) } : d);
-        const m = evalIndicatorCfg(trial, cfg.entry, tf, cfg.mode, sets, sl, tp);
+        const m = evalIndicatorCfg(trial, cfg.entry, tf, cfg.mode, sets, sl, tp, 5, short);
         if (better(m, bestMetrics)) { bestDefs = trial; bestMetrics = m; }
       }
       curDefs = bestDefs; curMetrics = bestMetrics;
@@ -1868,7 +1893,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
   }
   const curTf = cfg.tf || "5m";
   const curSets = tfSets[curTf] || tfSets[IND_TFS.find((t) => tfSets[t] && tfSets[t].length)] || [];
-  const current = curSets.length ? evalIndicatorCfg(baseDefs.map((d) => ({ ...d, tf: curTf })), cfg.entry, curTf, cfg.mode, curSets, sl, tp, 1) : null;
+  const current = curSets.length ? evalIndicatorCfg(baseDefs.map((d) => ({ ...d, tf: curTf })), cfg.entry, curTf, cfg.mode, curSets, sl, tp, 1, short) : null;
   if (!globalBest || !globalBest.metrics) return { entries: current ? current.trades : 0, current: current ? { ...current, tf: curTf } : null };
   const changes = globalBest.defs.map((d, i) => {
     const o = baseDefs[i] || {};
@@ -1884,7 +1909,7 @@ function optimizeIndicators(cfg, tfSets, cur, objective = "pnl", lockTf = null) 
 app.post("/api/optimize-indicators", async (req, res) => {
   try {
     const body = req.body || {};
-    const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m") };
+    const cfg = { defs: body.defs || [], entry: body.entry || [], tf: String(body.tf || "5m"), side: body.side || (body.short ? "SELL" : null) };
     if (body.mode === "metric") cfg.mode = "metric";
     let syms = Array.isArray(body.symbols) ? body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
     syms = [...new Set(syms)].slice(0, 4);
@@ -1897,7 +1922,7 @@ app.post("/api/optimize-indicators", async (req, res) => {
     const cur = { sl: Number(body.currentSl) || 0, tp: Number(body.currentTp) || 0 };
     const sig = JSON.stringify({ e: cfg.entry, d: cfg.defs, m: cfg.mode || "candle" });
     let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h * 33) ^ sig.charCodeAt(i)) >>> 0;
-    const key = "optind:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (lockTf || "all") + ":" + syms.slice().sort().join(",");
+    const key = "optind:" + h.toString(36) + ":" + objective + ":" + cur.sl + "/" + cur.tp + ":" + cfg.tf + ":" + (lockTf || "all") + ":" + (cfg.side === "SELL" ? "S" : "L") + ":" + syms.slice().sort().join(",");
     const out = await memo(key, 30 * 60_000, async () => {
       const tfSets = {};
       // Only fetch the timeframes we'll actually search — a locked tf fetches ONE, not all five.
@@ -2362,14 +2387,39 @@ async function candlesForOpt(symbol, range = "3mo", interval = "5m") {
   return best;
 }
 
-// Same rules as the in-app engine: TP / hard SL / trailing SL, worst-case on ties.
+// True when the trade is a SHORT (opened with a SELL). For a short, profit comes from the price
+// FALLING, so TP sits BELOW entry and the stop sits ABOVE it — the mirror image of a long.
+function isShortTrade(trade) {
+  return String(trade && trade.side).toUpperCase() === "SELL" || trade?.short === true;
+}
+// Same rules as the in-app engine: TP / hard SL / trailing SL, worst-case on ties. Direction-aware:
+// a LONG exits on a drop to its stop or a rise to its target; a SHORT is the mirror.
 function resolveExit(trade, candles) {
   const { tp, sl, tsl, entry, entryAt } = trade;
   if (!tp && !sl && !tsl) return null;
+  const rows = candles.filter((c) => c.t > (entryAt || 0));
+  if (isShortTrade(trade)) {
+    // Short: TP below entry, stops above. Trailing stop tracks the LOWEST price reached.
+    const target = tp ? entry * (1 - tp / 100) : null;
+    const hardStop = sl ? entry * (1 + sl / 100) : null;
+    let trough = entry;
+    for (const c of rows) {
+      const trailStop = tsl ? trough * (1 + tsl / 100) : null;
+      const stop = Math.min(hardStop ?? Infinity, trailStop ?? Infinity);
+      const hasStop = stop < Infinity;
+      const hitStop = hasStop && c.h >= stop;              // price rose into the stop → loss
+      const hitTarget = target != null && c.l <= target;   // price fell to target → profit
+      const stopLabel = (trailStop != null && stop === trailStop) ? "Trailing stop" : "Stop loss";
+      if (hitStop) return { exit: +stop.toFixed(2), exitAt: c.t, exitType: stopLabel };
+      if (hitTarget) return { exit: +target.toFixed(2), exitAt: c.t, exitType: "Exit trigger" };
+      if (c.l < trough) trough = c.l;
+    }
+    return null;
+  }
   const target = tp ? entry * (1 + tp / 100) : null;
   const hardStop = sl ? entry * (1 - sl / 100) : null;
   let peak = entry;
-  for (const c of candles.filter((c) => c.t > (entryAt || 0))) {
+  for (const c of rows) {
     const trailStop = tsl ? peak * (1 - tsl / 100) : null;
     const stop = Math.max(hardStop ?? -Infinity, trailStop ?? -Infinity);
     const hasStop = stop > -Infinity;
@@ -2418,7 +2468,8 @@ async function runExitMonitor() {
         }
         if (!hit) continue;
         const qty = trade.qty || 1;
-        const updated = { ...trade, ...hit, pnl: +((hit.exit - trade.entry) * qty).toFixed(2) };
+        const dir = isShortTrade(trade) ? -1 : 1;   // a short profits when price falls
+        const updated = { ...trade, ...hit, pnl: +((hit.exit - trade.entry) * qty * dir).toFixed(2) };
         await db.updateTrade(userId, updated);
         closed++;
         console.log(`[monitor] closed ${trade.sym} for ${userId} @ ${hit.exit} (${hit.exitType})`);
@@ -3115,11 +3166,19 @@ function sanitizeAiConds(arr) {
     }).slice(0, 8);
 }
 app.post("/api/ai/strategy", llmLimiter, async (req, res) => {
-  const text = String((req.body && req.body.text) || "").slice(0, 500);
+  // 800 chars (was 500) so a rich multi-condition prompt isn't truncated mid-rule — a real limiter on
+  // how "smart" Neo could be. Still bounded to keep token cost predictable.
+  const text = String((req.body && req.body.text) || "").slice(0, 800);
   if (!text.trim()) return res.status(400).json({ error: "text required" });
   const chain = providers();
   if (!chain.length) return res.status(500).json({ error: "no LLM configured" });
   const withTimeout = (p, ms, l) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error(`${l}: timeout`)), ms))]);
+  /* TOKEN SAVER: interpretation is deterministic for a given prompt, so cache the RESULT by prompt text
+     for an hour. Identical prompts (the same strategy typed by many users, or retried) never re-bill the
+     GROQ/LLM tokens — the single biggest lever on API spend for this endpoint. */
+  const cacheKey = "aistrat:" + text.trim().toLowerCase().replace(/\s+/g, " ");
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.t < 3_600_000) return res.json(cached.v);
   for (const p of chain) {
     try {
       const out = await withTimeout(p.fn(AI_STRAT_SYS, [{ role: "user", content: text }], 500), 8000, p.name);
@@ -3132,7 +3191,11 @@ app.post("/api/ai/strategy", llmLimiter, async (req, res) => {
       // Pass through optional SL/TP percentages when the model extracted them (0 < x <= 100).
       const okPct = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 && n <= 100 ? +n : null; };
       const sl = okPct(parsed.sl), tp = okPct(parsed.tp);
-      if (entry.length || exit.length) return res.json({ entry, exit, defs, ...(sl ? { sl } : {}), ...(tp ? { tp } : {}), engine: "Neo" });
+      if (entry.length || exit.length) {
+        const payload = { entry, exit, defs, ...(sl ? { sl } : {}), ...(tp ? { tp } : {}), engine: "Neo" };
+        cache.set(cacheKey, { v: payload, t: Date.now() });
+        return res.json(payload);
+      }
     } catch (e) { console.error("[ai/strategy]", p.name, e.message); }
   }
   res.status(502).json({ error: "couldn't interpret" });
@@ -4326,7 +4389,7 @@ app.post("/api/broker/order", async (req, res) => {
   const tslPct = Number(req.body?.tslPct) || 0;
   const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
   async function registerAutoExit() {
-    if (!wantAutoExit || String(side).toLowerCase() !== "buy") return null;
+    if (!wantAutoExit) return null;   // register for BOTH longs and shorts (exit math is direction-aware)
     // All brokers now have order placement wired, so any of them can be auto-exited.
     try {
       const bareSym = String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "");
@@ -4338,6 +4401,7 @@ app.post("/api/broker/order", async (req, res) => {
         sess, symbol: bareSym, brokerSym: symbol, qty: nQty, entry: entryRef,
         market: regMarket, sl: slPct || null, tp: tpPct || null, tsl: tslPct || null,
         cfg: exitCfg, yahoo, interval: req.body?.interval || "5m",
+        short: String(side).toLowerCase() === "sell",
       });
       return pos.id;
     } catch (e) { console.error("[autoexit] register failed:", e.message); return null; }
@@ -4459,7 +4523,7 @@ app.post("/api/broker/order", async (req, res) => {
          with the app closed. Best-effort and honestly reported: the entry has filled, so a
          bracket failure returns a warning rather than pretending the position is safe. */
       let bracket = null;
-      if (String(side).toLowerCase() === "buy" && (slPct > 0 || tpPct > 0)) {
+      if (slPct > 0 || tpPct > 0) {   // bracket both longs and shorts (placeDeltaBracket mirrors for sell)
         const entryRef = Number(o.average_fill_price) || Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, "Crypto");
         bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct, sess.userId);
       }
@@ -5077,10 +5141,11 @@ function mapProduct(broker, product) {
   return "CNC";
 }
 
-/* REDUCE-ONLY exit executor. Sells `qty` to CLOSE a long. Every branch is a plain sell;
-   Delta additionally sets reduce_only so it can never flip you short by accident. The exit
-   MUST use the same product the entry used (closing an MIS position with CNC would fail). */
-async function placeExitOrder(sess, symbol, qty, market, product) {
+/* REDUCE-ONLY exit executor. CLOSES a position by trading the OPPOSITE side: a long is closed
+   with a sell, a short (Delta perpetual only) with a buy. Delta additionally sets reduce_only so
+   it can never flip the position by accident. The exit MUST use the same product the entry used
+   (closing an MIS position with CNC would fail). Spot brokers can't hold shorts, so they always sell. */
+async function placeExitOrder(sess, symbol, qty, market, product, short = false) {
   const broker = sess.broker;
   const token = sess.accessToken;
   const prod = mapProduct(broker, product);
@@ -5092,7 +5157,7 @@ async function placeExitOrder(sess, symbol, qty, market, product) {
     const size = deltaCoinToContracts(prod, qty);
     const d = await deltaCall("POST", "/v2/orders", {
       userId: sess.userId,
-      body: { product_id: prod.id, size, side: "sell", order_type: "market_order", reduce_only: true },
+      body: { product_id: prod.id, size, side: short ? "buy" : "sell", order_type: "market_order", reduce_only: true },
     });
     return { orderId: d.result?.id ?? null };
   }
@@ -5173,7 +5238,7 @@ async function placeExitOrder(sess, symbol, qty, market, product) {
 
 /* Register a real position for the engine to watch. Called from /api/broker/order after a
    real buy that opted into auto-exit. Persists the creds needed to act on it later. */
-async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval, product }) {
+async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval, product, short = false }) {
   await persistSessionCred(sess);
   const pos = {
     id: crypto.randomBytes(16).toString("hex"),
@@ -5181,6 +5246,7 @@ async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, ma
     symbol, brokerSym, qty: Number(qty), entry: Number(entry) || null,
     entryAt: Date.now(), market: market || "Crypto",
     sl: sl || null, tp: tp || null, tsl: tsl || null,
+    short: !!short,                         // SHORT position → exit/SL/TP are mirrored, close with a BUY
     product: product || "CNC",              // so the exit closes with the SAME product as entry
     cfg: cfg || null,                       // strategy { defs, exit } for indicator exits
     yahoo: yahoo || symbol, interval: interval || (market === "IN" || market === "Commodity" ? "5m" : "5m"),
@@ -5256,7 +5322,7 @@ async function runAutoExitEngine() {
         const sess = await sessionFromCred(pos.userId, pos.broker);
         if (!sess) { await db.updateManagedPosition(pos.id, { status: "open", lastError: "no stored credentials — reconnect broker" }); continue; }
 
-        const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product);
+        const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
         await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null });
         exited++;
         console.log(`[autoexit] EXITED ${pos.symbol} for ${pos.userId} via ${pos.broker} — ${hit.reason} (order ${r.orderId})`);
@@ -5335,9 +5401,9 @@ const AB_MAX_POSITIONS = Number(process.env.AUTO_BUY_MAX_POSITIONS) || 100000;  
 const AB_MAX_NOTIONAL = Number(process.env.AUTO_BUY_MAX_NOTIONAL) || 0;   // 0 = only the user's amount
 const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 1000;   // in-flight window: never re-submit while a pending order is unresolved
 
-/* A real BUY to OPEN a position. Same per-broker plumbing as the manual order route, kept
-   to the brokers whose order placement is wired. */
-async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null) {
+/* A real order to OPEN a position. `short` opens a SELL (Delta perpetual only) instead of a buy;
+   spot brokers can't short, so they always buy. Same per-broker plumbing as the manual order route. */
+async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null, short = false) {
   const broker = sess.broker, token = sess.accessToken;
   const prod = mapProduct(broker, product);
   if (broker === "delta") {
@@ -5350,7 +5416,8 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     const { cv, contracts } = deltaContracts(dprod, qty);
     if (contracts < 1) throw new Error(`Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.`);
     assertDeltaTradable(sess.userId);   // sign with the user's own keys; refuse if they have none
-    const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: { product_id: dprod.id, size: contracts, side: "buy", order_type: "market_order" } });
+    const entrySide = short ? "sell" : "buy";
+    const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: { product_id: dprod.id, size: contracts, side: entrySide, order_type: "market_order" } });
     // HTTP 200 is NOT a fill — verify, and throw the real reason on a reject/no-fill.
     const o = d.result || {};
     const sizeC = Number(o.size) || contracts;                                   // contracts
@@ -5365,7 +5432,7 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     let bracket = null;
     if (Number(slPct) > 0 || Number(tpPct) > 0) {
       const entryRef = o.average_fill_price != null ? Number(o.average_fill_price) : (await liveMarkForOrder(symbol, "Crypto"));
-      try { bracket = await placeDeltaBracket(dprod, "buy", entryRef, slPct, tpPct, sess.userId); }
+      try { bracket = await placeDeltaBracket(dprod, entrySide, entryRef, slPct, tpPct, sess.userId); }
       catch (e) { bracket = { placed: false, message: String(e.message || e) }; }
     }
     // Return COIN units (contracts × contract_value) so the stored position + P&L stay correct.
@@ -5484,12 +5551,12 @@ async function runAutoBuyEngine() {
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
         // price, so P&L reflects what really executed, not what we requested.
-        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null);
+        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null, !!st.short);
         const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
         const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : px;
         const pos = await registerManagedPosition({
           sess, symbol: st.symbol, brokerSym: st.brokerSym, qty: fillQty, entry: fillPx, market: st.market,
-          sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product,
+          sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: !!st.short,
         });
         await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null });
         posCache.delete(st.userId);   // this user's positions changed — re-read next time it's needed
@@ -5520,7 +5587,7 @@ app.post("/api/autobuy/register", async (req, res) => {
   if (!sess) return res.status(401).json({ error: "connect the broker first" });
   const b = sess.broker;
   if (!["delta", "coindcx", "zerodha", "fyers"].includes(b)) return res.status(400).json({ error: `auto-buy isn't supported for ${b} yet` });
-  const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product } = req.body || {};
+  const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product, short } = req.body || {};
   if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
   if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
   try {
@@ -5537,6 +5604,7 @@ app.post("/api/autobuy/register", async (req, res) => {
       symbol: symbol || String(brokerSym), brokerSym, market: market || "Crypto",
       cfg, notional: Number(notional), interval: interval || "5m",
       product: product || "CNC",              // "Intraday" (MIS/INTRADAY) or "Delivery/NRML" (CNC)
+      short: !!short,                         // SHORT strategy → open a SELL, mirror the exit
       sl: sl || null, tp: tp || null, tsl: tsl || null,
       yahoo: yahoo || (market === "Crypto" ? `${String(brokerSym).replace(/(USDT|USD|INR)$/i, "")}-USD` : `${String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "")}.NS`),
       status: "active", createdAt: Date.now(), openPositionId: null,
@@ -5596,7 +5664,7 @@ app.post("/api/autobuy/close", async (req, res) => {
     const sess = await sessionFromCred(userId, pos.broker || strat.broker);
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
     await db.updateManagedPosition(pos.id, { status: "closing" });
-    const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product);
+    const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
     await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close", exitOrderId: r.orderId || null });
     await db.updateRealStrategy(id, { status: "cancelled" });
     res.json({ ok: true, closed: true, orderId: r.orderId || null });

@@ -21,20 +21,22 @@
  *  - retPct   = SUM of per-trade % returns (not the average)
  *  - pnl      = SUM of per-trade absolute moves (exitPx - entryPx), i.e. P&L per 1 unit/contract
  */
-function evalExitPair(sl, tp, events, maxBars = 200) {
+function evalExitPair(sl, tp, events, maxBars = 200, short = false) {
   let n = 0, wins = 0, sumWin = 0, sumLoss = 0, sumRet = 0, slHit = 0, tpHit = 0, pnlAbs = 0;
   for (const ev of events) {
     const c = ev.c, e = ev.e, px = c[e].c;
     if (!(px > 0)) continue;
-    const target = px * (1 + tp / 100), stop = px * (1 - sl / 100);
+    // A SHORT mirrors the levels: TP sits BELOW entry, stop ABOVE, and it profits when price falls.
+    const target = short ? px * (1 - tp / 100) : px * (1 + tp / 100);
+    const stop = short ? px * (1 + sl / 100) : px * (1 - sl / 100);
     const end = Math.min(e + maxBars, c.length - 1);
     let ret = null, exitPx = null;
     for (let j = e + 1; j <= end; j++) {
-      if (c[j].l <= stop) { ret = -sl; exitPx = stop; slHit++; break; }        // stop first on a same-bar tie
-      if (c[j].h >= target) { ret = tp; exitPx = target; tpHit++; break; }
+      if (short ? c[j].h >= stop : c[j].l <= stop) { ret = -sl; exitPx = stop; slHit++; break; }   // stop first on a same-bar tie
+      if (short ? c[j].l <= target : c[j].h >= target) { ret = tp; exitPx = target; tpHit++; break; }
     }
-    if (ret === null) { exitPx = c[end].c; ret = (exitPx / px - 1) * 100; }     // no level hit -> exit at window end
-    n++; sumRet += ret; pnlAbs += (exitPx - px);
+    if (ret === null) { exitPx = c[end].c; ret = (short ? -1 : 1) * (exitPx / px - 1) * 100; }   // no level hit -> exit at window end
+    n++; sumRet += ret; pnlAbs += (short ? (px - exitPx) : (exitPx - px));
     if (ret > 0) { wins++; sumWin += ret; } else { sumLoss += ret; }
   }
   if (!n) return null;
