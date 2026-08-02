@@ -5437,7 +5437,7 @@ app.get("/api/broker/optionchain", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
+app.get("/api/broker/portfolio", requireAuth, requireActiveUser, async (req, res) => {   // R21-P2-02: real holdings are sensitive — a stale/blocked token must not retain visibility
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
   const { broker, accessToken: token } = sess;
