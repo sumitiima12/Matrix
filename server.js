@@ -407,6 +407,17 @@ const computeLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Too many analysis requests. Please wait a minute and try again." },
 });
+/* R21-P2-11 — per-IP budget for PUBLIC market-data routes (quote/history/news/fundamentals/quotes). These call
+   upstream providers (Yahoo/Delta) and cost CPU + rate-limited API quota, so an unauthenticated caller mustn't
+   be able to hammer them. Generous enough for normal browsing (a page render fires several), hard-capped so a
+   scraper/abuser is throttled. Diagnostics/health are separately gated to non-production below. */
+const publicDataLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests — please slow down." },
+});
 
 /* P2-11 — don't leak raw upstream/internal error text (stack fragments, DB driver messages, provider
    payloads) to the client. Log the full detail server-side; return a generic message. Routes that need
@@ -452,8 +463,14 @@ app.post("/api/register", authLimiter, async (req, res) => {
       try {
         const oldUid = storageKeyFor(phone);
         const archiveKey = `arch_${existingUser.deletedAt || Date.now()}_${oldUid}`;
-        const moved = await db.reassignTrades(oldUid, archiveKey);
-        if (moved) await db.recordTradeArchive(phone, archiveKey);
+        // R21-P2-08: reassign the previous owner's trades AND register the archive in ONE transaction, so a
+        // crash can't move history without recording where it went (or leave an orphaned archive record).
+        if (typeof db.reassignAndArchiveTrades === "function") {
+          await db.reassignAndArchiveTrades(phone, oldUid, archiveKey);
+        } else {
+          const moved = await db.reassignTrades(oldUid, archiveKey);
+          if (moved) await db.recordTradeArchive(phone, archiveKey);
+        }
         if (typeof db.purgeLedgersForUser === "function") await db.purgeLedgersForUser(oldUid);
       } catch (e) {
         console.error("[register] archive of recycled-number history failed — aborting registration:", e.message);
@@ -1776,7 +1793,7 @@ function reqUserIdOptional(req) {
   } catch { return null; }
 }
 
-app.get("/api/quote", async (req, res) => {
+app.get("/api/quote", publicDataLimiter, async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
   try {
@@ -1812,7 +1829,7 @@ app.get("/api/quote", async (req, res) => {
 
 /* ------------------------------ /api/history ------------------------------ */
 // e.g. /api/history?symbol=RELIANCE.NS&range=6mo&interval=1d  -> OHLC candles
-app.get("/api/history", async (req, res) => {
+app.get("/api/history", publicDataLimiter, async (req, res) => {
   const symbol = String(req.query.symbol || "").trim();
   const range = String(req.query.range || "6mo");
   const interval = String(req.query.interval || "1d");
@@ -2374,7 +2391,7 @@ app.post("/api/momentum-scan", computeLimiter, async (req, res) => {
 
 /* -------------------------------- /api/news ------------------------------- */
 // e.g. /api/news?symbol=RELIANCE.NS  (Yahoo) — swap for NewsAPI if NEWS_API_KEY set
-app.get("/api/news", async (req, res) => {
+app.get("/api/news", publicDataLimiter, async (req, res) => {
   const symbol = String(req.query.symbol || req.query.q || "").trim();
   const name = String(req.query.name || "").trim();
   if (!symbol) return res.status(400).json({ error: "symbol/q required" });
@@ -2584,7 +2601,7 @@ async function indianApiFundamentals(symbol) {
   };
 }
 const _fundCache = new Map();   // success-only cache; failures are NOT cached so we keep retrying
-app.get("/api/fundamentals", async (req, res) => {
+app.get("/api/fundamentals", publicDataLimiter, async (req, res) => {
   const symbol = String(req.query.symbol || "").trim();
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   if (req.query.raw === "1") {   // debug: see the raw indianapi payload to verify field mapping
@@ -2638,7 +2655,7 @@ async function indiaEarnings() {
     return { recent: rows.filter((x) => x.date <= today).slice(0, 40), upcoming: rows.filter((x) => x.date > today).slice(0, 40) };
   } catch { return { recent: [], upcoming: [] }; }
 }
-app.get("/api/earnings", async (req, res) => {
+app.get("/api/earnings", publicDataLimiter, async (req, res) => {
   const market = String(req.query.market || "US");
   try {
     const out = await memo(`earn:${market}`, 60 * 60 * 1000, () => (market === "IN" ? indiaEarnings() : usEarnings()));
@@ -3186,7 +3203,7 @@ async function intradayFor(sym) {
   };
 }
 
-app.get("/api/intraday", async (req, res) => {
+app.get("/api/intraday", publicDataLimiter, async (req, res) => {
   // Same silent-truncation bug as /api/indicators: 60 < the 79-symbol Indian universe.
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 200);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
@@ -3205,7 +3222,7 @@ app.get("/api/intraday", async (req, res) => {
   }
 });
 
-app.get("/api/indicators", async (req, res) => {
+app.get("/api/indicators", publicDataLimiter, async (req, res) => {
   /* The cap used to be 60, applied with a SILENT .slice(). The Indian universe is 79
      symbols, so everything from position 61 on — RELIANCE among them — never received
      indicators at all, and its card read "Data currently unavailable" forever. The stock
@@ -4259,7 +4276,11 @@ app.post("/api/account/delete", requireAuth, requireFreshSessionAllowBlocked, as
     // Purge in-memory state for this user.
     for (const [id, s] of brokerSessions) if (s.userId === String(userId)) brokerSessions.delete(id);
     for (const k of appCredCache.keys()) if (k.startsWith(`${userId}|`)) appCredCache.delete(k);
-    res.json({ ok: true });
+    /* R21-P2-09: report the ACTUAL erasure contract rather than a blanket "deleted". Personal data (profile,
+       PIN, email, connected-broker credentials, strategies, ideas, saved config, notices, in-flight ledgers)
+       is erased; realised TRADE HISTORY is RETAINED under a de-identified stub for regulatory/audit records
+       and is no longer linked to live personal details. */
+    res.json({ ok: true, erased: ["profile", "pin", "email", "brokerCredentials", "strategies", "ideas", "config", "notices", "ledgers"], retained: ["tradeHistory"], retentionReason: "Trade records are retained (de-identified) to meet record-keeping obligations; personal details are erased." });
   } catch (e) { serverError(res, e); }
 });
 
@@ -4924,6 +4945,17 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
       if (rec && rec.status === "succeeded" && rec.response) return res.status(200).json({ ...rec.response, idempotentReplay: true });
       if (rec && rec.status === "unknown") {
         return res.status(409).json({ error: "A previous attempt with this key had an UNVERIFIED outcome. Check the order on your broker before retrying — we won't resubmit automatically.", ...(rec.response ? { previous: rec.response } : {}) });
+      }
+      /* R21-P2-05: a request that's genuinely still in flight blocks for a few seconds — but a record that's
+         been in_flight for MINUTES means the original attempt died mid-execution (crash/timeout). We must NOT
+         auto-resubmit (the broker may have received it), so instead of blocking forever we surface a RECONCILE
+         path: tell the user the outcome is unverified and to check their broker. The stamped client/broker id
+         lives in the record for that reconciliation. */
+      // Age from createdAt (set at claim time) — updatedAt is null until finalize, which a stuck record never reaches.
+      const ageMs = rec ? (Date.now() - (rec.createdAt || rec.updatedAt || Date.now())) : 0;
+      const STALE_INFLIGHT_MS = Number(process.env.IDEM_STALE_MS) || 120_000;
+      if (rec && ageMs > STALE_INFLIGHT_MS) {
+        return res.status(409).json({ error: "A previous attempt with this key never confirmed (it may have reached your broker). Check your broker before retrying — we won't resubmit automatically.", staleMs: ageMs });
       }
       return res.status(409).json({ error: "This order is already being placed — please wait a moment before retrying." });
     }
@@ -6880,6 +6912,11 @@ async function runProtectionWatcher() {
       // else still pending — the lease lapses and it's re-checked next sweep
     } catch (e) { console.error("[protection] sweep item failed:", e.message); }
   }
+}
+/* R21-P2-05: periodically reconcile stale idempotency records so a dead in-flight request can't block a key
+   forever — mark long-in_flight rows 'unknown' (surfaces a reconcile prompt on retry) and purge very old rows. */
+if (typeof db.reconcileStaleIdempotency === "function") {
+  setInterval(() => { db.reconcileStaleIdempotency().then((r) => { if (r && (r.markedUnknown || r.purged)) logFinancial("idempotency.reconcile", r); }).catch(() => {}); }, 5 * 60 * 1000);
 }
 const PROTECTION_MS = Math.max(30_000, Number(process.env.PROTECTION_MS) || 60_000);
 if (process.env.EXIT_MONITOR !== "off") {

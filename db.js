@@ -346,6 +346,32 @@ async function recordTradeArchive(phone, archiveKey) {
   if (USING_PG) { await pool.query(`CREATE TABLE IF NOT EXISTS trade_archives (archive_key TEXT PRIMARY KEY, phone TEXT, created_at BIGINT)`).catch(() => {}); await pool.query(`INSERT INTO trade_archives (archive_key, phone, created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [String(archiveKey), String(phone), Date.now()]).catch(() => {}); return; }
   const f = FILES.tradeArch || (FILES.tradeArch = path.join(__dirname, "trade_archives.json")); const d = readJSON(f); (d[String(phone)] = d[String(phone)] || []).push({ archiveKey: String(archiveKey), createdAt: Date.now() }); writeJSON(f, d);
 }
+/* R21-P2-08: recycled-number handoff done ATOMICALLY. When a soft-deleted phone is reused, the previous
+   owner's trades must be moved to an opaque archive key AND that archive registered as ONE unit — otherwise a
+   crash between the two steps could move history without recording where it went (orphan) or vice-versa. On
+   Postgres this runs in a single transaction; flat-file does both writes then only reports success if both
+   land. Returns the number of trades reassigned. Throws on failure so the caller can abort the registration. */
+async function reassignAndArchiveTrades(phone, fromUserId, archiveKey) {
+  if (USING_PG) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`CREATE TABLE IF NOT EXISTS trade_archives (archive_key TEXT PRIMARY KEY, phone TEXT, created_at BIGINT)`);
+      await client.query(`INSERT INTO trade_archives (archive_key, phone, created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [String(archiveKey), String(phone), Date.now()]);
+      const r = await client.query(`UPDATE trades SET user_id=$2 WHERE user_id=$1`, [String(fromUserId), String(archiveKey)]);
+      await client.query("COMMIT");
+      return r.rowCount || 0;
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw e;
+    } finally { client.release(); }
+  }
+  // Flat-file: reassign then record; if the record write throws, the reassign already happened but we surface
+  // the error so the caller aborts and can retry (idempotent — the archive key is deterministic).
+  const n = await reassignTrades(fromUserId, archiveKey);
+  await recordTradeArchive(phone, archiveKey);
+  return n;
+}
 async function getArchivedTradesForPhone(phone) {
   if (USING_PG) {
     const a = await pool.query(`SELECT archive_key FROM trade_archives WHERE phone=$1`, [String(phone)]).catch(() => ({ rows: [] }));
@@ -564,21 +590,29 @@ async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHas
    Pass { preserveTrades: false } for a genuine right-to-erasure that also wipes the trade history and the
    user row entirely.
    `userId` is the per-user storage key (trades/state/creds); `phone` is the login key. */
+/* R21-P2-09 — ERASURE CONTRACT. On account deletion we ERASE all personal + operational data (credentials,
+   config, strategies, positions, ledgers, screeners, ideas). Past TRADES are RETAINED by default
+   (preserveTrades) as a financial/audit record under a de-identified stub; the UI states this explicitly.
+   This function no longer swallows every failure: it deletes as much as possible, then if ANY store failed it
+   THROWS with the list — so the caller reports partial deletion honestly instead of a false "deleted". */
 async function deleteAccount(userId, phone, { preserveTrades = true } = {}) {
   const uid = String(userId), ph = String(phone);
   if (USING_PG) {
-    if (!preserveTrades) await pool.query(`DELETE FROM trades WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM app_state WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM broker_creds WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM broker_apps WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM managed_positions WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM real_strategies WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM risk_policy WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM automation_flags WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM user_screeners WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM ideas WHERE owner=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM public_strategies WHERE owner=$1`, [uid]).catch(() => {});
-    await purgeLedgersForUser(uid).catch(() => {});   // R17-P2-09: drop order-intent/idempotency/protection rows
+    const failed = [];
+    const del = async (label, sql, params) => { try { await pool.query(sql, params); } catch (e) { failed.push(label); console.error(`[delete] ${label} failed`, e.message); } };
+    if (!preserveTrades) await del("trades", `DELETE FROM trades WHERE user_id=$1`, [uid]);
+    await del("app_state", `DELETE FROM app_state WHERE user_id=$1`, [uid]);
+    await del("broker_creds", `DELETE FROM broker_creds WHERE user_id=$1`, [uid]);
+    await del("broker_apps", `DELETE FROM broker_apps WHERE user_id=$1`, [uid]);
+    await del("managed_positions", `DELETE FROM managed_positions WHERE user_id=$1`, [uid]);
+    await del("real_strategies", `DELETE FROM real_strategies WHERE user_id=$1`, [uid]);
+    await del("risk_policy", `DELETE FROM risk_policy WHERE user_id=$1`, [uid]);
+    await del("automation_flags", `DELETE FROM automation_flags WHERE user_id=$1`, [uid]);
+    await del("user_screeners", `DELETE FROM user_screeners WHERE user_id=$1`, [uid]);
+    await del("ideas", `DELETE FROM ideas WHERE owner=$1`, [uid]);
+    await del("public_strategies", `DELETE FROM public_strategies WHERE owner=$1`, [uid]);
+    try { await purgeLedgersForUser(uid); } catch (e) { failed.push("ledgers"); console.error("[delete] ledgers failed", e.message); }
+    if (failed.length) throw new Error(`Account deletion incomplete — these stores could not be cleared: ${failed.join(", ")}. Retry.`);
     if (preserveTrades) {
       // Keep the stub (so admin can still see the retained history) but make the account unusable. Bump the
       // token version (M-02) so every existing token for this account is revoked immediately — and, since a
@@ -1105,8 +1139,30 @@ async function claimIdempotencyKey(userId, key, reqHash = null) {
   d[k] = { response: null, reqHash, status: "in_flight", createdAt: Date.now() }; writeJSON(FILES.idem, d); return true;
 }
 async function getIdempotencyRecord(userId, key) {
-  if (USING_PG) { const r = await pool.query(`SELECT response, req_hash, status FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return r.rows[0] ? { response: r.rows[0].response, reqHash: r.rows[0].req_hash, status: r.rows[0].status } : null; }
-  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"))); const row = d[`${userId}|${key}`]; return row ? { response: row.response, reqHash: row.reqHash, status: row.status } : null;
+  if (USING_PG) { const r = await pool.query(`SELECT response, req_hash, status, updated_at, created_at FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return r.rows[0] ? { response: r.rows[0].response, reqHash: r.rows[0].req_hash, status: r.rows[0].status, updatedAt: r.rows[0].updated_at != null ? Number(r.rows[0].updated_at) : null, createdAt: r.rows[0].created_at != null ? Number(r.rows[0].created_at) : null } : null; }
+  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"))); const row = d[`${userId}|${key}`]; return row ? { response: row.response, reqHash: row.reqHash, status: row.status, updatedAt: row.updated_at != null ? Number(row.updated_at) : (row.updatedAt || null), createdAt: row.createdAt != null ? Number(row.createdAt) : null } : null;
+}
+/* R21-P2-05: reclaim STALE idempotency records so a key can't block a user forever. An `in_flight` row older
+   than the response deadline means the original request DIED before finalizing (crash/timeout) — its outcome is
+   unknown, so we DON'T silently release it into a fresh order; instead we mark it `unknown` so the UI prompts
+   the user to reconcile with the broker. Rows in `unknown`/`succeeded` past a long TTL (default 24h) are then
+   purged so the key is eventually reusable. Returns counts. Safe to run periodically from any instance. */
+async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000, ttlMs = 24 * 60 * 60 * 1000 } = {}) {
+  const now = Date.now();
+  if (USING_PG) {
+    const m = await pool.query(`UPDATE order_idempotency SET status='unknown' WHERE status='in_flight' AND created_at < $1`, [now - inflightMs]).catch(() => ({ rowCount: 0 }));
+    const p = await pool.query(`DELETE FROM order_idempotency WHERE status IN ('unknown','succeeded') AND created_at < $1`, [now - ttlMs]).catch(() => ({ rowCount: 0 }));
+    return { markedUnknown: m.rowCount || 0, purged: p.rowCount || 0 };
+  }
+  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"));
+  const d = readJSON(f); let marked = 0, purged = 0, changed = false;
+  for (const k of Object.keys(d)) {
+    const r = d[k]; const created = Number(r.createdAt) || 0;
+    if (r.status === "in_flight" && created < now - inflightMs) { r.status = "unknown"; marked++; changed = true; }
+    else if ((r.status === "unknown" || r.status === "succeeded") && created < now - ttlMs) { delete d[k]; purged++; changed = true; }
+  }
+  if (changed) writeJSON(f, d);
+  return { markedUnknown: marked, purged };
 }
 /* Finalize the outcome. status ∈ succeeded | rejected | unknown. A 'rejected' (conclusive) DELETES the row
    so a same-key retry may proceed; 'succeeded'/'unknown' persist the response for replay/blocking. */
@@ -1274,4 +1330,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
