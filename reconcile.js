@@ -145,4 +145,13 @@ function fyersExitPlan(held, requestedQty) {
   return { action: "sell", sellQty: Math.min(qty, h) };
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan };
+/* R11-P1-01: is a position still in "closing" STALE enough to reconcile (rather than let the in-flight
+   attempt finish)? A missing/zero closingSince means a legacy or crash-stranded claim → stale immediately.
+   Otherwise stale once it's older than staleMs. Kept pure so the recovery decision is unit-tested. */
+function closingIsStale(closingSince, now, staleMs) {
+  const since = Number(closingSince) || 0;
+  if (!since) return true;
+  return (Number(now) - since) >= Number(staleMs);
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale };

@@ -5544,6 +5544,10 @@ async function adoptBrokerPosition(st) {
     // Attribute only OUR tagged, filled quantity + weighted-average price (pure, unit-tested).
     let { filledQty, avgPrice } = reconcile.attributeFyersFills(book, tag);
     if (filledQty <= 0) return null;                        // none of OUR order filled → nothing to adopt
+    // R11-P2-02: without a usable fill price we CAN'T compute SL/TP or link the position (link requires
+    // entry > 0). Registering an entry-less managed position would leave it unprotected/orphaned — so
+    // refuse to adopt and keep the strategy paused for review rather than create an unusable position.
+    if (!(avgPrice > 0)) return null;
     const held = await fyersNetQty(sess, st.brokerSym);     // signed net; safety ceiling
     if (held != null) { if (held <= 0) return null; filledQty = Math.min(filledQty, held); }   // never exceed real holding, refuse if flat/short
     return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty: filledQty, entry: avgPrice, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: false });
@@ -5590,6 +5594,10 @@ async function brokerOpenSize(st) {
 
 let autoExitRunning = false;
 let lastAutoExit = { at: null, checked: 0, exited: 0, live: false };
+/* R11-P1-01: how long a "closing" claim may sit before we treat it as STRANDED (crash or unrecovered
+   error between the claim and the resolution) and reconcile it, rather than skipping it forever. Must be
+   comfortably longer than one exit attempt (order placement + fill polling). */
+const CLOSING_STALE_MS = Number(process.env.CLOSING_STALE_MS) || 3 * 60 * 1000;
 async function runAutoExitEngine() {
   if (autoExitRunning) return;
   autoExitRunning = true;
@@ -5618,7 +5626,24 @@ async function runAutoExitEngine() {
     }
 
     for (const pos of open) {
-      if (pos.status === "closing") continue;         // already being handled
+      if (pos.status === "closing") {
+        /* R11-P1-01: "closing" is a transient claim — set just before the broker call and cleared to
+           open/closed in the SAME sweep. If we still see it on a LATER sweep it was STRANDED (a crash or
+           an unrecovered error between the claim and the resolution). NEVER skip it forever — that abandons
+           a live, unprotected position. Give the in-flight attempt a grace window, then reconcile against
+           broker truth: flat → closed; otherwise return it to "open" so SL/TP monitoring + exit retries
+           resume next tick. (A legacy stranded row with no closingSince reconciles immediately.) */
+        if (!reconcile.closingIsStale(pos.closingSince, Date.now(), CLOSING_STALE_MS)) continue;   // fresh — let it finish
+        let flat = false;
+        try {
+          if (pos.broker === "delta") { const held = await deltaHeldFor(pos.userId); if (held && !held.has(String(pos.brokerSym))) flat = true; }
+          else if (pos.broker === "fyers") { const sess = await sessionFromCred(pos.userId, "fyers"); const q = sess ? await fyersNetQty(sess, pos.brokerSym) : null; if (q != null && q <= 0) flat = true; }
+        } catch { /* couldn't verify → reopen to keep it protected */ }
+        if (flat) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — flat after stale close", closingSince: null }); reconciled++; continue; }
+        await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: "recovered a stranded 'closing' state — resumed monitoring" });
+        console.warn(`[autoexit] recovered STRANDED closing ${pos.symbol} for ${pos.userId} → resumed monitoring`);
+        continue;   // re-processed as an open position on the next sweep
+      }
       // Broker says this position is gone -> reconcile it closed and skip the exit check.
       if (pos.broker === "delta") {
         const held = await deltaHeldFor(pos.userId);
@@ -5642,8 +5667,9 @@ async function runAutoExitEngine() {
         if (!hit.fired && posIntraday && intradaySquareDue(pos.market)) hit = { fired: true, reason: "Intraday square-off" };
         if (!hit.fired) continue;
 
-        // Claim it FIRST so a crash/restart can't sell twice.
-        await db.updateManagedPosition(pos.id, { status: "closing", exitReason: hit.reason });
+        // Claim it FIRST so a crash/restart can't sell twice. Stamp closingSince so a claim that gets
+        // STRANDED by a crash is recognised as stale and reconciled (R11-P1-01), not skipped forever.
+        await db.updateManagedPosition(pos.id, { status: "closing", exitReason: hit.reason, closingSince: Date.now() });
 
         if (!live) {
           console.log(`[autoexit] DRY-RUN (AUTO_EXIT_LIVE!=true): would exit ${pos.symbol} for ${pos.userId} — ${hit.reason}`);
@@ -6239,19 +6265,33 @@ app.post("/api/autobuy/close", requireAuth, async (req, res) => {
     }
     const sess = await sessionFromCred(userId, pos.broker || strat.broker);
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
-    await db.updateManagedPosition(pos.id, { status: "closing" });
-    const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
+    await db.updateManagedPosition(pos.id, { status: "closing", closingSince: Date.now() });
+    let r;
+    try {
+      r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
+    } catch (exitErr) {
+      /* R11-P1-01: an exit that THROWS (e.g. the fail-closed FYERS holdings-read error) must NOT leave the
+         position stranded in "closing" — that would stop SL/TP monitoring forever. Restore it to "open" so
+         the exit engine keeps protecting/retrying it, and surface the error. */
+      await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: `Close failed (${String(exitErr.message || exitErr)}) — position kept open; the exit engine will keep retrying.` });
+      return res.status(502).json({ ok: false, closed: false, error: "Couldn't confirm the close with your broker — the position is kept open and will keep retrying. Try again in a moment." });
+    }
     // R8-lifecycle: don't claim a flat close the broker didn't confirm. Delta/FYERS report r.filled; a
     // partial/unfilled close leaves real exposure — keep the position OPEN so the exit engine retries and
     // tell the user, rather than cancelling the strategy over a position that's still live.
     if (r.filled === false) {
-      await db.updateManagedPosition(pos.id, { status: "open", lastError: `Close not fully filled (state ${r.state}) — the exit engine will keep retrying`, exitOrderId: r.orderId || null });
+      await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: `Close not fully filled (state ${r.state}) — the exit engine will keep retrying`, exitOrderId: r.orderId || null });
       return res.status(409).json({ ok: false, closed: false, orderId: r.orderId || null, error: "Broker didn't confirm a full close — position is still open and will keep retrying. Try again in a moment." });
     }
-    await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close", exitOrderId: r.orderId || null });
+    await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close", exitOrderId: r.orderId || null, closingSince: null });
     await db.updateRealStrategy(id, { status: "cancelled" });
     res.json({ ok: true, closed: true, orderId: r.orderId || null });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) {
+    // The exit-throw path above already restores "open". Any other stranded "closing" (a db write failing
+    // after the claim) is caught by the exit engine's stale-closing reconciliation (R11-P1-01), so it can
+    // never be skipped forever.
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 /* UPDATE SL/TP — change the strategy's stop-loss / take-profit and push the new levels onto its open

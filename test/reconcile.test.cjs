@@ -124,6 +124,16 @@ test("fyersExitPlan: fails CLOSED on unknown holding; clamps to holding; refuses
   assert.deepEqual(R.fyersExitPlan(10, 3), { action: "sell", sellQty: 3 });
 });
 
+test("closingIsStale: fresh claim waits; missing/old timestamp reconciles (never skipped forever)", () => {
+  const now = 1_700_000_000_000, stale = 3 * 60_000;
+  assert.equal(R.closingIsStale(now - 10_000, now, stale), false);   // 10s old → still in-flight, wait
+  assert.equal(R.closingIsStale(now - 5 * 60_000, now, stale), true); // 5 min old → stranded, reconcile
+  assert.equal(R.closingIsStale(now, now, stale), false);            // just claimed → wait
+  assert.equal(R.closingIsStale(0, now, stale), true);               // no timestamp (legacy/crash) → reconcile now
+  assert.equal(R.closingIsStale(null, now, stale), true);
+  assert.equal(R.closingIsStale(undefined, now, stale), true);
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match
