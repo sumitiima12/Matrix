@@ -112,6 +112,18 @@ test("attributeFyersFills: sums ONLY our tagged fills, weighted avg; ignores oth
   assert.equal(noPrice.filledQty, 3); assert.equal(noPrice.avgPrice, null);
 });
 
+test("fyersExitPlan: fails CLOSED on unknown holding; clamps to holding; refuses flat/short", () => {
+  // Holdings read failed → place NO order (caller retries) — must NOT fall back to requested qty.
+  assert.deepEqual(R.fyersExitPlan(null, 10), { action: "unverified", sellQty: 0 });
+  // Flat or short → nothing to close with a SELL.
+  assert.deepEqual(R.fyersExitPlan(0, 10), { action: "flat", sellQty: 0 });
+  assert.deepEqual(R.fyersExitPlan(-5, 10), { action: "flat", sellQty: 0 });
+  // Normal: sell what we want, capped at the real holding (retry after a partial can't oversell).
+  assert.deepEqual(R.fyersExitPlan(10, 10), { action: "sell", sellQty: 10 });
+  assert.deepEqual(R.fyersExitPlan(4, 10), { action: "sell", sellQty: 4 });   // only 4 left → sell 4, never 10
+  assert.deepEqual(R.fyersExitPlan(10, 3), { action: "sell", sellQty: 3 });
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match

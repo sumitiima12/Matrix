@@ -132,4 +132,17 @@ function attributeFyersFills(orderBook, tag) {
   return { filledQty, avgPrice: pricedQty > 0 ? notional / pricedQty : null };
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills };
+/* R10-P1-01: decide how much to SELL to close a FYERS long, given the broker's signed net holding and the
+   quantity we want to close. FYERS equity SELL is NOT reduce-only, so this is the guard that stops a retry
+   after a partial fill from overselling into a short. FAIL CLOSED: if we couldn't read the holding
+   (held == null), place NO order ("unverified" → caller retries). Flat/short holding → nothing to close.
+   Otherwise sell only min(requested, held) — never more than we actually hold. */
+function fyersExitPlan(held, requestedQty) {
+  const qty = Number(requestedQty) || 0;
+  if (held == null) return { action: "unverified", sellQty: 0 };   // couldn't read holdings → do not sell
+  const h = Number(held);
+  if (!(h > 0)) return { action: "flat", sellQty: 0 };             // flat or short → nothing to close with a SELL
+  return { action: "sell", sellQty: Math.min(qty, h) };
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan };

@@ -4645,14 +4645,21 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
          position at the REAL filled quantity/price. A rejected or still-pending entry arms nothing — so the
          exit engine can't later SELL against a holding that doesn't exist. Order placement itself still
          returns to the client; only the auto-exit arming is gated on the fill. */
-      let autoExitId = null, fillStatus = "PENDING";
+      let autoExitId = null, fillStatus = "PENDING", autoExitNote = null;
       if (wantAutoExit) {
-        const c = await verifyFyersFill(sess, d.id, Number(qty));
-        if (c.filled) { autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice); fillStatus = "FILLED"; }
-        else if (c.rejected) fillStatus = "REJECTED";
-        else fillStatus = "PENDING";   // accepted but not confirmed filled → do NOT arm; user verifies in FYERS
+        /* R10-audit: our FYERS exit path can only SELL — it cannot BUY-to-cover. So we must NOT arm
+           app-managed SL/TP on a SHORT (SELL) entry: the exit engine would later fire another SELL and
+           GROW the short instead of closing it. Refuse to arm; the user manages a short in their FYERS app. */
+        if (String(side).toLowerCase() !== "buy") {
+          autoExitNote = "SL/TP not armed — app-managed FYERS exits support long (BUY) entries only. Our exit can't buy-to-cover a short; manage this position in your FYERS app.";
+        } else {
+          const c = await verifyFyersFill(sess, d.id, Number(qty));
+          if (c.filled) { autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice); fillStatus = "FILLED"; }
+          else if (c.rejected) { fillStatus = "REJECTED"; autoExitNote = "SL/TP not armed — entry was rejected."; }
+          else { fillStatus = "PENDING"; autoExitNote = "SL/TP not armed — entry not confirmed filled. Verify in FYERS and re-arm from the position."; }
+        }
       }
-      return res.json({ orderId: d.id, status: fillStatus, broker, autoExitId, autoExitArmed: !!autoExitId, ...(wantAutoExit && !autoExitId ? { autoExitNote: "SL/TP not armed — entry not confirmed filled. Verify in FYERS and re-arm from the position." } : {}) });
+      return res.json({ orderId: d.id, status: fillStatus, broker, autoExitId, autoExitArmed: !!autoExitId, ...(autoExitNote ? { autoExitNote } : {}) });
     }
 
     if (broker === "delta") {
@@ -5450,8 +5457,13 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false)
        more than we still hold and flip us into a short. If FYERS reports the account already flat (or
        short), there is nothing to close — report it closed instead of firing another SELL. */
     const held = await fyersNetQty(sess, symbol);   // signed; null = couldn't read
-    if (held != null && held <= 0) return { orderId: null, filled: true, alreadyFlat: true, state: "closed", filledQty: 0, remaining: 0 };
-    const sellQty = held != null ? Math.min(Number(qty), held) : Number(qty);
+    // R10-P1-01: size the SELL from the broker's real holding (pure, unit-tested). Fail CLOSED — if the
+    // holdings read failed we place NO order and throw so the exit engine retries next tick, rather than
+    // selling an unverified internal quantity that a partial-fill retry could oversell into a short.
+    const plan = reconcile.fyersExitPlan(held, qty);
+    if (plan.action === "unverified") throw new Error("Couldn't read FYERS positions to size the exit safely — retrying (won't sell an unverified quantity).");
+    if (plan.action === "flat") return { orderId: null, filled: true, alreadyFlat: true, state: "closed", filledQty: 0, remaining: 0 };
+    const sellQty = plan.sellQty;
     const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
       body: JSON.stringify({ symbol, qty: sellQty, type: 2, side: -1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
