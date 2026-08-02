@@ -95,6 +95,23 @@ test("fyersOrderTag: FYERS-safe, deterministic, ≤20 chars; hasFyersOrderTag sc
   assert.equal(R.hasFyersOrderTag(null, tag), false);
 });
 
+test("attributeFyersFills: sums ONLY our tagged fills, weighted avg; ignores others' holdings", () => {
+  const book = [
+    { orderTag: "mine", status: 2, qty: 6, filledQty: 6, tradedPrice: 100 },   // ours
+    { orderTag: "mine", status: 2, qty: 4, filledQty: 4, tradedPrice: 110 },   // ours (second slice)
+    { orderTag: "other", status: 2, qty: 50, filledQty: 50, tradedPrice: 90 }, // someone else's / pre-existing
+    { orderTag: "mine", status: 6, qty: 5, filledQty: 0 },                      // ours but not filled
+  ];
+  const r = R.attributeFyersFills(book, "mine");
+  assert.equal(r.filledQty, 10);                        // 6 + 4, NOT the 50 from "other"
+  assert.equal(r.avgPrice, (6 * 100 + 4 * 110) / 10);   // 104 weighted
+  assert.deepEqual(R.attributeFyersFills(book, "missing"), { filledQty: 0, avgPrice: null });
+  assert.deepEqual(R.attributeFyersFills(null, "mine"), { filledQty: 0, avgPrice: null });
+  // No priced fills → filledQty counted, avgPrice null (caller falls back).
+  const noPrice = R.attributeFyersFills([{ orderTag: "t", status: 2, qty: 3, filledQty: 3 }], "t");
+  assert.equal(noPrice.filledQty, 3); assert.equal(noPrice.avgPrice, null);
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match

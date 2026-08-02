@@ -5515,23 +5515,26 @@ async function adoptBrokerPosition(st) {
     return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short });
   }
   if (st.broker === "fyers") {
-    // R8-P2-01: adopt the REAL FYERS net position (actual qty + average price), never a synthesized one.
-    let net = null;
+    /* R9-P2-02: adopt ONLY the quantity attributable to OUR stamped order (matched by orderTag in the
+       order book), NEVER the aggregate net position — which could include shares the user already held
+       and must not be managed or sold by this strategy. The net position is used only as a safety
+       CEILING (never adopt more than the broker actually holds net-long) and to refuse shorts. */
+    const tag = reconcile.fyersOrderTag(st.pendingClientId);
+    if (!tag) return null;                                  // no durable key → can't attribute → don't adopt
+    let book = null;
     try {
-      const r = await fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth("fyers", sess.accessToken, st.userId) });
+      const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders", { headers: brokerAuth("fyers", sess.accessToken, st.userId) });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || d.s === "error") return null;
-      net = Array.isArray(d.netPositions) ? d.netPositions : null;
+      book = Array.isArray(d.orderBook) ? d.orderBook : null;
     } catch { return null; }
-    if (!net) return null;
-    const p = net.find((x) => String(x.symbol) === String(st.brokerSym));
-    if (!p || !Number(p.netQty)) return null;   // broker shows FLAT → nothing to adopt
-    // R8-audit F-1: our FYERS exit path only SELLS (can't buy-to-cover), so we must not adopt a SHORT
-    // position — we couldn't close it correctly. Refuse; the user manages a short in their broker app.
-    if (Number(p.netQty) < 0) return null;
-    const qty = Math.abs(Number(p.netQty));
-    const entry = Number(p.avgPrice) || Number(p.netAvg) || null;
-    return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: false });
+    if (!book) return null;
+    // Attribute only OUR tagged, filled quantity + weighted-average price (pure, unit-tested).
+    let { filledQty, avgPrice } = reconcile.attributeFyersFills(book, tag);
+    if (filledQty <= 0) return null;                        // none of OUR order filled → nothing to adopt
+    const held = await fyersNetQty(sess, st.brokerSym);     // signed net; safety ceiling
+    if (held != null) { if (held <= 0) return null; filledQty = Math.min(filledQty, held); }   // never exceed real holding, refuse if flat/short
+    return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty: filledQty, entry: avgPrice, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: false });
   }
   // R6-P1-01: for brokers WITHOUT an actual position lookup we refuse to adopt. Synthesizing a managed
   // position from the intended notional + current price is unsafe — a partial fill, a different fill

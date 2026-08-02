@@ -117,4 +117,19 @@ function hasFyersOrderTag(records, tag) {
   return records.some((o) => String((o && o.orderTag) || "") === String(tag));
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag };
+/* R9-P2-02: sum the filled quantity and weighted-average fill price across ONLY the FYERS order-book
+   entries carrying our stamped orderTag. Adoption uses this so a strategy adopts just the exposure its own
+   order created — never a user's pre-existing holding in the same symbol. Returns { filledQty, avgPrice }. */
+function attributeFyersFills(orderBook, tag) {
+  let filledQty = 0, pricedQty = 0, notional = 0;
+  if (tag && Array.isArray(orderBook)) {
+    for (const o of orderBook) {
+      if (String((o && o.orderTag) || "") !== String(tag)) continue;
+      const c = classifyFyersOrder(o);
+      if (c.filled && c.filledQty > 0) { filledQty += c.filledQty; if (c.avgPrice > 0) { pricedQty += c.filledQty; notional += c.filledQty * c.avgPrice; } }
+    }
+  }
+  return { filledQty, avgPrice: pricedQty > 0 ? notional / pricedQty : null };
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills };
