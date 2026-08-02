@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Syntax check
+        run: node --check server.js && node --check db.js && node --check auth.js && node --check riskEngine.js
+      - name: Unit tests (risk, parity, reconcile, idempotency, claims)
+        run: npm test
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
