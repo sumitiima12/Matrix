@@ -1311,6 +1311,13 @@ async function getRealStrategiesForUser(userId, limit = 200) {
    concurrent writers (e.g. a late engine fill-completion and a user pause) can't lose each other's fields
    via a read-modify-write race. `status` column is updated only when the patch carries one, otherwise the
    existing status is preserved (so an engine write never silently un-pauses/un-cancels a strategy). */
+/* R21-P2-10 concurrency contract: on Postgres this is an ATOMIC field-level merge — `data = data || $3::jsonb`
+   runs entirely inside one UPDATE, so two concurrent patches to DIFFERENT fields BOTH land (no read-modify-write
+   lost update), same-field patches serialize last-writer-wins, and `version` bumps atomically. The money-
+   critical mutual-exclusion (no double entry / double exit) is handled separately by the compare-and-set claims
+   (claimRealStrategyForEntry / claimManagedForExit) and by transitionRealStrategy for expected-version edges;
+   this generic merge is for telemetry + non-conflicting lifecycle fields. Flat-file mode below is a racy
+   read-modify-write and is DEV-ONLY — real trading requires Postgres (startup warns when DATABASE_URL is unset). */
 async function updateRealStrategy(id, patch) {
   if (USING_PG) {
     const upd = await pool.query(
