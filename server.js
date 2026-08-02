@@ -65,7 +65,7 @@ function isHouseOwner(req) {
   if (!(process.env.HOUSE_OWNER_ID || "").trim()) return false;
   try {
     const h = req.get("Authorization") || "";
-    const token = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
+    const token = h.startsWith("Bearer ") ? h.slice(7) : "";   // M-01: header only, never query string
     const v = verifyToken(token);
     if (!v) return false;
     return idMatchesOwner(v.userId);
@@ -115,6 +115,28 @@ app.use((req, res, next) => { res.set("X-App-Version", APP_VERSION); res.set("X-
 function logFinancial(event, fields) {
   try { console.log(JSON.stringify({ ts: new Date().toISOString(), lvl: "fin", evt: event, ...fields })); }
   catch { try { console.log("[fin]", event); } catch { /* noop */ } }
+}
+/* R17-P2-03: write a durable user-facing notice (used by background jobs like delayed-fill protection so the
+   user learns the terminal outcome even though it happened server-side). Best-effort; never throws. */
+async function addUserNotice(userId, notice) {
+  try { await db.addNotice(String(userId), { ...notice, at: Date.now() }); } catch { /* non-fatal */ }
+}
+/* M-02: on SENSITIVE routes, re-check the DB after requireAuth — reject a token whose version is stale
+   (PIN reset / block / logout / deletion bumped it) or whose account is now blocked/deleted. A stolen 30-day
+   token can't keep trading after the user secures the account. Best-effort: if the lookup fails we allow (the
+   route's own checks still apply), never lock a user out on a transient DB error. */
+async function requireFreshSession(req, res, next) {
+  try {
+    const phone = stripPh(req.authUserId || "");
+    if (!phone) return res.status(401).json({ error: "Authentication required." });
+    const u = await db.getUser(phone);
+    if (!u || u.deleted) return res.status(401).json({ error: "This session is no longer valid — sign in again." });
+    if (u.blocked) return res.status(403).json({ error: "This account is blocked." });
+    if ((Number(u.tokenVersion) || 0) !== (Number(req.authTokenVersion) || 0)) {
+      return res.status(401).json({ error: "Your session was reset (PIN change or security action) — sign in again." });
+    }
+  } catch { /* transient — fall through, route-level checks still apply */ }
+  next();
 }
 app.get("/api/version", (req, res) => res.json({ name: "matrixone-api", version: APP_VERSION, apiVersion: API_VERSION }));
 
@@ -250,6 +272,22 @@ app.post("/api/risk-policy", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* R17-P2-03: durable user notices (delayed-protection outcomes, etc.) + pending-protection status, so the
+   user can see "protected / rejected / expired / still pending" for background jobs. */
+app.get("/api/notices", requireAuth, async (req, res) => {
+  try {
+    const uid = storageKeyFor(req.authUserId);
+    const notices = await db.getNotices(uid, 50).catch(() => []);
+    const pending = (await db.listPendingProtection(200).catch(() => [])).filter((p) => String(p.userId) === String(uid))
+      .map((p) => ({ orderId: p.orderId, symbol: p.symbol, broker: p.broker, since: p.created_at, attempts: p.attempts }));
+    res.json({ ok: true, notices, pendingProtection: pending });
+  } catch (e) { serverError(res, e); }
+});
+app.post("/api/notices/read", requireAuth, async (req, res) => {
+  try { await db.markNoticesRead(storageKeyFor(req.authUserId)); res.json({ ok: true }); }
+  catch (e) { serverError(res, e); }
+});
+
 /* ----------------------- users (phone + PIN) & state ---------------------- */
 /* PINs are now bcrypt-hashed. Existing users were SHA-256 — we MUST NOT lock them out, so
    verifyPin accepts the old scheme too, and a successful legacy login is transparently
@@ -341,6 +379,19 @@ app.post("/api/register", authLimiter, async (req, res) => {
     const existingUser = await db.getUser(phone);
     // A soft-deleted stub is kept only for the admin's trade-history audit; the number is free to reuse.
     if (existingUser && !existingUser.deleted) return res.status(409).json({ error: "That number is already registered — please log in." });
+    /* R17-P2-06: if this number was previously soft-deleted, a NEW person may now own it. Move the old
+       account's retained trades to an opaque archive key BEFORE creating the new account, so the new user
+       starts with a clean slate and can never load the previous owner's financial history. Admin can still
+       retrieve the archived trades for the number for audit. */
+    if (existingUser && existingUser.deleted) {
+      try {
+        const oldUid = storageKeyFor(phone);
+        const archiveKey = `arch_${existingUser.deletedAt || Date.now()}_${oldUid}`;
+        const moved = await db.reassignTrades(oldUid, archiveKey);
+        if (moved) await db.recordTradeArchive(phone, archiveKey);
+        if (typeof db.purgeLedgersForUser === "function") await db.purgeLedgersForUser(oldUid);
+      } catch (e) { console.error("[register] archive of recycled-number history failed:", e.message); }
+    }
     const username = cleanUsername(req.body && req.body.username);
     if (!username) return res.status(400).json({ error: "Choose a user ID: 3–20 characters, starting with a letter (letters, numbers, underscore)." });
     if (typeof db.getUserByUsername === "function" && await db.getUserByUsername(username)) {
@@ -408,7 +459,7 @@ app.post("/api/login", authLimiter, async (req, res) => {
       try { await db.updateUserPin(phone, hashPin(pin)); } catch { /* upgrade later */ }
     }
     if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
-    res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, email: u.email || null, createdAt: u.createdAt || null, token: signToken(phone) });
+    res.json({ ok: true, userId: phone, name: u.name || "", username: u.username || null, email: u.email || null, createdAt: u.createdAt || null, token: signToken(phone, undefined, undefined, Number(u.tokenVersion) || 0) });
   } catch (e) { serverError(res, e); }
 });
 
@@ -615,9 +666,10 @@ app.post("/api/forgot/reset", authLimiter, async (req, res) => {
     clearPinFails(ansKey);
 
     await db.updateUserPin(phone, hashPin(newPin));
-    // Log them straight in with a fresh token.
+    // M-02: a PIN reset REVOKES all prior tokens (bump the version), then issues one fresh token.
+    if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
     const u = await db.getUser(phone);
-    res.json({ ok: true, userId: phone, name: (u && u.name) || "", token: signToken(phone) });
+    res.json({ ok: true, userId: phone, name: (u && u.name) || "", token: signToken(phone, undefined, undefined, Number(u && u.tokenVersion) || 0) });
   } catch (e) { serverError(res, e); }
 });
 
@@ -650,9 +702,14 @@ app.post("/api/security-question", requireAuth, async (req, res) => {
 // Save/load a user's app state blob (automations, watchlists, wallets, profile).
 app.post("/api/state", requireAuth, async (req, res) => {
   try {
-    const { state } = req.body || {};
+    const state = (req.body && req.body.state && typeof req.body.state === "object" && !Array.isArray(req.body.state)) ? req.body.state : {};
+    /* M-05: bound the app-state blob — it's an opaque per-user document, so cap its serialized size and the
+       number of top-level sections to stop a corrupt/oversized/adversarial payload inflating DB rows/caches. */
+    let size = 0; try { size = Buffer.byteLength(JSON.stringify(state)); } catch { size = Infinity; }
+    if (size > 512 * 1024) return res.status(413).json({ error: "App state is too large to save." });
+    if (Object.keys(state).length > 200) return res.status(400).json({ error: "App state has too many sections." });
     const userId = storageKeyFor(req.authUserId);   // from the verified token
-    await db.saveState(userId, state || {});
+    await db.saveState(userId, state);
     rcBust(`state:${userId}`);
     res.json({ ok: true });
   } catch (e) { serverError(res, e); }
@@ -693,7 +750,7 @@ function isAdmin(req) {
   let uid = req.authUserId ? stripPh(req.authUserId) : null;
   if (!uid) {
     const h = req.get("Authorization") || "";
-    const tok = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
+    const tok = h.startsWith("Bearer ") ? h.slice(7) : "";   // M-01: header only, never query string
     const v = verifyToken(tok);
     if (v) uid = stripPh(v.userId);
   }
@@ -1603,7 +1660,7 @@ async function userFyersHistory(userId, ySym, range, interval) {
 function reqUserIdOptional(req) {
   try {
     const h = req.get("Authorization") || "";
-    const token = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
+    const token = h.startsWith("Bearer ") ? h.slice(7) : "";   // M-01: header only, never query string
     const v = verifyToken(token);
     return v ? storageKeyFor(v.userId) : null;
   } catch { return null; }
@@ -1712,7 +1769,7 @@ app.get("/api/history", async (req, res) => {
 // POST { pattern: "cup-handle", symbols: ["RELIANCE.NS", ...] }
 // Fetches daily candles for each symbol and returns those currently forming the pattern.
 // Symbols are capped and fetched with small concurrency so we never hammer the upstream feed.
-app.post("/api/pattern-scan", async (req, res) => {
+app.post("/api/pattern-scan", computeLimiter, async (req, res) => {
   try {
     const pattern = String((req.body && req.body.pattern) || "").trim();
     if (!pattern) return res.status(400).json({ error: "pattern required" });
@@ -1725,7 +1782,8 @@ app.post("/api/pattern-scan", async (req, res) => {
       const batch = syms.slice(i, i + CONC);
       const out = await Promise.all(batch.map(async (sym) => {
         try {
-          const candles = await candlesFor(sym, range, interval);
+          // C-03: interval "2m" was a mislabelled 3m — fetch native 1m and fold ×3 into a real 3m candle.
+          const candles = interval === "2m" ? aggCandles(await candlesFor(sym, range, "1m"), 3) : await candlesFor(sym, range, interval);
           if (!candles || candles.length < 30) return null;
           const found = patterns.detectPatterns(candles);
           const hit = found.find((p) => p.key === pattern);
@@ -1792,7 +1850,7 @@ async function scanOneIdea(sym) {
   let daily = null;
   for (const [interval, range, tf] of [["1d", "6mo", "1d"], ["60m", "1mo", "1h"]]) {
     let candles;
-    try { candles = await candlesFor(sym, range, interval); } catch { continue; }
+    try { candles = interval === "2m" ? aggCandles(await candlesFor(sym, range, "1m"), 3) : await candlesFor(sym, range, interval); } catch { continue; }   // C-03: real 3m
     if (!candles || candles.length < 30) continue;
     if (interval === "1d") daily = candles;
     const px = candles[candles.length - 1].c;
@@ -1819,7 +1877,7 @@ async function scanOneIdea(sym) {
   if (daily) { try { return techIdea(sym, daily); } catch { return null; } }
   return null;
 }
-app.post("/api/idea-scan", async (req, res) => {
+app.post("/api/idea-scan", computeLimiter, async (req, res) => {
   try {
     let syms = Array.isArray(req.body && req.body.symbols) ? req.body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
     syms = [...new Set(syms)].slice(0, 60);
@@ -1846,14 +1904,37 @@ app.post("/api/idea-scan", async (req, res) => {
    screener's ENTRY chain right now (evaluated by the same engine that runs live strategies). Powers the
    homepage "Popular Screeners" carousels: a symbol appears only while it meets the entry trigger.
    Cached ~2 min since the underlying is 5-minute candles.                                            */
-app.post("/api/screener-scan", async (req, res) => {
+/* C-03: fold base candles into a higher timeframe, SESSION-ALIGNED (buckets never span a calendar day), so a
+   "3m from 1m" or "4h from 60m" bar is a real fixed-duration candle, not a mislabelled 2m or a cross-session
+   group. Mirrors the frontend marketService.aggregate. */
+function aggCandles(candles, n) {
+  if (!Array.isArray(candles) || n <= 1) return candles || [];
+  const dayKey = (t) => { const ms = t < 1e12 ? t * 1000 : t; const d = new Date(ms); return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`; };
+  const days = new Map();
+  for (const c of candles) { const k = dayKey(c.t); if (!days.has(k)) days.set(k, []); days.get(k).push(c); }
+  const out = [];
+  for (const grp of days.values()) {
+    for (let i = 0; i < grp.length; i += n) {
+      const g = grp.slice(i, i + n); if (!g.length) continue;
+      out.push({ t: g[0].t, o: g[0].o, c: g[g.length - 1].c, h: Math.max(...g.map((x) => x.h)), l: Math.min(...g.map((x) => x.l)), v: g.reduce((a, x) => a + (x.v || 0), 0) });
+    }
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+/* Fetch candles for a scan/optimizer timeframe. For 3m we fetch native 1m and fold ×3 (true 3m); everything
+   else uses its native Yahoo interval. */
+async function candlesForTf(sym, tf, range) {
+  if (tf === "3m") { const base = await candlesFor(sym, range || "5d", "1m"); return aggCandles(base || [], 3); }
+  const interval = ({ "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d" })[tf] || "5m";
+  return candlesFor(sym, range || (tf === "1d" ? "1y" : "5d"), interval);
+}
+app.post("/api/screener-scan", computeLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     let syms = Array.isArray(body.symbols) ? body.symbols.map(String).map((s) => s.trim()).filter(Boolean) : [];
     syms = [...new Set(syms)].slice(0, 60);
     const cfg = { defs: body.defs || [], entry: body.entry || [], tf: body.tf || "5m" };
     if (!syms.length || !cfg.entry.length) return res.json({ matches: [] });
-    const interval = ({ "3m": "2m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d" })[cfg.tf] || "5m";
     const range = cfg.tf === "1d" ? "1y" : "5d";
     const cacheKey = "scrscan:" + (body.key || "") + ":" + cfg.tf + ":" + syms.slice().sort().join(",");
     const matches = await memo(cacheKey, 2 * 60_000, async () => {
@@ -1862,7 +1943,7 @@ app.post("/api/screener-scan", async (req, res) => {
       for (let i = 0; i < syms.length; i += CONC) {
         const rs = await Promise.all(syms.slice(i, i + CONC).map(async (sym) => {
           try {
-            const candles = await candlesFor(sym, range, interval);
+            const candles = await candlesForTf(sym, cfg.tf, range);
             if (!candles || candles.length < 30) return null;
             const r = strat.entrySignalFired(cfg, candles);
             if (!r || !r.fired) return null;
@@ -3140,7 +3221,7 @@ app.get("/api/diag/candles", async (req, res) => {
       }
     } catch (e) { fyRaw = { error: String(e && e.message) }; }
     let all = [];
-    try { all = await candlesFor(ySym, range, interval); } catch (e) { fyErr = fyErr || String(e && e.message); }
+    try { all = interval === "2m" ? aggCandles(await candlesFor(ySym, range, "1m"), 3) : await candlesFor(ySym, range, interval); } catch (e) { fyErr = fyErr || String(e && e.message); }   // C-03: real 3m
     res.json({
       symbol: ySym, fyersSymbol, tf, range, interval,
       fyersHouseCount, candlesForCount: (all || []).length,
@@ -3264,7 +3345,10 @@ Be crisp and structured; where relevant give bull case, bear case and key levels
       console.error(`[ask] ${p.name} failed after ${Date.now() - t0}ms:`, e.message);
     }
   }
-  res.status(502).json({ error: errors.join(" | ") });
+  // L-05: don't leak the joined provider error chain (vendor names/status) to the client — log it, return a
+  // generic message. Which vendor answered/failed is an internal detail.
+  console.error("[ask] all providers failed:", errors.join(" | "));
+  res.status(502).json({ error: "Neo is unavailable right now. Please try again in a moment." });
 });
 
 /* AI STRATEGY INTERPRETER — turns any plain-English rule into executable conditions.
@@ -3323,6 +3407,31 @@ Examples:
 If a part is genuinely impossible to express, omit it. Never invent operands outside the list above.`;
 
 const AI_OPS = new Set([">", "<", ">=", "<=", "crosses_above", "crosses_below"]);
+/* H-07: strictly validate LLM-produced indicator DEFS against a schema with type-specific numeric bounds and
+   an allow-list of types. Malformed/adversarial model output (huge lengths, NaNs, unknown types) can't
+   create expensive/invalid indicators or a strategy that appears armed but never fires. */
+const AI_DEF_TYPES = new Set(["RSI", "EMA", "SMA", "MACD", "BB", "ADX", "CCI", "VWAP", "Stoch", "DMI", "CurrentCandle", "PrevCandle", "DayChange", "DayChangePrevClose", "PriceChange", "ATR", "Keltner"]);
+const boundInt = (v, lo, hi, dflt) => { const n = Math.round(Number(v)); return Number.isFinite(n) && n >= lo && n <= hi ? n : dflt; };
+function sanitizeAiDefs(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const d of arr) {
+    if (!d || typeof d.type !== "string" || typeof d.name !== "string") continue;
+    const type = d.type.trim();
+    if (!AI_DEF_TYPES.has(type)) continue;                       // unknown operand type → drop
+    if (d.name.length > 24) continue;
+    const nd = { type, name: d.name.trim().slice(0, 24) };
+    if (["RSI", "EMA", "SMA", "ADX", "CCI", "ATR"].includes(type)) nd.len = String(boundInt(d.len, 2, 400, 14));
+    else if (type === "BB" || type === "Keltner") { nd.len = String(boundInt(d.len, 2, 400, 20)); nd.mult = boundInt(d.mult, 1, 6, 2); }
+    else if (type === "MACD") { nd.fast = boundInt(d.fast, 2, 200, 12); nd.slow = boundInt(d.slow, 3, 400, 26); nd.signal = boundInt(d.signal, 1, 200, 9); if (nd.fast >= nd.slow) { nd.fast = 12; nd.slow = 26; } }
+    else if (type === "Stoch" || type === "DMI") nd.len = String(boundInt(d.len, 2, 200, 14));
+    else if (type === "PriceChange") nd.winMin = boundInt(d.winMin, 1, 1440, 5);
+    // CurrentCandle/PrevCandle/VWAP/DayChange(*) need no numeric params
+    out.push(nd);
+    if (out.length >= 8) break;
+  }
+  return out;
+}
 function sanitizeAiConds(arr) {
   if (!Array.isArray(arr)) return [];
   return arr.filter((c) => c && typeof c.la === "string" && AI_OPS.has(c.op) && c.b != null)
@@ -3354,7 +3463,7 @@ app.post("/api/ai/strategy", llmLimiter, async (req, res) => {
       const parsed = JSON.parse(m[0]);
       const entry = sanitizeAiConds(parsed.entry);
       const exit = sanitizeAiConds(parsed.exit);
-      const defs = Array.isArray(parsed.defs) ? parsed.defs.filter((d) => d && d.type && d.name).slice(0, 8) : [];
+      const defs = sanitizeAiDefs(parsed.defs);   // H-07: schema-validated, type-bounded
       // Pass through optional SL/TP percentages when the model extracted them (0 < x <= 100).
       const okPct = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 && n <= 100 ? +n : null; };
       const sl = okPct(parsed.sl), tp = okPct(parsed.tp);
@@ -4612,7 +4721,7 @@ async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct, userId = nu
 /* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
    the client must send X-Confirm-Live: yes. Two locks, because the failure mode
    here is real money moving without the user meaning it. */
-app.post("/api/broker/order", requireAuth, async (req, res) => {
+app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res) => {
   if (!TRADING_ENABLED) {
     return res.status(403).json({
       error: "Live trading is disabled on this server. Set BROKER_TRADING_ENABLED=true to allow real orders.",
@@ -4624,31 +4733,65 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
 
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
-  /* R16-P2-09 durable idempotency: a client sends a stable X-Idempotency-Key (or clientRequestId) per user
-     ACTION. The first request claims it; a double-tap / reload / network retry with the same key replays the
-     original outcome instead of placing a second real order. A failed order releases the key so a genuine
-     retry can proceed; a success stores the response for replay. */
+  /* R17-P1-02 / P2-07 durable idempotency with EXPLICIT outcome states. A live order MUST carry a stable
+     X-Idempotency-Key (UUID) per user action. The first request claims it (stamping a request-body hash);
+     a repeat with the same key: replays a succeeded response, is BLOCKED while still in_flight or after an
+     UNKNOWN (ambiguous transport) outcome — it never silently re-submits — and is rejected if the same key
+     is reused with a DIFFERENT payload. Only a CONCLUSIVE broker rejection frees the key for a real retry. */
   const idemKey = String(req.get("X-Idempotency-Key") || (req.body && req.body.clientRequestId) || "").slice(0, 100);
-  if (idemKey) {
-    const idemUser = storageKeyFor(sess.userId);
-    const won = await db.claimIdempotencyKey(idemUser, idemKey).catch(() => true);
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(idemKey)) {
+    return res.status(400).json({ error: "A valid idempotency key is required for live orders (update the app if this persists)." });
+  }
+  const idemUser = storageKeyFor(sess.userId);
+  const idemHash = crypto.createHash("sha256").update(JSON.stringify({
+    b: sess.broker, s: req.body?.symbol, d: req.body?.side, q: req.body?.qty,
+    t: req.body?.orderType || "MARKET", p: req.body?.product || "CNC",
+    px: req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price,
+  })).digest("hex");
+  {
+    const won = await db.claimIdempotencyKey(idemUser, idemKey, idemHash).catch(() => true);
     if (!won) {
-      const prior = await db.getIdempotentResponse(idemUser, idemKey).catch(() => null);
-      if (prior) return res.status(200).json({ ...prior, idempotentReplay: true });
+      const rec = await db.getIdempotencyRecord(idemUser, idemKey).catch(() => null);
+      if (rec && rec.reqHash && rec.reqHash !== idemHash) {
+        return res.status(409).json({ error: "This idempotency key was already used for a different order. Start a new order." });
+      }
+      if (rec && rec.status === "succeeded" && rec.response) return res.status(200).json({ ...rec.response, idempotentReplay: true });
+      if (rec && rec.status === "unknown") {
+        return res.status(409).json({ error: "A previous attempt with this key had an UNVERIFIED outcome. Check the order on your broker before retrying — we won't resubmit automatically.", ...(rec.response ? { previous: rec.response } : {}) });
+      }
       return res.status(409).json({ error: "This order is already being placed — please wait a moment before retrying." });
     }
+    /* Classify the outcome as the response leaves: success → store for replay; a CONCLUSIVE rejection →
+       release the key (a genuine retry may reuse it); anything else (timeout/transport/unknown, incl. thrown
+       503s) → mark UNKNOWN and KEEP the key so a same-key retry is blocked until the user reconciles. */
     const _json = res.json.bind(res);
     res.json = (obj) => {
       try {
-        if (obj && !obj.error && (obj.orderId || obj.ok)) db.saveIdempotentResponse(idemUser, idemKey, obj).catch(() => {});
-        else db.releaseIdempotencyKey(idemUser, idemKey).catch(() => {});
+        const code = res.statusCode || 200;
+        if (obj && !obj.error && (obj.orderId || obj.ok)) db.finalizeIdempotency(idemUser, idemKey, "succeeded", obj).catch(() => {});
+        else {
+          const msg = String((obj && (obj.reason || obj.error)) || "");
+          const conclusiveReject = code === 422 || code === 400 || /reject|insufficient|not filled|unfilled|cancell?ed|invalid|margin|too small|min(?:imum)? size|not enough|balance|bad request/i.test(msg);
+          if (conclusiveReject) db.finalizeIdempotency(idemUser, idemKey, "rejected", obj).catch(() => {});
+          else db.finalizeIdempotency(idemUser, idemKey, "unknown", obj).catch(() => {});
+        }
       } catch { /* never block the response on ledger bookkeeping */ }
       return _json(obj);
     };
   }
   const broker = sess.broker;
   const token = sess.accessToken;
-  const { symbol, side, qty, orderType = "MARKET", product = "CNC" } = req.body || {};
+  /* H-03: normalize + strictly allowlist the order enums ONCE, up front, before any broker-specific mapping.
+     Several adapters map "anything not exactly BUY" to SELL, so a malformed/case-mismatched side ("buy",
+     "BYY", "") could become a real SELL. Reject unless side ∈ {BUY,SELL}, type ∈ supported set, product valid. */
+  const side = String(req.body?.side || "").trim().toUpperCase();
+  const orderType = String(req.body?.orderType || "MARKET").trim().toUpperCase();
+  const product = String(req.body?.product || "CNC").trim().toUpperCase();
+  const symbol = req.body?.symbol;
+  const qty = req.body?.qty;
+  if (!["BUY", "SELL"].includes(side)) return res.status(400).json({ error: "side must be exactly BUY or SELL." });
+  if (!["MARKET", "LIMIT"].includes(orderType)) return res.status(400).json({ error: "orderType must be MARKET or LIMIT." });
+  if (!["CNC", "MIS", "INTRADAY", "NRML", "MARGIN"].includes(product)) return res.status(400).json({ error: "Unsupported product type for this order." });
   // A LIMIT order needs a price; the client may send it as `limitPrice` or `price`.
   const price = req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price;
   // Optional native stop-loss / take-profit (percentages) to attach as an exchange-side
@@ -5685,8 +5828,16 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
 
 /* Register a real position for the engine to watch. Called from /api/broker/order after a
    real buy that opted into auto-exit. Persists the creds needed to act on it later. */
-async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval, product, short = false }) {
+async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval, product, short = false, entryOrderId = null }) {
   await persistSessionCred(sess);
+  /* R17-P1-03: when the caller supplies the broker entry-order id, registration is IDEMPOTENT by
+     (broker,user,entryOrderId) — if a managed position for that entry already exists (e.g. another replica's
+     delayed-protection worker got there first), reuse it instead of arming a second exit for one holding. */
+  if (entryOrderId) {
+    const existing = (await db.getManagedPositionsForUser(String(sess.userId)).catch(() => []))
+      .find((p) => p && String(p.entryOrderId) === String(entryOrderId) && p.broker === sess.broker);
+    if (existing) return existing;
+  }
   const pos = {
     id: crypto.randomBytes(16).toString("hex"),
     userId: String(sess.userId), broker: sess.broker,
@@ -5697,9 +5848,16 @@ async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, ma
     product: product || "CNC",              // so the exit closes with the SAME product as entry
     cfg: cfg || null,                       // strategy { defs, exit } for indicator exits
     yahoo: yahoo || symbol, interval: interval || (market === "IN" || market === "Commodity" ? "5m" : "5m"),
+    ...(entryOrderId ? { entryOrderId: String(entryOrderId) } : {}),
     status: "open",
   };
-  await db.saveManagedPosition(pos);
+  try {
+    await db.saveManagedPosition(pos);
+  } catch (e) {
+    // Unique (broker,user,entryOrderId) violation → another worker just armed it. Reuse theirs.
+    if (entryOrderId) { const other = (await db.getManagedPositionsForUser(String(sess.userId)).catch(() => [])).find((p) => p && String(p.entryOrderId) === String(entryOrderId) && p.broker === sess.broker); if (other) return other; }
+    throw e;
+  }
   return pos;
 }
 
@@ -6326,24 +6484,26 @@ async function runAutoBuyEngine() {
         const sess = await sessionFromCred(st.userId, st.broker);
         if (!sess) { await db.updateRealStrategy(st.id, { lastError: "no stored credentials — reconnect broker" }); continue; }
 
-        /* R16-P1-02: the SAME server-owned risk policy that guards manual orders must guard unattended
-           auto-buy. Load the user's caps, fetch broker account truth, and run the shared risk engine BEFORE
-           claiming. If the account can't be verified we refuse (this is real money) rather than trade blind.
-           The exact policy is recorded with the order intent. */
+        /* R17-P1-01: the SAME shared risk engine that guards manual orders must guard unattended auto-buy —
+           ALWAYS, not only when the user saved a custom policy. Fetch broker account truth and run
+           serverValidateOrder every cycle. If the user saved caps we pass them (tightening the DEFAULT_LIMITS
+           floor); if not, we pass no `limits` so the engine applies its built-in DEFAULT_LIMITS (25% daily-loss
+           breaker, open-position/trade caps, per-symbol cooldown, funds/margin). Fail CLOSED if the account
+           can't be verified — never trade blind with real money. */
         const abMarketKind = st.market === "Crypto" ? "Crypto" : (st.market === "US" ? "US" : "IN");
         const abStoreKey = storageKeyFor(st.userId);   // same key manual orders + /api/risk-policy use
-        const abPolicy = await db.getRiskPolicy(abStoreKey).catch(() => null);
-        if (abPolicy && Object.keys(cleanRiskPolicy(abPolicy)).length) {
+        const abPolicy = cleanRiskPolicy(await db.getRiskPolicy(abStoreKey).catch(() => null));
+        {
           const abAccount = await fetchBrokerAccount(sess).catch(() => null);
           if (!abAccount) { await db.updateRealStrategy(st.id, { lastError: "Couldn't verify account with broker to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }); continue; }
           const abTrades = await db.getTrades(abStoreKey, 0, Date.now()).catch(() => []);
           const abCheck = serverValidateOrder(
             { sym: String(st.brokerSym).replace(/^NSE:/, "").replace(/-EQ$/, ""), side: st.short ? "SELL" : "BUY", qty, price: px, market: abMarketKind },
-            { wallet: abAccount.wallet, portfolio: abAccount.portfolio, trades: abTrades || [], limits: cleanRiskPolicy(abPolicy) },
+            { wallet: abAccount.wallet, portfolio: abAccount.portfolio, trades: abTrades || [], ...(Object.keys(abPolicy).length ? { limits: abPolicy } : {}) },
           );
           if (!abCheck.ok) {
-            await db.updateRealStrategy(st.id, { lastError: "Blocked by your safety caps: " + (abCheck.reasons[0] || "not allowed"), lastOrderStatus: "risk-blocked" });
-            logFinancial("autobuy.risk_blocked", { userId: st.userId, broker: st.broker, symbol: st.symbol, reasons: abCheck.reasons });
+            await db.updateRealStrategy(st.id, { lastError: "Blocked by risk checks: " + (abCheck.reasons[0] || "not allowed"), lastOrderStatus: "risk-blocked" });
+            logFinancial("autobuy.risk_blocked", { userId: st.userId, broker: st.broker, symbol: st.symbol, reasons: abCheck.reasons, usedDefaults: !Object.keys(abPolicy).length });
             continue;
           }
         }
@@ -6417,33 +6577,47 @@ if (process.env.EXIT_MONITOR !== "off") {
   setTimeout(runAutoBuyEngine, 20_000);
 }
 
-/* R16-P2-10 delayed-fill protection watcher. Re-checks parked LIMIT entries until terminal and, on a
-   confirmed fill, attaches the requested app-managed SL/TP to the ACTUAL filled quantity. Gives up on a
-   rejected order or after a long DAY-order horizon so nothing lingers. */
+/* R16-P2-10 / R17-P1-03 delayed-fill protection watcher. Rows are ATOMICALLY LEASED (claimPendingProtection),
+   so exactly one replica processes each — no duplicate managed exits. On a confirmed fill it arms app-managed
+   SL/TP, idempotent by (broker,user,entryOrderId), to the ACTUAL filled quantity. R17-P2-01: a fill without a
+   usable average price is NOT armed (SL/TP maths would be meaningless) — the job is kept for a later sweep and
+   the user is warned. Gives up only on a broker rejection or a real DAY-order horizon. */
 async function runProtectionWatcher() {
   let rows = [];
-  try { rows = await db.listPendingProtection(200); } catch { return; }
+  try { rows = await db.claimPendingProtection(Math.max(90_000, Number(process.env.PROTECTION_LEASE_MS) || 120_000), 200); } catch { return; }
   for (const p of rows) {
     try {
       const ageMs = Date.now() - (p.created_at || 0);
-      if ((p.attempts || 0) > 90 || ageMs > 8 * 3600 * 1000) { await db.deletePendingProtection(p.id); continue; }
-      await db.bumpPendingProtection(p.id);
+      if ((p.attempts || 0) > 600 || ageMs > 8 * 3600 * 1000) {
+        await db.deletePendingProtection(p.id);
+        logFinancial("protection.expired", { userId: p.userId, broker: p.broker, orderId: p.orderId });
+        await addUserNotice(p.userId, { type: "protection_expired", broker: p.broker, symbol: p.symbol, msg: `Your ${p.symbol} limit order didn't confirm a fill in time — SL/TP was NOT attached. Check it on your broker.` });
+        continue;
+      }
       if (p.broker !== "fyers") { await db.deletePendingProtection(p.id); continue; }   // only FYERS parks here today
       const sess = await sessionFromCred(p.userId, "fyers");
-      if (!sess) continue;   // creds unavailable this cycle — retry next sweep
+      if (!sess) continue;   // creds unavailable this cycle — lease will lapse, retried later
       const c = await verifyFyersFill(sess, p.orderId, Number(p.qty));
       if (c.filled) {
+        const avg = Number(c.avgPrice);
+        if (!(avg > 0)) {
+          // R17-P2-01: filled but no usable average price — do NOT arm an inert exit. Keep for retry.
+          logFinancial("protection.filled_no_price", { userId: p.userId, broker: "fyers", orderId: p.orderId });
+          continue;
+        }
         await registerManagedPosition({
-          sess, symbol: p.symbol, brokerSym: p.brokerSym, qty: c.filledQty || Number(p.qty), entry: c.avgPrice || 0,
+          sess, symbol: p.symbol, brokerSym: p.brokerSym, qty: c.filledQty || Number(p.qty), entry: avg,
           market: p.market, sl: p.sl || null, tp: p.tp || null, tsl: p.tsl || null, cfg: p.cfg || null,
-          yahoo: p.yahoo, interval: p.interval, product: p.product, short: !!p.short,
+          yahoo: p.yahoo, interval: p.interval, product: p.product, short: !!p.short, entryOrderId: p.orderId,
         });
         await db.deletePendingProtection(p.id);
         logFinancial("protection.attached", { userId: p.userId, broker: "fyers", orderId: p.orderId, qty: c.filledQty || p.qty });
+        await addUserNotice(p.userId, { type: "protection_attached", broker: "fyers", symbol: p.symbol, msg: `SL/TP is now protecting your ${p.symbol} position (filled at ${avg}).` });
       } else if (c.rejected) {
         await db.deletePendingProtection(p.id);
+        await addUserNotice(p.userId, { type: "protection_rejected", broker: "fyers", symbol: p.symbol, msg: `Your ${p.symbol} limit order was rejected — no SL/TP attached.` });
       }
-      // else still pending — leave it for the next sweep
+      // else still pending — the lease lapses and it's re-checked next sweep
     } catch (e) { console.error("[protection] sweep item failed:", e.message); }
   }
 }

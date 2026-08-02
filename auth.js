@@ -33,10 +33,11 @@ const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;   // 30 days
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const b64urlJson = (obj) => b64url(JSON.stringify(obj));
 
-/** Sign a token for userId. `secret` and `ttlMs` are injectable for testing. */
-function signToken(userId, secret = DEFAULT_SECRET, ttlMs = TOKEN_TTL_MS) {
+/** Sign a token for userId. `secret` and `ttlMs` are injectable for testing. `tv` is the token version
+    (M-02) — bumped on block / PIN reset / logout / deletion so older tokens can be revoked. */
+function signToken(userId, secret = DEFAULT_SECRET, ttlMs = TOKEN_TTL_MS, tv = 0) {
   const header = b64urlJson({ alg: "HS256", typ: "JWT" });
-  const payload = b64urlJson({ sub: String(userId), iat: Date.now(), exp: Date.now() + ttlMs });
+  const payload = b64urlJson({ sub: String(userId), iat: Date.now(), exp: Date.now() + ttlMs, tv: Number(tv) || 0 });
   const sig = b64url(crypto.createHmac("sha256", secret).update(`${header}.${payload}`).digest());
   return `${header}.${payload}.${sig}`;
 }
@@ -58,17 +59,20 @@ function verifyToken(token, secret = DEFAULT_SECRET) {
   try { data = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString()); }
   catch { return null; }
   if (!data || !data.sub || !data.exp || Date.now() > data.exp) return null;
-  return { userId: data.sub };
+  return { userId: data.sub, tv: Number(data.tv) || 0 };
 }
 
 /* Middleware: require a valid token. Reads `Authorization: Bearer <token>`, verifies it,
    and attaches req.authUserId (the trusted userId). Rejects with 401 otherwise. */
 function requireAuth(req, res, next) {
+  /* M-01: accept the token ONLY from the Authorization header — never a query string. A token in the URL
+     leaks into access logs, browser history, analytics and Referer headers. */
   const h = req.get("Authorization") || "";
-  const token = h.startsWith("Bearer ") ? h.slice(7) : (req.query.token || "");
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
   const v = verifyToken(token);
   if (!v) return res.status(401).json({ error: "Authentication required." });
   req.authUserId = v.userId;
+  req.authTokenVersion = v.tv || 0;   // M-02: for the DB freshness check on sensitive routes
   next();
 }
 

@@ -23,6 +23,20 @@ const DEFAULT_LIMITS = {
   cooldownMs: 15000,        // 15s min gap between two entries in the same symbol
 };
 
+/* H-04: daily risk windows (trade count, daily-loss circuit breaker) must reset on the EXCHANGE session day,
+   not the server's local/UTC midnight. On a UTC host an Indian loss at 01:00 IST would otherwise count against
+   the previous day. Derive midnight in the market's timezone (IST / ET-with-DST / UTC for 24×7 crypto). */
+function startOfSessionDay(market) {
+  const tz = market === "US" ? "America/New_York" : (market === "Crypto" ? "UTC" : "Asia/Kolkata");
+  const now = new Date();
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).formatToParts(now).map((x) => [x.type, x.value]));
+  const wallAsUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +(p.hour === "24" ? 0 : p.hour), +p.minute, +p.second);
+  const offset = wallAsUTC - now.getTime();               // tz offset from UTC, DST-correct at this instant
+  const midnightWallAsUTC = Date.UTC(+p.year, +p.month - 1, +p.day, 0, 0, 0);
+  return midnightWallAsUTC - offset;                       // the real UTC instant of tz-local midnight today
+}
 const startOfDay = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
 
 /* R3-#6: a short consumes MARGIN, and the engine doesn't know the account's exact leverage. These are
@@ -56,7 +70,8 @@ function validateOrder(order, account) {
 
   const value = qty * price;
   const held = portfolio.find((h) => h.sym === sym);
-  const todays = trades.filter((t) => (t.entryAt || 0) >= startOfDay() && (t.market || "IN") === market);
+  const sessionStart = startOfSessionDay(market);
+  const todays = trades.filter((t) => (t.entryAt || 0) >= sessionStart && (t.market || "IN") === market);
   const openInMarket = portfolio.filter((h) => (h.market || "IN") === market);
 
   if (side === "BUY") {
@@ -79,12 +94,15 @@ function validateOrder(order, account) {
 
   if (side === "SELL") {
     /* P1-03 — reconcile with the frontend, which allows a SELL to OPEN a short. The portion covered by
-       an existing long is a plain reduce/close (always allowed, no funds check). Any UNCOVERED portion
-       opens a short, which consumes margin like a buy — so it gets the same position-size / count caps
-       (and a warning that the market/broker must permit shorting; the broker rejects an illegal short). */
-    const heldQty = held ? (held.qty || 0) : 0;
-    if (heldQty < qty) {
-      const shortQty = qty - heldQty;
+       an existing LONG is a plain reduce/close (always allowed, no funds check). Any UNCOVERED portion
+       opens/increases a short, which consumes margin like a buy — so it gets the same position-size / count
+       caps (and a warning that the market/broker must permit shorting; the broker rejects an illegal short).
+       H-05: only a LONG holding covers a SELL. An existing SHORT does NOT cover it — selling more INCREASES
+       the short — so we must not treat a short holding as coverage (that bypassed the uncovered-short caps). */
+    const heldIsShort = held && (held.short === true || String(held.side || "").toUpperCase() === "SELL");
+    const longHeld = held && !heldIsShort ? (held.qty || 0) : 0;
+    if (longHeld < qty) {
+      const shortQty = qty - longHeld;
       const px = price || (held && (held.price || held.avg)) || 0;
       if (px > 0) {
         const equity = wallet + portfolio.reduce((a, h) => a + Math.abs(h.qty || 0) * (h.price || h.avg || 0), 0);
@@ -110,7 +128,7 @@ function validateOrder(order, account) {
 
   // --- daily loss limit (based on start-of-day equity, not current wallet) ---
   const realisedToday = trades
-    .filter((t) => (t.exitAt || 0) >= startOfDay() && (t.market || "IN") === market)
+    .filter((t) => (t.exitAt || 0) >= sessionStart && (t.market || "IN") === market)
     .reduce((a, t) => a + (t.pnl || 0), 0);
   const startOfDayWallet = wallet - realisedToday;
   const lossCap = -(startOfDayWallet * limits.maxDailyLossPct) / 100;
@@ -118,12 +136,16 @@ function validateOrder(order, account) {
     reasons.push(`Daily loss limit hit in ${market} (${realisedToday.toFixed(0)} vs cap ${lossCap.toFixed(0)}).`);
   }
 
-  // --- duplicate / cooldown ---
+  /* C-04: cooldown is a BLOCKING control, not a warning — it exists to kill resubmission loops that would
+     otherwise place repeated real orders 15s apart (idempotency only stops same-key retries; a loop minting
+     new keys would bypass it). Applies to a BUY and to opening/increasing an uncovered SHORT. */
   const lastSame = trades
     .filter((t) => t.sym === sym && t.entryAt)
     .sort((a, b) => b.entryAt - a.entryAt)[0];
-  if (side === "BUY" && lastSame && Date.now() - lastSame.entryAt < limits.cooldownMs) {
-    warnings.push(`Bought ${sym} moments ago — cooling down.`);
+  const openingExposure = side === "BUY" || (side === "SELL" && (!held || (held.short === true || String(held.side || "").toUpperCase() === "SELL")));
+  if (openingExposure && lastSame && Date.now() - lastSame.entryAt < limits.cooldownMs) {
+    const waitMs = limits.cooldownMs - (Date.now() - lastSame.entryAt);
+    reasons.push(`Cooldown: ${sym} was traded ${Math.round((Date.now() - lastSame.entryAt) / 1000)}s ago — wait ${Math.ceil(waitMs / 1000)}s before another entry.`);
   }
 
   return { ok: reasons.length === 0, reasons, warnings };
