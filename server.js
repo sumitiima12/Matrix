@@ -177,6 +177,39 @@ app.post("/api/trades/clear-virtual", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* RECONCILE AGAINST DELTA — self-heal phantom records. Reads the caller's ACTUAL Delta positions (signed
+   with their own keys) and DROPS any OPEN real crypto journal record for a symbol Delta doesn't actually
+   hold. This fixes an inflated dashboard/P&L (e.g. positions the browser optimistically recorded that were
+   rejected or never filled) WITHOUT touching real holdings or the server's managed positions. Delta only —
+   it's the broker whose positions we can verify. Scoped to the verified token's own book. */
+app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const sess = await sessionFromCred(req.authUserId, "delta");
+    if (!sess) return res.status(400).json({ error: "Connect your Delta account first — reconcile verifies against Delta's actual positions." });
+    // Actual open Delta positions → set of normalized base symbols the account really holds.
+    let held;
+    try {
+      const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId }), 8000);
+      const norm = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "");
+      held = new Set((pr && pr.result || [])
+        .filter((x) => Number(x.size) !== 0)
+        .map((x) => norm(x.product_symbol || (x.product && x.product.symbol) || "")));
+    } catch { return res.status(502).json({ error: "Couldn't read your Delta positions right now — try again in a moment." }); }
+    // Find OPEN, REAL, CRYPTO journal records whose symbol Delta does NOT hold → phantom → drop.
+    const norm = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "");
+    const trades = await db.getTrades(userId, 0, Date.now()).catch(() => []);
+    const phantom = (trades || []).filter((t) =>
+      t && t.real === true && (t.market || "") === "Crypto" &&
+      t.entryAt != null && (t.exitAt == null || t.exit == null) &&      // still "open"
+      t.status !== "rejected" && !held.has(norm(t.sym)));
+    const removed = await db.deleteTradesByIds(userId, phantom.map((t) => t.id));
+    rcBust(`trades:${userId}`);
+    logFinancial("trades.reconcileReal", { userId, removed, held: [...held] });
+    res.json({ ok: true, removed, heldSymbols: [...held], droppedSymbols: phantom.map((t) => t.sym) });
+  } catch (e) { serverError(res, e); }
+});
+
 /* ----------------------- users (phone + PIN) & state ---------------------- */
 /* PINs are now bcrypt-hashed. Existing users were SHA-256 — we MUST NOT lock them out, so
    verifyPin accepts the old scheme too, and a successful legacy login is transparently

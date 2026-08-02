@@ -154,6 +154,23 @@ async function saveTrade(userId, trade) {
   writeJSON(FILES.trades, db);
   return trade;
 }
+/* Delete specific trades by their id (scoped to the user). Used by the Delta reconcile to drop phantom
+   OPEN real journal records the broker doesn't actually hold. Returns how many were removed. */
+async function deleteTradesByIds(userId, ids) {
+  const list = (ids || []).map(String).filter(Boolean);
+  if (!list.length) return 0;
+  if (USING_PG) {
+    const r = await pool.query(`DELETE FROM trades WHERE user_id=$1 AND id = ANY($2::text[])`, [userId, list]);
+    return r.rowCount || 0;
+  }
+  const db = readJSON(FILES.trades);
+  const arr = db[userId] || [];
+  const set = new Set(list);
+  const before = arr.length;
+  db[userId] = arr.filter((t) => !(t && set.has(String(t.id))));
+  writeJSON(FILES.trades, db);
+  return before - db[userId].length;
+}
 async function getTrades(userId, from, to) {
   if (USING_PG) {
     const r = await pool.query(
@@ -751,4 +768,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
