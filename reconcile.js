@@ -67,4 +67,24 @@ function redirectBindingOk(stateRedirect, echoed, enforce) {
   return { ok: true };
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk };
+/* ONE interpretation of a Delta order response → fill truth, so ENTRY and EXIT read fills the same way
+   (the review's "internal truth diverges on partial/delayed/unknown fills"). `requested` is the contract
+   size we asked for, used when the response omits size. HTTP 200 is NOT a fill — a market order can be
+   accepted then partially filled or rejected, so we derive from size/unfilled_size/state. */
+function classifyDeltaOrder(o, requested = 0) {
+  o = o || {};
+  const size = Number(o.size) || Number(requested) || 0;
+  const unfilled = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : size);
+  const filled = Math.max(0, size - unfilled);
+  const rejected = o.state === "cancelled" || o.state === "rejected";
+  return {
+    state: o.state || "unknown",
+    size, filled, unfilled, rejected,
+    fullyFilled: !rejected && filled > 0 && unfilled <= 0,
+    partial: !rejected && filled > 0 && unfilled > 0,
+    avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null,
+    orderId: o.id != null ? o.id : null,
+  };
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder };

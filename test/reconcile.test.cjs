@@ -49,6 +49,18 @@ test("redirectAllowed: exact origin + path boundary, no subdomain prefix bypass"
   assert.equal(R.redirectAllowed(null, allow), true);                 // no redirect = nothing to gate
 });
 
+test("classifyDeltaOrder: fully-filled / partial / rejected fill truth", () => {
+  const full = R.classifyDeltaOrder({ id: 7, size: 5, unfilled_size: 0, state: "closed", average_fill_price: 100 }, 5);
+  assert.equal(full.fullyFilled, true); assert.equal(full.partial, false); assert.equal(full.filled, 5); assert.equal(full.orderId, 7);
+  const part = R.classifyDeltaOrder({ id: 8, size: 5, unfilled_size: 2, state: "open" }, 5);
+  assert.equal(part.fullyFilled, false); assert.equal(part.partial, true); assert.equal(part.filled, 3); assert.equal(part.unfilled, 2);
+  const rej = R.classifyDeltaOrder({ id: 9, size: 5, unfilled_size: 5, state: "rejected" }, 5);
+  assert.equal(rej.rejected, true); assert.equal(rej.fullyFilled, false); assert.equal(rej.filled, 0);
+  // Missing size falls back to the requested contracts; a plain "closed" implies fully filled.
+  const closed = R.classifyDeltaOrder({ id: 10, state: "closed" }, 4);
+  assert.equal(closed.fullyFilled, true); assert.equal(closed.filled, 4);
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match

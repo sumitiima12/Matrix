@@ -5303,7 +5303,10 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false)
       userId: sess.userId,
       body: { product_id: prod.id, size, side: short ? "buy" : "sell", order_type: "market_order", reduce_only: true },
     });
-    return { orderId: d.result?.id ?? null };
+    // R6-lifecycle: verify the exit actually FILLED — a partial/rejected reduce-only leaves the position
+    // open at the broker, so we must NOT let the caller mark it fully closed. Report the fill truth.
+    const c = reconcile.classifyDeltaOrder(d.result || {}, size);
+    return { orderId: c.orderId, filled: c.fullyFilled, partial: c.partial, state: c.state, remainingContracts: c.unfilled };
   }
   if (broker === "coindcx") {
     const { apiKey, apiSecret } = sess.extra || {};
@@ -5513,6 +5516,15 @@ async function runAutoExitEngine() {
         if (!sess) { await db.updateManagedPosition(pos.id, { status: "open", lastError: "no stored credentials — reconnect broker" }); continue; }
 
         const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
+        // R6-lifecycle: only mark CLOSED when the exit actually flattened. A verified-partial Delta exit
+        // (r.filled === false) leaves a real position open, so we return it to "open" — the reduce-only
+        // retry on the next tick (and the flat-reconcile) will finish the job instead of losing track of
+        // live exposure. Non-Delta brokers don't report fill truth (r.filled undefined) → treated as closed.
+        if (r.filled === false) {
+          await db.updateManagedPosition(pos.id, { status: "open", lastError: `Exit not fully filled (state ${r.state}, ~${r.remainingContracts} left) — will retry`, exitOrderId: r.orderId || null });
+          console.warn(`[autoexit] PARTIAL/UNFILLED exit ${pos.symbol} for ${pos.userId} — retrying next tick (order ${r.orderId})`);
+          continue;
+        }
         await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null });
         exited++;
         console.log(`[autoexit] EXITED ${pos.symbol} for ${pos.userId} via ${pos.broker} — ${hit.reason} (order ${r.orderId})`);
