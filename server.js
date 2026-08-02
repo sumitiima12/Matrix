@@ -5825,17 +5825,52 @@ app.post("/api/autobuy/register", requireAuth, async (req, res) => {
 });
 app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
-  const { id, paused } = req.body || {};
+  const { id, paused, force } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
   const mine = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
   if (!mine) return res.status(404).json({ error: "not found" });
-  // R3-#1: RESUMING is the user's explicit "I've verified with my broker" — clear any unknown-order
-  // review marker so the strategy restarts clean instead of immediately re-pausing itself.
-  const patch = paused
-    ? { status: "paused" }
-    : { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null };
-  await db.updateRealStrategy(id, patch);
-  res.json({ ok: true });
+
+  // Pausing is always safe.
+  if (paused) { await db.updateRealStrategy(id, { status: "paused" }); return res.json({ ok: true, status: "paused" }); }
+
+  // RESUMING a strategy that is NOT under unknown-order review → just activate.
+  if (!mine.needsReview && !mine.pendingSince) { await db.updateRealStrategy(id, { status: "active" }); return res.json({ ok: true, status: "active" }); }
+
+  /* RESUMING A STRATEGY UNDER REVIEW (unknown order). Clearing the marker blindly is the duplicate hole:
+     if the original order actually FILLED, a cleared marker lets the strategy open a SECOND position. So
+     re-verify the outcome before we ever clear it — never on faith. */
+  // 1) A matching OPEN position already exists → link it and activate. The strategy now holds that
+  //    position and will not re-enter until it closes. Safe.
+  const managed = await db.getManagedPositionsForUser(userId).catch(() => []);
+  const openMatch = managed.find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(mine.brokerSym) && Number(p.entry) > 0);
+  if (openMatch) {
+    await db.updateRealStrategy(id, { status: "active", openPositionId: openMatch.id, pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
+    logFinancial("autobuy.review.linked", { userId, id, positionId: openMatch.id });
+    return res.json({ ok: true, status: "active", linked: openMatch.id, note: "Linked to your open position — the exit engine manages it and no duplicate entry will be placed." });
+  }
+  // 2) Ask the broker's own order book about the original client_order_id.
+  const probe = await brokerOrderProbe(mine);
+  if (probe === false) {
+    // Broker confirms the order never landed → safe to clear and resume fresh.
+    await db.updateRealStrategy(id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
+    logFinancial("autobuy.review.resumedClean", { userId, id });
+    return res.json({ ok: true, status: "active", note: "Broker confirmed the earlier order never filled — resumed cleanly." });
+  }
+  // 3) The order EXISTS at the broker (probe===true) or we couldn't verify (null). Resuming now could
+  //    duplicate a real fill, so we DO NOT clear on our own — the user must explicitly force it AFTER
+  //    checking their broker. Until then the strategy stays paused (no re-entry).
+  if (!force) {
+    return res.status(409).json({
+      ok: false, needsReview: true, status: "paused",
+      reason: probe === true
+        ? "Your earlier order was found at the broker but isn't linked to an open position here. Flatten it with “Stop & sell”, or — only if you've confirmed there's no open position — resume anyway."
+        : "Couldn't confirm the earlier order's outcome with your broker. Check your broker; only if there's no open position for this strategy, resume anyway.",
+    });
+  }
+  // Forced resume — the user has taken responsibility after checking their broker.
+  await db.updateRealStrategy(id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
+  logFinancial("autobuy.review.forceResumed", { userId, id });
+  return res.json({ ok: true, status: "active", forced: true });
 });
 app.post("/api/autobuy/cancel", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
