@@ -4543,17 +4543,18 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
   const exitCfg = req.body?.strategy || null;      // { defs, exit } from the strategy builder
   const tslPct = Number(req.body?.tslPct) || 0;
   const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
-  async function registerAutoExit() {
+  async function registerAutoExit(qtyOverride, entryOverride) {
     if (!wantAutoExit) return null;   // register for BOTH longs and shorts (exit math is direction-aware)
     // All brokers now have order placement wired, so any of them can be auto-exited.
     try {
       const bareSym = String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "");
-      const entryRef = Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, regMarket) || null;
+      const entryRef = Number(entryOverride) > 0 ? Number(entryOverride) : (Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, regMarket) || null);
+      const regQty = Number(qtyOverride) > 0 ? Number(qtyOverride) : nQty;
       const yahoo = req.body?.yahoo || (regMarket === "Crypto"
         ? `${String(symbol).replace(/(USDT|USD|INR)$/i, "")}-USD`
         : `${bareSym}.NS`);
       const pos = await registerManagedPosition({
-        sess, symbol: bareSym, brokerSym: symbol, qty: nQty, entry: entryRef,
+        sess, symbol: bareSym, brokerSym: symbol, qty: regQty, entry: entryRef,
         market: regMarket, sl: slPct || null, tp: tpPct || null, tsl: tslPct || null,
         cfg: exitCfg, yahoo, interval: req.body?.interval || "5m",
         short: String(side).toLowerCase() === "sell",
@@ -4639,8 +4640,19 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
       });
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
-      const autoExitId = await registerAutoExit();
-      return res.json({ orderId: d.id, status: "PENDING", broker, autoExitId });
+      /* R9-P1-02: NEVER arm app-managed SL/TP on mere acceptance. If the user asked for auto-exit, confirm
+         the entry actually FILLED first (same verification the auto-buy path uses) and register the managed
+         position at the REAL filled quantity/price. A rejected or still-pending entry arms nothing — so the
+         exit engine can't later SELL against a holding that doesn't exist. Order placement itself still
+         returns to the client; only the auto-exit arming is gated on the fill. */
+      let autoExitId = null, fillStatus = "PENDING";
+      if (wantAutoExit) {
+        const c = await verifyFyersFill(sess, d.id, Number(qty));
+        if (c.filled) { autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice); fillStatus = "FILLED"; }
+        else if (c.rejected) fillStatus = "REJECTED";
+        else fillStatus = "PENDING";   // accepted but not confirmed filled → do NOT arm; user verifies in FYERS
+      }
+      return res.json({ orderId: d.id, status: fillStatus, broker, autoExitId, autoExitArmed: !!autoExitId, ...(wantAutoExit && !autoExitId ? { autoExitNote: "SL/TP not armed — entry not confirmed filled. Verify in FYERS and re-arm from the position." } : {}) });
     }
 
     if (broker === "delta") {
@@ -5331,6 +5343,21 @@ async function verifyFyersFill(sess, orderId, wantQty = 0) {
   return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
 }
 
+/* R9-P1-01: signed FYERS net quantity for a symbol (positive = long, negative = short, 0 = flat), or null
+   when we can't read it. FYERS equity SELLs are NOT reduce-only, so the exit path clamps to this to make a
+   retry after a partial fill unable to oversell into a short. */
+async function fyersNetQty(sess, symbol) {
+  try {
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth("fyers", sess.accessToken, sess.userId) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") return null;
+    const net = Array.isArray(d.netPositions) ? d.netPositions : null;
+    if (!net) return null;
+    const p = net.find((x) => String(x.symbol) === String(symbol));
+    return p ? (Number(p.netQty) || 0) : 0;
+  } catch { return null; }
+}
+
 /* REDUCE-ONLY exit executor. CLOSES a position by trading the OPPOSITE side: a long is closed
    with a sell, a short (Delta perpetual only) with a buy. Delta additionally sets reduce_only so
    it can never flip the position by accident. The exit MUST use the same product the entry used
@@ -5418,17 +5445,28 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false)
     return { orderId: d.data.order_id };
   }
   if (broker === "fyers") {
+    /* R9-P1-01: FYERS equity SELL is NOT reduce-only. Before EVERY exit (initial or retry) clamp the
+       quantity to the broker's actual net-long holding, so a retry after a partial fill can never sell
+       more than we still hold and flip us into a short. If FYERS reports the account already flat (or
+       short), there is nothing to close — report it closed instead of firing another SELL. */
+    const held = await fyersNetQty(sess, symbol);   // signed; null = couldn't read
+    if (held != null && held <= 0) return { orderId: null, filled: true, alreadyFlat: true, state: "closed", filledQty: 0, remaining: 0 };
+    const sellQty = held != null ? Math.min(Number(qty), held) : Number(qty);
     const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: -1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
+      body: JSON.stringify({ symbol, qty: sellQty, type: 2, side: -1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
     });
     const d = await r.json();
     if (!r.ok || d.s === "error") throw new Error(d.message || `fyers exit ${r.status}`);
     // Acceptance ≠ execution. Verify the actual fill before letting the caller mark the position closed.
-    const c = await verifyFyersFill(sess, d.id, Number(qty));
+    const c = await verifyFyersFill(sess, d.id, sellQty);
     if (c.rejected) throw new Error(c.reason || `FYERS rejected the exit (status ${c.status})`);
-    const filledAll = c.filled && (!Number(qty) || c.filledQty >= Number(qty));
-    return { orderId: d.id, filled: filledAll, partial: c.filled && !filledAll, state: c.filled ? "closed" : "open", avgPrice: c.avgPrice };
+    const filledQty = Number(c.filledQty) || 0;
+    const filledAll = c.filled && filledQty >= sellQty;
+    // Remaining is what the ORIGINAL requested qty still needs closed after this fill — the caller uses it
+    // to shrink the managed position so the next retry only sells the unsold remainder.
+    const remaining = Math.max(0, Number(qty) - filledQty);
+    return { orderId: d.id, filled: filledAll, partial: c.filled && !filledAll, state: filledAll ? "closed" : "open", avgPrice: c.avgPrice, filledQty, remaining };
   }
   throw new Error(`auto-exit not supported for ${broker}`);
 }
@@ -5488,10 +5526,12 @@ async function adoptBrokerPosition(st) {
     if (!net) return null;
     const p = net.find((x) => String(x.symbol) === String(st.brokerSym));
     if (!p || !Number(p.netQty)) return null;   // broker shows FLAT → nothing to adopt
+    // R8-audit F-1: our FYERS exit path only SELLS (can't buy-to-cover), so we must not adopt a SHORT
+    // position — we couldn't close it correctly. Refuse; the user manages a short in their broker app.
+    if (Number(p.netQty) < 0) return null;
     const qty = Math.abs(Number(p.netQty));
     const entry = Number(p.avgPrice) || Number(p.netAvg) || null;
-    const short = Number(p.netQty) < 0;
-    return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short });
+    return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: false });
   }
   // R6-P1-01: for brokers WITHOUT an actual position lookup we refuse to adopt. Synthesizing a managed
   // position from the intended notional + current price is unsafe — a partial fill, a different fill
@@ -5606,8 +5646,17 @@ async function runAutoExitEngine() {
         // live exposure. Delta and FYERS both report fill truth; other brokers leave r.filled undefined
         // (=== false is not true) → treated as closed.
         if (r.filled === false) {
-          await db.updateManagedPosition(pos.id, { status: "open", lastError: `Exit not fully filled (state ${r.state}, ~${r.remainingContracts} left) — will retry`, exitOrderId: r.orderId || null });
-          console.warn(`[autoexit] PARTIAL/UNFILLED exit ${pos.symbol} for ${pos.userId} — retrying next tick (order ${r.orderId})`);
+          /* R9-P1-01: shrink the managed quantity to what the broker CONFIRMED still needs closing, so the
+             next retry sells only the unsold remainder — never the full original qty again (which, on a
+             non-reduce-only FYERS SELL, could oversell into a short). `r.remaining` is broker-confirmed
+             (FYERS); Delta is reduce-only so it can't oversell and reports contracts separately. */
+          const patch = { status: "open", lastError: `Exit not fully filled (state ${r.state}${r.remaining != null ? `, ${r.remaining} left` : (r.remainingContracts != null ? `, ~${r.remainingContracts} left` : "")}) — will retry`, exitOrderId: r.orderId || null };
+          if (Number(r.remaining) >= 0 && r.remaining != null) {
+            if (r.remaining === 0) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null }); exited++; continue; }
+            patch.qty = Number(r.remaining);
+          }
+          await db.updateManagedPosition(pos.id, patch);
+          console.warn(`[autoexit] PARTIAL/UNFILLED exit ${pos.symbol} for ${pos.userId} — retrying remaining next tick (order ${r.orderId})`);
           continue;
         }
         await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null });
@@ -5684,6 +5733,10 @@ app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT
      • COOLDOWN so a still-true signal can't fire twice inside one candle.
    Exits are handed to the auto-exit engine (SL/TP/trailing + the strategy's own exit signal). */
 
+/* R8-audit: brokers whose ENTRY path verifies the actual fill before we register a managed position.
+   Others return on mere order ACCEPTANCE, which would create a phantom position — so LIVE auto-buy is
+   fail-closed to this set. Keep in sync with placeBuyOrder's per-broker fill verification. */
+const FILL_VERIFIED_BROKERS = new Set(["delta", "fyers"]);
 const AB_MAX_POSITIONS = Number(process.env.AUTO_BUY_MAX_POSITIONS) || 100000;   // effectively no cap (user asked to remove real limits)
 const AB_MAX_NOTIONAL = Number(process.env.AUTO_BUY_MAX_NOTIONAL) || 0;   // 0 = only the user's amount
 const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 1000;   // in-flight window: never re-submit while a pending order is unresolved
@@ -5693,6 +5746,9 @@ const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 10
 async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null, short = false, clientOrderId = null) {
   const broker = sess.broker, token = sess.accessToken;
   const prod = mapProduct(broker, product);
+  // R8-audit F-1 (defense in depth): only Delta's entry path handles a short (opens a SELL). Every other
+  // branch hardcodes a BUY, so a short here would open the OPPOSITE direction — refuse instead.
+  if (short && broker !== "delta") throw new Error(`invalid: short (SELL) entry not supported on ${broker} — would open a long`);
   if (broker === "delta") {
     const prods = await deltaCall("GET", "/v2/products", { signed: false });
     const dprod = (prods.result || []).find((p) => p.symbol === symbol);
@@ -5921,6 +5977,14 @@ async function runAutoBuyEngine() {
         // engine is SEPARATE — so open positions keep their stop-loss/target managed; we only skip
         // placing any new entry. Resume is instant (one tap), no re-connect / re-login.
         if (haltedEntries.has(String(st.userId))) continue;
+        /* R8-audit F-1 (wrong-way trade): a SHORT entry is only correctly implemented for Delta — every
+           other broker's entry path hardcodes a BUY, so a short-armed strategy would silently open a LONG.
+           Refuse rather than trade the opposite direction. */
+        if (st.short && st.broker !== "delta") { await db.updateRealStrategy(st.id, { lastError: "Short (SELL) auto-buy is only supported on Delta right now — re-arm this strategy as BUY, or use Delta for shorts.", lastOrderStatus: "blocked" }); continue; }
+        /* R8-audit F-3 (phantom position): only brokers whose entry path VERIFIES the fill may place a LIVE
+           entry. Others return on mere acceptance, which would register a position for an order that may
+           never fill. Fail closed. (Dry-run still simulates below.) */
+        if (live && !FILL_VERIFIED_BROKERS.has(st.broker)) { await db.updateRealStrategy(st.id, { lastError: `Live auto-buy isn't enabled for ${st.broker} yet — we can't confirm its fills, which risks a phantom position. Supported: Delta, FYERS.`, lastOrderStatus: "blocked" }); continue; }
         // Cooldown: don't re-fire a still-true signal inside the same candle.
         const intervalMs = (st.interval === "1d" ? 86400 : (Number((st.interval || "5m").replace(/[^\d]/g, "")) || 5) * 60) * 1000;
         if (st.lastOrderAt && Date.now() - st.lastOrderAt < intervalMs) continue;
