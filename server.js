@@ -3378,6 +3378,17 @@ const OAUTH_STATE_TTL = 10 * 60_000;         // 10 minutes to complete the broke
    means "don't change behaviour" so existing BYOA flows keep working. The canonical redirect is also
    stored in the one-time state record and verified at completion when the client echoes it back. */
 const OAUTH_REDIRECT_ALLOW = (process.env.OAUTH_REDIRECT_ALLOWLIST || "").split(",").map((s) => s.trim()).filter(Boolean);
+/* R7-P1-03: make the OAuth hardening posture VISIBLE at boot instead of silently permissive. In
+   production we WARN when the allow-list or redirect-echo enforcement is off, and hard-FAIL startup if the
+   operator opted into OAUTH_REQUIRE_ALLOWLIST but forgot to configure it. All three are documented in ENV.md. */
+(() => {
+  const prod = process.env.NODE_ENV === "production";
+  const enforceEcho = /^(1|true|yes)$/i.test(String(process.env.OAUTH_ENFORCE_REDIRECT || ""));
+  const requireAllow = /^(1|true|yes)$/i.test(String(process.env.OAUTH_REQUIRE_ALLOWLIST || ""));
+  if (requireAllow && !OAUTH_REDIRECT_ALLOW.length) throw new Error("OAUTH_REQUIRE_ALLOWLIST is set but OAUTH_REDIRECT_ALLOWLIST is empty — configure your exact callback origin(s)/path(s). See ENV.md.");
+  if (prod && !OAUTH_REDIRECT_ALLOW.length) console.warn("[oauth] PRODUCTION without OAUTH_REDIRECT_ALLOWLIST — any redirect is accepted. Set it to your exact callback URL(s). See ENV.md.");
+  if (prod && !enforceEcho) console.warn("[oauth] PRODUCTION without OAUTH_ENFORCE_REDIRECT=1 — a missing redirect echo is allowed (mismatches are still rejected). Enable it once frontend + backend are both deployed. See ENV.md.");
+})();
 /* R6-P2-03: match on EXACT origin + a PATH BOUNDARY — never a naive startsWith, which would let
    "https://app.example" prefix-match the attacker origin "https://app.example.evil.com". An allow entry
    may be a bare origin ("https://app.example") or an origin+path prefix ("https://app.example/oauth"). */
@@ -3961,7 +3972,10 @@ app.get("/api/broker/login-url", requireAuth, async (req, res) => {
   // CSRF: mint a single-use state nonce bound to this login (verified back at /api/broker/session),
   // and BIND the canonical redirect into that state so the transaction is tied to the URL that started it.
   const stateNonce = issueOAuthState(userId, id, redirect);   // userId is already the verified, storageKeyFor'd id
-  res.json({ url: b.loginUrl(key, redirect, stateNonce), state: stateNonce });
+  // R7-P1-01: return the EFFECTIVE redirect (possibly server-canonicalised to FYERS_REDIRECT_URI) so the
+  // client echoes THIS exact value back at session — otherwise the binding check rejects a valid callback
+  // whenever the browser URL differs from the pinned canonical redirect.
+  res.json({ url: b.loginUrl(key, redirect, stateNonce), state: stateNonce, redirect: redirect || null });
 });
 
 /* Step 2: exchange the short-lived request/auth code for an access token.
@@ -5972,16 +5986,22 @@ app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
     return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason });
   }
   if (resolution === "nofill") {
-    // R6-P2-01: where we CAN get broker evidence (Delta), require the account to be FLAT before clearing.
-    // If the broker shows an open position, the order actually filled → refuse and steer to adopt.
+    // Delta: require BROKER EVIDENCE the account is flat before clearing + resuming (R6-P2-01).
     if (mine.broker === "delta") {
       const os = await brokerOpenSize(mine);
       if (os == null) return res.status(502).json({ ok: false, needsReview: true, reason: "Couldn't confirm with your broker that the account is flat — try again in a moment." });
       if (os.size > 0) return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason: "Your broker shows an OPEN position for this strategy — the order DID fill. Choose “Order filled” to adopt it (or flatten with Stop & sell)." });
+      await db.updateRealStrategy(id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
+      logFinancial("autobuy.review.resolvedNoFill", { userId, id, verified: true });
+      return res.json({ ok: true, status: "active", note: "Broker confirmed no open position — resolved as no-fill and resumed." });
     }
-    await db.updateRealStrategy(id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
-    logFinancial("autobuy.review.resolvedNoFill", { userId, id, verified: mine.broker === "delta" });
-    return res.json({ ok: true, status: "active", note: mine.broker === "delta" ? "Broker confirmed no open position — resolved as no-fill and resumed." : "Resolved as no-fill — resumed. Watch the next entry closely." });
+    // R7-P1-04: for a broker with NO position lookup we can't verify the account is flat, so a bare
+    // "no fill" assertion isn't safe to RESUME on (a real fill would then be duplicated). STOP the
+    // strategy instead — no duplicate is possible while it's stopped — and the user re-arms it after
+    // confirming their broker is flat.
+    await db.updateRealStrategy(id, { status: "cancelled", pendingSince: null, pendingClientId: null, needsReview: false, lastError: "Stopped: unknown order on a broker we can't verify. Confirm your account is flat, then re-arm." });
+    logFinancial("autobuy.review.stoppedUnverifiable", { userId, id, broker: mine.broker });
+    return res.json({ ok: true, status: "cancelled", stopped: true, note: "We can't verify this broker, so the strategy was STOPPED to prevent a duplicate. Confirm your account is flat on your broker, then re-arm it." });
   }
   // No explicit resolution → keep blocked and ask the user to choose an outcome.
   return res.status(409).json({
