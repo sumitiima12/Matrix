@@ -26,7 +26,7 @@ const { evalExitPair, optRanker, lenOptions, costPctFor } = require("./optimizer
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
-const { marketOpenIST, intradaySquareDue } = require("./marketHours");   // IST market-open + intraday square-off
+const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
@@ -3370,16 +3370,27 @@ function setUserAppCred(userId, broker, cred) {
    /api/broker/session. Prevents an attacker's auth_code (from a login THEY started) being planted
    into a victim's session — the old hardcoded `state=matrix` gave no such protection. In-memory is
    fine: an unfinished login just restarts. */
-const oauthStates = new Map();               // nonce -> { userId, broker, exp }
+const oauthStates = new Map();               // nonce -> { userId, broker, redirect, exp }
 const OAUTH_STATE_TTL = 10 * 60_000;         // 10 minutes to complete the broker login
-function issueOAuthState(userId, broker) {
+/* R4/R5-P2-03: OAuth callback allow-list. When OAUTH_REDIRECT_ALLOWLIST is set (comma-separated origins
+   or URL prefixes) the login redirect must match one of them; otherwise it's rejected. Opt-in — unset
+   means "don't change behaviour" so existing BYOA flows keep working. The canonical redirect is also
+   stored in the one-time state record and verified at completion when the client echoes it back. */
+const OAUTH_REDIRECT_ALLOW = (process.env.OAUTH_REDIRECT_ALLOWLIST || "").split(",").map((s) => s.trim()).filter(Boolean);
+function redirectAllowed(redirect) {
+  if (!redirect) return true;                // no redirect supplied → nothing to gate
+  if (!OAUTH_REDIRECT_ALLOW.length) return true;   // not configured → opt-in, don't break existing flows
+  try { const u = new URL(redirect); return OAUTH_REDIRECT_ALLOW.some((a) => u.origin === a || redirect.startsWith(a)); }
+  catch { return false; }
+}
+function issueOAuthState(userId, broker, redirect = null) {
   const now = Date.now();
   for (const [k, v] of oauthStates) if (v.exp < now) oauthStates.delete(k);   // prune expired
   const nonce = crypto.randomBytes(24).toString("hex");
-  oauthStates.set(nonce, { userId: userId != null ? String(userId) : null, broker, exp: now + OAUTH_STATE_TTL });
+  oauthStates.set(nonce, { userId: userId != null ? String(userId) : null, broker, redirect: redirect || null, exp: now + OAUTH_STATE_TTL });
   return nonce;
 }
-function consumeOAuthState(nonce, broker, userId) {
+function consumeOAuthState(nonce, broker, userId, redirect = null) {
   if (!nonce) return { ok: false, reason: "missing state — start the broker login again" };
   const s = oauthStates.get(nonce);
   oauthStates.delete(nonce);                 // one-time use, even on failure
@@ -3387,6 +3398,8 @@ function consumeOAuthState(nonce, broker, userId) {
   if (s.exp < Date.now()) return { ok: false, reason: "the login expired — please try again" };
   if (s.broker !== broker) return { ok: false, reason: "broker mismatch" };
   if (s.userId && userId && String(s.userId) !== String(userId)) return { ok: false, reason: "this login belongs to a different account" };
+  // Bind the transaction to the redirect that started it — when the client echoes it back at completion.
+  if (redirect && s.redirect && String(s.redirect) !== String(redirect)) return { ok: false, reason: "redirect mismatch" };
   return { ok: true };
 }
 
@@ -3942,10 +3955,11 @@ app.get("/api/broker/login-url", requireAuth, async (req, res) => {
   if (id === "fyers" && envKey("FYERS_REDIRECT_URI") && !getUserAppCred("fyers", userId)) {
     redirect = envKey("FYERS_REDIRECT_URI");   // only for shared-app users; BYOA users keep their own
   }
-  // CSRF: mint a single-use state nonce bound to this login (verified back at /api/broker/session).
-  // Normalise the id the SAME way routeUserId will at session (storageKeyFor adds the "ph_" prefix),
-  // so the user-binding check compares like-for-like instead of raw-vs-prefixed.
-  const stateNonce = issueOAuthState(userId, id);   // userId is already the verified, storageKeyFor'd id
+  // R4/R5-P2-03: reject a callback that isn't on the configured allow-list (opt-in via env).
+  if (!redirectAllowed(redirect)) return res.status(400).json({ error: "This redirect URL isn't allow-listed for OAuth. Use your registered callback." });
+  // CSRF: mint a single-use state nonce bound to this login (verified back at /api/broker/session),
+  // and BIND the canonical redirect into that state so the transaction is tied to the URL that started it.
+  const stateNonce = issueOAuthState(userId, id, redirect);   // userId is already the verified, storageKeyFor'd id
   res.json({ url: b.loginUrl(key, redirect, stateNonce), state: stateNonce });
 });
 
@@ -3963,7 +3977,7 @@ app.post("/api/broker/session", requireAuth, async (req, res) => {
      without it, an attacker's auth_code could be planted into someone else's connect. Verified only
      for the redirect brokers (fyers/schwab); Delta/userCreds/house sessions have no OAuth redirect. */
   if ((broker === "fyers" || broker === "schwab") && !(req.body && req.body.extra && req.body.extra.house)) {
-    const chk = consumeOAuthState(req.body && req.body.state, broker, userId);
+    const chk = consumeOAuthState(req.body && req.body.state, broker, userId, req.body && req.body.redirect);   // redirect echo-verified when the client sends it
     if (!chk.ok) return res.status(400).json({ error: "Login could not be verified (" + chk.reason + ")." });
   }
 
@@ -5385,6 +5399,38 @@ async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, ma
   return pos;
 }
 
+/* R4-P1-01 ADOPT: register a managed position for an order the user CONFIRMS filled but which we never
+   linked (the unknown-order case). Places NO new broker order — it only records the position so the exit
+   engine protects it and the strategy won't open a duplicate. For Delta we adopt the broker's ACTUAL
+   open position (real size + entry); for other brokers we adopt a protective placeholder at the
+   strategy's intended size and the live mark (the reduce-only exit later flattens the true size).
+   Returns the managed position, or null if the broker shows FLAT / we can't size it. */
+async function adoptBrokerPosition(st) {
+  const sess = await sessionFromCred(st.userId, st.broker);
+  if (!sess) return null;
+  if (st.broker === "delta") {
+    let held = [];
+    try { const pr = await deltaCall("GET", "/v2/positions/margined", { userId: st.userId }); held = (pr && pr.result) || []; } catch { return null; }
+    let dprod = null;
+    try { const prods = await deltaCall("GET", "/v2/products", { signed: false }); dprod = (prods.result || []).find((p) => p.symbol === st.brokerSym) || null; } catch { /* ignore */ }
+    const pid = dprod ? dprod.id : null;
+    const p = held.find((x) => (pid != null && Number(x.product_id) === Number(pid)) || String(x.product_symbol || "") === String(st.brokerSym));
+    if (!p || !Number(p.size)) return null;   // broker shows FLAT → nothing to adopt
+    const cv = dprod ? (Number(dprod.contract_value) || 1) : 1;
+    const qty = Math.abs(Number(p.size)) * cv;   // coin units
+    const entry = Number(p.entry_price) || Number(p.avg_price) || null;
+    const short = Number(p.size) < 0;
+    return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short });
+  }
+  // Non-Delta: protective placeholder at the strategy's intended size.
+  const px = (await liveMarkForOrder(st.brokerSym, st.market).catch(() => 0)) || 0;
+  if (!(px > 0)) return null;
+  const notional = Number(st.notional) || 0;
+  const qty = st.market === "Crypto" ? +(notional / px).toFixed(6) : Math.max(1, Math.floor(notional / px));
+  if (!(qty > 0)) return null;
+  return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry: px, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: !!st.short });
+}
+
 let autoExitRunning = false;
 let lastAutoExit = { at: null, checked: 0, exited: 0, live: false };
 async function runAutoExitEngine() {
@@ -5633,16 +5679,29 @@ app.post("/api/automation/entry-halt", requireAuth, async (req, res) => {
              unresolved and block, never re-enter.
    Only Delta (the supported real-crypto broker) is queryable today; other brokers return null and
    are handled conservatively (paused for manual review) by the caller. */
+/* R4-P1-02: absence must be CONCLUSIVE before we ever return `false` (which lets the strategy re-enter).
+   A truncated page (result length == page_size ⇒ there may be more we didn't see), a non-array result,
+   or a transport error are all INCONCLUSIVE → return null so the caller keeps the strategy blocked. Only
+   a schema-valid, COMPLETE (short) page in BOTH the live and history sets, with our id absent, is a
+   definitive "no order". We use a large page and match by our own client_order_id (the durable key). */
+const DELTA_PROBE_PAGE = 500;
 async function brokerOrderProbe(st) {
   if (st.broker !== "delta" || !st.pendingClientId) return null;
   const cid = String(st.pendingClientId);
-  const has = (resp) => Array.isArray(resp && resp.result) && resp.result.some((o) => String(o && o.client_order_id || "") === cid);
+  const scan = async (path) => {
+    const resp = await deltaCall("GET", path, { query: `?page_size=${DELTA_PROBE_PAGE}`, userId: st.userId });
+    if (!resp || !Array.isArray(resp.result)) return { found: false, conclusive: false };   // bad schema → inconclusive
+    const found = resp.result.some((o) => String((o && o.client_order_id) || "") === cid);
+    const conclusive = resp.result.length < DELTA_PROBE_PAGE;   // a short page means we saw them all
+    return { found, conclusive };
+  };
   try {
-    // Live/working orders first, then the closed/cancelled history. A just-placed market order that
-    // is still working shows in /v2/orders; a filled/cancelled one moves to /v2/orders/history.
-    if (has(await deltaCall("GET", "/v2/orders", { query: "?page_size=100", userId: st.userId }))) return true;
-    if (has(await deltaCall("GET", "/v2/orders/history", { query: "?page_size=100", userId: st.userId }))) return true;
-    return false;   // both endpoints answered cleanly and neither carries our id → it never landed
+    const live = await scan("/v2/orders");
+    if (live.found) return true;
+    const hist = await scan("/v2/orders/history");
+    if (hist.found) return true;
+    // Neither set carries our id. Only trust that as "never landed" if BOTH sets were complete.
+    return (live.conclusive && hist.conclusive) ? false : null;
   } catch { return null; }   // any failure → unknown; caller must NOT re-enter on an unknown
 }
 
@@ -5665,6 +5724,13 @@ async function runAutoBuyEngine() {
       checked++;
       try {
         if (!marketOpenIST(st.market)) continue;   // market closed — do not enter
+        // R4/R5-P2-02 FAIL CLOSED: if we don't have the exchange holiday calendar for this market's
+        // current year, we can't know weekday holidays — so a LIVE entry must NOT be placed (it could
+        // land on a closed exchange day). Skip with a clear flag until the calendar is loaded.
+        if (live && !holidayCalendarReady(st.market)) {
+          await db.updateRealStrategy(st.id, { lastError: `Holiday calendar for ${st.market} isn't loaded for this year — new real entries are paused (fail-closed) until it's updated.` });
+          continue;
+        }
         // One position per strategy: if it still holds an open managed position, do nothing.
         if (st.openPositionId) {
           const pos = (await positionsFor(st.userId)).find((p) => p.id === st.openPositionId);
@@ -5825,7 +5891,7 @@ app.post("/api/autobuy/register", requireAuth, async (req, res) => {
 });
 app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
   const userId = routeUserId(req);
-  const { id, paused, force } = req.body || {};
+  const { id, paused, resolution } = req.body || {};   // resolution: "filled" (adopt) | "nofill" (clear)
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
   const mine = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
   if (!mine) return res.status(404).json({ error: "not found" });
@@ -5856,21 +5922,34 @@ app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
     logFinancial("autobuy.review.resumedClean", { userId, id });
     return res.json({ ok: true, status: "active", note: "Broker confirmed the earlier order never filled — resumed cleanly." });
   }
-  // 3) The order EXISTS at the broker (probe===true) or we couldn't verify (null). Resuming now could
-  //    duplicate a real fill, so we DO NOT clear on our own — the user must explicitly force it AFTER
-  //    checking their broker. Until then the strategy stays paused (no re-entry).
-  if (!force) {
-    return res.status(409).json({
-      ok: false, needsReview: true, status: "paused",
-      reason: probe === true
-        ? "Your earlier order was found at the broker but isn't linked to an open position here. Flatten it with “Stop & sell”, or — only if you've confirmed there's no open position — resume anyway."
-        : "Couldn't confirm the earlier order's outcome with your broker. Check your broker; only if there's no open position for this strategy, resume anyway.",
-    });
+  // 3) The order EXISTS at the broker (probe===true) or we couldn't verify (null). We NEVER clear on our
+  //    own here — the user must declare the outcome EXPLICITLY, and the only safe outcomes are:
+  //      • "filled"  → ADOPT the real broker position (no new entry is ever placed), or
+  //      • "nofill"  → the user confirms nothing filled → clear and resume.
+  //    Anything else keeps the strategy blocked. (Replaces the old blind "force" that could re-enter.)
+  if (resolution === "filled") {
+    let adopted = null;
+    try { adopted = await adoptBrokerPosition(mine); }
+    catch { return res.status(502).json({ ok: false, needsReview: true, reason: "Couldn't reach your broker to adopt the position — try again." }); }
+    if (adopted) {
+      await db.updateRealStrategy(id, { status: "active", openPositionId: adopted.id, pendingSince: null, pendingClientId: null, needsReview: false, lastError: null, lastOrderStatus: "filled" });
+      logFinancial("autobuy.review.adopted", { userId, id, positionId: adopted.id });
+      return res.json({ ok: true, status: "active", adopted: adopted.id, note: "Adopted your open broker position — the exit engine now manages it and no new entry will be placed." });
+    }
+    return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason: "No matching OPEN position found at your broker to adopt. If it already closed, choose “Didn't fill”; otherwise flatten it with Stop & sell." });
   }
-  // Forced resume — the user has taken responsibility after checking their broker.
-  await db.updateRealStrategy(id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
-  logFinancial("autobuy.review.forceResumed", { userId, id });
-  return res.json({ ok: true, status: "active", forced: true });
+  if (resolution === "nofill") {
+    await db.updateRealStrategy(id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
+    logFinancial("autobuy.review.resolvedNoFill", { userId, id });
+    return res.json({ ok: true, status: "active", note: "Resolved as no-fill — resumed. Watch the next entry closely." });
+  }
+  // No explicit resolution → keep blocked and ask the user to choose an outcome.
+  return res.status(409).json({
+    ok: false, needsReview: true, status: "paused",
+    reason: probe === true
+      ? "An order for this strategy was found at your broker. If it FILLED, choose “Order filled” to adopt the position; if it did NOT fill, choose “Didn't fill”."
+      : "Couldn't confirm the earlier order with your broker. Check it, then choose “Order filled” (adopt the position) or “Didn't fill”.",
+  });
 });
 app.post("/api/autobuy/cancel", requireAuth, async (req, res) => {
   const userId = routeUserId(req);

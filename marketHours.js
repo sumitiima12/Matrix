@@ -84,6 +84,16 @@ function isMarketHoliday(market, nowMs = Date.now()) {
   return (IN_HOLIDAYS[yr] || []).includes(k);
 }
 
+/* R4/R5-P2-02: is the exchange holiday calendar COMPLETE for the market's current year? Crypto (24/7) and
+   US (holidays are computed, never stale) are always ready. IN/FNO/Commodity need a loaded IN_HOLIDAYS
+   table for the current IST year — if it's missing we can't know weekday holidays, so unattended REAL
+   entries must FAIL CLOSED rather than trade on a possibly-closed exchange day. */
+function holidayCalendarReady(market, nowMs = Date.now()) {
+  if (market === "Crypto" || market === "US") return true;
+  const yr = Number(zoneDateKey(nowMs, "Asia/Kolkata").slice(0, 4));
+  return !!IN_HOLIDAYS[yr];
+}
+
 function marketOpenIST(market, nowMs = Date.now()) {
   if (market === "Crypto") return true;
   if (isMarketHoliday(market, nowMs)) return false;                // exchange holiday — shut even on a weekday
@@ -118,4 +128,4 @@ function intradaySquareDue(market, nowMs = Date.now(), bufferMin = 15) {
   return m != null && m <= bufferMin;
 }
 
-module.exports = { istParts, marketOpenIST, minsToCloseIST, intradaySquareDue, isMarketHoliday, usMarketHolidays };
+module.exports = { istParts, marketOpenIST, minsToCloseIST, intradaySquareDue, isMarketHoliday, holidayCalendarReady, usMarketHolidays };

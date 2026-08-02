@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { marketOpenIST, minsToCloseIST, intradaySquareDue, isMarketHoliday, usMarketHolidays } = require("../marketHours");
+const { marketOpenIST, minsToCloseIST, intradaySquareDue, isMarketHoliday, holidayCalendarReady, usMarketHolidays } = require("../marketHours");
 
 /* Build a UTC epoch that corresponds to a given IST wall-clock on a given weekday.
    IST = UTC+5:30, so IST 09:15 == UTC 03:45. We anchor to known dates whose weekday we control:
@@ -92,6 +92,16 @@ test("intradaySquareDue: true once the market is closed (never carry overnight)"
 
 test("intradaySquareDue: crypto never squares off", () => {
   assert.equal(intradaySquareDue("Crypto", istEpoch(SAT, 3, 0)), false);
+});
+
+// R4/R5-P2-02: calendar readiness gates fail-closed real entries. Crypto/US are always ready; IN is ready
+// only for years present in IN_HOLIDAYS (2026/2027), and NOT ready for an uncovered future year.
+test("holidayCalendarReady: crypto/US always, IN only for loaded years", () => {
+  assert.equal(holidayCalendarReady("Crypto", istEpoch("2099-01-05", 12, 0)), true);
+  assert.equal(holidayCalendarReady("US", istEpoch("2099-01-05", 12, 0)), true);
+  assert.equal(holidayCalendarReady("IN", istEpoch("2026-06-01", 12, 0)), true);
+  assert.equal(holidayCalendarReady("IN", istEpoch("2027-06-01", 12, 0)), true);
+  assert.equal(holidayCalendarReady("IN", istEpoch("2035-06-01", 12, 0)), false);   // no table → not ready
 });
 
 // R3-#7: the Indian calendar now extends past 2026. Republic Day 2027-01-26 is a recognised holiday,
