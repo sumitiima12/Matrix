@@ -187,40 +187,48 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
     const userId = storageKeyFor(req.authUserId);
     const sess = await sessionFromCred(req.authUserId, "delta");
     if (!sess) return res.status(400).json({ error: "Connect your Delta account first — reconcile verifies against Delta's actual positions." });
-    // Actual open Delta positions → set of normalized base symbols the account really holds.
-    let held;
+    /* R16-P2-05: reconcile with SIDE + SIGNED SIZE per Delta product, not a base-symbol set. We build a map
+       of base symbol → { long: totalLongSize, short: totalShortSize } so a phantom is judged against the
+       actual direction and quantity Delta holds, not merely "some BTC position exists". */
+    let deltaBook;
     try {
       const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId }), 8000);
-      const norm = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "");
-      held = new Set((pr && pr.result || [])
-        .filter((x) => Number(x.size) !== 0)
-        .map((x) => norm(x.product_symbol || (x.product && x.product.symbol) || "")));
+      deltaBook = reconcile.buildDeltaBook((pr && pr.result) || []);
     } catch { return res.status(502).json({ error: "Couldn't read your Delta positions right now — try again in a moment." }); }
-    /* BROKER SAFETY: this reconcile only knows Delta's positions, so it must NEVER delete a row that
-       could belong to ANOTHER crypto broker (CoinDCX/Binance/CoinSwitch). We drop a row only if it is
-       POSITIVELY attributable to Delta: either it is explicitly tagged broker="delta", OR it carries no
-       broker tag AND the user has no OTHER crypto broker connected (so it can't belong to one). */
-    const OTHER_CRYPTO_BROKERS = ["coindcx", "binance", "coinswitch"];
-    let hasOtherCryptoBroker = false;
-    for (const b of OTHER_CRYPTO_BROKERS) {
-      try { if (await db.getBrokerCred(userId, b)) { hasOtherCryptoBroker = true; break; } } catch { /* ignore */ }
-    }
-    const norm = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "");
-    const attributableToDelta = (t) => {
-      const b = String(t.broker || "").toLowerCase();
-      if (b === "delta") return true;
-      if (b) return false;                         // tagged to a different broker → never touch
-      return !hasOtherCryptoBroker;                // untagged → safe only if Delta is the sole crypto broker
-    };
+    /* R16-P2-05/06: partition using the PURE, unit-tested planner. Only broker="delta" rows are auto-closable;
+       untagged phantoms are "broker unknown" and require explicit confirmIds (never auto-closed on the mere
+       absence of another broker's saved credential). */
     const trades = await db.getTrades(userId, 0, Date.now()).catch(() => []);
-    const phantom = (trades || []).filter((t) =>
+    const openCryptoReal = (trades || []).filter((t) =>
       t && t.real === true && (t.market || "") === "Crypto" &&
-      t.entryAt != null && (t.exitAt == null || t.exit == null) &&      // still "open"
-      t.status !== "rejected" && attributableToDelta(t) && !held.has(norm(t.sym)));
-    const removed = await db.deleteTradesByIds(userId, phantom.map((t) => t.id));
+      t.entryAt != null && (t.exitAt == null || t.exit == null) && t.status !== "rejected");
+    const { phantomDelta, phantomUnknown } = reconcile.deltaReconcilePlan(openCryptoReal, deltaBook);
+
+    // Preview mode (default): report what WOULD change; touch nothing. Pass apply:true to act.
+    const apply = req.body && req.body.apply === true;
+    const confirmIds = new Set((req.body && Array.isArray(req.body.confirmIds) ? req.body.confirmIds : []).map(String));
+    const heldSymbols = [...deltaBook.keys()];
+    if (!apply) {
+      return res.json({ ok: true, preview: true, removed: 0, heldSymbols,
+        wouldClose: phantomDelta.map((t) => ({ id: t.id, sym: t.sym, side: t.side || (t.short ? "SELL" : "BUY"), qty: t.qty })),
+        unknownIds: phantomUnknown.map((t) => t.id),
+        unknownBroker: phantomUnknown.map((t) => ({ id: t.id, sym: t.sym, side: t.side || (t.short ? "SELL" : "BUY"), qty: t.qty })) });
+    }
+    /* R16-P2-07: close phantom rows with an IMMUTABLE reconciliation adjustment (mark them closed at
+       break-even with an audit note) rather than a hard delete, so P&L / Orders / Portfolio stay consistent
+       and the history is preserved. Delta-tagged phantoms auto-close; untagged only if user-confirmed. */
+    const toClose = phantomDelta.concat(phantomUnknown.filter((t) => confirmIds.has(String(t.id))));
+    const now = Date.now();
+    for (const t of toClose) {
+      await db.updateTrade(userId, { ...t, exit: Number(t.entry) || t.exit || 0, exitAt: now, pnl: 0, status: "closed",
+        reconciled: true, reconciledAt: now, reconcileReason: "Closed via Delta reconciliation — Delta held no matching position." }).catch(() => {});
+    }
     rcBust(`trades:${userId}`);
-    logFinancial("trades.reconcileReal", { userId, removed, held: [...held] });
-    res.json({ ok: true, removed, heldSymbols: [...held], droppedSymbols: phantom.map((t) => t.sym) });
+    logFinancial("trades.reconcileReal", { userId, closed: toClose.length, held: heldSymbols });
+    res.json({ ok: true, removed: toClose.length, heldSymbols,
+      closedSymbols: toClose.map((t) => t.sym),
+      unknownIds: phantomUnknown.filter((t) => !confirmIds.has(String(t.id))).map((t) => t.id),
+      unknownBroker: phantomUnknown.filter((t) => !confirmIds.has(String(t.id))).map((t) => ({ id: t.id, sym: t.sym, side: t.side || (t.short ? "SELL" : "BUY"), qty: t.qty })) });
   } catch (e) { serverError(res, e); }
 });
 
@@ -330,7 +338,9 @@ app.post("/api/register", authLimiter, async (req, res) => {
   try {
     const phone = cleanPhone(req.body && req.body.phone), pin = req.body && req.body.pin, name = (req.body && req.body.name) || "";
     if (phone.length < 6 || !pin || String(pin).length < 4) return res.status(400).json({ error: "Enter a valid phone and a 4+ digit PIN." });
-    if (await db.getUser(phone)) return res.status(409).json({ error: "That number is already registered — please log in." });
+    const existingUser = await db.getUser(phone);
+    // A soft-deleted stub is kept only for the admin's trade-history audit; the number is free to reuse.
+    if (existingUser && !existingUser.deleted) return res.status(409).json({ error: "That number is already registered — please log in." });
     const username = cleanUsername(req.body && req.body.username);
     if (!username) return res.status(400).json({ error: "Choose a user ID: 3–20 characters, starting with a letter (letters, numbers, underscore)." });
     if (typeof db.getUserByUsername === "function" && await db.getUserByUsername(username)) {
@@ -377,6 +387,9 @@ app.post("/api/login", authLimiter, async (req, res) => {
     // Unified Login / Sign-up: if there's no account for this number, tell the client so
     // it can switch to the "looks like you're new" sign-up step instead of showing an error.
     if (!u) return res.status(404).json({ ok: false, newAccount: true, error: "No account for this number." });
+    // A soft-deleted account (self- or admin-deleted) keeps only a stub so the admin can still see its
+    // trade history — the login is dead. Treat it like a new number so the client offers a fresh sign-up.
+    if (u.deleted) return res.status(404).json({ ok: false, newAccount: true, error: "No account for this number." });
     if (!verifyPin(pin, u.pin)) { recordPinFail(phone); return res.status(401).json({ error: "Wrong PIN for this number." }); }
     clearPinFails(phone);
 
@@ -4604,6 +4617,28 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
 
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
+  /* R16-P2-09 durable idempotency: a client sends a stable X-Idempotency-Key (or clientRequestId) per user
+     ACTION. The first request claims it; a double-tap / reload / network retry with the same key replays the
+     original outcome instead of placing a second real order. A failed order releases the key so a genuine
+     retry can proceed; a success stores the response for replay. */
+  const idemKey = String(req.get("X-Idempotency-Key") || (req.body && req.body.clientRequestId) || "").slice(0, 100);
+  if (idemKey) {
+    const idemUser = storageKeyFor(sess.userId);
+    const won = await db.claimIdempotencyKey(idemUser, idemKey).catch(() => true);
+    if (!won) {
+      const prior = await db.getIdempotentResponse(idemUser, idemKey).catch(() => null);
+      if (prior) return res.status(200).json({ ...prior, idempotentReplay: true });
+      return res.status(409).json({ error: "This order is already being placed — please wait a moment before retrying." });
+    }
+    const _json = res.json.bind(res);
+    res.json = (obj) => {
+      try {
+        if (obj && !obj.error && (obj.orderId || obj.ok)) db.saveIdempotentResponse(idemUser, idemKey, obj).catch(() => {});
+        else db.releaseIdempotencyKey(idemUser, idemKey).catch(() => {});
+      } catch { /* never block the response on ledger bookkeeping */ }
+      return _json(obj);
+    };
+  }
   const broker = sess.broker;
   const token = sess.accessToken;
   const { symbol, side, qty, orderType = "MARKET", product = "CNC" } = req.body || {};
@@ -4738,7 +4773,19 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
           const c = await verifyFyersFill(sess, d.id, Number(qty));
           if (c.filled) { autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice); fillStatus = "FILLED"; }
           else if (c.rejected) { fillStatus = "REJECTED"; autoExitNote = "SL/TP not armed — entry was rejected."; }
-          else { fillStatus = "PENDING"; autoExitNote = "SL/TP not armed — entry not confirmed filled. Verify in FYERS and re-arm from the position."; }
+          else {
+            fillStatus = "PENDING";
+            /* R16-P2-10: don't abandon the requested protection. Park it so the background watcher attaches
+               SL/TP once (if) this LIMIT entry fills later — protection tracks the CONFIRMED filled qty. */
+            const bareSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+            await db.savePendingProtection({
+              id: `pp_${sess.userId}_${d.id}`, userId: String(sess.userId), broker: "fyers", orderId: d.id,
+              symbol: bareSym, brokerSym: symbol, qty: Number(qty), market: regMarket, product,
+              sl: slPct || null, tp: tpPct || null, tsl: tslPct || null, cfg: exitCfg,
+              yahoo: req.body?.yahoo || `${bareSym}.NS`, interval: req.body?.interval || "5m", short: String(side).toLowerCase() === "sell",
+            }).catch(() => {});
+            autoExitNote = "Entry not filled yet — we'll attach your SL/TP automatically if it fills. You can also re-arm from the position.";
+          }
         }
       }
       return res.json({ orderId: d.id, status: fillStatus, broker, autoExitId, autoExitArmed: !!autoExitId, ...(autoExitNote ? { autoExitNote } : {}) });
@@ -5132,12 +5179,21 @@ app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
           source: "positions",
         }));
 
-      /* Merge: if the same symbol appears in both (a partially-settled holding), keep the
-         settled holding row and don't double-count the position. */
+      /* R16-P3-02: keep the DISPLAY consistent with the SELLABLE-qty math (`fyersSellableLong`), which for a
+         symbol present in both takes settled holdings + today's signed net position. Previously the display
+         kept only the settled row and dropped the position, so a same-day partial sell (netQty < 0) showed a
+         larger quantity than was actually sellable. Now overlapping rows are COMBINED (qty = settled + net). */
       const bySym = new Map();
       settled.forEach((x) => bySym.set(x.sym, x));
-      open.forEach((x) => { if (!bySym.has(x.sym)) bySym.set(x.sym, x); });
-      const holdings = [...bySym.values()];
+      open.forEach((x) => {
+        const prev = bySym.get(x.sym);
+        if (!prev) { bySym.set(x.sym, x); return; }
+        const qty = Number(prev.qty || 0) + Number(x.qty || 0);
+        const ltp = prev.ltp ?? x.ltp ?? null;
+        bySym.set(x.sym, { ...prev, qty, ltp, value: (ltp != null) ? +(ltp * qty).toFixed(2) : prev.value, source: "holdings+positions" });
+      });
+      // Drop rows that net to flat once combined (a settled holding fully sold intraday).
+      const holdings = [...bySym.values()].filter((x) => Number(x.qty || 0) !== 0);
 
       // fund_limit is a list of labelled buckets; the available cash is the one we want.
       const bucket = (f.fund_limit || []).find((x) => /available/i.test(x.title || ""));
@@ -6263,18 +6319,49 @@ async function runAutoBuyEngine() {
         const sess = await sessionFromCred(st.userId, st.broker);
         if (!sess) { await db.updateRealStrategy(st.id, { lastError: "no stored credentials — reconnect broker" }); continue; }
 
-        // STAMP THE INTENT before we touch the broker. If we crash after the fill but before we
-        // persist the position, the pending marker (reconciled at the top of the loop) prevents a
-        // duplicate order on the next sweep. lastOrderAt is set now too, so the cooldown also holds.
-        // R3-#1: a unique client_order_id stamped WITH the pending marker is the durable dedupe key —
-        // if this order times out, the reconciler finds it in the broker's order book by this id.
-        const pendingClientId = `mx_${st.id}_${Date.now()}`;
-        // ATOMIC CLAIM (multi-replica safe): stamp the pending marker only if no order is already in-flight,
-        // in one conditional UPDATE. If another replica already claimed this strategy's entry this tick, we
-        // lose the claim and MUST NOT place a second order.
-        const claimed = await db.claimRealStrategyForEntry(st.id, { pendingSince: Date.now(), pendingClientId, lastOrderAt: Date.now() });
+        /* R16-P1-02: the SAME server-owned risk policy that guards manual orders must guard unattended
+           auto-buy. Load the user's caps, fetch broker account truth, and run the shared risk engine BEFORE
+           claiming. If the account can't be verified we refuse (this is real money) rather than trade blind.
+           The exact policy is recorded with the order intent. */
+        const abMarketKind = st.market === "Crypto" ? "Crypto" : (st.market === "US" ? "US" : "IN");
+        const abStoreKey = storageKeyFor(st.userId);   // same key manual orders + /api/risk-policy use
+        const abPolicy = await db.getRiskPolicy(abStoreKey).catch(() => null);
+        if (abPolicy && Object.keys(cleanRiskPolicy(abPolicy)).length) {
+          const abAccount = await fetchBrokerAccount(sess).catch(() => null);
+          if (!abAccount) { await db.updateRealStrategy(st.id, { lastError: "Couldn't verify account with broker to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }); continue; }
+          const abTrades = await db.getTrades(abStoreKey, 0, Date.now()).catch(() => []);
+          const abCheck = serverValidateOrder(
+            { sym: String(st.brokerSym).replace(/^NSE:/, "").replace(/-EQ$/, ""), side: st.short ? "SELL" : "BUY", qty, price: px, market: abMarketKind },
+            { wallet: abAccount.wallet, portfolio: abAccount.portfolio, trades: abTrades || [], limits: cleanRiskPolicy(abPolicy) },
+          );
+          if (!abCheck.ok) {
+            await db.updateRealStrategy(st.id, { lastError: "Blocked by your safety caps: " + (abCheck.reasons[0] || "not allowed"), lastOrderStatus: "risk-blocked" });
+            logFinancial("autobuy.risk_blocked", { userId: st.userId, broker: st.broker, symbol: st.symbol, reasons: abCheck.reasons });
+            continue;
+          }
+        }
+
+        /* STAMP THE INTENT before we touch the broker (R16-P1-01). The claim is candle-idempotent and
+           version-guarded: it succeeds only if the strategy is still active, holds no open position, has no
+           in-flight pending marker AND has not already fired on this exact closed candle. Across replicas a
+           UNIQUE (strategy, candle) row guarantees at-most-once even if a fast winner clears pendingSince
+           before a delayed replica arrives, and it blocks an order after the user pauses/cancels. The broker
+           client_order_id derives from the same candle key so a timed-out order is found by it. */
+        const candleKey = String(sig.candleTime ?? (candles[candles.length - 1] && candles[candles.length - 1].t) ?? Date.now());
+        const pendingClientId = `mx_${st.id}_${candleKey}`;
+        const claimed = await db.claimRealStrategyForEntry(st.id, candleKey, { pendingSince: Date.now(), pendingClientId, lastOrderAt: Date.now(), userId: st.userId });
         if (!claimed) continue;
         st.pendingSince = claimed.pendingSince; st.pendingClientId = pendingClientId; st.lastOrderAt = claimed.lastOrderAt;
+
+        /* R16-P2-01 last-mile guard: close the tiny window between claiming and sending the order. If the
+           user paused/cancelled (or the kill-switch fired) in that gap, abort and release the pending marker
+           BEFORE we touch the broker — no post-pause order. The candle intent stays consumed so we won't
+           re-fire this bar on resume. */
+        const fresh = (await db.getRealStrategiesForUser(String(st.userId)).catch(() => [])).find((x) => x && x.id === st.id);
+        if ((fresh && fresh.status !== "active") || haltedEntries.has(String(st.userId))) {
+          await db.updateRealStrategy(st.id, { pendingSince: null, pendingClientId: null, lastOrderStatus: "skipped", lastError: "Paused/cancelled before the order was sent — no entry placed." });
+          continue;
+        }
 
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
@@ -6321,6 +6408,42 @@ const AUTO_BUY_MS = Math.max(30_000, Number(process.env.AUTO_BUY_MS) || 120_000)
 if (process.env.EXIT_MONITOR !== "off") {
   setInterval(runAutoBuyEngine, AUTO_BUY_MS);
   setTimeout(runAutoBuyEngine, 20_000);
+}
+
+/* R16-P2-10 delayed-fill protection watcher. Re-checks parked LIMIT entries until terminal and, on a
+   confirmed fill, attaches the requested app-managed SL/TP to the ACTUAL filled quantity. Gives up on a
+   rejected order or after a long DAY-order horizon so nothing lingers. */
+async function runProtectionWatcher() {
+  let rows = [];
+  try { rows = await db.listPendingProtection(200); } catch { return; }
+  for (const p of rows) {
+    try {
+      const ageMs = Date.now() - (p.created_at || 0);
+      if ((p.attempts || 0) > 90 || ageMs > 8 * 3600 * 1000) { await db.deletePendingProtection(p.id); continue; }
+      await db.bumpPendingProtection(p.id);
+      if (p.broker !== "fyers") { await db.deletePendingProtection(p.id); continue; }   // only FYERS parks here today
+      const sess = await sessionFromCred(p.userId, "fyers");
+      if (!sess) continue;   // creds unavailable this cycle — retry next sweep
+      const c = await verifyFyersFill(sess, p.orderId, Number(p.qty));
+      if (c.filled) {
+        await registerManagedPosition({
+          sess, symbol: p.symbol, brokerSym: p.brokerSym, qty: c.filledQty || Number(p.qty), entry: c.avgPrice || 0,
+          market: p.market, sl: p.sl || null, tp: p.tp || null, tsl: p.tsl || null, cfg: p.cfg || null,
+          yahoo: p.yahoo, interval: p.interval, product: p.product, short: !!p.short,
+        });
+        await db.deletePendingProtection(p.id);
+        logFinancial("protection.attached", { userId: p.userId, broker: "fyers", orderId: p.orderId, qty: c.filledQty || p.qty });
+      } else if (c.rejected) {
+        await db.deletePendingProtection(p.id);
+      }
+      // else still pending — leave it for the next sweep
+    } catch (e) { console.error("[protection] sweep item failed:", e.message); }
+  }
+}
+const PROTECTION_MS = Math.max(30_000, Number(process.env.PROTECTION_MS) || 60_000);
+if (process.env.EXIT_MONITOR !== "off") {
+  setInterval(runProtectionWatcher, PROTECTION_MS);
+  setTimeout(runProtectionWatcher, 40_000);
 }
 
 /* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
@@ -6647,6 +6770,13 @@ setInterval(refreshAllBrokerTokens, 6 * 60 * 60 * 1000).unref?.();
      old derived key on existing deployments). Otherwise we warn loudly. */
   if (prod && credWeak && /^(1|true|yes)$/i.test(String(process.env.CRED_KEY_REQUIRED || ""))) {
     throw new Error("[startup] CRED_KEY_REQUIRED is set but CRED_KEY is missing/weak (need ≥16 chars). Set a strong, dedicated broker-credential encryption key. Refusing to start.");
+  }
+  /* R16-P2-11: whenever LIVE trading is enabled, a dedicated strong CRED_KEY is mandatory — real broker
+     credentials must not be protected by a key derived from JWT_SECRET/DATABASE_URL. Fail closed in
+     production. An existing deployment that still needs the legacy derived key can set CRED_KEY_ALLOW_WEAK=1
+     as a deliberate, temporary escape hatch (logs a loud warning instead). */
+  if (prod && TRADING_ENABLED && credWeak && !/^(1|true|yes)$/i.test(String(process.env.CRED_KEY_ALLOW_WEAK || ""))) {
+    throw new Error("[startup] Live trading is enabled (BROKER_TRADING_ENABLED=true) but CRED_KEY is missing/weak (need ≥16 chars). Real broker credentials require a dedicated strong encryption key. Set CRED_KEY, or set CRED_KEY_ALLOW_WEAK=1 to override temporarily. Refusing to start.");
   }
   const problems = [];
   if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).length < 16) problems.push("JWT_SECRET (set a long, stable random string)");

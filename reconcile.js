@@ -187,4 +187,45 @@ function exitPreflightAction(exState) {
   return (exState === "pending" || exState === "unknown") ? "wait" : "fire";
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction };
+/* ---- R16-P2-05/06 Delta reconciliation (PURE) ----
+   Build a base-symbol → {long, short} size map from raw Delta positions, then judge each open real crypto
+   journal row against the ACTUAL side + quantity Delta holds. Provenance rule (R16-P2-06): only rows tagged
+   broker="delta" are auto-reconcilable; untagged rows are "broker unknown" and require explicit confirmation
+   (never auto-closed on the mere absence of another broker's credential). */
+const _normSym = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "");
+function buildDeltaBook(positions) {
+  const book = new Map();
+  for (const x of positions || []) {
+    const size = Number(x && x.size);
+    if (!size) continue;
+    const base = _normSym((x.product_symbol) || (x.product && x.product.symbol) || "");
+    const cur = book.get(base) || { long: 0, short: 0 };
+    if (size > 0) cur.long += size; else cur.short += Math.abs(size);
+    book.set(base, cur);
+  }
+  return book;
+}
+function deltaHoldsCover(trade, book) {
+  const b = book.get(_normSym(trade && trade.sym));
+  if (!b) return false;
+  const isShort = String(trade.side || "").toUpperCase() === "SELL" || trade.short === true;
+  const have = isShort ? b.short : b.long;
+  const need = Math.abs(Number(trade.qty) || 0);
+  return have > 0 && (need <= 0 || have + 1e-9 >= need);
+}
+/* Partition open real crypto rows into {phantomDelta (auto-closable), phantomUnknown (needs confirm)}. */
+function deltaReconcilePlan(openCryptoRealTrades, book) {
+  const deltaTagged = [], untagged = [];
+  for (const t of openCryptoRealTrades || []) {
+    const tag = String((t && t.broker) || "").trim().toLowerCase();
+    if (tag === "delta") deltaTagged.push(t);
+    else if (!tag) untagged.push(t);
+    // rows tagged to another broker are ignored entirely
+  }
+  return {
+    phantomDelta: deltaTagged.filter((t) => !deltaHoldsCover(t, book)),
+    phantomUnknown: untagged.filter((t) => !deltaHoldsCover(t, book)),
+  };
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan };

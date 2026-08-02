@@ -425,7 +425,9 @@ function entrySignalFired(cfg, rawCandles) {
     const get = (op) => resolveOperand(op, cfg.defs || [], c, closes, vols, cache, cfg.tf || null);
     const i = c.length - 1;
     const fired = chainEval(cfg.entry, i, get);
-    return { fired, reason: fired ? "Strategy entry signal" : undefined, price: fired ? closes[i] : null };
+    // `candleTime` is the timestamp of the exact CLOSED candle the signal fired on — used as the
+    // durable (strategy, candle) idempotency key so an entry executes at most once per signal bar.
+    return { fired, reason: fired ? "Strategy entry signal" : undefined, price: fired ? closes[i] : null, candleTime: fired ? (c[i].t ?? c[i].time ?? null) : null };
   } catch (e) {
     return { fired: false, error: String(e && e.message || e) };
   }

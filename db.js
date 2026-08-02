@@ -52,6 +52,10 @@ async function initDb() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login BIGINT`);
   // Optional contact email the user can add from their profile.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
+  // Soft-delete: when a user deletes their account we KEEP the row (login disabled) so the admin can
+  // still attribute the retained trade history to a real person. `deleted_at` records when.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at BIGINT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY, user_id TEXT, ts BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS trades_user_ts ON trades (user_id, ts)`);
@@ -104,6 +108,25 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS real_strategies (
     id TEXT PRIMARY KEY, user_id TEXT, status TEXT, updated_at BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS real_strats_status ON real_strategies (status)`);
+  // Row-version for optimistic, conditional lifecycle transitions (R16-P2-01). Existing rows start at 0.
+  await pool.query(`ALTER TABLE real_strategies ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 0`);
+  /* Durable at-most-once entry ledger (R16-P1-01). One row per (strategy, closed-candle) — the UNIQUE
+     constraint means only ONE replica can ever claim a given candle's entry, even across restarts. The
+     broker client-order-id derives from `client_id` here, so a timed-out order is found by the same key. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_intents (
+    strategy_id TEXT, candle_key TEXT, client_id TEXT, user_id TEXT, created_at BIGINT,
+    PRIMARY KEY (strategy_id, candle_key))`);
+  /* Durable MANUAL-order idempotency (R16-P2-09). One row per (user, client_request_id). The first request
+     claims the key; a double-tap / reload / retry with the same key replays the stored outcome instead of
+     placing a second broker order. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_idempotency (
+    user_id TEXT, key TEXT, response JSONB, created_at BIGINT,
+    PRIMARY KEY (user_id, key))`);
+  /* Delayed-fill protection watcher (R16-P2-10). A manual LIMIT entry that asked for app-managed SL/TP but
+     hadn't filled within the sync window is parked here; a background sweep re-checks the broker until the
+     order is terminal and, on fill, attaches the requested protection to the CONFIRMED filled quantity. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS pending_protection (
+    id TEXT PRIMARY KEY, user_id TEXT, broker TEXT, order_id TEXT, data JSONB, attempts INT DEFAULT 0, created_at BIGINT)`);
   /* User-built screeners ("My Screeners") — one JSON array per user, so a saved screener survives
      logout / a new device. Small, so stored whole like app_state rather than row-per-screener. */
   await pool.query(`CREATE TABLE IF NOT EXISTS user_screeners (
@@ -237,7 +260,7 @@ async function clearTradesByType(userId, tradeType, scope = "virtual") {
 
 /* --------------------------------- users --------------------------------- */
 async function getUser(phone) {
-  if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by, email, last_login, created_at, blocked, approved FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) { row.referredBy = row.referred_by; row.lastLogin = row.last_login ? Number(row.last_login) : null; row.createdAt = row.created_at ? Number(row.created_at) : null; } return row || null; }
+  if (USING_PG) { const r = await pool.query(`SELECT pin, name, username, referred_by, email, last_login, created_at, blocked, approved, deleted, deleted_at FROM users WHERE phone=$1`, [phone]); const row = r.rows[0]; if (row) { row.referredBy = row.referred_by; row.lastLogin = row.last_login ? Number(row.last_login) : null; row.createdAt = row.created_at ? Number(row.created_at) : null; row.deleted = !!row.deleted; row.deletedAt = row.deleted_at ? Number(row.deleted_at) : null; } return row || null; }
   return readJSON(FILES.users)[phone] || null;
 }
 // Approve (or un-approve) a pending signup.
@@ -248,8 +271,8 @@ async function setUserApproved(phone, approved) {
 }
 // Accounts awaiting approval, for the admin console.
 async function listPendingUsers(limit = 200) {
-  if (USING_PG) { const r = await pool.query(`SELECT phone, name, username, created_at FROM users WHERE approved IS NOT TRUE ORDER BY created_at DESC LIMIT $1`, [limit]); return r.rows.map((u) => ({ phone: u.phone, name: u.name, username: u.username, createdAt: u.created_at ? Number(u.created_at) : null })); }
-  return Object.entries(readJSON(FILES.users)).filter(([, u]) => u.approved !== true).map(([phone, u]) => ({ phone, name: u.name, username: u.username, createdAt: u.createdAt || null })).slice(0, limit);
+  if (USING_PG) { const r = await pool.query(`SELECT phone, name, username, created_at FROM users WHERE approved IS NOT TRUE AND deleted IS NOT TRUE ORDER BY created_at DESC LIMIT $1`, [limit]); return r.rows.map((u) => ({ phone: u.phone, name: u.name, username: u.username, createdAt: u.created_at ? Number(u.created_at) : null })); }
+  return Object.entries(readJSON(FILES.users)).filter(([, u]) => u.approved !== true && !u.deleted).map(([phone, u]) => ({ phone, name: u.name, username: u.username, createdAt: u.createdAt || null })).slice(0, limit);
 }
 
 /* Set (or change) a user's email. Free-form; validated at the route. */
@@ -314,31 +337,55 @@ async function updateSecurityQuestion(phone, secQuestion, secAnswerHash) {
 }
 async function createUser(phone, pinHash, name, secQuestion = null, secAnswerHash = null, username = null, referredBy = null, approved = false) {
   if (USING_PG) {
+    // Upsert: a fresh signup inserts; a signup reusing a soft-deleted number overwrites the dead stub and
+    // clears the deleted flag (its old trade history stays under the same user_id).
     await pool.query(
-      `INSERT INTO users (phone, pin, name, created_at, sec_question, sec_answer, username, referred_by, approved) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      `INSERT INTO users (phone, pin, name, created_at, sec_question, sec_answer, username, referred_by, approved, blocked, deleted, deleted_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,FALSE,NULL)
+       ON CONFLICT (phone) DO UPDATE SET pin=EXCLUDED.pin, name=EXCLUDED.name, created_at=EXCLUDED.created_at,
+         sec_question=EXCLUDED.sec_question, sec_answer=EXCLUDED.sec_answer, username=EXCLUDED.username,
+         referred_by=EXCLUDED.referred_by, approved=EXCLUDED.approved, blocked=FALSE, deleted=FALSE, deleted_at=NULL`,
       [phone, pinHash, name, Date.now(), secQuestion, secAnswerHash, username, referredBy, !!approved]
     );
     return;
   }
   const users = readJSON(FILES.users);
-  users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null, username: username || null, referredBy: referredBy || null, approved: !!approved };
+  users[phone] = { pin: pinHash, name, createdAt: Date.now(), secQuestion: secQuestion || null, secAnswer: secAnswerHash || null, username: username || null, referredBy: referredBy || null, approved: !!approved, blocked: false, deleted: false, deletedAt: null };
   writeJSON(FILES.users, users);
 }
 
-/* Permanently delete an account and ALL of its data — the user's own right-to-erasure.
+/* Delete an account and all of its ACTIVE data, but by default RETAIN the trade history so the admin can
+   still audit it (product requirement). The account is soft-deleted: the login is disabled (PIN cleared,
+   approval revoked, `deleted` flagged) and every sensitive/live artefact is purged — broker credentials,
+   broker apps, live positions, armed strategies, risk policy, automation flags, saved screeners, app state,
+   ideas and published strategies — but the `users` stub and the `trades` rows survive so the retained
+   history stays attributable to a real person.
+   Pass { preserveTrades: false } for a genuine right-to-erasure that also wipes the trade history and the
+   user row entirely.
    `userId` is the per-user storage key (trades/state/creds); `phone` is the login key. */
-async function deleteAccount(userId, phone) {
+async function deleteAccount(userId, phone, { preserveTrades = true } = {}) {
   const uid = String(userId), ph = String(phone);
   if (USING_PG) {
-    await pool.query(`DELETE FROM trades WHERE user_id=$1`, [uid]);
+    if (!preserveTrades) await pool.query(`DELETE FROM trades WHERE user_id=$1`, [uid]).catch(() => {});
     await pool.query(`DELETE FROM app_state WHERE user_id=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM broker_creds WHERE user_id=$1`, [uid]);
-    await pool.query(`DELETE FROM broker_apps WHERE user_id=$1`, [uid]);
-    await pool.query(`DELETE FROM managed_positions WHERE user_id=$1`, [uid]);
-    await pool.query(`DELETE FROM real_strategies WHERE user_id=$1`, [uid]);
+    await pool.query(`DELETE FROM broker_creds WHERE user_id=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM broker_apps WHERE user_id=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM managed_positions WHERE user_id=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM real_strategies WHERE user_id=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM risk_policy WHERE user_id=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM automation_flags WHERE user_id=$1`, [uid]).catch(() => {});
+    await pool.query(`DELETE FROM user_screeners WHERE user_id=$1`, [uid]).catch(() => {});
     await pool.query(`DELETE FROM ideas WHERE owner=$1`, [uid]).catch(() => {});
     await pool.query(`DELETE FROM public_strategies WHERE owner=$1`, [uid]).catch(() => {});
-    await pool.query(`DELETE FROM users WHERE phone=$1`, [ph]);
+    if (preserveTrades) {
+      // Keep the stub (so admin can still see the retained history) but make the account unusable.
+      await pool.query(
+        `UPDATE users SET pin='', approved=FALSE, blocked=TRUE, deleted=TRUE, deleted_at=$2 WHERE phone=$1`,
+        [ph, Date.now()]
+      ).catch(() => {});
+    } else {
+      await pool.query(`DELETE FROM users WHERE phone=$1`, [ph]).catch(() => {});
+    }
     return;
   }
   const dropByUser = (file, key = "user_id") => {
@@ -346,10 +393,18 @@ async function deleteAccount(userId, phone) {
     for (const k of Object.keys(d)) { const r = d[k]; if (r && (String(r[key]) === uid || String(r.userId) === uid || String(r.owner) === uid)) { delete d[k]; changed = true; } }
     if (changed) writeJSON(file, d);
   };
-  dropByUser(FILES.trades); dropByUser(FILES.creds); dropByUser(FILES.brokerApps);
+  if (!preserveTrades) dropByUser(FILES.trades);
+  dropByUser(FILES.creds); dropByUser(FILES.brokerApps);
   dropByUser(FILES.managed); dropByUser(FILES.realStrats); dropByUser(FILES.ideas, "owner"); dropByUser(FILES.public, "owner");
+  // Config stores keyed directly by uid.
+  for (const f of [FILES.riskPolicy, FILES.autoFlags, FILES.screeners]) { const d = readJSON(f); if (d[uid]) { delete d[uid]; writeJSON(f, d); } }
   const st = readJSON(FILES.state); if (st[uid]) { delete st[uid]; writeJSON(FILES.state, st); }
-  const users = readJSON(FILES.users); if (users[ph]) { delete users[ph]; writeJSON(FILES.users, users); }
+  const users = readJSON(FILES.users);
+  if (users[ph]) {
+    if (preserveTrades) { users[ph] = { ...users[ph], pin: "", approved: false, blocked: true, deleted: true, deletedAt: Date.now() }; }
+    else { delete users[ph]; }
+    writeJSON(FILES.users, users);
+  }
 }
 
 /* ---------------------------- public strategies -------------------------- */
@@ -524,12 +579,12 @@ async function updateTrade(userId, trade) {
    the admin route strips it, but we also never select it in PG). */
 async function listUsers() {
   if (USING_PG) {
-    const r = await pool.query(`SELECT phone, name, username, referred_by, email, created_at, last_login, blocked, approved FROM users ORDER BY created_at DESC`);
-    return r.rows.map((x) => ({ phone: x.phone, name: x.name, username: x.username || null, referredBy: x.referred_by || null, email: x.email || null, createdAt: x.created_at ? Number(x.created_at) : null, lastLogin: x.last_login ? Number(x.last_login) : null, blocked: !!x.blocked, approved: x.approved !== false }));
+    const r = await pool.query(`SELECT phone, name, username, referred_by, email, created_at, last_login, blocked, approved, deleted, deleted_at FROM users ORDER BY created_at DESC`);
+    return r.rows.map((x) => ({ phone: x.phone, name: x.name, username: x.username || null, referredBy: x.referred_by || null, email: x.email || null, createdAt: x.created_at ? Number(x.created_at) : null, lastLogin: x.last_login ? Number(x.last_login) : null, blocked: !!x.blocked, approved: x.approved !== false, deleted: !!x.deleted, deletedAt: x.deleted_at ? Number(x.deleted_at) : null }));
   }
   const users = readJSON(FILES.users);
   return Object.entries(users).map(([phone, u]) => ({
-    phone, name: u.name || "", username: u.username || null, referredBy: u.referredBy || null, email: u.email || null, createdAt: u.createdAt || null, lastLogin: u.lastLogin || null, blocked: !!u.blocked, approved: u.approved !== false,
+    phone, name: u.name || "", username: u.username || null, referredBy: u.referredBy || null, email: u.email || null, createdAt: u.createdAt || null, lastLogin: u.lastLogin || null, blocked: !!u.blocked, approved: u.approved !== false, deleted: !!u.deleted, deletedAt: u.deletedAt || null,
   })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 
@@ -734,21 +789,119 @@ async function getRiskPolicy(userId) {
   if (USING_PG) { const r = await pool.query(`SELECT data FROM risk_policy WHERE user_id=$1`, [userId]); return r.rows[0] ? r.rows[0].data : null; }
   return readJSON(FILES.riskPolicy)[userId] || null;
 }
-async function claimRealStrategyForEntry(id, patch = {}) {
+/* Atomic, candle-idempotent ENTRY claim (R16-P1-01). A claim only succeeds if ALL invariants hold in one
+   conditional step: the strategy is column-`status='active'`, has no in-flight pending marker, holds no open
+   position, and has NOT already fired on this closed candle. On Postgres a UNIQUE (strategy_id, candle_key)
+   row in `order_intents` is inserted first, so across replicas/restarts at most ONE worker can ever own a
+   given candle's entry — even if a fast winner clears `pendingSince` before a delayed replica arrives. The
+   broker client-order-id derives from the same `client_id`. Returns the updated row to the sole winner, else
+   null (which the engine treats as "someone else has it / not eligible" and never double-orders). */
+async function claimRealStrategyForEntry(id, candleKey, patch = {}) {
+  const key = String(candleKey || "");
+  const clientId = patch.pendingClientId || `mx_${id}_${key || Date.now()}`;
   if (USING_PG) {
+    if (key) {
+      const ins = await pool.query(
+        `INSERT INTO order_intents (strategy_id, candle_key, client_id, user_id, created_at)
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (strategy_id, candle_key) DO NOTHING RETURNING client_id`,
+        [id, key, clientId, patch.userId ? String(patch.userId) : null, Date.now()]
+      );
+      if (!ins.rows[0]) return null;   // this candle's entry was already claimed elsewhere
+    }
+    const merge = { ...patch }; if (key) merge.lastEntryCandle = key; delete merge.userId;
     const upd = await pool.query(
-      `UPDATE real_strategies SET updated_at=$2, data = data || $3::jsonb
-       WHERE id=$1 AND (data->>'pendingSince') IS NULL RETURNING data`,
-      [id, Date.now(), JSON.stringify(patch)]
+      `UPDATE real_strategies SET updated_at=$2, version=COALESCE(version,0)+1, data = data || $3::jsonb
+       WHERE id=$1 AND status='active'
+         AND (data->>'pendingSince') IS NULL
+         AND (data->>'openPositionId') IS NULL
+         AND (data->>'lastEntryCandle') IS DISTINCT FROM $4
+       RETURNING data`,
+      [id, Date.now(), JSON.stringify(merge), key]
     );
-    return upd.rows[0] ? upd.rows[0].data : null;
+    return upd.rows[0] ? upd.rows[0].data : null;   // not eligible (paused / has position / already fired)
   }
   const dbf = readJSON(FILES.realStrats);
   const cur = dbf[id];
-  if (!cur || cur.pendingSince != null) return null;
-  dbf[id] = { ...cur, ...patch, updated_at: Date.now() };
+  if (!cur) return null;
+  if (cur.status !== "active") return null;
+  if (cur.pendingSince != null) return null;
+  if (cur.openPositionId != null) return null;
+  if (key && String(cur.lastEntryCandle || "") === key) return null;
+  const { userId, ...rest } = patch;
+  dbf[id] = { ...cur, ...rest, lastEntryCandle: key || cur.lastEntryCandle || null, version: (cur.version || 0) + 1, updated_at: Date.now() };
   writeJSON(FILES.realStrats, dbf);
   return dbf[id];
+}
+/* Versioned lifecycle transition (R16-P2-01). Pause / cancel / review-resolution and engine completion
+   each read a row version and write only if it is unchanged, so a late engine write can't silently clobber
+   a concurrent user pause/cancel. `expectVersion` null skips the check (used by internal engine writes that
+   already hold a fresh row). Returns the new row, or null if the version moved under us. */
+async function transitionRealStrategy(id, patch, expectVersion = null) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data, version FROM real_strategies WHERE id=$1`, [id]);
+    if (!r.rows[0]) return null;
+    const curVer = Number(r.rows[0].version || 0);
+    if (expectVersion != null && curVer !== Number(expectVersion)) return null;
+    const next = { ...r.rows[0].data, ...patch };
+    const upd = await pool.query(
+      `UPDATE real_strategies SET status=$2, updated_at=$3, data=$4, version=COALESCE(version,0)+1
+       WHERE id=$1 AND COALESCE(version,0)=$5 RETURNING data`,
+      [id, next.status || "active", Date.now(), next, curVer]
+    );
+    return upd.rows[0] ? upd.rows[0].data : null;   // lost the race — caller may re-read and retry
+  }
+  const dbf = readJSON(FILES.realStrats);
+  if (!dbf[id]) return null;
+  const curVer = Number(dbf[id].version || 0);
+  if (expectVersion != null && curVer !== Number(expectVersion)) return null;
+  dbf[id] = { ...dbf[id], ...patch, version: curVer + 1, updated_at: Date.now() };
+  writeJSON(FILES.realStrats, dbf);
+  return dbf[id];
+}
+/* R16-P2-09 manual-order idempotency ledger. `claimIdempotencyKey` returns true only to the FIRST caller
+   for a (user,key); later callers get false and should replay the stored response (or wait if it's still
+   in-flight). `release` frees the key when the order failed, so a genuine retry can proceed. */
+async function claimIdempotencyKey(userId, key) {
+  if (USING_PG) {
+    const r = await pool.query(
+      `INSERT INTO order_idempotency (user_id, key, response, created_at) VALUES ($1,$2,NULL,$3)
+       ON CONFLICT (user_id, key) DO NOTHING RETURNING key`, [String(userId), String(key), Date.now()]);
+    return !!r.rows[0];
+  }
+  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")));
+  const k = `${userId}|${key}`;
+  if (d[k]) return false;
+  d[k] = { response: null, createdAt: Date.now() }; writeJSON(FILES.idem, d); return true;
+}
+async function getIdempotentResponse(userId, key) {
+  if (USING_PG) { const r = await pool.query(`SELECT response FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return r.rows[0] ? r.rows[0].response : null; }
+  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"))); const row = d[`${userId}|${key}`]; return row ? row.response : null;
+}
+async function saveIdempotentResponse(userId, key, response) {
+  if (USING_PG) { await pool.query(`UPDATE order_idempotency SET response=$3 WHERE user_id=$1 AND key=$2`, [String(userId), String(key), response]); return; }
+  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); d[`${userId}|${key}`] = { response, createdAt: Date.now() }; writeJSON(f, d);
+}
+async function releaseIdempotencyKey(userId, key) {
+  if (USING_PG) { await pool.query(`DELETE FROM order_idempotency WHERE user_id=$1 AND key=$2 AND response IS NULL`, [String(userId), String(key)]); return; }
+  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const row = d[`${userId}|${key}`]; if (row && row.response == null) { delete d[`${userId}|${key}`]; writeJSON(f, d); }
+}
+/* R16-P2-10 delayed-fill protection store. */
+async function savePendingProtection(rec) {
+  const row = { id: rec.id, user_id: String(rec.userId), broker: rec.broker, order_id: String(rec.orderId), data: rec, attempts: 0, created_at: Date.now() };
+  if (USING_PG) { await pool.query(`INSERT INTO pending_protection (id,user_id,broker,order_id,data,attempts,created_at) VALUES ($1,$2,$3,$4,$5,0,$6) ON CONFLICT (id) DO NOTHING`, [row.id, row.user_id, row.broker, row.order_id, rec, row.created_at]); return row; }
+  const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); const d = readJSON(f); d[row.id] = row; writeJSON(f, d); return row;
+}
+async function listPendingProtection(limit = 500) {
+  if (USING_PG) { const r = await pool.query(`SELECT data, attempts FROM pending_protection ORDER BY created_at ASC LIMIT $1`, [limit]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts })); }
+  const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); return Object.values(readJSON(f)).map((x) => ({ ...x.data, attempts: x.attempts })).slice(0, limit);
+}
+async function bumpPendingProtection(id) {
+  if (USING_PG) { await pool.query(`UPDATE pending_protection SET attempts=COALESCE(attempts,0)+1 WHERE id=$1`, [id]); return; }
+  const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); const d = readJSON(f); if (d[id]) { d[id].attempts = (d[id].attempts || 0) + 1; writeJSON(f, d); }
+}
+async function deletePendingProtection(id) {
+  if (USING_PG) { await pool.query(`DELETE FROM pending_protection WHERE id=$1`, [id]); return; }
+  const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); const d = readJSON(f); if (d[id]) { delete d[id]; writeJSON(f, d); }
 }
 async function updateManagedPosition(id, patch) {
   if (USING_PG) {
@@ -795,19 +948,27 @@ async function getRealStrategiesForUser(userId, limit = 200) {
   }
   return Object.values(readJSON(FILES.realStrats)).filter((s) => String(s.userId) === String(userId)).slice(0, limit);
 }
+/* R16-P2-01: ATOMIC field update — the JSONB merge happens IN the database in a single statement, so two
+   concurrent writers (e.g. a late engine fill-completion and a user pause) can't lose each other's fields
+   via a read-modify-write race. `status` column is updated only when the patch carries one, otherwise the
+   existing status is preserved (so an engine write never silently un-pauses/un-cancels a strategy). */
 async function updateRealStrategy(id, patch) {
   if (USING_PG) {
-    const r = await pool.query(`SELECT data FROM real_strategies WHERE id=$1`, [id]);
-    if (!r.rows[0]) return null;
-    const next = { ...r.rows[0].data, ...patch };
-    await pool.query(`UPDATE real_strategies SET status=$2, updated_at=$3, data=$4 WHERE id=$1`, [id, next.status || "active", Date.now(), next]);
-    return next;
+    const upd = await pool.query(
+      `UPDATE real_strategies
+         SET updated_at=$2, version=COALESCE(version,0)+1,
+             status = COALESCE($4, status),
+             data = data || $3::jsonb
+       WHERE id=$1 RETURNING data`,
+      [id, Date.now(), JSON.stringify(patch), (patch && patch.status) || null]
+    );
+    return upd.rows[0] ? upd.rows[0].data : null;
   }
   const dbf = readJSON(FILES.realStrats);
   if (!dbf[id]) return null;
-  dbf[id] = { ...dbf[id], ...patch, updated_at: Date.now() };
+  dbf[id] = { ...dbf[id], ...patch, version: (dbf[id].version || 0) + 1, updated_at: Date.now() };
   writeJSON(FILES.realStrats, dbf);
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotentResponse, saveIdempotentResponse, releaseIdempotencyKey, savePendingProtection, listPendingProtection, bumpPendingProtection, deletePendingProtection, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
