@@ -3488,17 +3488,24 @@ const OAUTH_REDIRECT_ALLOW = (process.env.OAUTH_REDIRECT_ALLOWLIST || "").split(
    "https://app.example" prefix-match the attacker origin "https://app.example.evil.com". An allow entry
    may be a bare origin ("https://app.example") or an origin+path prefix ("https://app.example/oauth"). */
 const redirectAllowed = (redirect) => reconcile.redirectAllowed(redirect, OAUTH_REDIRECT_ALLOW);
-function issueOAuthState(userId, broker, redirect = null) {
+/* R16-P2-11: the nonce lives in a SHARED Postgres store when a DB is configured, so a login started on one
+   replica can complete on another and state survives a restart. Flat-file/no-DB deployments fall back to the
+   in-memory Map (single process, so that's still correct there). */
+async function issueOAuthState(userId, broker, redirect = null) {
   const now = Date.now();
-  for (const [k, v] of oauthStates) if (v.exp < now) oauthStates.delete(k);   // prune expired
   const nonce = crypto.randomBytes(24).toString("hex");
-  oauthStates.set(nonce, { userId: userId != null ? String(userId) : null, broker, redirect: redirect || null, exp: now + OAUTH_STATE_TTL });
+  const rec = { userId: userId != null ? String(userId) : null, broker, redirect: redirect || null, exp: now + OAUTH_STATE_TTL };
+  const stored = await db.saveOAuthState(nonce, rec, rec.exp).catch(() => false);
+  if (!stored) {
+    for (const [k, v] of oauthStates) if (v.exp < now) oauthStates.delete(k);   // prune expired (mem fallback)
+    oauthStates.set(nonce, rec);
+  }
   return nonce;
 }
-function consumeOAuthState(nonce, broker, userId, redirect = null) {
+async function consumeOAuthState(nonce, broker, userId, redirect = null) {
   if (!nonce) return { ok: false, reason: "missing state — start the broker login again" };
-  const s = oauthStates.get(nonce);
-  oauthStates.delete(nonce);                 // one-time use, even on failure
+  let s = await db.consumeOAuthStateRow(nonce).catch(() => null);
+  if (!s) { s = oauthStates.get(nonce) || null; oauthStates.delete(nonce); }   // one-time use (mem fallback)
   if (!s) return { ok: false, reason: "unknown or expired state — start the broker login again" };
   if (s.exp < Date.now()) return { ok: false, reason: "the login expired — please try again" };
   if (s.broker !== broker) return { ok: false, reason: "broker mismatch" };
@@ -4067,7 +4074,7 @@ app.get("/api/broker/login-url", requireAuth, async (req, res) => {
   if (!redirectAllowed(redirect)) return res.status(400).json({ error: "This redirect URL isn't allow-listed for OAuth. Use your registered callback." });
   // CSRF: mint a single-use state nonce bound to this login (verified back at /api/broker/session),
   // and BIND the canonical redirect into that state so the transaction is tied to the URL that started it.
-  const stateNonce = issueOAuthState(userId, id, redirect);   // userId is already the verified, storageKeyFor'd id
+  const stateNonce = await issueOAuthState(userId, id, redirect);   // userId is already the verified, storageKeyFor'd id
   // R7-P1-01: return the EFFECTIVE redirect (possibly server-canonicalised to FYERS_REDIRECT_URI) so the
   // client echoes THIS exact value back at session — otherwise the binding check rejects a valid callback
   // whenever the browser URL differs from the pinned canonical redirect.
@@ -4088,7 +4095,7 @@ app.post("/api/broker/session", requireAuth, async (req, res) => {
      without it, an attacker's auth_code could be planted into someone else's connect. Verified only
      for the redirect brokers (fyers/schwab); Delta/userCreds/house sessions have no OAuth redirect. */
   if ((broker === "fyers" || broker === "schwab") && !(req.body && req.body.extra && req.body.extra.house)) {
-    const chk = consumeOAuthState(req.body && req.body.state, broker, userId, req.body && req.body.redirect);   // redirect echo-verified when the client sends it
+    const chk = await consumeOAuthState(req.body && req.body.state, broker, userId, req.body && req.body.redirect);   // redirect echo-verified when the client sends it
     if (!chk.ok) return res.status(400).json({ error: "Login could not be verified (" + chk.reason + ")." });
   }
 

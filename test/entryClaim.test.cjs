@@ -55,6 +55,17 @@ test("updateRealStrategy is an atomic merge that never un-pauses (COALESCE statu
   assert.equal(after.openPositionId, "pos-9");
 });
 
+test("BARRIER: many simultaneous claimants for one candle → exactly one winner", async () => {
+  await seed({ id: "s2", pendingSince: null, openPositionId: null });
+  // Fire N claims for the SAME (strategy, candle) at once. In flat-file mode this exercises the guard
+  // logic; on Postgres the UNIQUE(order_intents) row is what enforces at-most-once across replicas.
+  const attempts = await Promise.all(
+    Array.from({ length: 12 }, (_, i) => db.claimRealStrategyForEntry("s2", "barrier-candle", { pendingSince: Date.now(), pendingClientId: `w${i}` }))
+  );
+  const winners = attempts.filter(Boolean);
+  assert.equal(winners.length, 1, "exactly one worker may claim a given candle's entry");
+});
+
 test("transitionRealStrategy honours the expected version", async () => {
   const s = await seed();
   const v0 = (await db.getRealStrategiesForUser("ph_1")).find((x) => x.id === "s1").version || 0;

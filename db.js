@@ -122,6 +122,11 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS order_idempotency (
     user_id TEXT, key TEXT, response JSONB, created_at BIGINT,
     PRIMARY KEY (user_id, key))`);
+  /* Shared, restart-durable OAuth CSRF state (R16-P2-11 / R15-P2-09). One-time nonce per broker-login
+     attempt, stored in Postgres so it survives restarts and is shared across replicas — a login started on
+     worker A can complete its callback on worker B. Consumed atomically (DELETE ... RETURNING). */
+  await pool.query(`CREATE TABLE IF NOT EXISTS oauth_states (
+    nonce TEXT PRIMARY KEY, data JSONB, exp BIGINT)`);
   /* Delayed-fill protection watcher (R16-P2-10). A manual LIMIT entry that asked for app-managed SL/TP but
      hadn't filled within the sync window is parked here; a background sweep re-checks the broker until the
      order is terminal and, on fill, attaches the requested protection to the CONFIRMED filled quantity. */
@@ -885,6 +890,22 @@ async function releaseIdempotencyKey(userId, key) {
   if (USING_PG) { await pool.query(`DELETE FROM order_idempotency WHERE user_id=$1 AND key=$2 AND response IS NULL`, [String(userId), String(key)]); return; }
   const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const row = d[`${userId}|${key}`]; if (row && row.response == null) { delete d[`${userId}|${key}`]; writeJSON(f, d); }
 }
+/* R16-P2-11 shared OAuth CSRF state (Postgres-backed; in-memory fallback for flat-file mode lives in
+   server.js). `saveOAuthState` upserts the nonce; `consumeOAuthState` deletes-and-returns atomically so a
+   nonce can be used at most once even across replicas. */
+async function saveOAuthState(nonce, data, exp) {
+  if (USING_PG) {
+    await pool.query(`INSERT INTO oauth_states (nonce, data, exp) VALUES ($1,$2,$3) ON CONFLICT (nonce) DO UPDATE SET data=EXCLUDED.data, exp=EXCLUDED.exp`, [String(nonce), data, exp]);
+    // opportunistic prune of expired nonces
+    await pool.query(`DELETE FROM oauth_states WHERE exp < $1`, [Date.now()]).catch(() => {});
+    return true;
+  }
+  return false;
+}
+async function consumeOAuthStateRow(nonce) {
+  if (USING_PG) { const r = await pool.query(`DELETE FROM oauth_states WHERE nonce=$1 RETURNING data, exp`, [String(nonce)]); return r.rows[0] ? { ...r.rows[0].data, exp: Number(r.rows[0].exp) } : null; }
+  return null;
+}
 /* R16-P2-10 delayed-fill protection store. */
 async function savePendingProtection(rec) {
   const row = { id: rec.id, user_id: String(rec.userId), broker: rec.broker, order_id: String(rec.orderId), data: rec, attempts: 0, created_at: Date.now() };
@@ -971,4 +992,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotentResponse, saveIdempotentResponse, releaseIdempotencyKey, savePendingProtection, listPendingProtection, bumpPendingProtection, deletePendingProtection, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotentResponse, saveIdempotentResponse, releaseIdempotencyKey, savePendingProtection, listPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
