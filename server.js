@@ -228,26 +228,7 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
    stored server-side and loaded on every order — a tampered/old client can't drop them by omitting the
    body. Only clean positive numbers are kept. `merge` returns the STRICTER of two policies per field so a
    per-order client override can only tighten, never loosen. */
-const RISK_KEYS = ["maxPositionPct", "maxOpenPositions", "maxTradesPerDay", "maxDailyLossPct", "cooldownMs"];
-function cleanRiskPolicy(obj) {
-  const o = obj && typeof obj === "object" ? obj : {};
-  const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : undefined; };
-  const out = {};
-  for (const k of RISK_KEYS) { const v = num(o[k]); if (v !== undefined) out[k] = v; }
-  return out;
-}
-function strictestRiskPolicy(a, b) {
-  const A = a || {}, B = b || {}, out = {};
-  for (const k of RISK_KEYS) {
-    const va = A[k], vb = B[k];
-    if (va == null && vb == null) continue;
-    if (va == null) { out[k] = vb; continue; }
-    if (vb == null) { out[k] = va; continue; }
-    // caps are maxima → smaller is stricter; cooldownMs is a minimum wait → larger is stricter.
-    out[k] = k === "cooldownMs" ? Math.max(va, vb) : Math.min(va, vb);
-  }
-  return out;
-}
+const { cleanRiskPolicy, strictestRiskPolicy } = require("./riskPolicy");   // pure + unit-tested
 app.get("/api/risk-policy", requireAuth, async (req, res) => {
   try { const p = await db.getRiskPolicy(storageKeyFor(req.authUserId)); res.json({ ok: true, policy: p || {} }); }
   catch (e) { serverError(res, e); }
