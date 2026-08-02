@@ -126,6 +126,14 @@ function stableStringify(v) {
   if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
   return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(v[k])}`).join(",")}}`;
 }
+/* R22-C01: the server risk gate must derive state ONLY from VERIFIED executions. A client can POST a trade,
+   but a REAL row that the browser authored (not stamped serverAuthored by a verified broker fill) must never
+   feed the daily-loss / trade-count / cooldown maths — otherwise a fabricated `real:true` row with fake P&L
+   could loosen the loss breaker or the cooldown. Virtual (paper) trades and server-verified real fills count;
+   client-authored real rows are display-only. */
+function riskEligibleTrades(trades) {
+  return (trades || []).filter((t) => !(t && t.real === true && t.clientAuthored === true && t.serverAuthored !== true));
+}
 /* R17-P2-03: write a durable user-facing notice (used by background jobs like delayed-fill protection so the
    user learns the terminal outcome even though it happened server-side). Best-effort; never throws. */
 async function addUserNotice(userId, notice) {
@@ -150,6 +158,11 @@ async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null
         try { await db.setRiskLock(userKey, true); } catch { /* best-effort */ }
         if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") {
           try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); } catch { /* best-effort */ }
+          /* R22-C03: engage the LIVE in-memory kill-switch immediately too — the durable flag alone wouldn't
+             stop the already-running Auto-Buy engine until restart. This makes a manual/delayed/auto journal
+             failure halt the engine in the SAME process, right now. (haltedEntries is defined later; resolved
+             at call time.) */
+          try { haltedEntries.add(String(storageKeyFor(String(haltUserIdOnFail)))); } catch { /* engine may not be up */ }
         }
         return false;
       }
@@ -231,6 +244,10 @@ app.post("/api/trades", requireAuth, async (req, res) => {
     // R21-P1-02: a browser post is NEVER authoritative. Strip any client-claimed serverAuthored flag; saveTrade
     // (authoritative:false) then guarantees it can only annotate — not overwrite — a server-verified fill row.
     delete rec.serverAuthored;
+    // R22-C01: mark any REAL row the browser posts as clientAuthored so the risk gate ignores it (it can only
+    // ANNOTATE a server-verified fill, never feed the daily-loss / count / cooldown maths). Fabricated fake-P&L
+    // posts therefore can't loosen the risk controls; they remain display-only.
+    if (rec.real === true) rec.clientAuthored = true;
     // R20 follow-up (H1): saveTrade may re-key to a user-namespaced/canonical id — echo the STORED row back so
     // the client holds the id the DB actually uses (not the raw one it sent), else later deletes/patches miss.
     const saved = await db.saveTrade(userId, rec, { authoritative: false });
@@ -4900,8 +4917,11 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
   {
     const isReduceOnly = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
     if (!isReduceOnly && typeof db.isRiskLocked === "function") {
-      let locked = false;
-      try { locked = await db.isRiskLocked(storageKeyFor(sess.userId)); } catch { locked = false; }
+      /* R22-C03: a safety gate must FAIL CLOSED. If we can't read the risk-lock (DB incident), do NOT let a new
+         real entry through on the assumption it's unlocked — reject with 503 until the lock can be verified. */
+      let locked;
+      try { locked = await db.isRiskLocked(storageKeyFor(sess.userId)); }
+      catch { return res.status(503).json({ error: "Couldn't verify your account's trading status right now — please retry in a moment." }); }
       if (locked) return res.status(423).json({ error: "Trading is paused: a recent fill couldn't be saved to your risk history. Reconcile with your broker, then resume. Closing/exit orders are still allowed.", riskLocked: true });
     }
   }
@@ -5068,7 +5088,7 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
     const userLimits = Object.keys(effLimits).length ? effLimits : null;
     const check = serverValidateOrder(
       { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket },
-      { wallet: account.wallet, portfolio: account.portfolio, trades: rkTrades || [], ...(userLimits ? { limits: userLimits } : {}) },
+      { wallet: account.wallet, portfolio: account.portfolio, trades: riskEligibleTrades(rkTrades), ...(userLimits ? { limits: userLimits } : {}) },
     );
     if (!check.ok) {
       return res.status(422).json({ error: "Order blocked by risk checks: " + (check.reasons[0] || "not allowed"), reasons: check.reasons });
@@ -5158,6 +5178,18 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
           }).catch(() => {});
           autoExitNote = "Entry not filled yet — we'll attach your SL/TP automatically if it fills. You can also re-arm from the position.";
         }
+      }
+      /* R22-C02: a PLAIN (no SL/TP) FYERS order that's still pending when we respond can fill later at the
+         broker with no journal event. Park a durable row (plain:true → journal only, no protection) so the
+         background watcher reconciles the eventual fill exactly once, keeping the risk ledger complete. */
+      if (!wantAutoExit && fillStatus === "PENDING") {
+        const bareSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+        await db.savePendingProtection({
+          id: `pp_${sess.userId}_${d.id}`, userId: String(sess.userId), broker: "fyers", orderId: d.id,
+          symbol: bareSym, brokerSym: symbol, qty: Number(qty), market: regMarket, product,
+          sl: null, tp: null, tsl: null, cfg: null, plain: true, tradeType: String(req.body?.tradeType || "Manual"),
+          yahoo: req.body?.yahoo || `${bareSym}.NS`, interval: req.body?.interval || "5m", short: String(side).toLowerCase() === "sell",
+        }).catch(() => {});
       }
       return res.json({ orderId: d.id, status: fillStatus, broker, autoExitId, autoExitArmed: !!autoExitId, ...(autoExitNote ? { autoExitNote } : {}) });
     }
@@ -6763,7 +6795,7 @@ async function runAutoBuyEngine() {
           const abTrades = await db.getTrades(abStoreKey, 0, Date.now()).catch(() => []);
           const abCheck = serverValidateOrder(
             { sym: String(st.brokerSym).replace(/^NSE:/, "").replace(/-EQ$/, ""), side: st.short ? "SELL" : "BUY", qty, price: px, market: abMarketKind },
-            { wallet: abAccount.wallet, portfolio: abAccount.portfolio, trades: abTrades || [], ...(Object.keys(abPolicy).length ? { limits: abPolicy } : {}) },
+            { wallet: abAccount.wallet, portfolio: abAccount.portfolio, trades: riskEligibleTrades(abTrades), ...(Object.keys(abPolicy).length ? { limits: abPolicy } : {}) },
           );
           if (!abCheck.ok) {
             await db.updateRealStrategy(st.id, { lastError: "Blocked by risk checks: " + (abCheck.reasons[0] || "not allowed"), lastOrderStatus: "risk-blocked" });
@@ -6897,14 +6929,19 @@ async function runProtectionWatcher() {
           entryAt: Date.now(), market: p.market, real: true, broker: "fyers",
           tradeType: String(p.tradeType || "Manual"), orderId: p.orderId, serverAuthored: true,
         });
-        await registerManagedPosition({
-          sess, symbol: p.symbol, brokerSym: p.brokerSym, qty: c.filledQty || Number(p.qty), entry: avg,
-          market: p.market, sl: p.sl || null, tp: p.tp || null, tsl: p.tsl || null, cfg: p.cfg || null,
-          yahoo: p.yahoo, interval: p.interval, product: p.product, short: !!p.short, entryOrderId: p.orderId,
-        });
+        /* R22-C02: a `plain` row (a no-SL/TP order parked only to RECONCILE its fill) journals the fill above and
+           then stops — there's no protection to attach, so we don't register a managed position. */
+        if (!p.plain) {
+          await registerManagedPosition({
+            sess, symbol: p.symbol, brokerSym: p.brokerSym, qty: c.filledQty || Number(p.qty), entry: avg,
+            market: p.market, sl: p.sl || null, tp: p.tp || null, tsl: p.tsl || null, cfg: p.cfg || null,
+            yahoo: p.yahoo, interval: p.interval, product: p.product, short: !!p.short, entryOrderId: p.orderId,
+          });
+        }
         await db.deletePendingProtection(p.id);
-        logFinancial("protection.attached", { userId: p.userId, broker: "fyers", orderId: p.orderId, qty: c.filledQty || p.qty });
-        await addUserNotice(p.userId, { type: "protection_attached", broker: "fyers", symbol: p.symbol, msg: `SL/TP is now protecting your ${p.symbol} position (filled at ${avg}).` });
+        logFinancial(p.plain ? "delayed_fill.reconciled" : "protection.attached", { userId: p.userId, broker: "fyers", orderId: p.orderId, qty: c.filledQty || p.qty });
+        if (!p.plain) await addUserNotice(p.userId, { type: "protection_attached", broker: "fyers", symbol: p.symbol, msg: `SL/TP is now protecting your ${p.symbol} position (filled at ${avg}).` });
+        else await addUserNotice(p.userId, { type: "fill_reconciled", broker: "fyers", symbol: p.symbol, msg: `Your ${p.symbol} order filled at ${avg} and is now recorded.` });
       } else if (c.rejected) {
         await db.deletePendingProtection(p.id);
         await addUserNotice(p.userId, { type: "protection_rejected", broker: "fyers", symbol: p.symbol, msg: `Your ${p.symbol} limit order was rejected — no SL/TP attached.` });
