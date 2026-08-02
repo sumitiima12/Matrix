@@ -147,7 +147,14 @@ async function addUserNotice(userId, notice) {
    Returns true if the row is durable, false if it could not be persisted. */
 async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null } = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { await db.saveTrade(userKey, trade, { authoritative: true }); return true; }
+    try {
+      await db.saveTrade(userKey, trade, { authoritative: true });
+      /* ARCH-1: write-through to the IMMUTABLE fills ledger (append-only, idempotent). This is the server-owned
+         source of truth for reconciliation/audit and future risk derivation; the trades table stays the editable
+         projection. Best-effort relative to the trade write — the trade write is what the retry/halt guards. */
+      if (typeof db.recordFill === "function") { try { await db.recordFill(userKey, trade); } catch { /* ledger append is non-fatal to the trade write */ } }
+      return true;
+    }
     catch (e) {
       if (attempt === 2) {
         logFinancial("authoritative_fill_persist_failed", { userKey, orderId: trade && trade.orderId, sym: trade && trade.sym, broker: trade && trade.broker, err: String((e && e.message) || e) });
@@ -264,6 +271,21 @@ app.get("/api/trades", requireAuth, async (req, res) => {
     const to = req.query.to ? +req.query.to : Date.now();
     const trades = await rcWrap(`trades:${userId}:${from}:${to}`, () => db.getTrades(userId, from, to));
     res.json({ trades });
+  } catch (e) { serverError(res, e); }
+});
+
+/* ARCH-4: durable order-intent reconcile. The order_idempotency ledger IS the intent store — it survives
+   restart (Postgres) and records each intent's terminal outcome. This lets the UI resolve an AMBIGUOUS order
+   ("outcome unknown—checking broker") after a timeout/reload by polling the SAME idempotency key:
+     succeeded → the order went through (replay the stored response);  rejected/none → nothing executed, safe to
+     retry;  in_flight/unknown → still unresolved, keep showing the reconcile state. Scoped to the caller. */
+app.get("/api/order/intent-status", requireAuth, async (req, res) => {
+  try {
+    const key = String(req.query.key || "").slice(0, 100);
+    if (!/^[A-Za-z0-9_-]{8,100}$/.test(key)) return res.status(400).json({ error: "A valid intent key is required." });
+    const rec = await db.getIdempotencyRecord(storageKeyFor(req.authUserId), key).catch(() => null);
+    if (!rec) return res.json({ status: "none" });
+    res.json({ status: rec.status, ageMs: rec.createdAt ? Date.now() - rec.createdAt : null, ...(rec.status === "succeeded" && rec.response ? { response: rec.response } : {}) });
   } catch (e) { serverError(res, e); }
 });
 

@@ -65,6 +65,14 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY, user_id TEXT, ts BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS trades_user_ts ON trades (user_id, ts)`);
+  /* ARCH-1: the IMMUTABLE, server-only FILLS ledger. Every verified broker fill is appended here exactly once
+     (idempotent on the natural broker key). Clients can NEVER write it. It is the audit/reconciliation source of
+     truth and the basis for future risk derivation; the `trades` table above stays as the editable display
+     projection. Append-only: rows are never updated or deleted in normal operation. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS fills (
+    fill_id TEXT PRIMARY KEY, user_id TEXT, broker TEXT, order_id TEXT, side TEXT,
+    qty DOUBLE PRECISION, price DOUBLE PRECISION, market TEXT, trade_type TEXT, ts BIGINT, data JSONB)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS fills_user_ts ON fills (user_id, ts)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS app_state (
     user_id TEXT PRIMARY KEY, updated_at BIGINT, data JSONB)`);
   // Public strategies — shared across users. `owner` is the bare phone; `owner_name` is the
@@ -204,6 +212,7 @@ async function initDb() {
 /* ---------------------------- flat-file fallback --------------------------- */
 const FILES = {
   trades: process.env.TRADES_FILE || path.join(__dirname, "trades.json"),
+  fills: process.env.FILLS_FILE || path.join(__dirname, "fills.json"),
   users: process.env.USERS_FILE || path.join(__dirname, "users.json"),
   state: process.env.STATE_FILE || path.join(__dirname, "state.json"),
   public: process.env.PUBLIC_STRATS_FILE || path.join(__dirname, "public_strategies.json"),
@@ -316,6 +325,40 @@ async function saveTrade(userId, trade, { authoritative = false } = {}) {
   db[userId] = list.slice(0, 5000);
   writeJSON(FILES.trades, db);
   return trade;
+}
+/* ARCH-1: append a VERIFIED broker fill to the immutable ledger. Idempotent on the natural broker key
+   (`user_broker_order[_fillId]`) so the same fill — replayed by a retry, a poll and the delayed watcher — is
+   recorded exactly once. Never updates an existing row. Returns { inserted } so callers can tell first-write
+   from a duplicate. Safe to call in addition to saveTrade (write-through); does not touch the trades table. */
+async function recordFill(userId, fill) {
+  const uref = userRef(userId);
+  const brk = String((fill && fill.broker) || "x").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const oid = String((fill && fill.orderId) != null ? fill.orderId : "");
+  const fillId = String((fill && fill.fillId) || `f_${uref}_${brk}_${oid}`);
+  const ts = Number(fill && (fill.ts || fill.entryAt)) || Date.now();
+  const row = { ...fill, fillId };
+  if (USING_PG) {
+    const r = await pool.query(
+      `INSERT INTO fills (fill_id, user_id, broker, order_id, side, qty, price, market, trade_type, ts, data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (fill_id) DO NOTHING`,
+      [fillId, String(userId), brk, oid, String(fill.side || ""), Number(fill.qty) || 0, Number(fill.entry != null ? fill.entry : fill.price) || 0, String(fill.market || ""), String(fill.tradeType || ""), ts, row]
+    );
+    return { inserted: (r.rowCount || 0) > 0, fillId };
+  }
+  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  const d = readJSON(f); const bucket = d[String(userId)] || {};
+  const inserted = !(fillId in bucket);
+  if (inserted) { bucket[fillId] = { ...row, ts }; d[String(userId)] = bucket; writeJSON(f, d); }
+  return { inserted, fillId };
+}
+/* Read the immutable fills for a user in a time window (audit / reconciliation / future risk derivation). */
+async function getFills(userId, from = 0, to = Date.now()) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM fills WHERE user_id=$1 AND ts>=$2 AND ts<=$3 ORDER BY ts DESC LIMIT 5000`, [String(userId), from, to]);
+    return r.rows.map((x) => x.data);
+  }
+  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  return Object.values(readJSON(f)[String(userId)] || {}).filter((x) => (x.ts || 0) >= from && (x.ts || 0) <= to).sort((a, b) => (b.ts || 0) - (a.ts || 0));
 }
 /* Delete specific trades by their id (scoped to the user). Used by the Delta reconcile to drop phantom
    OPEN real journal records the broker doesn't actually hold. Returns how many were removed. */
@@ -781,8 +824,14 @@ async function getHaltedEntryUsers() {
   if (USING_PG) { const r = await pool.query(`SELECT user_id FROM automation_flags WHERE halt_entries=true`); return r.rows.map((x) => x.user_id); }
   const all = readJSON(FILES.autoFlags); return Object.keys(all).filter((u) => all[u] && all[u].halt_entries);
 }
-/* R21-P1-03: durable per-user risk-ledger lock. Set when a verified fill can't be persisted; checked by every
-   new-entry route so trading can't continue against an incomplete risk history. Cleared on reconciliation. */
+/* R21-P1-03 / ARCH-3: durable per-user risk-ledger lock. Set when a verified fill can't be persisted; checked by
+   every new-entry route so trading can't continue against an incomplete risk history. Cleared on reconciliation.
+   MULTI-INSTANCE NOTE: this state — and the entry-halt flag — live in POSTGRES, so they are ALREADY a shared,
+   strongly-consistent safety store across replicas (any instance reads the same row). The only process-local
+   pieces left are the in-memory `haltedEntries` kill-switch CACHE (a fast mirror of the durable halt, rebuilt at
+   startup) and the express rate limiters. For true multi-instance those two would move to Redis (activated by a
+   REDIS_URL env), but the AUTHORITATIVE gates are already shared via PG — so a second instance can't bypass a
+   set lock. Single-instance today, so no Redis is wired. */
 async function setRiskLock(userId, locked) {
   const u = String(userId), on = !!locked, now = Date.now();
   if (USING_PG) {
@@ -1337,4 +1386,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, getFills, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
