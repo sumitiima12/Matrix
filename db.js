@@ -113,6 +113,10 @@ async function initDb() {
      by an app_settings save or the user-state blob (both of which overwrite wholesale). */
   await pool.query(`CREATE TABLE IF NOT EXISTS automation_flags (
     user_id TEXT PRIMARY KEY, halt_entries BOOLEAN DEFAULT false, updated_at BIGINT)`);
+  /* SERVER-OWNED risk policy (R15-P1-02) — the authoritative per-user caps enforced on every real order.
+     Its own table so it is never clobbered by an app_state blob save. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS risk_policy (
+    user_id TEXT PRIMARY KEY, data JSONB, updated_at BIGINT)`);
   console.log("[db] Postgres ready");
 }
 
@@ -129,6 +133,7 @@ const FILES = {
   managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
   realStrats: process.env.REAL_STRATS_FILE || path.join(__dirname, "real_strategies.json"),
   screeners: process.env.SCREENERS_FILE || path.join(__dirname, "user_screeners.json"),
+  riskPolicy: process.env.RISK_POLICY_FILE || path.join(__dirname, "risk_policy.json"),
   autoFlags: process.env.AUTO_FLAGS_FILE || path.join(__dirname, "automation_flags.json"),
 };
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return {}; } };
@@ -708,6 +713,43 @@ async function claimManagedForExit(id, patch = {}) {
   writeJSON(FILES.managed, db);
   return db[id];
 }
+/* Atomic ENTRY claim for a real strategy — the entry-side analogue of claimManagedForExit. Stamps the
+   pending marker ONLY if no order is currently in-flight (pendingSince absent/null), in ONE conditional
+   UPDATE, so two server replicas can't both place an auto-buy entry for the same strategy. Returns the
+   updated row to the winner and null to any other caller. */
+/* SERVER-OWNED risk policy (R15-P1-02): the authoritative per-user caps loaded on every real order, so a
+   tampered/old client can't drop them by omitting the request body. */
+async function saveRiskPolicy(userId, policy) {
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO risk_policy (user_id, data, updated_at) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id) DO UPDATE SET data=EXCLUDED.data, updated_at=EXCLUDED.updated_at`,
+      [userId, policy, Date.now()]
+    );
+    return policy;
+  }
+  const db = readJSON(FILES.riskPolicy); db[userId] = policy; writeJSON(FILES.riskPolicy, db); return policy;
+}
+async function getRiskPolicy(userId) {
+  if (USING_PG) { const r = await pool.query(`SELECT data FROM risk_policy WHERE user_id=$1`, [userId]); return r.rows[0] ? r.rows[0].data : null; }
+  return readJSON(FILES.riskPolicy)[userId] || null;
+}
+async function claimRealStrategyForEntry(id, patch = {}) {
+  if (USING_PG) {
+    const upd = await pool.query(
+      `UPDATE real_strategies SET updated_at=$2, data = data || $3::jsonb
+       WHERE id=$1 AND (data->>'pendingSince') IS NULL RETURNING data`,
+      [id, Date.now(), JSON.stringify(patch)]
+    );
+    return upd.rows[0] ? upd.rows[0].data : null;
+  }
+  const dbf = readJSON(FILES.realStrats);
+  const cur = dbf[id];
+  if (!cur || cur.pendingSince != null) return null;
+  dbf[id] = { ...cur, ...patch, updated_at: Date.now() };
+  writeJSON(FILES.realStrats, dbf);
+  return dbf[id];
+}
 async function updateManagedPosition(id, patch) {
   if (USING_PG) {
     const r = await pool.query(`SELECT data FROM managed_positions WHERE id=$1`, [id]);
@@ -768,4 +810,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

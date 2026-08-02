@@ -196,17 +196,68 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
         .filter((x) => Number(x.size) !== 0)
         .map((x) => norm(x.product_symbol || (x.product && x.product.symbol) || "")));
     } catch { return res.status(502).json({ error: "Couldn't read your Delta positions right now — try again in a moment." }); }
-    // Find OPEN, REAL, CRYPTO journal records whose symbol Delta does NOT hold → phantom → drop.
+    /* BROKER SAFETY: this reconcile only knows Delta's positions, so it must NEVER delete a row that
+       could belong to ANOTHER crypto broker (CoinDCX/Binance/CoinSwitch). We drop a row only if it is
+       POSITIVELY attributable to Delta: either it is explicitly tagged broker="delta", OR it carries no
+       broker tag AND the user has no OTHER crypto broker connected (so it can't belong to one). */
+    const OTHER_CRYPTO_BROKERS = ["coindcx", "binance", "coinswitch"];
+    let hasOtherCryptoBroker = false;
+    for (const b of OTHER_CRYPTO_BROKERS) {
+      try { if (await db.getBrokerCred(userId, b)) { hasOtherCryptoBroker = true; break; } } catch { /* ignore */ }
+    }
     const norm = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "");
+    const attributableToDelta = (t) => {
+      const b = String(t.broker || "").toLowerCase();
+      if (b === "delta") return true;
+      if (b) return false;                         // tagged to a different broker → never touch
+      return !hasOtherCryptoBroker;                // untagged → safe only if Delta is the sole crypto broker
+    };
     const trades = await db.getTrades(userId, 0, Date.now()).catch(() => []);
     const phantom = (trades || []).filter((t) =>
       t && t.real === true && (t.market || "") === "Crypto" &&
       t.entryAt != null && (t.exitAt == null || t.exit == null) &&      // still "open"
-      t.status !== "rejected" && !held.has(norm(t.sym)));
+      t.status !== "rejected" && attributableToDelta(t) && !held.has(norm(t.sym)));
     const removed = await db.deleteTradesByIds(userId, phantom.map((t) => t.id));
     rcBust(`trades:${userId}`);
     logFinancial("trades.reconcileReal", { userId, removed, held: [...held] });
     res.json({ ok: true, removed, heldSymbols: [...held], droppedSymbols: phantom.map((t) => t.sym) });
+  } catch (e) { serverError(res, e); }
+});
+
+/* SERVER-OWNED RISK POLICY (R15-P1-02). The per-user caps are the REAL safety control, so they must be
+   stored server-side and loaded on every order — a tampered/old client can't drop them by omitting the
+   body. Only clean positive numbers are kept. `merge` returns the STRICTER of two policies per field so a
+   per-order client override can only tighten, never loosen. */
+const RISK_KEYS = ["maxPositionPct", "maxOpenPositions", "maxTradesPerDay", "maxDailyLossPct", "cooldownMs"];
+function cleanRiskPolicy(obj) {
+  const o = obj && typeof obj === "object" ? obj : {};
+  const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : undefined; };
+  const out = {};
+  for (const k of RISK_KEYS) { const v = num(o[k]); if (v !== undefined) out[k] = v; }
+  return out;
+}
+function strictestRiskPolicy(a, b) {
+  const A = a || {}, B = b || {}, out = {};
+  for (const k of RISK_KEYS) {
+    const va = A[k], vb = B[k];
+    if (va == null && vb == null) continue;
+    if (va == null) { out[k] = vb; continue; }
+    if (vb == null) { out[k] = va; continue; }
+    // caps are maxima → smaller is stricter; cooldownMs is a minimum wait → larger is stricter.
+    out[k] = k === "cooldownMs" ? Math.max(va, vb) : Math.min(va, vb);
+  }
+  return out;
+}
+app.get("/api/risk-policy", requireAuth, async (req, res) => {
+  try { const p = await db.getRiskPolicy(storageKeyFor(req.authUserId)); res.json({ ok: true, policy: p || {} }); }
+  catch (e) { serverError(res, e); }
+});
+app.post("/api/risk-policy", requireAuth, async (req, res) => {
+  try {
+    const policy = cleanRiskPolicy(req.body && req.body.policy);
+    await db.saveRiskPolicy(storageKeyFor(req.authUserId), policy);
+    logFinancial("risk.policySaved", { userId: storageKeyFor(req.authUserId), policy });
+    res.json({ ok: true, policy });
   } catch (e) { serverError(res, e); }
 });
 
@@ -4639,14 +4690,13 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
     // Market order, new position: no limit price and nothing held. Fetch a live mark so the
     // risk engine can size the order instead of refusing it for "No live price".
     if (rkPrice == null) rkPrice = await liveMarkForOrder(symbol, rkMarket);
-    // User-configured risk caps (opt-in from Profile; OFF by default). Only clean positive numbers are
-    // honoured, and since the server default is unlimited, a client value can only TIGHTEN — never loosen.
-    const rl = req.body?.riskLimits && typeof req.body.riskLimits === "object" ? req.body.riskLimits : null;
-    const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : undefined; };
-    const userLimits = rl ? Object.fromEntries(Object.entries({
-      maxPositionPct: num(rl.maxPositionPct), maxOpenPositions: num(rl.maxOpenPositions),
-      maxTradesPerDay: num(rl.maxTradesPerDay), maxDailyLossPct: num(rl.maxDailyLossPct), cooldownMs: num(rl.cooldownMs),
-    }).filter(([, v]) => v !== undefined)) : null;
+    /* R15-P1-02: caps come from the SERVER-OWNED policy (loaded here, authoritative), NOT the request body.
+       A per-order client override may only make them STRICTER — omitting/altering the body can never drop a
+       cap the user configured. */
+    const serverPolicy = await db.getRiskPolicy(storageKeyFor(sess.userId)).catch(() => null);
+    const clientOverride = cleanRiskPolicy(req.body?.riskLimits);
+    const effLimits = strictestRiskPolicy(serverPolicy, clientOverride);
+    const userLimits = Object.keys(effLimits).length ? effLimits : null;
     const check = serverValidateOrder(
       { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket },
       { wallet: account.wallet, portfolio: account.portfolio, trades: rkTrades || [], ...(userLimits ? { limits: userLimits } : {}) },
@@ -6238,8 +6288,12 @@ async function runAutoBuyEngine() {
         // R3-#1: a unique client_order_id stamped WITH the pending marker is the durable dedupe key —
         // if this order times out, the reconciler finds it in the broker's order book by this id.
         const pendingClientId = `mx_${st.id}_${Date.now()}`;
-        await db.updateRealStrategy(st.id, { pendingSince: Date.now(), pendingClientId, lastOrderAt: Date.now() });
-        st.pendingSince = Date.now(); st.pendingClientId = pendingClientId; st.lastOrderAt = Date.now();
+        // ATOMIC CLAIM (multi-replica safe): stamp the pending marker only if no order is already in-flight,
+        // in one conditional UPDATE. If another replica already claimed this strategy's entry this tick, we
+        // lose the claim and MUST NOT place a second order.
+        const claimed = await db.claimRealStrategyForEntry(st.id, { pendingSince: Date.now(), pendingClientId, lastOrderAt: Date.now() });
+        if (!claimed) continue;
+        st.pendingSince = claimed.pendingSince; st.pendingClientId = pendingClientId; st.lastOrderAt = claimed.lastOrderAt;
 
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
