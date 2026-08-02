@@ -94,7 +94,9 @@ app.use(cors({
   },
   // "Authorization" MUST be here or every authed call (login token → trades, state,
   // username, public strategies, ideas) is blocked by the browser as a CORS error.
-  allowedHeaders: ["Content-Type", "Authorization", "X-Broker-Session", "X-User-Id", "X-Confirm-Live", "X-Admin-Key"],
+  // R19-P1-01: X-Idempotency-Key is a custom header the browser preflights — it MUST be allow-listed or every
+  // cross-origin live-order request is rejected at preflight before /api/broker/order ever runs.
+  allowedHeaders: ["Content-Type", "Authorization", "X-Broker-Session", "X-User-Id", "X-Confirm-Live", "X-Admin-Key", "X-Idempotency-Key"],
   exposedHeaders: ["Location"],   // Schwab returns the order id in the Location header
 }));
 
@@ -144,6 +146,20 @@ async function requireFreshSession(req, res, next) {
 }
 // H2-03: alias — the same active/unblocked/fresh-token guard for sensitive mutation + broker-data routes.
 const requireActiveUser = requireFreshSession;
+/* R19-P2-02: account DELETION must reject a stale/revoked token and a vanished user (fail closed on outage),
+   but must NOT be blocked for a *blocked* user — data-deletion is a right that survives an account block. */
+async function requireFreshSessionAllowBlocked(req, res, next) {
+  const phone = stripPh(req.authUserId || "");
+  if (!phone) return res.status(401).json({ error: "Authentication required." });
+  let u;
+  try { u = await db.getUser(phone); }
+  catch { return res.status(503).json({ error: "Couldn't verify your session right now — please retry in a moment." }); }
+  if (!u || u.deleted) return res.status(401).json({ error: "This session is no longer valid — sign in again." });
+  if ((Number(u.tokenVersion) || 0) !== (Number(req.authTokenVersion) || 0)) {
+    return res.status(401).json({ error: "Your session was reset (PIN change or security action) — sign in again." });
+  }
+  next();
+}
 app.get("/api/version", (req, res) => res.json({ name: "matrixone-api", version: APP_VERSION, apiVersion: API_VERSION }));
 
 const PORT = process.env.PORT || 8787;
@@ -269,7 +285,7 @@ app.get("/api/risk-policy", requireAuth, async (req, res) => {
   try { const p = await db.getRiskPolicy(storageKeyFor(req.authUserId)); res.json({ ok: true, policy: p || {} }); }
   catch (e) { serverError(res, e); }
 });
-app.post("/api/risk-policy", requireAuth, async (req, res) => {
+app.post("/api/risk-policy", requireAuth, requireActiveUser, async (req, res) => {
   try {
     const policy = cleanRiskPolicy(req.body && req.body.policy);
     await db.saveRiskPolicy(storageKeyFor(req.authUserId), policy);
@@ -854,6 +870,13 @@ app.post("/api/admin/approve", async (req, res) => {
     const approved = req.body && req.body.approved === false ? false : true;
     if (!phone) return res.status(400).json({ error: "phone required" });
     await db.setUserApproved(phone, approved);
+    /* R19-P2-03: UN-approval is a security transition — revoke existing tokens (bump the version) and halt new
+       automated entries. (Auto-buy already refuses to enter for approved!==true; this also kills live tokens
+       and freezes the kill-switch so nothing armed keeps trading.) */
+    if (!approved) {
+      if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
+      if (typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(storageKeyFor(phone), true); } catch { /* non-fatal */ } }
+    }
     res.json({ ok: true, phone, approved });
   } catch (e) { serverError(res, e); }
 });
@@ -891,12 +914,18 @@ app.post("/api/pin/change", requireAuth, async (req, res) => {
     if (!u) return res.status(404).json({ error: "user not found" });
     if (!verifyPin(currentPin, u.pin)) { recordPinFail(phone); return res.status(401).json({ error: "Your current PIN is incorrect." }); }
     clearPinFails(phone);
-    await db.updateUserPin(phone, hashPin(newPin));
-    /* C2-02: a PIN change REVOKES every existing token (bump the version), then issues ONE fresh token to
-       THIS device so the user stays signed in here while any stolen/old token is invalidated. */
-    if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
-    const nu = await db.getUser(phone);
-    res.json({ ok: true, token: signToken(phone, undefined, undefined, Number(nu && nu.tokenVersion) || 0) });
+    /* C2-02 / R19-P2-01: change the PIN and revoke every existing token in ONE atomic write, then issue one
+       fresh token to THIS device. The atomic helper returns the new token_version so there's no window where
+       the PIN is changed but old tokens still validate (the previous two-call sequence could crash between). */
+    let newTv = 0;
+    if (typeof db.updateUserPinAndBumpToken === "function") {
+      newTv = Number(await db.updateUserPinAndBumpToken(phone, hashPin(newPin))) || 0;
+    } else {
+      await db.updateUserPin(phone, hashPin(newPin));
+      if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
+      const nu = await db.getUser(phone); newTv = Number(nu && nu.tokenVersion) || 0;
+    }
+    res.json({ ok: true, token: signToken(phone, undefined, undefined, newTv) });
   } catch (e) { serverError(res, e); }
 });
 
@@ -909,9 +938,13 @@ app.post("/api/admin/reset-pin", async (req, res) => {
     const newPin = req.body && req.body.newPin;
     if (!phone || !newPin || String(newPin).length < 4) return res.status(400).json({ error: "phone and a 4+ digit newPin are required." });
     if (!(await db.getUser(phone))) return res.status(404).json({ error: "user not found" });
-    await db.updateUserPin(phone, hashPin(newPin));
-    // M-02: an admin PIN reset revokes the user's existing tokens too (same as self-service recovery).
-    if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
+    // M-02 / R19-P2-01: an admin PIN reset revokes the user's existing tokens too — atomically.
+    if (typeof db.updateUserPinAndBumpToken === "function") {
+      await db.updateUserPinAndBumpToken(phone, hashPin(newPin));
+    } else {
+      await db.updateUserPin(phone, hashPin(newPin));
+      if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
+    }
     res.json({ ok: true, phone });
   } catch (e) { serverError(res, e); }
 });
@@ -4072,7 +4105,7 @@ app.get("/api/broker/connect-info", (req, res) => {
    AES-256-GCM encrypted in db.broker_apps and cached in memory so the OAuth login + token
    exchange (which reuse b.key()/b.secret()) work for this user. The plaintext secret never
    goes to the browser after this and never lands in an env var. */
-app.post("/api/broker/app-creds", requireAuth, async (req, res) => {
+app.post("/api/broker/app-creds", requireAuth, requireActiveUser, async (req, res) => {
   const userId = storageKeyFor(req.authUserId);
   const { broker } = req.body || {};
   const b = BROKERS[broker];
@@ -4152,7 +4185,7 @@ app.post("/api/app-settings", async (req, res) => {
 /* Right-to-erasure: a user permanently deletes their OWN account and all associated data.
    Auth is taken from the verified token — you can only delete yourself. Also clears any live
    broker sessions and cached app credentials so nothing survives in memory. */
-app.post("/api/account/delete", requireAuth, async (req, res) => {
+app.post("/api/account/delete", requireAuth, requireFreshSessionAllowBlocked, async (req, res) => {
   const phone = req.authUserId;
   const userId = storageKeyFor(phone);
   try {
@@ -4464,7 +4497,7 @@ app.post("/api/broker/session", requireAuth, requireActiveUser, async (req, res)
    reconnect. This is what makes a connection survive the app being closed on mobile or the
    free-tier server restarting: the browser keeps the broker id in localStorage, and on a dead
    session it calls this to mint a fresh session id from the stored creds. */
-app.post("/api/broker/resume", requireAuth, async (req, res) => {
+app.post("/api/broker/resume", requireAuth, requireActiveUser, async (req, res) => {
   const userId = routeUserId(req);
   const broker = req.body && req.body.broker;
   if (!userId || !broker) return res.status(400).json({ error: "userId and broker required" });
@@ -4784,10 +4817,17 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
     return res.status(400).json({ error: "A valid idempotency key is required for live orders (update the app if this persists)." });
   }
   const idemUser = storageKeyFor(sess.userId);
+  /* R19-P2-04: the payload hash must cover EVERY field that changes what actually gets placed — not just
+     symbol/side/qty/price. Two requests that share a key but differ in SL/TP/trailing/auto-exit/interval
+     are DIFFERENT orders and must be rejected as a key-reuse mismatch, never silently replayed. */
   const idemHash = crypto.createHash("sha256").update(JSON.stringify({
     b: sess.broker, s: req.body?.symbol, d: req.body?.side, q: req.body?.qty,
     t: req.body?.orderType || "MARKET", p: req.body?.product || "CNC",
     px: req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price,
+    sl: Number(req.body?.slPct) || 0, tp: Number(req.body?.tpPct) || 0,
+    tr: Number(req.body?.trailPct ?? req.body?.trailingPct) || 0,
+    ax: req.body?.autoExit ? 1 : 0, ae: req.body?.autoExitStrategyId || req.body?.strategyId || null,
+    iv: req.body?.interval || null, yh: req.body?.yahoo || req.body?.yahooSymbol || null,
   })).digest("hex");
   {
     /* C2-01: the idempotency claim must FAIL CLOSED. If the ledger can't be written (DB incident), we must
@@ -4811,17 +4851,22 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
        release the key (a genuine retry may reuse it); anything else (timeout/transport/unknown, incl. thrown
        503s) → mark UNKNOWN and KEEP the key so a same-key retry is blocked until the user reconciles. */
     const _json = res.json.bind(res);
-    res.json = (obj) => {
+    /* R19-P2-05: AWAIT the ledger write before the response leaves. Previously this was fire-and-forget, so a
+       fast client retry could arrive before the "succeeded" record was durable and either re-submit or see a
+       spurious "in flight". We now persist first, THEN respond. Express ignores the returned promise; the
+       response is still sent when _json runs. On a ledger write failure we log and respond anyway — the order
+       already executed, so blocking the confirmation would be strictly worse. */
+    res.json = async (obj) => {
       try {
         const code = res.statusCode || 200;
-        if (obj && !obj.error && (obj.orderId || obj.ok)) db.finalizeIdempotency(idemUser, idemKey, "succeeded", obj).catch(() => {});
-        else {
+        if (obj && !obj.error && (obj.orderId || obj.ok)) {
+          await db.finalizeIdempotency(idemUser, idemKey, "succeeded", obj);
+        } else {
           const msg = String((obj && (obj.reason || obj.error)) || "");
           const conclusiveReject = code === 422 || code === 400 || /reject|insufficient|not filled|unfilled|cancell?ed|invalid|margin|too small|min(?:imum)? size|not enough|balance|bad request/i.test(msg);
-          if (conclusiveReject) db.finalizeIdempotency(idemUser, idemKey, "rejected", obj).catch(() => {});
-          else db.finalizeIdempotency(idemUser, idemKey, "unknown", obj).catch(() => {});
+          await db.finalizeIdempotency(idemUser, idemKey, conclusiveReject ? "rejected" : "unknown", obj);
         }
-      } catch { /* never block the response on ledger bookkeeping */ }
+      } catch { /* durable-write failed; still deliver the response so a real fill isn't hidden from the user */ }
       return _json(obj);
     };
   }
@@ -4967,7 +5012,12 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
           autoExitNote = "SL/TP not armed — app-managed FYERS exits support long (BUY) entries only. Our exit can't buy-to-cover a short; manage this position in your FYERS app.";
         } else {
           const c = await verifyFyersFill(sess, d.id, Number(qty));
-          if (c.filled) { autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice); fillStatus = "FILLED"; }
+          if (c.filled) {
+            autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice); fillStatus = "FILLED";
+            // R19-P1-04: server-authoritative trade row on a verified FYERS fill, so risk counters include it
+            // even if the browser never posts a journal row (lost response / closed tab).
+            try { await db.saveTrade(storageKeyFor(sess.userId), { id: `fy_${d.id}`, sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0, entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: "Manual", orderId: d.id, serverAuthored: true }); } catch { /* non-fatal */ }
+          }
           else if (c.rejected) { fillStatus = "REJECTED"; autoExitNote = "SL/TP not armed — entry was rejected."; }
           else {
             fillStatus = "PENDING";
@@ -5035,6 +5085,8 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
         bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct, sess.userId);
       }
       const autoExitId = await registerAutoExit();
+      // R19-P1-04: server-authoritative trade row on the verified Delta fill (risk counters count it server-side).
+      try { await db.saveTrade(storageKeyFor(sess.userId), { id: `dl_${o.id}`, sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: "Manual", orderId: o.id ?? null, serverAuthored: true }); } catch { /* non-fatal */ }
       return res.json({ ok: true, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, bracket, autoExitId, raw: o });
     }
 
@@ -5590,7 +5642,7 @@ app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
 });
 
 /** Drop a broker session (logout, or the user disconnecting). */
-app.post("/api/broker/logout", requireAuth, (req, res) => {
+app.post("/api/broker/logout", requireAuth, requireActiveUser, (req, res) => {
   const id = req.get("X-Broker-Session");
   const s = id ? brokerSessions.get(id) : null;
   // Only the session's OWNER may drop it — otherwise a leaked/guessed session id could DoS another user.
@@ -6188,7 +6240,7 @@ app.get("/api/autoexit", requireAuth, async (req, res) => {
 });
 /* Cancel auto-exit for a position (stops the engine watching it; does NOT touch the position
    at the broker). The user must own it. */
-app.post("/api/autoexit/cancel", requireAuth, async (req, res) => {
+app.post("/api/autoexit/cancel", requireAuth, requireActiveUser, async (req, res) => {
   const userId = routeUserId(req);
   const { id } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
@@ -6202,7 +6254,7 @@ app.post("/api/autoexit/cancel", requireAuth, async (req, res) => {
    one the user already owns, not one we just bought. Registers a managed position so the exit
    engine watches it and places a reduce-only SELL when SL/TP is hit. Entry defaults to the
    holding's average cost, so "SL 2%" means 2% below what they paid. Requires stored creds. */
-app.post("/api/autoexit/register", requireAuth, async (req, res) => {
+app.post("/api/autoexit/register", requireAuth, requireActiveUser, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { broker, symbol, brokerSym, qty, entry, market, sl, tp, tsl, product } = req.body || {};
@@ -6354,7 +6406,7 @@ const haltedEntries = new Set();
 app.get("/api/automation/entry-halt", requireAuth, (req, res) => {
   res.json({ halted: haltedEntries.has(String(storageKeyFor(req.authUserId))) });
 });
-app.post("/api/automation/entry-halt", requireAuth, async (req, res) => {
+app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (req, res) => {
   const uid = String(storageKeyFor(req.authUserId));
   const halt = !!(req.body && req.body.halt);
   if (halt) haltedEntries.add(uid); else haltedEntries.delete(uid);
@@ -6530,13 +6582,19 @@ async function runAutoBuyEngine() {
         const sess = await sessionFromCred(st.userId, st.broker);
         if (!sess) { await db.updateRealStrategy(st.id, { lastError: "no stored credentials — reconnect broker" }); continue; }
 
-        /* Round18-3: a BLOCKED or DELETED account must not keep opening new real exposure via its armed
-           strategies. (Protective EXIT engines are separate and keep running, so existing positions still get
-           their stop-loss/target managed — blocking freezes NEW entries only.) Pause the strategy so the
-           state is visible to the user/admin. */
-        const owner = await db.getUser(stripPh(String(st.userId))).catch(() => null);
-        if (owner && (owner.blocked || owner.deleted)) {
-          await db.updateRealStrategy(st.id, { status: "paused", lastError: "New entries paused — account is blocked or closed.", lastOrderStatus: "blocked" });
+        /* R19-P1-03: authorization for a new real entry FAILS CLOSED. Require a present owner who is
+           approved === true, not blocked, not deleted. A DB-read failure or a missing/unapproved row must
+           SKIP the entry (never place blind during the exact incident when we can't verify identity).
+           Protective EXIT engines are separate and keep running, so existing positions stay managed. */
+        let owner, ownerLookupFailed = false;
+        try { owner = await db.getUser(stripPh(String(st.userId))); }
+        catch { ownerLookupFailed = true; }
+        if (ownerLookupFailed) {
+          await db.updateRealStrategy(st.id, { lastError: "Couldn't verify the account to authorize this automated entry — skipped this cycle.", lastOrderStatus: "blocked" });
+          continue;   // transient — do NOT pause (retry next sweep), but never trade unverified
+        }
+        if (!owner || owner.blocked || owner.deleted || owner.approved !== true) {
+          await db.updateRealStrategy(st.id, { status: "paused", lastError: "New entries paused — account is not active (blocked, closed, or not approved).", lastOrderStatus: "blocked" });
           continue;
         }
 
@@ -6597,6 +6655,17 @@ async function runAutoBuyEngine() {
           sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: !!st.short,
         });
         await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null, pendingClientId: null });
+        /* R19-P1-04: write an AUTHORITATIVE server-owned trade row on a real fill, keyed the same way the risk
+           engine reads (storageKeyFor), so the daily trade-count / daily-loss / cooldown controls count this
+           automated entry even though no browser was open to post a journal row. This is the safety source of
+           record; the client journal is a display projection. */
+        try {
+          await db.saveTrade(storageKeyFor(st.userId), {
+            id: `ab_${st.id}_${candleKey}`, sym: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty,
+            entry: fillPx, entryAt: Date.now(), market: st.market, real: true, broker: st.broker,
+            tradeType: "Auto Buy", orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
+          });
+        } catch (te) { console.error("[autobuy] authoritative trade write failed:", te.message); }
         posCache.delete(st.userId);   // this user's positions changed — re-read next time it's needed
         bought++;
         logFinancial(r.partial ? "autobuy.partial" : "autobuy.filled", { userId: st.userId, broker: st.broker, symbol: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty, reqQty: qty, price: fillPx, orderId: r.orderId, reason: sig.reason });

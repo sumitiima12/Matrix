@@ -146,9 +146,12 @@ async function initDb() {
   // R17-P1-03: a short lease so exactly ONE replica processes a pending-protection row at a time.
   await pool.query(`ALTER TABLE pending_protection ADD COLUMN IF NOT EXISTS leased_until BIGINT DEFAULT 0`);
   await pool.query(`ALTER TABLE pending_protection ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'`);
-  // R17-P1-03: managed positions are unique per (broker,user,entry order) so two workers can't arm two exits
-  // for one holding. Partial index over the durable entry-order id we stamp into `data`.
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS managed_entry_order ON managed_positions ((data->>'entryOrderId')) WHERE (data->>'entryOrderId') IS NOT NULL`);
+  /* R17-P1-03 / R19-P2-06: managed positions are unique per (broker, user, entry order) — NOT globally by
+     entryOrderId, or two different users/brokers with colliding order ids would block each other's protection.
+     Replace any old global index with the composite one. */
+  await pool.query(`DROP INDEX IF EXISTS managed_entry_order`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS managed_entry_order_composite
+    ON managed_positions (broker, user_id, (data->>'entryOrderId')) WHERE (data->>'entryOrderId') IS NOT NULL`);
   /* User-built screeners ("My Screeners") — one JSON array per user, so a saved screener survives
      logout / a new device. Small, so stored whole like app_state rather than row-per-screener. */
   await pool.query(`CREATE TABLE IF NOT EXISTS user_screeners (
@@ -394,6 +397,28 @@ async function updateUserPin(phone, pinHash) {
   if (USING_PG) { await pool.query(`UPDATE users SET pin=$2 WHERE phone=$1`, [phone, pinHash]); return; }
   const users = readJSON(FILES.users);
   if (users[phone]) { users[phone].pin = pinHash; writeJSON(FILES.users, users); }
+}
+
+/* R19-P2-01 / H3-04: change the PIN and revoke existing sessions ATOMICALLY, returning the new token
+   version. A two-call sequence (updateUserPin then bumpTokenVersion) can leave a window where the PIN
+   is changed but old tokens still validate — or crash between the two writes. One statement / one file
+   write closes that gap. Returns the fresh token_version so the caller can re-sign immediately. */
+async function updateUserPinAndBumpToken(phone, pinHash) {
+  if (USING_PG) {
+    const r = await pool.query(
+      `UPDATE users SET pin=$2, token_version = COALESCE(token_version,0)+1 WHERE phone=$1 RETURNING token_version`,
+      [phone, pinHash]
+    );
+    return r.rows[0] ? (Number(r.rows[0].token_version) || 0) : 0;
+  }
+  const users = readJSON(FILES.users);
+  if (users[phone]) {
+    users[phone].pin = pinHash;
+    users[phone].tokenVersion = (Number(users[phone].tokenVersion) || 0) + 1;
+    writeJSON(FILES.users, users);
+    return users[phone].tokenVersion;
+  }
+  return 0;
 }
 
 /* Set or change a user's security question + hashed answer (for existing accounts). */
@@ -972,9 +997,13 @@ async function purgeLedgersForUser(userId) {
     await pool.query(`DELETE FROM order_idempotency WHERE user_id=$1`, [String(userId)]).catch(() => {});
     await pool.query(`DELETE FROM order_intents WHERE user_id=$1`, [String(userId)]).catch(() => {});
     await pool.query(`DELETE FROM pending_protection WHERE user_id=$1`, [String(userId)]).catch(() => {});
+    // R19-P2-10: personal in-app notices are personal data — purge them on account deletion too.
+    await pool.query(`DELETE FROM user_notices WHERE user_id=$1`, [String(userId)]).catch(() => {});
     return;
   }
   for (const key of ["idem"]) { const f = FILES[key]; if (!f) continue; const d = readJSON(f); let ch = false; for (const k of Object.keys(d)) if (k.startsWith(`${userId}|`)) { delete d[k]; ch = true; } if (ch) writeJSON(f, d); }
+  // R19-P2-10 (flat-file): drop this user's notices bucket.
+  try { const nf = FILES.notices; if (nf) { const nd = readJSON(nf); if (nd[String(userId)]) { delete nd[String(userId)]; writeJSON(nf, nd); } } } catch { /* non-fatal */ }
 }
 /* R16-P2-11 shared OAuth CSRF state (Postgres-backed; in-memory fallback for flat-file mode lives in
    server.js). `saveOAuthState` upserts the nonce; `consumeOAuthState` deletes-and-returns atomically so a
@@ -1015,6 +1044,13 @@ async function savePendingProtection(rec) {
 async function listPendingProtection(limit = 500) {
   if (USING_PG) { const r = await pool.query(`SELECT data, attempts FROM pending_protection ORDER BY created_at ASC LIMIT $1`, [limit]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts })); }
   const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); return Object.values(readJSON(f)).map((x) => ({ ...x.data, attempts: x.attempts })).slice(0, limit);
+}
+/* R19-P2-11: query pending-protection rows for ONE user directly, so a per-user status endpoint isn't
+   capped by a global LIMIT (a busy platform could push a user's own rows past the first page). */
+async function listPendingProtectionForUser(userId, limit = 200) {
+  if (USING_PG) { const r = await pool.query(`SELECT data, attempts FROM pending_protection WHERE user_id=$1 ORDER BY created_at ASC LIMIT $2`, [String(userId), limit]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts })); }
+  const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json"));
+  return Object.values(readJSON(f)).map((x) => ({ ...x.data, attempts: x.attempts })).filter((x) => String(x.userId) === String(userId)).slice(0, limit);
 }
 /* R17-P1-03: atomically LEASE due protection rows so exactly one replica processes each. On Postgres the
    conditional UPDATE (leased_until < now) with RETURNING is the compare-and-set; a leaseholder owns the row
@@ -1110,4 +1146,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, purgeLedgersForUser, savePendingProtection, listPendingProtection, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

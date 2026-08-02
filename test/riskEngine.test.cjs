@@ -147,3 +147,15 @@ test("C-04: a BUY inside the same-symbol cooldown is BLOCKED, not just warned", 
   assert.strictEqual(r.ok, false);
   assert.ok(r.reasons.some((x) => /cooldown/i.test(x)));
 });
+
+/* R19-P2-08: a user cannot DISABLE the same-symbol cooldown by saving cooldownMs:0 — the platform enforces a
+   minimum floor (3s). A BUY 1s after the last entry is still blocked even though the user set cooldownMs:0. */
+test("R19-P2-08: cooldownMs:0 is floored to the platform minimum, so a rapid re-entry is still blocked", () => {
+  const trades = [{ sym: "TCS", entryAt: Date.now() - 1000, market: "IN" }];   // bought 1s ago
+  const r = validateOrder(
+    { sym: "TCS", side: "BUY", qty: 1, price: 3000, market: "IN" },
+    { wallet: 100000, portfolio: [], trades, limits: { cooldownMs: 0 } },
+  );
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.reasons.some((x) => /cooldown/i.test(x)));
+});

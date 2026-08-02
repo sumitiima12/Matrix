@@ -58,12 +58,19 @@ const shortMarginFraction = (market) => SHORT_MARGIN_FRACTION[market] != null ? 
    the platform maximum. These are the real safety floor; DEFAULT_LIMITS are the defaults applied when the
    user saved nothing. */
 const PLATFORM_CEILING = { maxPositionPct: 100, maxOpenPositions: 50, maxTradesPerDay: 100, maxDailyLossPct: 25 };
+/* R19-P2-08: cooldownMs is a FLOOR-type limit (unlike the ceilings above) — a longer gap is safer, a shorter
+   one is riskier — so the platform enforces a MINIMUM. A client that saves cooldownMs=0 (or omits it) can't
+   defeat the same-symbol anti-spam guard; the effective cooldown is max(userValue, platformMinimum). */
+const PLATFORM_COOLDOWN_MIN_MS = 3000;
 function clampToPlatform(limits) {
   const out = { ...limits };
   for (const k of Object.keys(PLATFORM_CEILING)) {
     if (out[k] == null) out[k] = PLATFORM_CEILING[k];
     else out[k] = Math.min(Number(out[k]) || PLATFORM_CEILING[k], PLATFORM_CEILING[k]);   // user can only tighten
   }
+  // Cooldown floor: user may LENGTHEN it, never shorten below the platform minimum.
+  const uc = Number(out.cooldownMs);
+  out.cooldownMs = Math.max(Number.isFinite(uc) ? uc : 0, PLATFORM_COOLDOWN_MIN_MS);
   return out;
 }
 function validateOrder(order, account) {
