@@ -118,6 +118,14 @@ function logFinancial(event, fields) {
   try { console.log(JSON.stringify({ ts: new Date().toISOString(), lvl: "fin", evt: event, ...fields })); }
   catch { try { console.log("[fin]", event); } catch { /* noop */ } }
 }
+/* R21-P2-04: deterministic JSON — recursively SORT object keys so two semantically-identical payloads (differing
+   only in property insertion order) serialize identically. Used for the idempotency payload hash so an unchanged
+   strategy object isn't mistaken for a changed order just because the client reordered its keys. */
+function stableStringify(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(v[k])}`).join(",")}}`;
+}
 /* R17-P2-03: write a durable user-facing notice (used by background jobs like delayed-fill protection so the
    user learns the terminal outcome even though it happened server-side). Best-effort; never throws. */
 async function addUserNotice(userId, notice) {
@@ -131,11 +139,15 @@ async function addUserNotice(userId, notice) {
    Returns true if the row is durable, false if it could not be persisted. */
 async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null } = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { await db.saveTrade(userKey, trade); return true; }
+    try { await db.saveTrade(userKey, trade, { authoritative: true }); return true; }
     catch (e) {
       if (attempt === 2) {
         logFinancial("authoritative_fill_persist_failed", { userKey, orderId: trade && trade.orderId, sym: trade && trade.sym, broker: trade && trade.broker, err: String((e && e.message) || e) });
-        await addUserNotice(userKey, { kind: "reconcile", severity: "high", title: "Recording a filled order failed", body: `A real ${trade && trade.side} fill on ${trade && trade.sym} executed but couldn't be saved to your history. Please reconcile with your broker; automated entries have been paused as a precaution.`, orderId: trade && trade.orderId });
+        await addUserNotice(userKey, { kind: "reconcile", severity: "high", title: "Recording a filled order failed", body: `A real ${trade && trade.side} fill on ${trade && trade.sym} executed but couldn't be saved to your history. Please reconcile with your broker; new orders are paused as a precaution.`, orderId: trade && trade.orderId });
+        /* R21-P1-03: a journal-write failure means the risk ledger is now incomplete. Set the DURABLE per-user
+           risk-lock (checked by EVERY new-entry route — manual AND automated) so no further real order is placed
+           against a book we couldn't record. Also set the automated-entry halt. Both fail-closed. */
+        try { await db.setRiskLock(userKey, true); } catch { /* best-effort */ }
         if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") {
           try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); } catch { /* best-effort */ }
         }
@@ -216,9 +228,12 @@ app.post("/api/trades", requireAuth, async (req, res) => {
     if (String(trade.sym).length > 64)
       return res.status(400).json({ error: "symbol too long" });
     const rec = { id: trade.id || crypto.randomUUID(), ...trade };   // collision-proof id (P3-09), not time+short-random
+    // R21-P1-02: a browser post is NEVER authoritative. Strip any client-claimed serverAuthored flag; saveTrade
+    // (authoritative:false) then guarantees it can only annotate — not overwrite — a server-verified fill row.
+    delete rec.serverAuthored;
     // R20 follow-up (H1): saveTrade may re-key to a user-namespaced/canonical id — echo the STORED row back so
     // the client holds the id the DB actually uses (not the raw one it sent), else later deletes/patches miss.
-    const saved = await db.saveTrade(userId, rec);
+    const saved = await db.saveTrade(userId, rec, { authoritative: false });
     rcBust(`trades:${userId}`);
     res.json({ ok: true, trade: saved || rec });
   } catch (e) { serverError(res, e); }
@@ -722,11 +737,18 @@ app.post("/api/forgot/reset", authLimiter, async (req, res) => {
     if (!verifyPin(answer, hash)) { recordPinFail(ansKey); return res.status(401).json({ error: "That answer doesn't match." }); }
     clearPinFails(ansKey);
 
-    await db.updateUserPin(phone, hashPin(newPin));
-    // M-02: a PIN reset REVOKES all prior tokens (bump the version), then issues one fresh token.
-    if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
+    // R21-P2-01: reset the PIN and revoke all prior tokens in ONE atomic write (no crash window where the PIN
+    // changed but old tokens still validate), then issue exactly one fresh token from the committed version.
+    let newTv = 0;
+    if (typeof db.updateUserPinAndBumpToken === "function") {
+      newTv = Number(await db.updateUserPinAndBumpToken(phone, hashPin(newPin))) || 0;
+    } else {
+      await db.updateUserPin(phone, hashPin(newPin));
+      if (typeof db.bumpTokenVersion === "function") await db.bumpTokenVersion(phone);
+      const u0 = await db.getUser(phone); newTv = Number(u0 && u0.tokenVersion) || 0;
+    }
     const u = await db.getUser(phone);
-    res.json({ ok: true, userId: phone, name: (u && u.name) || "", token: signToken(phone, undefined, undefined, Number(u && u.tokenVersion) || 0) });
+    res.json({ ok: true, userId: phone, name: (u && u.name) || "", token: signToken(phone, undefined, undefined, newTv) });
   } catch (e) { serverError(res, e); }
 });
 
@@ -4840,6 +4862,17 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
 
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
+  /* R21-P1-03: if a prior verified fill couldn't be journaled, this account's risk history is incomplete. Block
+     new REAL ENTRIES until it's reconciled — but always allow a CLOSING/reduce-only order so the user can flatten
+     risk. Exit paths set body.reduceOnly or the X-Reduce-Only header. */
+  {
+    const isReduceOnly = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+    if (!isReduceOnly && typeof db.isRiskLocked === "function") {
+      let locked = false;
+      try { locked = await db.isRiskLocked(storageKeyFor(sess.userId)); } catch { locked = false; }
+      if (locked) return res.status(423).json({ error: "Trading is paused: a recent fill couldn't be saved to your risk history. Reconcile with your broker, then resume. Closing/exit orders are still allowed.", riskLocked: true });
+    }
+  }
   /* R17-P1-02 / P2-07 durable idempotency with EXPLICIT outcome states. A live order MUST carry a stable
      X-Idempotency-Key (UUID) per user action. The first request claims it (stamping a request-body hash);
      a repeat with the same key: replays a succeeded response, is BLOCKED while still in_flight or after an
@@ -4862,7 +4895,7 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
     // the old order silently. `strategy` is the full exit-config object, so hash its canonical JSON.
     sl: Number(req.body?.slPct) || 0, tp: Number(req.body?.tpPct) || 0, tsl: Number(req.body?.tslPct) || 0,
     ax: req.body?.autoExit === true ? 1 : 0,
-    st: req.body?.strategy != null ? JSON.stringify(req.body.strategy) : null,
+    st: req.body?.strategy != null ? stableStringify(req.body.strategy) : null,   // R21-P2-04: order-independent
     ep: req.body?.entryPrice != null ? Number(req.body.entryPrice) : null,
   })).digest("hex");
   {
@@ -5606,10 +5639,28 @@ app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
 
     if (broker === "delta") {
       // Real balances + real open positions. Signed calls; keys never leave this process.
-      const [w, p] = await Promise.all([
+      const [w, p, prodResp] = await Promise.all([
         deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }),
         deltaCall("GET", "/v2/positions/margined", { userId: sess.userId }),
+        deltaCall("GET", "/v2/products", { signed: false }).catch(() => ({ result: [] })),
       ]);
+      /* Delta trades in whole CONTRACTS, and one contract is `contract_value` COIN units (e.g. PAXG/XAUT gold
+         tokens are ~0.001 coin per contract). Build id/symbol → contract_value so we can show the real coin
+         quantity and notional — otherwise "26 contracts" of a $4050 token looks like a $105k holding instead of
+         the true ~$105. */
+      const cvById = new Map(), cvBySym = new Map();
+      for (const pr of (prodResp && prodResp.result) || []) {
+        const cv = Number(pr && pr.contract_value) || 1;
+        if (pr && pr.id != null) cvById.set(String(pr.id), cv);
+        if (pr && pr.symbol) cvBySym.set(pr.symbol, cv);
+      }
+      const cvForPos = (x) => Number(
+        x.contract_value != null ? x.contract_value
+          : (x.product && x.product.contract_value != null) ? x.product.contract_value
+          : cvById.get(String(x.product_id)) != null ? cvById.get(String(x.product_id))
+          : cvBySym.get(x.product_symbol || (x.product && x.product.symbol)) != null ? cvBySym.get(x.product_symbol || (x.product && x.product.symbol))
+          : 1
+      ) || 1;
 
       const bals = w.result || [];
       // Delta is a LEVERAGED venue: a position's notional (mark × size) is many times the capital
@@ -5624,19 +5675,24 @@ app.get("/api/broker/portfolio", requireAuth, async (req, res) => {
       const holdings = (p.result || [])
         .filter((x) => Number(x.size) !== 0)
         .map((x) => {
-          const notional = (x.mark_price != null && x.size != null) ? Number(x.mark_price) * Number(x.size) : null;
+          const cv = cvForPos(x);
+          const coinQty = Number(x.size) * cv;   // contracts → real coin units
+          // Notional uses the COIN quantity, not the raw contract count (mark/entry prices are per-coin).
+          const notional = (x.mark_price != null && x.size != null) ? Number(x.mark_price) * coinQty : null;
           // Actual capital in THIS position: Delta's own `margin` when present, else notional/leverage.
           const lev = x.leverage != null ? Number(x.leverage) : null;
           const margin = x.margin != null ? Number(x.margin) : (notional != null && lev ? notional / lev : null);
           return {
             sym: x.product_symbol || (x.product && x.product.symbol) || null,
-            qty: Number(x.size),
+            qty: coinQty,                               // REAL coin units (was raw contract count → 1000x too big for gold tokens)
+            contracts: Number(x.size),                  // keep the raw contract count for reference/exits
+            contractValue: cv,
             avg: x.entry_price != null ? Number(x.entry_price) : null,
             ltp: x.mark_price != null ? Number(x.mark_price) : null,
-            notional,                                   // leveraged position size
+            notional,                                   // leveraged position size (coin-based)
             margin,                                     // real capital deployed
             leverage: lev,
-            value: notional,                            // kept = notional so unit-price math (value/qty = mark) still holds
+            value: notional,                            // value/qty = mark price still holds (both coin-based now)
             pnl: x.unrealized_pnl != null ? Number(x.unrealized_pnl) : null,
             source: "positions",
             market: "Crypto",
@@ -6460,6 +6516,8 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
   const halt = !!(req.body && req.body.halt);
   if (halt) haltedEntries.add(uid); else haltedEntries.delete(uid);
   try { await db.setEntryHalt(uid, halt); } catch (e) { return res.status(500).json({ error: "Could not save — try again." }); }
+  // R21-P1-03: resuming means the user reconciled — also clear the durable risk-ledger lock so manual orders flow again.
+  if (!halt && typeof db.setRiskLock === "function") { try { await db.setRiskLock(uid, false); } catch { /* best-effort */ } }
   logFinancial(halt ? "killswitch.halt" : "killswitch.resume", { userId: uid });
   res.json({ ok: true, halted: halt });
 });
@@ -6712,11 +6770,18 @@ async function runAutoBuyEngine() {
            haltUserIdOnFail) so the engine never keeps trading against a book it can't record. Fall back to a
            deterministic ab_ id only when the fill has no broker orderId (saveTrade canonicalizes by orderId
            otherwise, collapsing any duplicate client post). */
-        await recordAuthoritativeFill(storageKeyFor(st.userId), {
+        const journaled = await recordAuthoritativeFill(storageKeyFor(st.userId), {
           id: `ab_${st.id}_${candleKey}`, sym: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty,
           entry: fillPx, entryAt: Date.now(), market: st.market, real: true, broker: st.broker,
           tradeType: "Auto Buy", orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
         }, { haltUserIdOnFail: st.userId });
+        if (!journaled) {
+          /* R21-P1-03: the fill could NOT be journaled. The durable halt+risk-lock are already set, but the
+             CURRENTLY RUNNING engine also reads the in-memory kill-switch set — engage it NOW so no further
+             strategy for this user places an entry in this same sweep against an incomplete risk book. */
+          haltedEntries.add(String(st.userId));
+          logFinancial("autobuy.halted_unjournaled_fill", { userId: st.userId, symbol: st.symbol, orderId: r.orderId });
+        }
         posCache.delete(st.userId);   // this user's positions changed — re-read next time it's needed
         bought++;
         logFinancial(r.partial ? "autobuy.partial" : "autobuy.filled", { userId: st.userId, broker: st.broker, symbol: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty, reqQty: qty, price: fillPx, orderId: r.orderId, reason: sig.reason });
@@ -6781,6 +6846,14 @@ async function runProtectionWatcher() {
           logFinancial("protection.filled_no_price", { userId: p.userId, broker: "fyers", orderId: p.orderId });
           continue;
         }
+        /* R21-P1-03: a DELAYED fill is still a real fill — write the authoritative journal event BEFORE we do
+           anything else, so the risk ledger includes this entry (previously the watcher attached protection but
+           never recorded the fill, under-counting daily trades/loss/cooldown). Dedupes by (user,broker,orderId). */
+        await recordAuthoritativeFill(storageKeyFor(p.userId), {
+          sym: p.symbol, side: p.short ? "SELL" : "BUY", qty: c.filledQty || Number(p.qty), entry: avg,
+          entryAt: Date.now(), market: p.market, real: true, broker: "fyers",
+          tradeType: String(p.tradeType || "Manual"), orderId: p.orderId, serverAuthored: true,
+        });
         await registerManagedPosition({
           sess, symbol: p.symbol, brokerSym: p.brokerSym, qty: c.filledQty || Number(p.qty), entry: avg,
           market: p.market, sl: p.sl || null, tp: p.tp || null, tsl: p.tsl || null, cfg: p.cfg || null,

@@ -31,6 +31,24 @@ test("R20-P1-02: server row and browser row for the same broker fill collapse to
   assert.strictEqual(forOrder.length, 1, "one broker fill must be exactly one journal row");
 });
 
+test("R21-P1-02: a client post cannot overwrite a server-verified fill's financial fields", async () => {
+  const user = "919000000002";
+  // Server records the verified fill (broker truth): qty 5 @ 100.
+  await db.saveTrade(user, { id: "fy_ORD9", sym: "INFY", side: "BUY", qty: 5, entry: 100, entryAt: Date.now(), real: true, broker: "fyers", orderId: "ORD9", serverAuthored: true }, { authoritative: true });
+  // Browser posts the SAME order but with a tampered qty/price and tries to drop the authoritative flag.
+  const back = await db.saveTrade(user, { id: "real-ORD9", sym: "INFY", side: "BUY", qty: 999, entry: 1, entryAt: Date.now(), real: true, broker: "fyers", orderId: "ORD9", serverAuthored: true, sl: 3 }, { authoritative: false });
+
+  assert.strictEqual(back.qty, 5, "server-verified qty must be preserved");
+  assert.strictEqual(back.entry, 100, "server-verified price must be preserved");
+  assert.strictEqual(back.serverAuthored, true, "client cannot strip the authoritative flag");
+  assert.strictEqual(back.sl, 3, "client may still annotate a presentation field (sl)");
+
+  const rows = await db.getTrades(user, 0, Date.now() + 60000);
+  const r = rows.filter((t) => t.orderId === "ORD9");
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].qty, 5);
+});
+
 test("R20-P1-03: a client-chosen id cannot collide across users (ids are user-namespaced)", async () => {
   const userA = "919000000010";
   const userB = "919000000011";

@@ -150,12 +150,38 @@ async function initDb() {
   // R17-P1-03: a short lease so exactly ONE replica processes a pending-protection row at a time.
   await pool.query(`ALTER TABLE pending_protection ADD COLUMN IF NOT EXISTS leased_until BIGINT DEFAULT 0`);
   await pool.query(`ALTER TABLE pending_protection ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'`);
-  /* R17-P1-03 / R19-P2-06: managed positions are unique per (broker, user, entry order) — NOT globally by
-     entryOrderId, or two different users/brokers with colliding order ids would block each other's protection.
-     Replace any old global index with the composite one. */
-  await pool.query(`DROP INDEX IF EXISTS managed_entry_order`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS managed_entry_order_composite
-    ON managed_positions (broker, user_id, (data->>'entryOrderId')) WHERE (data->>'entryOrderId') IS NOT NULL`);
+  /* R17-P1-03 / R19-P2-06 / R21-P2-06: managed positions are unique per (broker, user, entry order). This
+     migration is made SAFE for concurrent replicas and existing data:
+       1. A transaction-scoped ADVISORY LOCK so only ONE process runs the DDL at a time (others wait, then see
+          the finished index and no-op).
+       2. A duplicate PREFLIGHT that fails LOUDLY (throws → readiness fails) rather than silently dropping the
+          old protection and leaving the table without a unique guard.
+       3. The old index is dropped only AFTER the composite one exists. */
+  {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(4021001)");   // arbitrary app-wide lock id for this migration
+      // Preflight: are there existing rows that would violate the new unique constraint?
+      const dup = await client.query(
+        `SELECT broker, user_id, data->>'entryOrderId' AS eoid, COUNT(*) c
+           FROM managed_positions WHERE (data->>'entryOrderId') IS NOT NULL
+          GROUP BY broker, user_id, data->>'entryOrderId' HAVING COUNT(*) > 1 LIMIT 1`
+      );
+      if (dup.rowCount) {
+        throw new Error(`managed_positions has duplicate (broker,user,entryOrderId) rows — resolve before the unique index can be created (e.g. ${JSON.stringify(dup.rows[0])})`);
+      }
+      await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS managed_entry_order_composite
+        ON managed_positions (broker, user_id, (data->>'entryOrderId')) WHERE (data->>'entryOrderId') IS NOT NULL`);
+      await client.query(`DROP INDEX IF EXISTS managed_entry_order`);   // legacy global index — only after the composite exists
+      await client.query("COMMIT");
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw e;   // surfaces to initDb → readiness fails rather than running without the safety index
+    } finally {
+      client.release();
+    }
+  }
   /* User-built screeners ("My Screeners") — one JSON array per user, so a saved screener survives
      logout / a new device. Small, so stored whole like app_state rather than row-per-screener. */
   await pool.query(`CREATE TABLE IF NOT EXISTS user_screeners (
@@ -165,6 +191,9 @@ async function initDb() {
      by an app_settings save or the user-state blob (both of which overwrite wholesale). */
   await pool.query(`CREATE TABLE IF NOT EXISTS automation_flags (
     user_id TEXT PRIMARY KEY, halt_entries BOOLEAN DEFAULT false, updated_at BIGINT)`);
+  // R21-P1-03: durable "risk ledger unhealthy" lock — set when a verified fill can't be journaled, checked by
+  // EVERY new-entry path (manual + automated), cleared only after reconciliation.
+  await pool.query(`ALTER TABLE automation_flags ADD COLUMN IF NOT EXISTS risk_lock BOOLEAN DEFAULT false`);
   /* SERVER-OWNED risk policy (R15-P1-02) — the authoritative per-user caps enforced on every real order.
      Its own table so it is never clobbered by an app_state blob save. */
   await pool.query(`CREATE TABLE IF NOT EXISTS risk_policy (
@@ -211,14 +240,18 @@ const writeJSON = (f, d) => {
 };
 
 /* -------------------------------- trades --------------------------------- */
-async function saveTrade(userId, trade) {
+/* R21-P1-02: fields a CLIENT (browser) post may merge onto a row the SERVER already verified. Everything a
+   risk calc depends on (qty, entry/price, side, status, entry/exit time, pnl, orderId, broker, real,
+   serverAuthored) is EXCLUDED — a browser can annotate a fill, never rewrite broker truth. */
+const CLIENT_PRESENTATION_FIELDS = ["sl", "tp", "tsl", "note", "tag", "notes"];
+/* saveTrade(userId, trade, { authoritative })
+   - authoritative:true  → a SERVER-verified fill (broker truth). Stamps serverAuthored and OVERWRITES.
+   - authoritative:false → a CLIENT/browser post. Cannot claim serverAuthored, and if the target row is already
+     serverAuthored it may only merge CLIENT_PRESENTATION_FIELDS — the financial payload stays broker truth. */
+async function saveTrade(userId, trade, { authoritative = false } = {}) {
   const uref = userRef(userId);
-  /* R19 + R20-P1-03: a single REAL broker fill must never appear twice, AND one user's row must never be able
-     to collide with (or overwrite) another user's. So the STORED id is always NAMESPACED by the user:
-       - real trade with a broker orderId → deterministic `t_<uref>_ord_<broker>_<orderId>` (server row and the
-         browser's own row for the same fill collapse to ONE; and user A's orderId 123 can't touch user B's).
-       - anything else → the caller's id, but hard-prefixed with `t_<uref>_` so a client-chosen id can never
-         address another user's row. Idempotent: an already-namespaced id is left as-is. */
+  /* R19 + R20-P1-03: the STORED id is NAMESPACED by user so a real fill dedupes by (user,broker,orderId) and no
+     client-chosen id can address another user's row. */
   const nsPrefix = `t_${uref}_`;
   let sid;
   if (trade && trade.real && trade.orderId != null && String(trade.orderId) !== "") {
@@ -228,12 +261,24 @@ async function saveTrade(userId, trade) {
     const raw = String((trade && trade.id) || crypto.randomUUID());
     sid = raw.startsWith(nsPrefix) ? raw : `${nsPrefix}${raw}`;
   }
+  // A client can NEVER mark itself authoritative; a server fill always is.
   trade = { ...trade, id: sid };
+  if (authoritative) trade.serverAuthored = true; else delete trade.serverAuthored;
   const ts = trade.exitAt || trade.entryAt || Date.now();
+
   if (USING_PG) {
-    /* Ownership-safe upsert: only update a row that ALREADY belongs to this user. The namespaced id makes a
-       cross-user collision practically impossible, and this WHERE clause is the belt-and-suspenders guarantee
-       that a write can never mutate another account's row. RETURNING tells us the upsert actually applied. */
+    if (!authoritative) {
+      /* Client post: if a SERVER-verified row already exists at this id, merge ONLY presentation fields onto
+         broker truth — never let the browser rewrite qty/price/status/etc. */
+      const ex = await pool.query(`SELECT data FROM trades WHERE id=$1 AND user_id=$2`, [sid, userId]);
+      if (ex.rowCount && ex.rows[0].data && ex.rows[0].data.serverAuthored === true) {
+        const merged = { ...ex.rows[0].data };
+        for (const k of CLIENT_PRESENTATION_FIELDS) if (trade[k] !== undefined) merged[k] = trade[k];
+        await pool.query(`UPDATE trades SET data=$3 WHERE id=$1 AND user_id=$2`, [sid, userId, merged]);
+        return merged;
+      }
+    }
+    /* Ownership-safe upsert: only update a row that ALREADY belongs to this user. */
     const r = await pool.query(
       `INSERT INTO trades (id, user_id, ts, data) VALUES ($1,$2,$3,$4)
        ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts, data = EXCLUDED.data
@@ -242,21 +287,32 @@ async function saveTrade(userId, trade) {
       [trade.id, userId, ts, trade]
     );
     if (!r.rowCount) {
-      /* The id exists but is owned by a DIFFERENT user (should be impossible with namespacing, but never lose a
-         write or clobber): re-key to a fresh user-namespaced id and insert. Log LOUDLY — hitting this means a
-         namespacing assumption was violated and the row can no longer dedupe by orderId. */
+      /* id exists but owned by a DIFFERENT user (near-impossible with namespacing): re-key and insert. Log
+         loudly, and R21-P2-13: if the re-keyed insert ALSO persists nothing, THROW — never acknowledge a lost
+         financial write as success. */
       console.error(JSON.stringify({ lvl: "fin", evt: "saveTrade_rekey_on_owner_conflict", user: uref, orderId: trade && trade.orderId, sym: trade && trade.sym }));
       trade = { ...trade, id: `${nsPrefix}${crypto.randomUUID()}` };
       const rr = await pool.query(`INSERT INTO trades (id, user_id, ts, data) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`, [trade.id, userId, ts, trade]);
-      if (!rr.rowCount) console.error(JSON.stringify({ lvl: "fin", evt: "saveTrade_rekey_insert_dropped", user: uref, id: trade.id }));
+      if (!rr.rowCount) throw new Error("saveTrade: re-keyed insert persisted no row — refusing to report a lost trade write as success");
     }
     return trade;
   }
-  // Flat-file mode is already partitioned by user bucket, so cross-user collision is structurally impossible.
+  // Flat-file mode is partitioned by user bucket, so cross-user collision is structurally impossible.
   const db = readJSON(FILES.trades);
   const list = db[userId] || [];
   const i = list.findIndex((t) => t.id === trade.id);
-  if (i >= 0) list[i] = trade; else list.unshift(trade);
+  if (i >= 0) {
+    if (!authoritative && list[i] && list[i].serverAuthored === true) {
+      // Preserve broker truth; merge only presentation fields.
+      const merged = { ...list[i] };
+      for (const k of CLIENT_PRESENTATION_FIELDS) if (trade[k] !== undefined) merged[k] = trade[k];
+      list[i] = merged; trade = merged;
+    } else {
+      list[i] = trade;
+    }
+  } else {
+    list.unshift(trade);
+  }
   db[userId] = list.slice(0, 5000);
   writeJSON(FILES.trades, db);
   return trade;
@@ -690,6 +746,25 @@ async function setEntryHalt(userId, halt) {
 async function getHaltedEntryUsers() {
   if (USING_PG) { const r = await pool.query(`SELECT user_id FROM automation_flags WHERE halt_entries=true`); return r.rows.map((x) => x.user_id); }
   const all = readJSON(FILES.autoFlags); return Object.keys(all).filter((u) => all[u] && all[u].halt_entries);
+}
+/* R21-P1-03: durable per-user risk-ledger lock. Set when a verified fill can't be persisted; checked by every
+   new-entry route so trading can't continue against an incomplete risk history. Cleared on reconciliation. */
+async function setRiskLock(userId, locked) {
+  const u = String(userId), on = !!locked, now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO automation_flags (user_id, risk_lock, updated_at) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id) DO UPDATE SET risk_lock=$2, updated_at=$3`,
+      [u, on, now]
+    );
+    return;
+  }
+  const all = readJSON(FILES.autoFlags); all[u] = { ...(all[u] || {}), risk_lock: on, updated_at: now }; writeJSON(FILES.autoFlags, all);
+}
+async function isRiskLocked(userId) {
+  const u = String(userId);
+  if (USING_PG) { const r = await pool.query(`SELECT risk_lock FROM automation_flags WHERE user_id=$1`, [u]); return !!(r.rows[0] && r.rows[0].risk_lock); }
+  const all = readJSON(FILES.autoFlags); return !!(all[u] && all[u].risk_lock);
 }
 
 /* ----------------------- open positions (exit monitor) --------------------- */
@@ -1199,4 +1274,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
