@@ -23,6 +23,18 @@ test("deltaHoldsCover respects SIDE and QUANTITY (not just symbol presence)", ()
   assert.equal(deltaHoldsCover({ sym: "BTC", short: true, qty: 1 }, book), false);     // wrong side (no short)
 });
 
+test("Round18-6: broker qty is ALLOCATED across rows, not compared independently", () => {
+  const book = buildDeltaBook([{ product_symbol: "BTCUSD", size: 1 }]);   // Delta holds ONE BTC long
+  const rows = [
+    { id: "old", broker: "delta", sym: "BTCUSD", side: "BUY", qty: 1, entryAt: 100 },
+    { id: "new", broker: "delta", sym: "BTCUSD", side: "BUY", qty: 1, entryAt: 200 },
+  ];
+  const { phantomDelta } = deltaReconcilePlan(rows, book);
+  // Only ONE 1-BTC row can be covered by a 1-BTC holding — the other is a phantom (oldest kept, newest phantom).
+  assert.equal(phantomDelta.length, 1);
+  assert.equal(phantomDelta[0].id, "new");
+});
+
 test("plan: delta-tagged phantom is auto-closable; untagged phantom needs confirmation; covered kept", () => {
   const book = buildDeltaBook([{ product_symbol: "BTCUSD", size: 1 }]);
   const rows = [

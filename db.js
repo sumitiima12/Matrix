@@ -446,9 +446,12 @@ async function deleteAccount(userId, phone, { preserveTrades = true } = {}) {
     await pool.query(`DELETE FROM public_strategies WHERE owner=$1`, [uid]).catch(() => {});
     await purgeLedgersForUser(uid).catch(() => {});   // R17-P2-09: drop order-intent/idempotency/protection rows
     if (preserveTrades) {
-      // Keep the stub (so admin can still see the retained history) but make the account unusable.
+      // Keep the stub (so admin can still see the retained history) but make the account unusable. Bump the
+      // token version (M-02) so every existing token for this account is revoked immediately — and, since a
+      // re-registration on a recycled number inherits this higher version, the PREVIOUS owner's un-expired
+      // token can never validate against the new account.
       await pool.query(
-        `UPDATE users SET pin='', approved=FALSE, blocked=TRUE, deleted=TRUE, deleted_at=$2 WHERE phone=$1`,
+        `UPDATE users SET pin='', approved=FALSE, blocked=TRUE, deleted=TRUE, deleted_at=$2, token_version=COALESCE(token_version,0)+1 WHERE phone=$1`,
         [ph, Date.now()]
       ).catch(() => {});
     } else {
@@ -470,7 +473,7 @@ async function deleteAccount(userId, phone, { preserveTrades = true } = {}) {
   const st = readJSON(FILES.state); if (st[uid]) { delete st[uid]; writeJSON(FILES.state, st); }
   const users = readJSON(FILES.users);
   if (users[ph]) {
-    if (preserveTrades) { users[ph] = { ...users[ph], pin: "", approved: false, blocked: true, deleted: true, deletedAt: Date.now() }; }
+    if (preserveTrades) { users[ph] = { ...users[ph], pin: "", approved: false, blocked: true, deleted: true, deletedAt: Date.now(), tokenVersion: (Number(users[ph].tokenVersion) || 0) + 1 }; }   // M-02: revoke old tokens
     else { delete users[ph]; }
     writeJSON(FILES.users, users);
   }

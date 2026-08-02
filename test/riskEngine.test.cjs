@@ -122,3 +122,28 @@ test("a normal leveraged short within margin is allowed (R3-#6)", () => {
   const r = validateOrder({ sym: "BTCUSD", side: "SELL", qty: 1, price: 1000, market: "Crypto" }, acct({ wallet: 1000 }));
   assert.ok(!r.reasons.some((x) => /margin/i.test(x)), "a $40 margin short should pass on a $1000 wallet");
 });
+
+/* M2-04: a user policy can only TIGHTEN the platform ceiling, never loosen it. */
+test("M2-04: user cannot loosen the daily-loss ceiling above the platform max (25%)", () => {
+  const startOfDayMs = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime() + 60000; })();
+  // Realised −40% today; user tries to disable the breaker with maxDailyLossPct: 100.
+  const trades = [{ exitAt: Date.now(), entryAt: startOfDayMs, pnl: -40000, market: "IN" }];
+  const r = validateOrder(
+    { sym: "TCS", side: "BUY", qty: 1, price: 3000, market: "IN" },
+    { wallet: 60000, portfolio: [], trades, limits: { maxDailyLossPct: 100 } },
+  );
+  // The platform ceiling (25%) still applies → the order is blocked despite the loose user cap.
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.reasons.some((x) => /daily loss/i.test(x)));
+});
+
+/* C-04: cooldown is a BLOCKING reason for an exposure-increasing entry. */
+test("C-04: a BUY inside the same-symbol cooldown is BLOCKED, not just warned", () => {
+  const trades = [{ sym: "TCS", entryAt: Date.now() - 2000, market: "IN" }];   // bought 2s ago
+  const r = validateOrder(
+    { sym: "TCS", side: "BUY", qty: 1, price: 3000, market: "IN" },
+    { wallet: 100000, portfolio: [], trades, limits: { cooldownMs: 15000 } },
+  );
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.reasons.some((x) => /cooldown/i.test(x)));
+});

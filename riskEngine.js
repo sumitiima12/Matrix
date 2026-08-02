@@ -53,8 +53,21 @@ const shortMarginFraction = (market) => SHORT_MARGIN_FRACTION[market] != null ? 
  * @param account { wallet, portfolio:[{sym,qty,avg,price,market}], trades:[{entryAt,exitAt,pnl,market}], limits? }
  * @returns { ok, reasons:string[], warnings:string[] }
  */
+/* M2-04: IMMUTABLE platform ceilings. A user policy may only make a cap STRICTER than these — never looser.
+   So even if a client saves maxDailyLossPct=100 or maxTradesPerDay=99999, the effective value is clamped to
+   the platform maximum. These are the real safety floor; DEFAULT_LIMITS are the defaults applied when the
+   user saved nothing. */
+const PLATFORM_CEILING = { maxPositionPct: 100, maxOpenPositions: 50, maxTradesPerDay: 100, maxDailyLossPct: 25 };
+function clampToPlatform(limits) {
+  const out = { ...limits };
+  for (const k of Object.keys(PLATFORM_CEILING)) {
+    if (out[k] == null) out[k] = PLATFORM_CEILING[k];
+    else out[k] = Math.min(Number(out[k]) || PLATFORM_CEILING[k], PLATFORM_CEILING[k]);   // user can only tighten
+  }
+  return out;
+}
 function validateOrder(order, account) {
-  const limits = { ...DEFAULT_LIMITS, ...((account && account.limits) || {}) };
+  const limits = clampToPlatform({ ...DEFAULT_LIMITS, ...((account && account.limits) || {}) });
   const reasons = [];
   const warnings = [];
 

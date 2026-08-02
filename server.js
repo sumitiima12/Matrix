@@ -126,18 +126,24 @@ async function addUserNotice(userId, notice) {
    token can't keep trading after the user secures the account. Best-effort: if the lookup fails we allow (the
    route's own checks still apply), never lock a user out on a transient DB error. */
 async function requireFreshSession(req, res, next) {
-  try {
-    const phone = stripPh(req.authUserId || "");
-    if (!phone) return res.status(401).json({ error: "Authentication required." });
-    const u = await db.getUser(phone);
-    if (!u || u.deleted) return res.status(401).json({ error: "This session is no longer valid — sign in again." });
-    if (u.blocked) return res.status(403).json({ error: "This account is blocked." });
-    if ((Number(u.tokenVersion) || 0) !== (Number(req.authTokenVersion) || 0)) {
-      return res.status(401).json({ error: "Your session was reset (PIN change or security action) — sign in again." });
-    }
-  } catch { /* transient — fall through, route-level checks still apply */ }
+  const phone = stripPh(req.authUserId || "");
+  if (!phone) return res.status(401).json({ error: "Authentication required." });
+  let u;
+  try { u = await db.getUser(phone); }
+  catch {
+    // H2-02: a security control must FAIL CLOSED. If we can't verify the session against the DB (outage),
+    // do NOT let a possibly-revoked token through to a real-money / sensitive action.
+    return res.status(503).json({ error: "Couldn't verify your session right now — please retry in a moment." });
+  }
+  if (!u || u.deleted) return res.status(401).json({ error: "This session is no longer valid — sign in again." });
+  if (u.blocked) return res.status(403).json({ error: "This account is blocked." });
+  if ((Number(u.tokenVersion) || 0) !== (Number(req.authTokenVersion) || 0)) {
+    return res.status(401).json({ error: "Your session was reset (PIN change or security action) — sign in again." });
+  }
   next();
 }
+// H2-03: alias — the same active/unblocked/fresh-token guard for sensitive mutation + broker-data routes.
+const requireActiveUser = requireFreshSession;
 app.get("/api/version", (req, res) => res.json({ name: "matrixone-api", version: APP_VERSION, apiVersion: API_VERSION }));
 
 const PORT = process.env.PORT || 8787;
@@ -384,13 +390,19 @@ app.post("/api/register", authLimiter, async (req, res) => {
        starts with a clean slate and can never load the previous owner's financial history. Admin can still
        retrieve the archived trades for the number for audit. */
     if (existingUser && existingUser.deleted) {
+      /* Round18-4: archival must SUCCEED before we create the new account. If moving the previous owner's
+         retained trades to an archive key fails, we ABORT — otherwise the new user could load the old
+         owner's financial history under the shared phone-derived key. Fail closed. */
       try {
         const oldUid = storageKeyFor(phone);
         const archiveKey = `arch_${existingUser.deletedAt || Date.now()}_${oldUid}`;
         const moved = await db.reassignTrades(oldUid, archiveKey);
         if (moved) await db.recordTradeArchive(phone, archiveKey);
         if (typeof db.purgeLedgersForUser === "function") await db.purgeLedgersForUser(oldUid);
-      } catch (e) { console.error("[register] archive of recycled-number history failed:", e.message); }
+      } catch (e) {
+        console.error("[register] archive of recycled-number history failed — aborting registration:", e.message);
+        return res.status(503).json({ error: "Couldn't set up your account right now. Please try again in a moment." });
+      }
     }
     const username = cleanUsername(req.body && req.body.username);
     if (!username) return res.status(400).json({ error: "Choose a user ID: 3–20 characters, starting with a letter (letters, numbers, underscore)." });
@@ -417,7 +429,11 @@ app.post("/api/register", authLimiter, async (req, res) => {
     if (email && typeof db.setEmail === "function") { try { await db.setEmail(phone, email); } catch { email = ""; } }
     if (autoApprove) {
       if (typeof db.setLastLogin === "function") { try { await db.setLastLogin(phone); } catch { /* non-fatal */ } }
-      return res.json({ ok: true, userId: phone, name, username, referredBy, email: email || null, createdAt: Date.now(), token: signToken(phone) });
+      // M2-01: sign with the account's ACTUAL token version. On a recycled number the row inherited a bumped
+      // version from the prior deletion — signing with the real value keeps THIS token valid while the
+      // previous owner's older-version token stays revoked.
+      const nu = await db.getUser(phone);
+      return res.json({ ok: true, userId: phone, name, username, referredBy, email: email || null, createdAt: Date.now(), token: signToken(phone, undefined, undefined, Number(nu && nu.tokenVersion) || 0) });
     }
     // Pending: NO token is issued, so the client shows a "waiting for approval" screen.
     res.json({ ok: true, pending: true, userId: phone, name, username, message: "Account created. An admin will review and activate it shortly." });
@@ -876,7 +892,11 @@ app.post("/api/pin/change", requireAuth, async (req, res) => {
     if (!verifyPin(currentPin, u.pin)) { recordPinFail(phone); return res.status(401).json({ error: "Your current PIN is incorrect." }); }
     clearPinFails(phone);
     await db.updateUserPin(phone, hashPin(newPin));
-    res.json({ ok: true });
+    /* C2-02: a PIN change REVOKES every existing token (bump the version), then issues ONE fresh token to
+       THIS device so the user stays signed in here while any stolen/old token is invalidated. */
+    if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
+    const nu = await db.getUser(phone);
+    res.json({ ok: true, token: signToken(phone, undefined, undefined, Number(nu && nu.tokenVersion) || 0) });
   } catch (e) { serverError(res, e); }
 });
 
@@ -890,6 +910,8 @@ app.post("/api/admin/reset-pin", async (req, res) => {
     if (!phone || !newPin || String(newPin).length < 4) return res.status(400).json({ error: "phone and a 4+ digit newPin are required." });
     if (!(await db.getUser(phone))) return res.status(404).json({ error: "user not found" });
     await db.updateUserPin(phone, hashPin(newPin));
+    // M-02: an admin PIN reset revokes the user's existing tokens too (same as self-service recovery).
+    if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
     res.json({ ok: true, phone });
   } catch (e) { serverError(res, e); }
 });
@@ -1793,7 +1815,7 @@ app.post("/api/pattern-scan", computeLimiter, async (req, res) => {
       out.forEach((r) => { if (r) matches.push(r); });
     }
     res.json({ pattern, scanned: syms.length, matches });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* --------------------------- /api/idea-scan ---------------------------
@@ -1896,7 +1918,7 @@ app.post("/api/idea-scan", computeLimiter, async (req, res) => {
       return out.slice(0, 12);
     });
     res.json({ ideas, scanned: syms.length });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* --------------------------- /api/screener-scan ---------------------------
@@ -1907,19 +1929,33 @@ app.post("/api/idea-scan", computeLimiter, async (req, res) => {
 /* C-03: fold base candles into a higher timeframe, SESSION-ALIGNED (buckets never span a calendar day), so a
    "3m from 1m" or "4h from 60m" bar is a real fixed-duration candle, not a mislabelled 2m or a cross-session
    group. Mirrors the frontend marketService.aggregate. */
-function aggCandles(candles, n) {
+/* M2-02: bucket base candles into a higher timeframe by CLOCK BOUNDARY, not by "every n rows since the first
+   present that day". Each bar is keyed to floor(epochMinute / stepMin) so a bucket is a true fixed clock
+   window (e.g. 09:15–09:18, 09:18–09:21 for 3m) even if the feed starts late or has gaps. `baseMin` is the
+   base interval in minutes (1 for 1m→3m, 60 for 60m→4h). Partial buckets (fewer than n base candles) are
+   DROPPED so a half-formed bar can't be mistaken for a closed one. */
+function aggCandles(candles, n, baseMin = 1) {
   if (!Array.isArray(candles) || n <= 1) return candles || [];
-  const dayKey = (t) => { const ms = t < 1e12 ? t * 1000 : t; const d = new Date(ms); return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`; };
-  const days = new Map();
-  for (const c of candles) { const k = dayKey(c.t); if (!days.has(k)) days.set(k, []); days.get(k).push(c); }
-  const out = [];
-  for (const grp of days.values()) {
-    for (let i = 0; i < grp.length; i += n) {
-      const g = grp.slice(i, i + n); if (!g.length) continue;
-      out.push({ t: g[0].t, o: g[0].o, c: g[g.length - 1].c, h: Math.max(...g.map((x) => x.h)), l: Math.min(...g.map((x) => x.l)), v: g.reduce((a, x) => a + (x.v || 0), 0) });
-    }
+  const stepMs = n * baseMin * 60 * 1000;
+  const buckets = new Map();
+  for (const c of candles) {
+    const ms = c.t < 1e12 ? c.t * 1000 : c.t;
+    const key = Math.floor(ms / stepMs) * stepMs;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(c);
   }
-  return out.sort((a, b) => a.t - b.t);
+  const keys = [...buckets.keys()].sort((a, b) => a - b);
+  const lastKey = keys[keys.length - 1];
+  const out = [];
+  for (const key of keys) {
+    const g = buckets.get(key).sort((a, b) => a.t - b.t);
+    // Drop ONLY the trailing bucket while it's still forming (fewer than n base candles). Earlier buckets are
+    // kept even if a session edge left them short (e.g. a 4h window that only overlaps part of the session),
+    // so we don't discard real closed bars — but a half-formed CURRENT bar never leaks in as "closed".
+    if (key === lastKey && g.length < n) continue;
+    out.push({ t: g[0].t, o: g[0].o, c: g[g.length - 1].c, h: Math.max(...g.map((x) => x.h)), l: Math.min(...g.map((x) => x.l)), v: g.reduce((a, x) => a + (x.v || 0), 0) });
+  }
+  return out;
 }
 /* Fetch candles for a scan/optimizer timeframe. For 3m we fetch native 1m and fold ×3 (true 3m); everything
    else uses its native Yahoo interval. */
@@ -1956,7 +1992,7 @@ app.post("/api/screener-scan", computeLimiter, async (req, res) => {
       return out;
     });
     res.json({ matches, scanned: syms.length });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* --------------------------- /api/optimize-exits ---------------------------
@@ -2085,7 +2121,7 @@ app.post("/api/optimize-exits", computeLimiter, async (req, res) => {
       return optimizeExits(cfg, sets, cur, objective, rrMin, maxSl, costPct);
     });
     res.json(out);
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* --------------------------- /api/optimize-indicators ---------------------------
@@ -2184,7 +2220,7 @@ app.post("/api/optimize-indicators", computeLimiter, async (req, res) => {
       return optimizeIndicators(cfg, tfSets, cur, objective, lockTf, costPct);
     });
     res.json(out);
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* --------------------------- /api/momentum-scan ---------------------------
@@ -2234,7 +2270,7 @@ app.post("/api/momentum-scan", computeLimiter, async (req, res) => {
     }
     matches.sort((a, b) => (dir === "up" ? b.chg - a.chg : a.chg - b.chg));
     res.json({ tf, pct, dir, bars, scanned: syms.length, matches });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* -------------------------------- /api/news ------------------------------- */
@@ -2624,10 +2660,15 @@ function rangeLadder(range) {
 }
 async function candlesForOpt(symbol, range = "3mo", interval = "5m") {
   const MIN = 30;                                       // below this a range effectively "failed"
+  // C-03: "2m" is the legacy mislabel for 3m — the optimizers must use REAL 3m candles too. Fetch native
+  // 1m and fold ×3 (session-aligned) instead of ranking on 2m bars.
+  const threeMin = interval === "2m";
+  const fetchIv = threeMin ? "1m" : interval;
   let best = [];
   for (const r of rangeLadder(range)) {
     try {
-      const c = await candlesFor(symbol, r, interval);
+      let c = await candlesFor(symbol, r, fetchIv);
+      if (threeMin) c = aggCandles(c || [], 3);
       if (c && c.length > best.length) best = c;
       if (best.length >= MIN) break;                    // got a usable sample — stop stepping down
     } catch { /* try the next-shorter range */ }
@@ -3229,7 +3270,7 @@ app.get("/api/diag/candles", async (req, res) => {
       lastAt: (all || []).length ? new Date(all[all.length - 1].t).toISOString() : null,
       fyErr, fyRaw,
     });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 app.get("/api/diag/delta", async (req, res) => {
   if (!requireAdmin(req, res)) return;   // internal diagnostics — admin only, not public
@@ -4048,7 +4089,7 @@ app.post("/api/broker/app-creds", requireAuth, async (req, res) => {
     setUserAppCred(userId, broker, cred);
     res.json({ ok: true, staticIp: brokerStaticIp() });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    serverError(res, e);
   }
 });
 
@@ -4105,7 +4146,7 @@ app.post("/api/app-settings", async (req, res) => {
     await db.saveAppSettings(next);
     rcBust("app-settings");
     res.json({ ok: true, settings: next });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /* Right-to-erasure: a user permanently deletes their OWN account and all associated data.
@@ -4120,7 +4161,7 @@ app.post("/api/account/delete", requireAuth, async (req, res) => {
     for (const [id, s] of brokerSessions) if (s.userId === String(userId)) brokerSessions.delete(id);
     for (const k of appCredCache.keys()) if (k.startsWith(`${userId}|`)) appCredCache.delete(k);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 // Admin: permanently delete ANY account (by phone) and all its data.
@@ -4135,7 +4176,7 @@ app.post("/api/admin/delete-user", async (req, res) => {
     for (const [id, s] of brokerSessions) if (s.userId === String(userId)) brokerSessions.delete(id);
     for (const k of appCredCache.keys()) if (k.startsWith(`${userId}|`)) appCredCache.delete(k);
     res.json({ ok: true, phone });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /** Step 1 of OAuth: where the user logs in. */
@@ -4192,7 +4233,7 @@ app.get("/api/broker/login-url", requireAuth, async (req, res) => {
 
 /* Step 2: exchange the short-lived request/auth code for an access token.
    This is the ONLY place the api_secret is used, and it never leaves the server. */
-app.post("/api/broker/session", requireAuth, async (req, res) => {
+app.post("/api/broker/session", requireAuth, requireActiveUser, async (req, res) => {
   const { broker, requestToken } = req.body || {};
   const userId = routeUserId(req);   // verified token when present, else the client-supplied id
   const b = BROKERS[broker];
@@ -4432,7 +4473,7 @@ app.post("/api/broker/resume", requireAuth, async (req, res) => {
     if (!sess) return res.status(404).json({ error: "no stored connection — please reconnect" });
     const sid = putBrokerSession(userId, broker, sess.accessToken, sess.refreshToken, sess.extra || null);
     res.json({ sessionId: sid, broker });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 
 /** Auth header for a broker call. */
@@ -4749,7 +4790,12 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
     px: req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price,
   })).digest("hex");
   {
-    const won = await db.claimIdempotencyKey(idemUser, idemKey, idemHash).catch(() => true);
+    /* C2-01: the idempotency claim must FAIL CLOSED. If the ledger can't be written (DB incident), we must
+       NOT place a real order without a durable dedupe record — a retry/replica/timeout could then duplicate
+       it. Reject with 503 and touch no broker adapter. */
+    let won;
+    try { won = await db.claimIdempotencyKey(idemUser, idemKey, idemHash); }
+    catch { return res.status(503).json({ error: "Couldn't record this order safely right now (temporary). Please retry in a moment." }); }
     if (!won) {
       const rec = await db.getIdempotencyRecord(idemUser, idemKey).catch(() => null);
       if (rec && rec.reqHash && rec.reqHash !== idemHash) {
@@ -6187,7 +6233,7 @@ app.post("/api/autoexit/register", requireAuth, async (req, res) => {
       sl: Number(sl) || null, tp: Number(tp) || null, tsl: Number(tsl) || null, product: product || "CNC",
     });
     res.json({ ok: true, id: pos.id, protectionActive: true });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", live: String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true", last: lastAutoExit }));
 
@@ -6484,6 +6530,16 @@ async function runAutoBuyEngine() {
         const sess = await sessionFromCred(st.userId, st.broker);
         if (!sess) { await db.updateRealStrategy(st.id, { lastError: "no stored credentials — reconnect broker" }); continue; }
 
+        /* Round18-3: a BLOCKED or DELETED account must not keep opening new real exposure via its armed
+           strategies. (Protective EXIT engines are separate and keep running, so existing positions still get
+           their stop-loss/target managed — blocking freezes NEW entries only.) Pause the strategy so the
+           state is visible to the user/admin. */
+        const owner = await db.getUser(stripPh(String(st.userId))).catch(() => null);
+        if (owner && (owner.blocked || owner.deleted)) {
+          await db.updateRealStrategy(st.id, { status: "paused", lastError: "New entries paused — account is blocked or closed.", lastOrderStatus: "blocked" });
+          continue;
+        }
+
         /* R17-P1-01: the SAME shared risk engine that guards manual orders must guard unattended auto-buy —
            ALWAYS, not only when the user saved a custom policy. Fetch broker account truth and run
            serverValidateOrder every cycle. If the user saved caps we pass them (tightening the DEFAULT_LIMITS
@@ -6629,7 +6685,7 @@ if (process.env.EXIT_MONITOR !== "off") {
 
 /* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
    the creds the engine will act with). Supported brokers only. */
-app.post("/api/autobuy/register", requireAuth, async (req, res) => {
+app.post("/api/autobuy/register", requireAuth, requireActiveUser, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "connect the broker first" });
   const b = sess.broker;
@@ -6658,9 +6714,9 @@ app.post("/api/autobuy/register", requireAuth, async (req, res) => {
     };
     await db.saveRealStrategy(st);
     res.json({ ok: true, id: st.id, live: autoBuyLiveOn() });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
-app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
+app.post("/api/autobuy/pause", requireAuth, requireActiveUser, async (req, res) => {
   const userId = routeUserId(req);
   const { id, paused, resolution } = req.body || {};   // resolution: "filled" (adopt) | "nofill" (clear)
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
@@ -6739,7 +6795,7 @@ app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
       : "Couldn't confirm the earlier order with your broker. Check it, then choose “Order filled” (adopt the position) or “Didn't fill”.",
   });
 });
-app.post("/api/autobuy/cancel", requireAuth, async (req, res) => {
+app.post("/api/autobuy/cancel", requireAuth, requireActiveUser, async (req, res) => {
   const userId = routeUserId(req);
   const { id } = req.body || {};
   if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
@@ -6761,7 +6817,7 @@ async function openPositionForStrategy(userId, strat) {
 /* CLOSE NOW — flatten an auto-buy strategy's open position with a reduce-only MARKET sell, then stop
    the strategy from re-entering. Real money moves. Honors AUTO_EXIT_LIVE: in dry-run it marks the
    position closed WITHOUT placing a broker order (matching the exit engine's own gating). */
-app.post("/api/autobuy/close", requireAuth, async (req, res) => {
+app.post("/api/autobuy/close", requireAuth, requireActiveUser, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { id } = req.body || {};
@@ -6822,13 +6878,13 @@ app.post("/api/autobuy/close", requireAuth, async (req, res) => {
     // The exit-throw path above already restores "open". Any other stranded "closing" (a db write failing
     // after the claim) is caught by the exit engine's stale-closing reconciliation (R11-P1-01), so it can
     // never be skipped forever.
-    res.status(500).json({ error: String(e.message || e) });
+    serverError(res, e);
   }
 });
 
 /* UPDATE SL/TP — change the strategy's stop-loss / take-profit and push the new levels onto its open
    managed position so the exit engine acts on them. */
-app.post("/api/autobuy/update", requireAuth, async (req, res) => {
+app.post("/api/autobuy/update", requireAuth, requireActiveUser, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { id, sl, tp } = req.body || {};
@@ -6843,7 +6899,7 @@ app.post("/api/autobuy/update", requireAuth, async (req, res) => {
     const pos = await openPositionForStrategy(userId, strat);
     if (pos) await db.updateManagedPosition(pos.id, patch);
     res.json({ ok: true, updated: true, position: pos ? pos.id : null });
-  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  } catch (e) { serverError(res, e); }
 });
 /* Admin flips the whole auto-buy engine LIVE / dry-run at runtime (no redeploy). */
 app.post("/api/autobuy/live", async (req, res) => {

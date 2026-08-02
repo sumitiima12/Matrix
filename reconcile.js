@@ -213,7 +213,12 @@ function deltaHoldsCover(trade, book) {
   const need = Math.abs(Number(trade.qty) || 0);
   return have > 0 && (need <= 0 || have + 1e-9 >= need);
 }
-/* Partition open real crypto rows into {phantomDelta (auto-closable), phantomUnknown (needs confirm)}. */
+/* Partition open real crypto rows into {phantomDelta (auto-closable), phantomUnknown (needs confirm)}.
+   Round18-6 / R17-P2-04: the broker's held quantity is ALLOCATED across journal rows, not compared to each
+   row independently. If Delta holds 1 BTC long and the journal has two open 1-BTC-long rows, only ONE is
+   covered — the other is a phantom. We walk a mutable copy of the book, sort deterministically (oldest,
+   largest first) and DECREMENT the available long/short pool as each row is matched; whatever the pool can't
+   cover is phantom. */
 function deltaReconcilePlan(openCryptoRealTrades, book) {
   const deltaTagged = [], untagged = [];
   for (const t of openCryptoRealTrades || []) {
@@ -222,10 +227,27 @@ function deltaReconcilePlan(openCryptoRealTrades, book) {
     else if (!tag) untagged.push(t);
     // rows tagged to another broker are ignored entirely
   }
-  return {
-    phantomDelta: deltaTagged.filter((t) => !deltaHoldsCover(t, book)),
-    phantomUnknown: untagged.filter((t) => !deltaHoldsCover(t, book)),
+  // Mutable pool copy — allocated across BOTH tagged and untagged rows (tagged first, so a limited broker
+  // holding is credited to attributable rows before ambiguous ones).
+  const pool = new Map();
+  for (const [k, v] of book) pool.set(k, { long: v.long, short: v.short });
+  const isShort = (t) => String(t.side || "").toUpperCase() === "SELL" || t.short === true;
+  const sortRows = (rows) => rows.slice().sort((a, b) => (a.entryAt || 0) - (b.entryAt || 0) || (Math.abs(Number(b.qty) || 0) - (Math.abs(Number(a.qty) || 0))));
+  const allocate = (rows) => {
+    const phantom = [];
+    for (const t of sortRows(rows)) {
+      const p = pool.get(_normSym(t.sym));
+      const need = Math.abs(Number(t.qty) || 0);
+      const side = isShort(t) ? "short" : "long";
+      if (p && p[side] > 0 && (need <= 0 || p[side] + 1e-9 >= need)) {
+        p[side] -= (need > 0 ? need : p[side]);        // covered — consume from the pool
+      } else {
+        phantom.push(t);                               // pool can't cover it → phantom
+      }
+    }
+    return phantom;
   };
+  return { phantomDelta: allocate(deltaTagged), phantomUnknown: allocate(untagged) };
 }
 
 module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan };
