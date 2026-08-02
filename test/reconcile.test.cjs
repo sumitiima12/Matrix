@@ -81,6 +81,20 @@ test("classifyFyersOrder: acceptance is not execution — only status 2 with qty
   assert.equal(R.classifyFyersOrder({}).filled, false);
 });
 
+test("fyersOrderTag: FYERS-safe, deterministic, ≤20 chars; hasFyersOrderTag scans the order book", () => {
+  const cid = "mx_abcdef123_1700000000000";
+  const tag = R.fyersOrderTag(cid);
+  assert.ok(tag && tag.length <= 20 && /^[a-zA-Z0-9]+$/.test(tag));   // FYERS orderTag rules
+  assert.equal(R.fyersOrderTag(cid), tag);                            // deterministic (stamp == probe)
+  assert.equal(R.fyersOrderTag(""), null);
+  assert.equal(R.fyersOrderTag(null), null);
+  const book = [{ orderTag: "other" }, { orderTag: tag }, {}];
+  assert.equal(R.hasFyersOrderTag(book, tag), true);
+  assert.equal(R.hasFyersOrderTag(book, "missing"), false);
+  assert.equal(R.hasFyersOrderTag(book, null), false);
+  assert.equal(R.hasFyersOrderTag(null, tag), false);
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match

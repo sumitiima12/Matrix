@@ -25,13 +25,19 @@ misconfigured callback can't complete a connect.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OAUTH_REDIRECT_ALLOWLIST` | *(empty = allow any)* | Comma-separated exact callback origins or origin+path prefixes, e.g. `https://app.matrixone.example/oauth`. Matching is exact-origin + path-boundary (no subdomain-prefix bypass). **Set this in production** to your registered broker callback URL(s). |
-| `OAUTH_ENFORCE_REDIRECT` | off | When on, the session step REQUIRES the client to echo the redirect that started the login (a mismatch is *always* rejected regardless). Enable this **after** both frontend and backend are deployed with redirect-echo support, so an in-flight old client isn't broken. |
-| `OAUTH_REQUIRE_ALLOWLIST` | off | When on, the server **refuses to boot** unless `OAUTH_REDIRECT_ALLOWLIST` is configured — use it in production to guarantee the allow-list is never silently empty. |
+| `OAUTH_REDIRECT_ALLOWLIST` | *(required in production)* | Comma-separated exact callback origins or origin+path prefixes, e.g. `https://matrixone.app`. Matching is exact-origin + path-boundary (no subdomain-prefix bypass). **In production the server refuses to boot without this** (see fail-closed note below). |
+| `OAUTH_ENFORCE_REDIRECT` | off (**required on in production**) | When on, the session step REQUIRES the client to echo the redirect that started the login (a mismatch is *always* rejected regardless). Safe to enable once both frontend and backend are deployed with redirect-echo support. **In production the server refuses to boot unless this is on.** |
+| `OAUTH_ALLOW_INSECURE_REDIRECTS` | off | **Bring-up bypass only.** Set to `1` to let production boot WITHOUT the allow-list / enforcement above (e.g. first deploy before you've configured the callback URL). Do NOT leave this on for a real deployment. |
+| `OAUTH_REQUIRE_ALLOWLIST` | off | Legacy switch: hard-fails boot on an empty allow-list even outside production. Redundant with the production fail-closed default; kept for back-compat. |
 
-**Production checklist:** set `OAUTH_REDIRECT_ALLOWLIST` to your exact broker callback URL(s), then turn on
-`OAUTH_ENFORCE_REDIRECT=1` and `OAUTH_REQUIRE_ALLOWLIST=1`. The server logs a warning at boot for any of
-these left unset in production.
+**Fail-closed default (R8-P1-03):** when `NODE_ENV=production`, the server **refuses to start** unless
+`OAUTH_REDIRECT_ALLOWLIST` is set **and** `OAUTH_ENFORCE_REDIRECT=1`. To bring a new production instance up
+before the callback URL is finalized, set `OAUTH_ALLOW_INSECURE_REDIRECTS=1` temporarily, then remove it
+once the two settings are in place.
+
+**Production checklist:** set `OAUTH_REDIRECT_ALLOWLIST` to your exact broker callback URL (for FYERS this is
+your frontend URL, e.g. `https://matrixone.app`), and set `OAUTH_ENFORCE_REDIRECT=1`. Delta Exchange uses
+API-key signing (no OAuth redirect), so it needs no allow-list entry.
 
 ## Notes
 

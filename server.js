@@ -3378,16 +3378,23 @@ const OAUTH_STATE_TTL = 10 * 60_000;         // 10 minutes to complete the broke
    means "don't change behaviour" so existing BYOA flows keep working. The canonical redirect is also
    stored in the one-time state record and verified at completion when the client echoes it back. */
 const OAUTH_REDIRECT_ALLOW = (process.env.OAUTH_REDIRECT_ALLOWLIST || "").split(",").map((s) => s.trim()).filter(Boolean);
-/* R7-P1-03: make the OAuth hardening posture VISIBLE at boot instead of silently permissive. In
-   production we WARN when the allow-list or redirect-echo enforcement is off, and hard-FAIL startup if the
-   operator opted into OAUTH_REQUIRE_ALLOWLIST but forgot to configure it. All three are documented in ENV.md. */
+/* R8-P1-03: OAuth hardening is FAIL-CLOSED in production by default. Production refuses to boot unless the
+   redirect allow-list is configured AND redirect-echo enforcement is on — an unprotected callback is a
+   real-money account risk, so it should be an explicit, deliberate opt-OUT, not a silent default. The only
+   escape hatch is OAUTH_ALLOW_INSECURE_REDIRECTS=1 (development / first-deploy bring-up only). Outside
+   production (or with the bypass) we merely WARN. All variables are documented in ENV.md. */
 (() => {
   const prod = process.env.NODE_ENV === "production";
   const enforceEcho = /^(1|true|yes)$/i.test(String(process.env.OAUTH_ENFORCE_REDIRECT || ""));
+  const insecureBypass = /^(1|true|yes)$/i.test(String(process.env.OAUTH_ALLOW_INSECURE_REDIRECTS || ""));
+  // Back-compat: OAUTH_REQUIRE_ALLOWLIST still hard-fails on an empty list even outside production.
   const requireAllow = /^(1|true|yes)$/i.test(String(process.env.OAUTH_REQUIRE_ALLOWLIST || ""));
   if (requireAllow && !OAUTH_REDIRECT_ALLOW.length) throw new Error("OAUTH_REQUIRE_ALLOWLIST is set but OAUTH_REDIRECT_ALLOWLIST is empty — configure your exact callback origin(s)/path(s). See ENV.md.");
-  if (prod && !OAUTH_REDIRECT_ALLOW.length) console.warn("[oauth] PRODUCTION without OAUTH_REDIRECT_ALLOWLIST — any redirect is accepted. Set it to your exact callback URL(s). See ENV.md.");
-  if (prod && !enforceEcho) console.warn("[oauth] PRODUCTION without OAUTH_ENFORCE_REDIRECT=1 — a missing redirect echo is allowed (mismatches are still rejected). Enable it once frontend + backend are both deployed. See ENV.md.");
+  if (prod && !insecureBypass) {
+    if (!OAUTH_REDIRECT_ALLOW.length) throw new Error("Refusing to boot: NODE_ENV=production without OAUTH_REDIRECT_ALLOWLIST. Set it to your exact broker callback URL(s) (e.g. https://your-app-domain), or set OAUTH_ALLOW_INSECURE_REDIRECTS=1 for a temporary dev/bring-up bypass. See ENV.md.");
+    if (!enforceEcho) throw new Error("Refusing to boot: NODE_ENV=production without OAUTH_ENFORCE_REDIRECT=1. Enable redirect-echo enforcement (safe once frontend + backend are both deployed), or set OAUTH_ALLOW_INSECURE_REDIRECTS=1 for a temporary bypass. See ENV.md.");
+  }
+  if (prod && insecureBypass) console.warn("[oauth] PRODUCTION running with OAUTH_ALLOW_INSECURE_REDIRECTS=1 — allow-list/enforcement NOT required. This is a bring-up bypass; remove it and configure OAUTH_REDIRECT_ALLOWLIST + OAUTH_ENFORCE_REDIRECT=1 for a real deployment.");
 })();
 /* R6-P2-03: match on EXACT origin + a PATH BOUNDARY — never a naive startsWith, which would let
    "https://app.example" prefix-match the attacker origin "https://app.example.evil.com". An allow entry
@@ -5469,10 +5476,27 @@ async function adoptBrokerPosition(st) {
     const short = Number(p.size) < 0;
     return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short });
   }
+  if (st.broker === "fyers") {
+    // R8-P2-01: adopt the REAL FYERS net position (actual qty + average price), never a synthesized one.
+    let net = null;
+    try {
+      const r = await fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth("fyers", sess.accessToken, st.userId) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.s === "error") return null;
+      net = Array.isArray(d.netPositions) ? d.netPositions : null;
+    } catch { return null; }
+    if (!net) return null;
+    const p = net.find((x) => String(x.symbol) === String(st.brokerSym));
+    if (!p || !Number(p.netQty)) return null;   // broker shows FLAT → nothing to adopt
+    const qty = Math.abs(Number(p.netQty));
+    const entry = Number(p.avgPrice) || Number(p.netAvg) || null;
+    const short = Number(p.netQty) < 0;
+    return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short });
+  }
   // R6-P1-01: for brokers WITHOUT an actual position lookup we refuse to adopt. Synthesizing a managed
   // position from the intended notional + current price is unsafe — a partial fill, a different fill
   // price, or pre-existing exposure would make the reduce-only exit under-/over-close or reverse. Better
-  // to keep the strategy paused than to invent real-money position truth. (Delta is handled above.)
+  // to keep the strategy paused than to invent real-money position truth. (Delta/FYERS handled above.)
   return null;
 }
 
@@ -5481,15 +5505,32 @@ async function adoptBrokerPosition(st) {
    (0 = flat) for Delta, or null when we can't read the broker (unsupported broker or a transport error).
    The caller treats null as "unverifiable → don't clear". */
 async function brokerOpenSize(st) {
-  if (st.broker !== "delta") return null;
-  let held = null;
-  try { const pr = await deltaCall("GET", "/v2/positions/margined", { userId: st.userId }); held = (pr && pr.result); } catch { return null; }
-  if (!Array.isArray(held)) return null;
-  let dprod = null;
-  try { const prods = await deltaCall("GET", "/v2/products", { signed: false }); dprod = (prods.result || []).find((p) => p.symbol === st.brokerSym) || null; } catch { /* ignore */ }
-  const pid = dprod ? dprod.id : null;
-  const p = held.find((x) => (pid != null && Number(x.product_id) === Number(pid)) || String(x.product_symbol || "") === String(st.brokerSym));
-  return { size: p ? Math.abs(Number(p.size) || 0) : 0 };
+  if (st.broker === "delta") {
+    let held = null;
+    try { const pr = await deltaCall("GET", "/v2/positions/margined", { userId: st.userId }); held = (pr && pr.result); } catch { return null; }
+    if (!Array.isArray(held)) return null;
+    let dprod = null;
+    try { const prods = await deltaCall("GET", "/v2/products", { signed: false }); dprod = (prods.result || []).find((p) => p.symbol === st.brokerSym) || null; } catch { /* ignore */ }
+    const pid = dprod ? dprod.id : null;
+    const p = held.find((x) => (pid != null && Number(x.product_id) === Number(pid)) || String(x.product_symbol || "") === String(st.brokerSym));
+    return { size: p ? Math.abs(Number(p.size) || 0) : 0 };
+  }
+  if (st.broker === "fyers") {
+    // R8-P2-01: read FYERS net position size so "no fill" can require BROKER EVIDENCE the account is flat.
+    let net = null;
+    try {
+      const sess = await sessionFromCred(st.userId, "fyers");
+      if (!sess) return null;
+      const r = await fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth("fyers", sess.accessToken, st.userId) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.s === "error") return null;
+      net = Array.isArray(d.netPositions) ? d.netPositions : null;
+    } catch { return null; }
+    if (!net) return null;
+    const p = net.find((x) => String(x.symbol) === String(st.brokerSym));
+    return { size: p ? Math.abs(Number(p.netQty) || 0) : 0 };
+  }
+  return null;
 }
 
 let autoExitRunning = false;
@@ -5703,9 +5744,12 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     return { orderId: d.data.order_id };
   }
   if (broker === "fyers") {
+    // R8-P2-01: stamp our durable orderTag so a timed-out entry can be found in FYERS' order book later
+    // (the FYERS analogue of Delta's client_order_id — the dedupe/reconciliation key).
+    const orderTag = clientOrderId ? reconcile.fyersOrderTag(clientOrderId) : null;
     const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: 1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
+      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: 1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false, ...(orderTag ? { orderTag } : {}) }),
     });
     const d = await r.json(); if (!r.ok || d.s === "error") throw new Error(d.message || `fyers buy ${r.status}`);
     // Acceptance ≠ execution. Confirm the fill before we register a managed position at the entry — a
@@ -5763,7 +5807,12 @@ app.post("/api/automation/entry-halt", requireAuth, async (req, res) => {
    a schema-valid, COMPLETE (short) page in BOTH the live and history sets, with our id absent, is a
    definitive "no order". We use a large page and match by our own client_order_id (the durable key). */
 const DELTA_PROBE_PAGE = 500;
+/* Brokers where we can establish EXECUTION TRUTH from the broker's own API — probe an order by our durable
+   tag, read the actual open position to adopt, and confirm the account is flat. Only these may resume an
+   unknown-order review by adopting/clearing; others must STOP the strategy (no duplicate possible). */
+const RECONCILABLE_BROKERS = new Set(["delta", "fyers"]);
 async function brokerOrderProbe(st) {
+  if (st.broker === "fyers") return fyersOrderProbe(st);
   if (st.broker !== "delta" || !st.pendingClientId) return null;
   const cid = String(st.pendingClientId);
   // R6-P2-02: our order was placed at `pendingSince`, and Delta returns newest-first, so even a FULL page is
@@ -5783,6 +5832,28 @@ async function brokerOrderProbe(st) {
     // Neither set carries our id. Only trust that as "never landed" if BOTH sets were complete.
     return (live.conclusive && hist.conclusive) ? false : null;
   } catch { return null; }   // any failure → unknown; caller must NOT re-enter on an unknown
+}
+
+/* R8-P2-01: FYERS analogue of the Delta probe. We stamped our orderTag on the entry (placeBuyOrder), so
+   we can ask FYERS' own order book whether that tag is present. FYERS returns the full CURRENT-DAY order
+   book in one call (no pagination), and auto-buy reconciles within minutes of placing, so a schema-valid
+   book WITHOUT our tag is a conclusive "never landed" (false); the tag present → true; any transport/schema
+   failure → null (unknown → caller keeps the strategy blocked, never re-enters). */
+async function fyersOrderProbe(st) {
+  if (!st.pendingClientId) return null;
+  const tag = reconcile.fyersOrderTag(st.pendingClientId);
+  if (!tag) return null;
+  try {
+    const sess = await sessionFromCred(st.userId, "fyers");
+    if (!sess) return null;
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders", { headers: brokerAuth("fyers", sess.accessToken, st.userId) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") return null;
+    const book = Array.isArray(d.orderBook) ? d.orderBook : null;
+    if (!book) return null;                                  // bad schema → unknown
+    if (reconcile.hasFyersOrderTag(book, tag)) return true;  // the order reached FYERS → do NOT re-enter
+    return false;                                            // complete same-day book, tag absent → never landed
+  } catch { return null; }
 }
 
 async function runAutoBuyEngine() {
@@ -6016,15 +6087,15 @@ app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
       logFinancial("autobuy.review.adopted", { userId, id, positionId: adopted.id });
       return res.json({ ok: true, status: "active", adopted: adopted.id, note: "Adopted your open broker position — the exit engine now manages it and no new entry will be placed." });
     }
-    // R6-P1-01: adoption reads the broker's ACTUAL position; only Delta supports it today.
-    const reason = mine.broker === "delta"
+    // R6-P1-01 / R8-P2-01: adoption reads the broker's ACTUAL position; Delta and FYERS support it.
+    const reason = RECONCILABLE_BROKERS.has(mine.broker)
       ? "No matching OPEN position found at your broker to adopt. If it already closed, choose “Didn't fill”; otherwise flatten it with Stop & sell."
       : `Adopting a real position isn't supported for ${mine.broker} yet (we won't guess quantity/price). Manage the position in your broker app or use “Stop & sell”, then resolve as “Didn't fill” once your account is flat.`;
     return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason });
   }
   if (resolution === "nofill") {
-    // Delta: require BROKER EVIDENCE the account is flat before clearing + resuming (R6-P2-01).
-    if (mine.broker === "delta") {
+    // Delta/FYERS: require BROKER EVIDENCE the account is flat before clearing + resuming (R6-P2-01 / R8-P2-01).
+    if (RECONCILABLE_BROKERS.has(mine.broker)) {
       const os = await brokerOpenSize(mine);
       if (os == null) return res.status(502).json({ ok: false, needsReview: true, reason: "Couldn't confirm with your broker that the account is flat — try again in a moment." });
       if (os.size > 0) return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason: "Your broker shows an OPEN position for this strategy — the order DID fill. Choose “Order filled” to adopt it (or flatten with Stop & sell)." });

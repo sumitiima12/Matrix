@@ -102,4 +102,19 @@ function classifyFyersOrder(o) {
   return { status, qty, filledQty, avgPrice: Number.isFinite(avgPrice) ? avgPrice : null, filled, rejected, pending: !filled && !rejected };
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder };
+/* FYERS order tag = our durable dedupe key on FYERS (its analogue of Delta's client_order_id). FYERS
+   caps orderTag at 20 alphanumeric chars, so we strip separators from our client id and keep the last 20
+   (the trailing timestamp stays, so it's unique per order). The SAME derivation is used when we stamp the
+   order and when we later scan the order book for it, so they always match. */
+function fyersOrderTag(clientOrderId) {
+  const t = String(clientOrderId || "").replace(/[^a-zA-Z0-9]/g, "").slice(-20);
+  return t || null;
+}
+
+/* Does this FYERS order book carry our stamped orderTag? (absence-scan analogue of hasClientOrderId) */
+function hasFyersOrderTag(records, tag) {
+  if (!tag || !Array.isArray(records)) return false;
+  return records.some((o) => String((o && o.orderTag) || "") === String(tag));
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag };
