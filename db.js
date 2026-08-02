@@ -659,6 +659,29 @@ async function getManagedPositionsForUser(userId, limit = 200) {
   }
   return Object.values(readJSON(FILES.managed)).filter((p) => String(p.userId) === String(userId)).slice(0, limit);
 }
+/* R14-P1-03: ATOMICALLY claim an OPEN managed position for exit (open → closing). Returns the updated row
+   to the SINGLE winner, or null to everyone else (already closing/closed). This is the compare-and-set the
+   exit engine + Close Now route need so two overlapping actions can't both submit a SELL. In Postgres it's
+   a conditional UPDATE (`WHERE status='open'`); in single-threaded flat-file mode the read-check-write runs
+   without interleaving, so it is equally atomic. */
+async function claimManagedForExit(id, patch = {}) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM managed_positions WHERE id=$1 AND status='open'`, [id]);
+    // Do the conditional write in one statement so concurrent callers can't both win.
+    const upd = await pool.query(
+      `UPDATE managed_positions SET status='closing', updated_at=$2, data = data || $3::jsonb
+       WHERE id=$1 AND status='open' RETURNING data`,
+      [id, Date.now(), JSON.stringify({ ...patch, status: "closing" })]
+    );
+    return upd.rows[0] ? upd.rows[0].data : null;
+  }
+  const db = readJSON(FILES.managed);
+  const cur = db[id];
+  if (!cur || cur.status !== "open") return null;
+  db[id] = { ...cur, ...patch, status: "closing", updated_at: Date.now() };
+  writeJSON(FILES.managed, db);
+  return db[id];
+}
 async function updateManagedPosition(id, patch) {
   if (USING_PG) {
     const r = await pool.query(`SELECT data FROM managed_positions WHERE id=$1`, [id]);
@@ -719,4 +742,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

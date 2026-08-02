@@ -1596,8 +1596,11 @@ app.get("/api/history", async (req, res) => {
       } else {
         qs = `range=${range}&interval=${interval}`;
       }
+      // Map bare tickers to their Yahoo form BEFORE fetching — e.g. crypto "BTC" → "BTC-USD", "NIFTY50" →
+      // "^NSEI" (Y_SPECIAL). Without this, a crypto backtest for "BTC" hit Yahoo as "BTC" and got no data.
+      const yTicker = fallbackYF(Y_SPECIAL[symbol] || symbol);
       const data = await memo(`h:${symbol}:${range}:${interval}`, 60_000, () =>
-        j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(symbol))}?${qs}`));
+        j(`${YF}/v8/finance/chart/${encodeURIComponent(yTicker)}?${qs}`));
       const r = data.chart?.result?.[0];
       const ts = r?.timestamp || [];
       const q = r?.indicators?.quote?.[0] || {};
@@ -3790,10 +3793,11 @@ function brokerStaticIp() {
   return null;
 }
 
-/** Which brokers are actually configured on this server. */
-app.get("/api/broker/status", async (req, res) => {
-  // Report configuration for THIS user (per-user BYOA app if connected, else the global fallback).
-  const userId = req.query.userId || req.get("X-User-Id");
+/** Which brokers are actually configured on this server, for the AUTHENTICATED user only. */
+app.get("/api/broker/status", requireAuth, async (req, res) => {
+  /* R14-P2-05: identity MUST come from the verified token, never a spoofable X-User-Id/query param —
+     otherwise anyone could enumerate identifiers to learn whether a given user has broker credentials. */
+  const userId = req.authUserId;
   const storeKey = userId ? storageKeyFor(userId) : null;
   const out = {};
   for (const [id, b] of Object.entries(BROKERS)) {
@@ -4545,10 +4549,17 @@ app.post("/api/broker/order", requireAuth, async (req, res) => {
   const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
   async function registerAutoExit(qtyOverride, entryOverride) {
     if (!wantAutoExit) return null;   // register for BOTH longs and shorts (exit math is direction-aware)
-    // All brokers now have order placement wired, so any of them can be auto-exited.
+    /* R14-P1-05/06: only arm an app-managed exit for brokers whose exit path returns VERIFIED fill truth
+       (Delta, FYERS). Other brokers' exits report only acceptance — a managed position on them would be
+       armed before the entry is confirmed and later "closed" on acceptance, selling shares that may never
+       have been acquired. Fail closed: don't arm; the client warns the user to set SL/TP in their broker. */
+    if (!FILL_VERIFIED_BROKERS.has(broker)) { console.warn(`[autoexit] not arming managed SL/TP for ${broker} — no verified fill truth (long-only Delta/FYERS supported)`); return null; }
+    /* R14-P1-04: never arm protection without a USABLE entry price — priceExitFired returns fired:false when
+       entry<=0, so percentage SL/TP would be silently inert. Require a positive reference before registering. */
     try {
       const bareSym = String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "");
       const entryRef = Number(entryOverride) > 0 ? Number(entryOverride) : (Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, regMarket) || null);
+      if (!(Number(entryRef) > 0)) { console.warn(`[autoexit] not arming ${broker} ${symbol} — no usable entry price for SL/TP`); return null; }
       const regQty = Number(qtyOverride) > 0 ? Number(qtyOverride) : nQty;
       const yahoo = req.body?.yahoo || (regMarket === "Crypto"
         ? `${String(symbol).replace(/(USDT|USD|INR)$/i, "")}-USD`
@@ -5365,6 +5376,40 @@ async function fyersNetQty(sess, symbol) {
   } catch { return null; }
 }
 
+/* R14-P1-02: the VERIFIED sellable-long quantity for a FYERS symbol, product-aware — the exit path must
+   size a SELL from real broker truth, and FYERS splits it across two endpoints:
+     • /positions  — today's / unsettled activity (signed netQty);
+     • /holdings   — SETTLED demat shares (delivery/CNC), which have NO position row on a later day.
+   For a CNC (delivery) product the sellable long = settled holdings + today's signed net position (so a
+   same-day buy adds and a same-day partial sell subtracts). For INTRADAY it's the net position only.
+   FAIL CLOSED: returns null if a source we NEED can't be read, so the caller never sells a blind quantity
+   (positions-only would report a settled holding as flat and leave it unsold — the R14-P1-02 defect). */
+async function fyersSellableLong(sess, symbol, product) {
+  const auth = brokerAuth("fyers", sess.accessToken, sess.userId);
+  let net = null;
+  try {
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: auth });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.s !== "error" && Array.isArray(d.netPositions)) {
+      const p = d.netPositions.find((x) => String(x.symbol) === String(symbol));
+      net = p ? (Number(p.netQty) || 0) : 0;
+    }
+  } catch { net = null; }
+  const isCnc = /^(cnc|delivery|c|d)$/i.test(String(product || "")) || product == null;
+  if (!isCnc) return net;                     // intraday: positions only (null if unreadable → fail closed)
+  let held = null;
+  try {
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/holdings", { headers: auth });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.s !== "error" && Array.isArray(d.holdings)) {
+      const h = d.holdings.find((x) => String(x.symbol) === String(symbol));
+      held = h ? (Number(h.quantity ?? h.remainingQuantity ?? h.remainingQty ?? 0) || 0) : 0;
+    }
+  } catch { held = null; }
+  if (held == null || net == null) return null;   // CNC needs BOTH to size safely → fail closed
+  return held + net;
+}
+
 /* R12-P1-01: state of our tagged FYERS EXIT order — "pending" | "resolved" | "absent" | "unknown". Used by
    stale-close recovery to stay idempotent: it must never submit a second SELL while the first is still
    working. "unknown" (couldn't read the book) is treated by the caller like "pending" — never resubmit. */
@@ -5471,7 +5516,7 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
        quantity to the broker's actual net-long holding, so a retry after a partial fill can never sell
        more than we still hold and flip us into a short. If FYERS reports the account already flat (or
        short), there is nothing to close — report it closed instead of firing another SELL. */
-    const held = await fyersNetQty(sess, symbol);   // signed; null = couldn't read
+    const held = await fyersSellableLong(sess, symbol, product);   // R14-P1-02: product-aware (incl. settled CNC holdings)
     // R10-P1-01: size the SELL from the broker's real holding (pure, unit-tested). Fail CLOSED — if the
     // holdings read failed we place NO order and throw so the exit engine retries next tick, rather than
     // selling an unverified internal quantity that a partial-fill retry could oversell into a short.
@@ -5596,19 +5641,12 @@ async function brokerOpenSize(st) {
     return { size: p ? Math.abs(Number(p.size) || 0) : 0 };
   }
   if (st.broker === "fyers") {
-    // R8-P2-01: read FYERS net position size so "no fill" can require BROKER EVIDENCE the account is flat.
-    let net = null;
-    try {
-      const sess = await sessionFromCred(st.userId, "fyers");
-      if (!sess) return null;
-      const r = await fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: brokerAuth("fyers", sess.accessToken, st.userId) });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || d.s === "error") return null;
-      net = Array.isArray(d.netPositions) ? d.netPositions : null;
-    } catch { return null; }
-    if (!net) return null;
-    const p = net.find((x) => String(x.symbol) === String(st.brokerSym));
-    return { size: p ? Math.abs(Number(p.netQty) || 0) : 0 };
+    // R8-P2-01 / R14-P1-02: product-aware sellable long (positions + settled CNC holdings), so a settled
+    // holding isn't mistaken for flat. null when unreadable → caller treats as unverifiable.
+    const sess = await sessionFromCred(st.userId, "fyers");
+    if (!sess) return null;
+    const q = await fyersSellableLong(sess, st.brokerSym, st.product);
+    return q == null ? null : { size: Math.abs(q) };
   }
   return null;
 }
@@ -5673,12 +5711,20 @@ async function runAutoExitEngine() {
         let flat = false;
         try {
           if (pos.broker === "delta") { const held = await deltaHeldFor(pos.userId); if (held && !held.has(String(pos.brokerSym))) flat = true; }
-          else if (pos.broker === "fyers") { const sess = await sessionFromCred(pos.userId, "fyers"); const q = sess ? await fyersNetQty(sess, pos.brokerSym) : null; if (q != null && q <= 0) flat = true; }
+          else if (pos.broker === "fyers") { const sess = await sessionFromCred(pos.userId, "fyers"); const q = sess ? await fyersSellableLong(sess, pos.brokerSym, pos.product) : null; if (q != null && q <= 0) flat = true; }   // R14-P1-02: product-aware, so a settled CNC holding isn't seen as flat
         } catch { /* couldn't verify → reopen to keep it protected */ }
         if (flat) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — flat after stale close", closingSince: null, exitTag: null }); reconciled++; continue; }
         await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, exitTag: null, lastError: "recovered a stranded 'closing' state — resumed monitoring" });
         console.warn(`[autoexit] recovered STRANDED closing ${pos.symbol} for ${pos.userId} → resumed monitoring`);
         continue;   // re-processed as an open position on the next sweep
+      }
+      /* R14-P1-06: NEVER auto-exit a broker we can't get fill truth from — a SELL on acceptance could
+         over-/under-sell and we'd falsely mark it closed. New managed positions are only armed for verified
+         brokers (Delta/FYERS); any legacy position on another broker is left for the user to manage in their
+         broker app (flagged once) rather than auto-sold on unverified execution. */
+      if (!FILL_VERIFIED_BROKERS.has(pos.broker)) {
+        if (!pos.exitUnsupportedFlagged) await db.updateManagedPosition(pos.id, { exitUnsupportedFlagged: true, lastError: `App-managed exit isn't supported for ${pos.broker} — please set/monitor SL/TP in your broker app.` });
+        continue;
       }
       // Broker says this position is gone -> reconcile it closed and skip the exit check.
       if (pos.broker === "delta") {
@@ -5721,12 +5767,12 @@ async function runAutoExitEngine() {
           pos.exitTag = null;
         }
 
-        // Claim it FIRST so a crash/restart can't sell twice. Stamp closingSince so a claim that gets
-        // STRANDED by a crash is recognised as stale and reconciled (R11-P1-01), not skipped forever.
-        // R12-P1-01: stamp a durable exitTag BEFORE the broker call so stale recovery can find this exact
-        // exit order in FYERS' book and never fire a duplicate SELL while it's still working.
+        // R14-P1-03: ATOMICALLY claim the position (open → closing) so a concurrent Close Now (or another
+        // actor) can't also fire a SELL. Only ONE caller wins; a null return means someone else is already
+        // closing it → skip. Stamp closingSince (crash-stale reconciliation, R11) + a durable exitTag (R12).
         const exitTag = reconcile.fyersOrderTag(`mxx${pos.id}x${Date.now()}`);
-        await db.updateManagedPosition(pos.id, { status: "closing", exitReason: hit.reason, closingSince: Date.now(), exitTag });
+        const claimed = await db.claimManagedForExit(pos.id, { exitReason: hit.reason, closingSince: Date.now(), exitTag });
+        if (!claimed) { console.warn(`[autoexit] ${pos.symbol} for ${pos.userId}: exit already claimed elsewhere — skipping`); continue; }
         pos.exitTag = exitTag;
 
         if (!live) {
@@ -5824,27 +5870,31 @@ app.post("/api/autoexit/register", requireAuth, async (req, res) => {
     const { broker, symbol, brokerSym, qty, entry, market, sl, tp, tsl, product } = req.body || {};
     if (!userId || !symbol || !brokerSym || !(Number(qty) > 0)) return res.status(400).json({ error: "userId, symbol, brokerSym and qty are required" });
     if (!(Number(sl) > 0) && !(Number(tp) > 0) && !(Number(tsl) > 0)) return res.status(400).json({ error: "set at least one of stop-loss, take-profit or trailing-stop" });
+    // R14-P1-05/06: only arm an app-managed exit for brokers whose exit path returns VERIFIED fill truth.
+    if (!FILL_VERIFIED_BROKERS.has(broker)) return res.status(400).json({ error: `App-managed SL/TP isn't supported for ${broker} yet (we can't confirm its exit fills). Supported: Delta, FYERS. Manage protection in your broker app.` });
+    // R14-P1-04: percentage SL/TP is inert without a usable entry price — require one so protection is real.
+    if (!(Number(entry) > 0)) return res.status(400).json({ error: "A valid average/entry price is required to arm SL/TP (percentage levels can't be computed from an unknown entry)." });
     const sess = await sessionFromCred(userId, broker);
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
-    /* R12-P1-02: for FYERS, app-managed exits are LONG-ONLY (the exit executor can only SELL, not
-       buy-to-cover). Verify the broker's SIGNED net position: refuse a short/flat holding (we'd later
-       falsely report it "closed" without covering), require broker truth, and CLAMP the managed quantity
-       to the real long holding so we never try to sell more than the user actually owns. */
+    /* R12-P1-02 / R14-P1-02: for FYERS, app-managed exits are LONG-ONLY (the exit executor can only SELL,
+       not buy-to-cover). Verify the broker's PRODUCT-AWARE sellable long (positions + settled CNC holdings):
+       refuse a short/flat holding, require broker truth, and CLAMP the managed quantity to the real holding
+       so we never try to sell more than the user actually owns. */
     let regQty = Number(qty);
     if (broker === "fyers") {
-      const net = await fyersNetQty(sess, brokerSym);
-      if (net == null) return res.status(502).json({ error: "Couldn't read your FYERS position to arm protection safely — try again in a moment." });
+      const net = await fyersSellableLong(sess, brokerSym, product || "CNC");
+      if (net == null) return res.status(502).json({ error: "Couldn't read your FYERS holding to arm protection safely — try again in a moment." });
       if (net <= 0) return res.status(409).json({ error: "App-managed SL/TP on FYERS supports LONG holdings only. This symbol shows no long position (it may be flat or short) — manage a short in your FYERS app." });
       regQty = Math.min(regQty, net);   // never manage/sell more than the verified long holding
     }
     // Avoid arming two engines on the same instrument.
     const existing = (await db.getManagedPositionsForUser(userId).catch(() => [])).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(brokerSym));
-    if (existing) { await db.updateManagedPosition(existing.id, { sl: sl || null, tp: tp || null, tsl: tsl || null, qty: regQty }); return res.json({ ok: true, id: existing.id, updated: true }); }
+    if (existing) { await db.updateManagedPosition(existing.id, { sl: sl || null, tp: tp || null, tsl: tsl || null, qty: regQty }); return res.json({ ok: true, id: existing.id, updated: true, protectionActive: true }); }
     const pos = await registerManagedPosition({
-      sess, symbol, brokerSym, qty: regQty, entry: Number(entry) || null, market: market || "Crypto",
+      sess, symbol, brokerSym, qty: regQty, entry: Number(entry), market: market || "Crypto",
       sl: Number(sl) || null, tp: Number(tp) || null, tsl: Number(tsl) || null, product: product || "CNC",
     });
-    res.json({ ok: true, id: pos.id });
+    res.json({ ok: true, id: pos.id, protectionActive: true });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT_MONITOR !== "off", live: String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true", last: lastAutoExit }));
@@ -6351,10 +6401,12 @@ app.post("/api/autobuy/close", requireAuth, async (req, res) => {
     }
     const sess = await sessionFromCred(userId, pos.broker || strat.broker);
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
-    // R12-P1-01: stamp a durable exit tag BEFORE the broker call so a crash mid-close is idempotent — the
-    // exit engine's stale recovery finds this order and won't fire a duplicate SELL.
+    // R14-P1-03: ATOMICALLY claim the position so the exit engine (or a second Close Now click) can't also
+    // submit a SELL. If the claim fails, another action already owns the close — don't fire a duplicate.
+    // R12-P1-01: the durable exitTag makes a crash mid-close idempotent via stale-close reconciliation.
     const exitTag = reconcile.fyersOrderTag(`mxc${pos.id}x${Date.now()}`);
-    await db.updateManagedPosition(pos.id, { status: "closing", closingSince: Date.now(), exitTag });
+    const claimed = await db.claimManagedForExit(pos.id, { closingSince: Date.now(), exitTag });
+    if (!claimed) return res.status(409).json({ ok: false, closed: false, error: "A close is already in progress for this position — it won't be submitted twice. Check back in a moment." });
     let r;
     try {
       r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short, exitTag);
@@ -6512,11 +6564,20 @@ setInterval(refreshAllBrokerTokens, 6 * 60 * 60 * 1000).unref?.();
    loudly but DO NOT exit — crashing the whole service (and taking down real prices + trading) is
    worse than running with a warning. Set these in production; the warning tells you to. */
 (function guardSecrets() {
+  const prod = process.env.NODE_ENV === "production";
+  const credWeak = !process.env.CRED_KEY || String(process.env.CRED_KEY).length < 16;
+  /* R14-P2-07: broker credentials protect real accounts, so their encryption key should be a SEPARATE
+     strong secret — not silently derived from JWT_SECRET/DATABASE_URL. In production, opt into fail-closed
+     with CRED_KEY_REQUIRED=1 once a dedicated CRED_KEY is set (avoids orphaning creds encrypted under the
+     old derived key on existing deployments). Otherwise we warn loudly. */
+  if (prod && credWeak && /^(1|true|yes)$/i.test(String(process.env.CRED_KEY_REQUIRED || ""))) {
+    throw new Error("[startup] CRED_KEY_REQUIRED is set but CRED_KEY is missing/weak (need ≥16 chars). Set a strong, dedicated broker-credential encryption key. Refusing to start.");
+  }
   const problems = [];
   if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).length < 16) problems.push("JWT_SECRET (set a long, stable random string)");
-  if (!process.env.CRED_KEY || String(process.env.CRED_KEY).length < 16) problems.push("CRED_KEY (broker-credential encryption key)");
+  if (credWeak) problems.push("CRED_KEY (set a SEPARATE strong broker-credential encryption key; do not rely on the JWT_SECRET/DATABASE_URL fallback in production)");
   if (!problems.length) return;
-  console.warn("[startup] WARNING — missing/weak critical secrets: " + problems.join(", ") + ". Set these in production for secure sessions + credential encryption.");
+  console.warn("[startup] WARNING — missing/weak critical secrets: " + problems.join(", ") + ". Set these in production for secure sessions + credential encryption." + (prod && credWeak ? " Set CRED_KEY_REQUIRED=1 to enforce once configured." : ""));
 })();
 
 app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
