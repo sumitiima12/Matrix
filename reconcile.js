@@ -154,4 +154,19 @@ function closingIsStale(closingSince, now, staleMs) {
   return (Number(now) - since) >= Number(staleMs);
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale };
+/* R12-P1-01: classify the state of our tagged EXIT order in a FYERS order book, so stale-close recovery is
+   idempotent — it must NOT submit a second SELL while the first is still working. Returns:
+     "pending"  → an order with our tag is still transit/pending → do NOT resubmit; wait.
+     "resolved" → our tagged order(s) are all terminal (filled/rejected) → safe to reconcile net position.
+     "absent"   → no order with our tag → nothing outstanding → safe to reconcile/resubmit.
+   A non-array book means we couldn't read it → "unknown" (caller treats like pending: never resubmit). */
+function fyersTaggedExitState(orderBook, tag) {
+  if (!tag) return "absent";
+  if (!Array.isArray(orderBook)) return "unknown";
+  const ours = orderBook.filter((o) => String((o && o.orderTag) || "") === String(tag));
+  if (!ours.length) return "absent";
+  for (const o of ours) { const c = classifyFyersOrder(o); if (c.pending && !c.rejected) return "pending"; }
+  return "resolved";
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState };

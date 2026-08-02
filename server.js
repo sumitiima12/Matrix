@@ -5365,11 +5365,26 @@ async function fyersNetQty(sess, symbol) {
   } catch { return null; }
 }
 
+/* R12-P1-01: state of our tagged FYERS EXIT order — "pending" | "resolved" | "absent" | "unknown". Used by
+   stale-close recovery to stay idempotent: it must never submit a second SELL while the first is still
+   working. "unknown" (couldn't read the book) is treated by the caller like "pending" — never resubmit. */
+async function fyersExitOrderState(sess, exitTag) {
+  const tag = exitTag ? reconcile.fyersOrderTag(exitTag) : null;
+  if (!tag) return "absent";
+  try {
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders", { headers: brokerAuth("fyers", sess.accessToken, sess.userId) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") return "unknown";
+    const book = Array.isArray(d.orderBook) ? d.orderBook : null;
+    return reconcile.fyersTaggedExitState(book, tag);
+  } catch { return "unknown"; }
+}
+
 /* REDUCE-ONLY exit executor. CLOSES a position by trading the OPPOSITE side: a long is closed
    with a sell, a short (Delta perpetual only) with a buy. Delta additionally sets reduce_only so
    it can never flip the position by accident. The exit MUST use the same product the entry used
    (closing an MIS position with CNC would fail). Spot brokers can't hold shorts, so they always sell. */
-async function placeExitOrder(sess, symbol, qty, market, product, short = false) {
+async function placeExitOrder(sess, symbol, qty, market, product, short = false, exitTag = null) {
   const broker = sess.broker;
   const token = sess.accessToken;
   const prod = mapProduct(broker, product);
@@ -5464,9 +5479,12 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false)
     if (plan.action === "unverified") throw new Error("Couldn't read FYERS positions to size the exit safely — retrying (won't sell an unverified quantity).");
     if (plan.action === "flat") return { orderId: null, filled: true, alreadyFlat: true, state: "closed", filledQty: 0, remaining: 0 };
     const sellQty = plan.sellQty;
+    // R12-P1-01: stamp the durable exit orderTag on the SELL so stale-close recovery can find THIS order in
+    // the FYERS order book and never fire a duplicate SELL while it's still working.
+    const exTag = exitTag ? reconcile.fyersOrderTag(exitTag) : null;
     const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol, qty: sellQty, type: 2, side: -1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
+      body: JSON.stringify({ symbol, qty: sellQty, type: 2, side: -1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false, ...(exTag ? { orderTag: exTag } : {}) }),
     });
     const d = await r.json();
     if (!r.ok || d.s === "error") throw new Error(d.message || `fyers exit ${r.status}`);
@@ -5634,13 +5652,28 @@ async function runAutoExitEngine() {
            broker truth: flat → closed; otherwise return it to "open" so SL/TP monitoring + exit retries
            resume next tick. (A legacy stranded row with no closingSince reconciles immediately.) */
         if (!reconcile.closingIsStale(pos.closingSince, Date.now(), CLOSING_STALE_MS)) continue;   // fresh — let it finish
+        /* R12-P1-01 IDEMPOTENCY: before reopening (which would re-fire the exit), check whether OUR prior
+           exit order is still WORKING at the broker. If it is (or we can't tell), we must NOT submit a
+           second SELL — a non-reduce-only FYERS SELL could then oversell the long into a short. Wait. */
+        if (pos.broker === "fyers" && pos.exitTag) {
+          try {
+            const sess = await sessionFromCred(pos.userId, "fyers");
+            const exState = sess ? await fyersExitOrderState(sess, pos.exitTag) : "unknown";
+            if (exState === "pending" || exState === "unknown") {
+              await db.updateManagedPosition(pos.id, { closingSince: Date.now(), lastError: `prior exit order ${exState} at FYERS — waiting, not resubmitting (no duplicate SELL)` });
+              console.warn(`[autoexit] stale closing ${pos.symbol}: prior exit ${exState} → waiting, not resubmitting`);
+              continue;
+            }
+            // "resolved"/"absent" → the prior order is terminal/gone → safe to reconcile net position below.
+          } catch { await db.updateManagedPosition(pos.id, { closingSince: Date.now() }); continue; }   // unknown → wait
+        }
         let flat = false;
         try {
           if (pos.broker === "delta") { const held = await deltaHeldFor(pos.userId); if (held && !held.has(String(pos.brokerSym))) flat = true; }
           else if (pos.broker === "fyers") { const sess = await sessionFromCred(pos.userId, "fyers"); const q = sess ? await fyersNetQty(sess, pos.brokerSym) : null; if (q != null && q <= 0) flat = true; }
         } catch { /* couldn't verify → reopen to keep it protected */ }
-        if (flat) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — flat after stale close", closingSince: null }); reconciled++; continue; }
-        await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: "recovered a stranded 'closing' state — resumed monitoring" });
+        if (flat) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — flat after stale close", closingSince: null, exitTag: null }); reconciled++; continue; }
+        await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, exitTag: null, lastError: "recovered a stranded 'closing' state — resumed monitoring" });
         console.warn(`[autoexit] recovered STRANDED closing ${pos.symbol} for ${pos.userId} → resumed monitoring`);
         continue;   // re-processed as an open position on the next sweep
       }
@@ -5669,7 +5702,11 @@ async function runAutoExitEngine() {
 
         // Claim it FIRST so a crash/restart can't sell twice. Stamp closingSince so a claim that gets
         // STRANDED by a crash is recognised as stale and reconciled (R11-P1-01), not skipped forever.
-        await db.updateManagedPosition(pos.id, { status: "closing", exitReason: hit.reason, closingSince: Date.now() });
+        // R12-P1-01: stamp a durable exitTag BEFORE the broker call so stale recovery can find this exact
+        // exit order in FYERS' book and never fire a duplicate SELL while it's still working.
+        const exitTag = reconcile.fyersOrderTag(`mxx${pos.id}x${Date.now()}`);
+        await db.updateManagedPosition(pos.id, { status: "closing", exitReason: hit.reason, closingSince: Date.now(), exitTag });
+        pos.exitTag = exitTag;
 
         if (!live) {
           console.log(`[autoexit] DRY-RUN (AUTO_EXIT_LIVE!=true): would exit ${pos.symbol} for ${pos.userId} — ${hit.reason}`);
@@ -5680,7 +5717,7 @@ async function runAutoExitEngine() {
         const sess = await sessionFromCred(pos.userId, pos.broker);
         if (!sess) { await db.updateManagedPosition(pos.id, { status: "open", lastError: "no stored credentials — reconnect broker" }); continue; }
 
-        const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
+        const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short, exitTag);
         // R6/R8-lifecycle: only mark CLOSED when the exit actually flattened. A verified-partial/unfilled
         // exit (r.filled === false) leaves a real position open, so we return it to "open" — the reduce-only
         // retry on the next tick (and the flat-reconcile) will finish the job instead of losing track of
@@ -5751,11 +5788,22 @@ app.post("/api/autoexit/register", requireAuth, async (req, res) => {
     if (!(Number(sl) > 0) && !(Number(tp) > 0) && !(Number(tsl) > 0)) return res.status(400).json({ error: "set at least one of stop-loss, take-profit or trailing-stop" });
     const sess = await sessionFromCred(userId, broker);
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
+    /* R12-P1-02: for FYERS, app-managed exits are LONG-ONLY (the exit executor can only SELL, not
+       buy-to-cover). Verify the broker's SIGNED net position: refuse a short/flat holding (we'd later
+       falsely report it "closed" without covering), require broker truth, and CLAMP the managed quantity
+       to the real long holding so we never try to sell more than the user actually owns. */
+    let regQty = Number(qty);
+    if (broker === "fyers") {
+      const net = await fyersNetQty(sess, brokerSym);
+      if (net == null) return res.status(502).json({ error: "Couldn't read your FYERS position to arm protection safely — try again in a moment." });
+      if (net <= 0) return res.status(409).json({ error: "App-managed SL/TP on FYERS supports LONG holdings only. This symbol shows no long position (it may be flat or short) — manage a short in your FYERS app." });
+      regQty = Math.min(regQty, net);   // never manage/sell more than the verified long holding
+    }
     // Avoid arming two engines on the same instrument.
     const existing = (await db.getManagedPositionsForUser(userId).catch(() => [])).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(brokerSym));
-    if (existing) { await db.updateManagedPosition(existing.id, { sl: sl || null, tp: tp || null, tsl: tsl || null, qty: Number(qty) }); return res.json({ ok: true, id: existing.id, updated: true }); }
+    if (existing) { await db.updateManagedPosition(existing.id, { sl: sl || null, tp: tp || null, tsl: tsl || null, qty: regQty }); return res.json({ ok: true, id: existing.id, updated: true }); }
     const pos = await registerManagedPosition({
-      sess, symbol, brokerSym, qty: Number(qty), entry: Number(entry) || null, market: market || "Crypto",
+      sess, symbol, brokerSym, qty: regQty, entry: Number(entry) || null, market: market || "Crypto",
       sl: Number(sl) || null, tp: Number(tp) || null, tsl: Number(tsl) || null, product: product || "CNC",
     });
     res.json({ ok: true, id: pos.id });
@@ -6265,10 +6313,13 @@ app.post("/api/autobuy/close", requireAuth, async (req, res) => {
     }
     const sess = await sessionFromCred(userId, pos.broker || strat.broker);
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
-    await db.updateManagedPosition(pos.id, { status: "closing", closingSince: Date.now() });
+    // R12-P1-01: stamp a durable exit tag BEFORE the broker call so a crash mid-close is idempotent — the
+    // exit engine's stale recovery finds this order and won't fire a duplicate SELL.
+    const exitTag = reconcile.fyersOrderTag(`mxc${pos.id}x${Date.now()}`);
+    await db.updateManagedPosition(pos.id, { status: "closing", closingSince: Date.now(), exitTag });
     let r;
     try {
-      r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
+      r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short, exitTag);
     } catch (exitErr) {
       /* R11-P1-01: an exit that THROWS (e.g. the fail-closed FYERS holdings-read error) must NOT leave the
          position stranded in "closing" — that would stop SL/TP monitoring forever. Restore it to "open" so

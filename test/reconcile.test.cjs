@@ -134,6 +134,24 @@ test("closingIsStale: fresh claim waits; missing/old timestamp reconciles (never
   assert.equal(R.closingIsStale(undefined, now, stale), true);
 });
 
+test("fyersTaggedExitState: pending order blocks resubmit; resolved/absent allow reconcile", () => {
+  const tag = "myexit";
+  // A working (pending/transit) tagged order → must not resubmit.
+  assert.equal(R.fyersTaggedExitState([{ orderTag: tag, status: 6, qty: 10, filledQty: 0 }], tag), "pending");
+  assert.equal(R.fyersTaggedExitState([{ orderTag: tag, status: 4, qty: 10 }], tag), "pending");
+  // All terminal (filled/rejected) → resolved (safe to reconcile net position).
+  assert.equal(R.fyersTaggedExitState([{ orderTag: tag, status: 2, qty: 10, filledQty: 10 }], tag), "resolved");
+  assert.equal(R.fyersTaggedExitState([{ orderTag: tag, status: 5 }], tag), "resolved");
+  // Mixed: one still pending → pending wins (an order is still live).
+  assert.equal(R.fyersTaggedExitState([{ orderTag: tag, status: 2, filledQty: 4 }, { orderTag: tag, status: 6 }], tag), "pending");
+  // Our tag not present → nothing outstanding.
+  assert.equal(R.fyersTaggedExitState([{ orderTag: "other", status: 6 }], tag), "absent");
+  // Couldn't read the book → unknown (caller waits, never resubmits).
+  assert.equal(R.fyersTaggedExitState(null, tag), "unknown");
+  assert.equal(R.fyersTaggedExitState(undefined, tag), "unknown");
+  assert.equal(R.fyersTaggedExitState([], tag), "absent");
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match
