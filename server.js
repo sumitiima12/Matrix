@@ -5496,7 +5496,10 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
     // Remaining is what the ORIGINAL requested qty still needs closed after this fill — the caller uses it
     // to shrink the managed position so the next retry only sells the unsold remainder.
     const remaining = Math.max(0, Number(qty) - filledQty);
-    return { orderId: d.id, filled: filledAll, partial: c.filled && !filledAll, state: filledAll ? "closed" : "open", avgPrice: c.avgPrice, filledQty, remaining };
+    // R13-P1-01: distinguish a still-WORKING order (accepted, not yet confirmed filled — c.pending) from a
+    // TERMINAL partial. The caller must NOT fire a second SELL while this order is still pending; it keeps
+    // the position "closing" with the SAME exitTag and reconciles this order instead.
+    return { orderId: d.id, filled: filledAll, partial: c.filled && !filledAll, pending: !filledAll && !!c.pending, state: filledAll ? "closed" : "open", avgPrice: c.avgPrice, filledQty, remaining };
   }
   throw new Error(`auto-exit not supported for ${broker}`);
 }
@@ -5700,6 +5703,24 @@ async function runAutoExitEngine() {
         if (!hit.fired && posIntraday && intradaySquareDue(pos.market)) hit = { fired: true, reason: "Intraday square-off" };
         if (!hit.fired) continue;
 
+        /* R13-P1-01 IDEMPOTENCY (the decisive guard): NEVER create a new exit order while a PRIOR tagged
+           FYERS exit may still be working at the broker — that is the duplicate-SELL / oversell-to-short
+           path, whether the prior order lingered via a crash OR a normal pending-past-poll return. If a
+           persisted exitTag is still pending/unverifiable, wait; only once it is terminal (or absent) do we
+           clear it and start a fresh exit. This makes "at most one active SELL" hold across every sweep. */
+        if (pos.broker === "fyers" && pos.exitTag) {
+          const sessChk = await sessionFromCred(pos.userId, "fyers");
+          const exState = sessChk ? await fyersExitOrderState(sessChk, pos.exitTag) : "unknown";
+          if (reconcile.exitPreflightAction(exState) === "wait") {
+            await db.updateManagedPosition(pos.id, { status: "closing", closingSince: Date.now(), lastError: `Prior exit order ${exState} at FYERS — waiting, not resubmitting.` });
+            console.warn(`[autoexit] ${pos.symbol}: prior exit ${exState} → holding, not firing a new SELL`);
+            continue;
+          }
+          // terminal/absent → the prior order is done → clear the stale tag and fire a fresh, clamped exit.
+          await db.updateManagedPosition(pos.id, { exitTag: null });
+          pos.exitTag = null;
+        }
+
         // Claim it FIRST so a crash/restart can't sell twice. Stamp closingSince so a claim that gets
         // STRANDED by a crash is recognised as stale and reconciled (R11-P1-01), not skipped forever.
         // R12-P1-01: stamp a durable exitTag BEFORE the broker call so stale recovery can find this exact
@@ -5724,11 +5745,20 @@ async function runAutoExitEngine() {
         // live exposure. Delta and FYERS both report fill truth; other brokers leave r.filled undefined
         // (=== false is not true) → treated as closed.
         if (r.filled === false) {
-          /* R9-P1-01: shrink the managed quantity to what the broker CONFIRMED still needs closing, so the
-             next retry sells only the unsold remainder — never the full original qty again (which, on a
-             non-reduce-only FYERS SELL, could oversell into a short). `r.remaining` is broker-confirmed
-             (FYERS); Delta is reduce-only so it can't oversell and reports contracts separately. */
-          const patch = { status: "open", lastError: `Exit not fully filled (state ${r.state}${r.remaining != null ? `, ${r.remaining} left` : (r.remainingContracts != null ? `, ~${r.remainingContracts} left` : "")}) — will retry`, exitOrderId: r.orderId || null };
+          /* R13-P1-01: if the exit order is still WORKING at the broker (accepted, not yet confirmed
+             filled), keep the position "closing" with the SAME exitTag — the next sweep reconciles THIS
+             order rather than firing a second SELL. closingSince=null so the next sweep re-checks promptly
+             (a quick fill resolves fast; a genuinely stuck order then throttles to the stale window). */
+          if (reconcile.exitOutcomeAction(r) === "hold") {
+            await db.updateManagedPosition(pos.id, { status: "closing", closingSince: null, exitOrderId: r.orderId || null, lastError: `Exit order pending at broker (state ${r.state}) — awaiting fill; not resubmitting.` });
+            console.warn(`[autoexit] exit PENDING ${pos.symbol} for ${pos.userId} — holding tagged order ${r.orderId} (no second SELL)`);
+            continue;
+          }
+          /* R9-P1-01: TERMINAL partial — shrink the managed quantity to what the broker CONFIRMED still
+             needs closing, so the next retry sells only the unsold remainder — never the full original qty
+             again (which, on a non-reduce-only FYERS SELL, could oversell into a short). `r.remaining` is
+             broker-confirmed (FYERS); Delta is reduce-only so it can't oversell and reports contracts. */
+          const patch = { status: "open", exitTag: null, lastError: `Exit not fully filled (state ${r.state}${r.remaining != null ? `, ${r.remaining} left` : (r.remainingContracts != null ? `, ~${r.remainingContracts} left` : "")}) — will retry`, exitOrderId: r.orderId || null };
           if (Number(r.remaining) >= 0 && r.remaining != null) {
             if (r.remaining === 0) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null }); exited++; continue; }
             patch.qty = Number(r.remaining);
@@ -5741,9 +5771,17 @@ async function runAutoExitEngine() {
         exited++;
         console.log(`[autoexit] EXITED ${pos.symbol} for ${pos.userId} via ${pos.broker} — ${hit.reason} (order ${r.orderId})`);
       } catch (e) {
-        // Return to 'open' so it retries next sweep; a transient broker/network error must
-        // not silently abandon a position that still needs an exit.
-        await db.updateManagedPosition(pos.id, { status: "open", lastError: String(e.message || e) });
+        /* SELF-REVIEW fix: a FYERS exit that THREW may still have reached the broker (e.g. the order was
+           accepted but the response/verify failed). Flipping straight to "open" would let the next sweep
+           fire a SECOND SELL — the exact duplicate the R12 idempotency guard prevents. So for a FYERS exit
+           that had a stamped exitTag, keep it "closing" with closingSince=null: the very next sweep's
+           stale-recovery reconciles by that tag (pending → wait; absent/resolved → reopen/close) instead of
+           blindly resubmitting. Other brokers (Delta reduce_only-safe; no tag) retry via "open" as before. */
+        if (pos.broker === "fyers" && pos.exitTag) {
+          await db.updateManagedPosition(pos.id, { status: "closing", closingSince: null, lastError: String(e.message || e) });
+        } else {
+          await db.updateManagedPosition(pos.id, { status: "open", lastError: String(e.message || e) });
+        }
         console.error(`[autoexit] ${pos.symbol} (${pos.broker}):`, e.message);
       }
     }
@@ -6321,17 +6359,29 @@ app.post("/api/autobuy/close", requireAuth, async (req, res) => {
     try {
       r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short, exitTag);
     } catch (exitErr) {
-      /* R11-P1-01: an exit that THROWS (e.g. the fail-closed FYERS holdings-read error) must NOT leave the
-         position stranded in "closing" — that would stop SL/TP monitoring forever. Restore it to "open" so
-         the exit engine keeps protecting/retrying it, and surface the error. */
-      await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: `Close failed (${String(exitErr.message || exitErr)}) — position kept open; the exit engine will keep retrying.` });
+      /* R11-P1-01 + SELF-REVIEW: an exit that THROWS must not strand the position, but for FYERS the SELL
+         may have reached the broker — flipping to "open" could let the exit engine fire a duplicate SELL.
+         Keep it "closing" with closingSince=null so the engine's idempotent stale-recovery reconciles THIS
+         order by its exitTag on the next sweep (pending → wait; absent/resolved → reopen/close). Non-FYERS
+         brokers (no tag) restore to "open" and retry as before. Either way SL/TP monitoring continues. */
+      if (pos.broker === "fyers") {
+        await db.updateManagedPosition(pos.id, { status: "closing", closingSince: null, lastError: `Close failed (${String(exitErr.message || exitErr)}) — reconciling by exit tag; the engine will finish or reopen.` });
+      } else {
+        await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: `Close failed (${String(exitErr.message || exitErr)}) — position kept open; the exit engine will keep retrying.` });
+      }
       return res.status(502).json({ ok: false, closed: false, error: "Couldn't confirm the close with your broker — the position is kept open and will keep retrying. Try again in a moment." });
     }
     // R8-lifecycle: don't claim a flat close the broker didn't confirm. Delta/FYERS report r.filled; a
     // partial/unfilled close leaves real exposure — keep the position OPEN so the exit engine retries and
     // tell the user, rather than cancelling the strategy over a position that's still live.
     if (r.filled === false) {
-      await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: `Close not fully filled (state ${r.state}) — the exit engine will keep retrying`, exitOrderId: r.orderId || null });
+      /* R13-P1-01: a still-PENDING FYERS close must stay "closing" with its exitTag so the engine reconciles
+         THIS order and never fires a second SELL. A TERMINAL partial reopens to retry the remainder. */
+      if (r.pending && pos.broker === "fyers") {
+        await db.updateManagedPosition(pos.id, { status: "closing", closingSince: null, exitOrderId: r.orderId || null, lastError: `Close order pending at broker (state ${r.state}) — awaiting fill; not resubmitting.` });
+        return res.status(202).json({ ok: false, closed: false, pending: true, orderId: r.orderId || null, error: "Close order placed and pending at your broker — awaiting fill. It won't be submitted twice." });
+      }
+      await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, exitTag: null, lastError: `Close not fully filled (state ${r.state}) — the exit engine will keep retrying`, exitOrderId: r.orderId || null });
       return res.status(409).json({ ok: false, closed: false, orderId: r.orderId || null, error: "Broker didn't confirm a full close — position is still open and will keep retrying. Try again in a moment." });
     }
     await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close", exitOrderId: r.orderId || null, closingSince: null });

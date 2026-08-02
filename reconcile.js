@@ -169,4 +169,22 @@ function fyersTaggedExitState(orderBook, tag) {
   return "resolved";
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState };
+/* R13-P1-01: the exit-lifecycle decisions, made PURE so "at most one active SELL" is unit-tested rather
+   than scattered across engine branches.
+   exitOutcomeAction(r): map a placeExitOrder result to the managed-position action —
+     "close" = fully flat/filled; "hold" = order still WORKING (keep "closing" + same tag, never resubmit);
+     "retry" = terminal partial/unfilled (reopen and sell only the remainder with a fresh tag).
+   exitPreflightAction(exState): before firing a NEW exit, given the prior tagged order's state —
+     "wait" = a prior order may still be live (pending/unknown) → do NOT submit another; "fire" = terminal
+     or absent → safe to submit a fresh exit. */
+function exitOutcomeAction(r) {
+  r = r || {};
+  if (r.filled === true || r.alreadyFlat === true) return "close";
+  if (r.pending === true) return "hold";
+  return "retry";
+}
+function exitPreflightAction(exState) {
+  return (exState === "pending" || exState === "unknown") ? "wait" : "fire";
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction };

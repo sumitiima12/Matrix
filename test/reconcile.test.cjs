@@ -152,6 +152,24 @@ test("fyersTaggedExitState: pending order blocks resubmit; resolved/absent allow
   assert.equal(R.fyersTaggedExitState([], tag), "absent");
 });
 
+test("exitOutcomeAction: pending HOLDs (no second SELL); filled/flat close; terminal partial retries", () => {
+  assert.equal(R.exitOutcomeAction({ filled: true }), "close");
+  assert.equal(R.exitOutcomeAction({ alreadyFlat: true, filled: true }), "close");
+  // The decisive R13 case: order accepted but still working → HOLD (keep tag, never resubmit).
+  assert.equal(R.exitOutcomeAction({ filled: false, pending: true, remaining: 10 }), "hold");
+  // Terminal partial (some filled, order done) → retry the remainder with a fresh tag.
+  assert.equal(R.exitOutcomeAction({ filled: false, pending: false, partial: true, remaining: 4 }), "retry");
+  assert.equal(R.exitOutcomeAction({ filled: false }), "retry");
+  assert.equal(R.exitOutcomeAction(null), "retry");
+});
+
+test("exitPreflightAction: never fire a new exit while a prior tagged order may be live", () => {
+  assert.equal(R.exitPreflightAction("pending"), "wait");
+  assert.equal(R.exitPreflightAction("unknown"), "wait");   // couldn't read → must not resubmit
+  assert.equal(R.exitPreflightAction("resolved"), "fire");
+  assert.equal(R.exitPreflightAction("absent"), "fire");
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match
