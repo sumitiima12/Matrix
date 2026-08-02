@@ -5299,6 +5299,31 @@ function mapProduct(broker, product) {
   return "CNC";
 }
 
+/* R8-lifecycle: FYERS order ACCEPTANCE is not EXECUTION. `POST /orders/sync` returns an order id the
+   instant FYERS accepts the order — the fill can still be pending, partial, or rejected a beat later.
+   Poll the order book by id and classify with reconcile.classifyFyersOrder until we see a CONCLUSIVE
+   outcome (filled or rejected). Anything we can't positively read as filled stays PENDING — the safe
+   direction: an entry won't register a phantom position, an exit won't be marked closed while it's
+   still open at the broker. Bounded (~4 tries over ~3.2s); market orders normally confirm on the first. */
+async function verifyFyersFill(sess, orderId, wantQty = 0) {
+  if (!orderId) return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+  const auth = brokerAuth("fyers", sess.accessToken, sess.userId);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const r = await fyFetch(`https://api-t1.fyers.in/api/v3/orders?id=${encodeURIComponent(orderId)}`, { headers: auth });
+      const d = await r.json().catch(() => ({}));
+      // FYERS returns the matched order under orderBook[] (filtered) or orderDetails; fall back to the body.
+      const o = (Array.isArray(d.orderBook) && d.orderBook.find((x) => String(x.id) === String(orderId))) ||
+                (Array.isArray(d.orderBook) && d.orderBook[0]) || d.orderDetails || d;
+      const c = reconcile.classifyFyersOrder(o);
+      if (c.filled || c.rejected) return { ...c, reason: o.message || o.orderStatusDescription || null };
+      // still transit/pending → wait and re-poll
+    } catch { /* transient — keep polling */ }
+    if (attempt < 3) await new Promise((res) => setTimeout(res, 800));
+  }
+  return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+}
+
 /* REDUCE-ONLY exit executor. CLOSES a position by trading the OPPOSITE side: a long is closed
    with a sell, a short (Delta perpetual only) with a buy. Delta additionally sets reduce_only so
    it can never flip the position by accident. The exit MUST use the same product the entry used
@@ -5392,7 +5417,11 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false)
     });
     const d = await r.json();
     if (!r.ok || d.s === "error") throw new Error(d.message || `fyers exit ${r.status}`);
-    return { orderId: d.id };
+    // Acceptance ≠ execution. Verify the actual fill before letting the caller mark the position closed.
+    const c = await verifyFyersFill(sess, d.id, Number(qty));
+    if (c.rejected) throw new Error(c.reason || `FYERS rejected the exit (status ${c.status})`);
+    const filledAll = c.filled && (!Number(qty) || c.filledQty >= Number(qty));
+    return { orderId: d.id, filled: filledAll, partial: c.filled && !filledAll, state: c.filled ? "closed" : "open", avgPrice: c.avgPrice };
   }
   throw new Error(`auto-exit not supported for ${broker}`);
 }
@@ -5530,10 +5559,11 @@ async function runAutoExitEngine() {
         if (!sess) { await db.updateManagedPosition(pos.id, { status: "open", lastError: "no stored credentials — reconnect broker" }); continue; }
 
         const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
-        // R6-lifecycle: only mark CLOSED when the exit actually flattened. A verified-partial Delta exit
-        // (r.filled === false) leaves a real position open, so we return it to "open" — the reduce-only
+        // R6/R8-lifecycle: only mark CLOSED when the exit actually flattened. A verified-partial/unfilled
+        // exit (r.filled === false) leaves a real position open, so we return it to "open" — the reduce-only
         // retry on the next tick (and the flat-reconcile) will finish the job instead of losing track of
-        // live exposure. Non-Delta brokers don't report fill truth (r.filled undefined) → treated as closed.
+        // live exposure. Delta and FYERS both report fill truth; other brokers leave r.filled undefined
+        // (=== false is not true) → treated as closed.
         if (r.filled === false) {
           await db.updateManagedPosition(pos.id, { status: "open", lastError: `Exit not fully filled (state ${r.state}, ~${r.remainingContracts} left) — will retry`, exitOrderId: r.orderId || null });
           console.warn(`[autoexit] PARTIAL/UNFILLED exit ${pos.symbol} for ${pos.userId} — retrying next tick (order ${r.orderId})`);
@@ -5678,7 +5708,14 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
       body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: 1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false }),
     });
     const d = await r.json(); if (!r.ok || d.s === "error") throw new Error(d.message || `fyers buy ${r.status}`);
-    return { orderId: d.id };
+    // Acceptance ≠ execution. Confirm the fill before we register a managed position at the entry — a
+    // rejected order throws the real reason; an order accepted but not confirmed filled throws an
+    // "unconfirmed" error so the pending marker survives and reconciliation/review handles it (rather
+    // than opening a phantom position on a fill that never happened).
+    const c = await verifyFyersFill(sess, d.id, Number(qty));
+    if (c.rejected) throw new Error(c.reason || `FYERS rejected the order (status ${c.status})`);
+    if (!c.filled) throw new Error(`FYERS order ${d.id} accepted but not confirmed filled (status ${c.status ?? "pending"}) — awaiting fill`);
+    return { orderId: d.id, filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice, state: "filled", partial: Number(qty) > 0 && c.filledQty > 0 && c.filledQty < Number(qty) };
   }
   throw new Error(`auto-buy not supported for ${broker}`);
 }
@@ -6054,6 +6091,13 @@ app.post("/api/autobuy/close", requireAuth, async (req, res) => {
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
     await db.updateManagedPosition(pos.id, { status: "closing" });
     const r = await placeExitOrder(sess, pos.brokerSym, pos.qty, pos.market, pos.product, !!pos.short);
+    // R8-lifecycle: don't claim a flat close the broker didn't confirm. Delta/FYERS report r.filled; a
+    // partial/unfilled close leaves real exposure — keep the position OPEN so the exit engine retries and
+    // tell the user, rather than cancelling the strategy over a position that's still live.
+    if (r.filled === false) {
+      await db.updateManagedPosition(pos.id, { status: "open", lastError: `Close not fully filled (state ${r.state}) — the exit engine will keep retrying`, exitOrderId: r.orderId || null });
+      return res.status(409).json({ ok: false, closed: false, orderId: r.orderId || null, error: "Broker didn't confirm a full close — position is still open and will keep retrying. Try again in a moment." });
+    }
     await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close", exitOrderId: r.orderId || null });
     await db.updateRealStrategy(id, { status: "cancelled" });
     res.json({ ok: true, closed: true, orderId: r.orderId || null });

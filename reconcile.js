@@ -87,4 +87,19 @@ function classifyDeltaOrder(o, requested = 0) {
   };
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder };
+/* FYERS order status → fill truth. v3 status codes: 1 cancelled · 2 traded/filled · 4 transit · 5 rejected
+   · 6 pending. Acceptance (an order id) is NOT execution — only status 2 with a positive filled qty is a
+   confirmed fill. Everything we can't positively read as filled/rejected is treated as PENDING (the safe
+   direction: we won't register a phantom entry or mark an unconfirmed exit closed). */
+function classifyFyersOrder(o) {
+  o = o || {};
+  const status = Number(o.status);
+  const qty = Number(o.qty) || 0;
+  const filledQty = Number(o.filledQty != null ? o.filledQty : o.filled_qty) || 0;
+  const avgPrice = (o.tradedPrice != null ? Number(o.tradedPrice) : (o.avgPrice != null ? Number(o.avgPrice) : null));
+  const filled = status === 2 && filledQty > 0;
+  const rejected = status === 5 || status === 1;   // rejected or cancelled → nothing executed
+  return { status, qty, filledQty, avgPrice: Number.isFinite(avgPrice) ? avgPrice : null, filled, rejected, pending: !filled && !rejected };
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder };

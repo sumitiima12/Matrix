@@ -61,6 +61,26 @@ test("classifyDeltaOrder: fully-filled / partial / rejected fill truth", () => {
   assert.equal(closed.fullyFilled, true); assert.equal(closed.filled, 4);
 });
 
+test("classifyFyersOrder: acceptance is not execution — only status 2 with qty is filled", () => {
+  // status 2 = traded/filled
+  const filled = R.classifyFyersOrder({ status: 2, qty: 10, filledQty: 10, tradedPrice: 250.5 });
+  assert.equal(filled.filled, true); assert.equal(filled.rejected, false); assert.equal(filled.pending, false);
+  assert.equal(filled.filledQty, 10); assert.equal(filled.avgPrice, 250.5);
+  // status 6 = pending: accepted but NOT filled → must be pending, never filled
+  const pending = R.classifyFyersOrder({ status: 6, qty: 10, filledQty: 0 });
+  assert.equal(pending.filled, false); assert.equal(pending.pending, true); assert.equal(pending.rejected, false);
+  // status 4 = transit → pending
+  assert.equal(R.classifyFyersOrder({ status: 4, qty: 5 }).pending, true);
+  // status 5 = rejected, status 1 = cancelled → rejected, nothing executed
+  assert.equal(R.classifyFyersOrder({ status: 5, qty: 5 }).rejected, true);
+  assert.equal(R.classifyFyersOrder({ status: 1, qty: 5 }).rejected, true);
+  // status 2 but zero filledQty (schema oddity) → NOT treated as filled (safe direction)
+  assert.equal(R.classifyFyersOrder({ status: 2, qty: 5, filledQty: 0 }).filled, false);
+  // empty/garbage → pending, never a phantom fill
+  assert.equal(R.classifyFyersOrder(null).pending, true);
+  assert.equal(R.classifyFyersOrder({}).filled, false);
+});
+
 test("redirectBindingOk: mismatch always rejected; missing rejected only when enforcing", () => {
   assert.deepEqual(R.redirectBindingOk(null, null, true), { ok: true });                 // nothing bound
   assert.equal(R.redirectBindingOk("https://a/x", "https://a/x", false).ok, true);       // match
