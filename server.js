@@ -1823,7 +1823,18 @@ app.get("/api/history", async (req, res) => {
     //  2. A CONNECTED user -> THEIR OWN broker's history (their data, their use).
     //  3. Everyone else -> Yahoo (delayed/limited).
     let candles = null;
-    if (isHouseOwner(req)) {
+    /* CRYPTO must NEVER touch FYERS — FYERS is an Indian-equity feed and asking it for a crypto ticker throws,
+       which previously propagated to the 502 catch below and showed "no data" for every crypto backtest. Route
+       crypto straight to its exchange: Delta first (it lists small tokens Yahoo doesn't — RAVE/LAB/EVAA), then
+       Yahoo as a secondary for the major coins' longer intraday window. */
+    const isCrypto = /-USD$|USDT$|USDC$/i.test(symbol) || /\.P$/i.test(symbol) || !!yahooToDelta(symbol);
+    if (isCrypto) {
+      const dsym = deltaPerpFromAny(symbol);
+      if (dsym) {
+        try { candles = await memo(`dch:${dsym}:${range}:${interval}`, 60_000, () => deltaCandles(dsym, deltaResolution(interval), range)); }
+        catch { /* fall through to Yahoo for the major coins */ }
+      }
+    } else if (isHouseOwner(req)) {
       // US tickers have no FYERS feed — the owner gets IND Money's live US candles (owner-scoped cache).
       candles = isUsTicker(symbol)
         ? await memo(`imc:${symbol}:${range}:o`, 60_000, () => indmoneyUsCandles(symbol, range, true))
