@@ -10,8 +10,12 @@
  */
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const USING_PG = !!process.env.DATABASE_URL;
+// R20-P1-03: short, stable per-user reference used to NAMESPACE trade ids so one user's row can never share
+// a global primary key with another's (broker order numbers are account-scoped, not globally unique).
+function userRef(userId) { return crypto.createHash("sha1").update(String(userId)).digest("hex").slice(0, 12); }
 let pool = null;
 
 if (USING_PG) {
@@ -197,21 +201,58 @@ const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); }
 const writeJSON = (f, d) => {
   const tmp = `${f}.${process.pid}.${Date.now()}.tmp`;
   try { fs.writeFileSync(tmp, JSON.stringify(d)); fs.renameSync(tmp, f); }
-  catch (e) { try { fs.unlinkSync(tmp); } catch { /* ignore */ } console.error("[db] write failed", e.message); }
+  catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    console.error("[db] write failed", e.message);
+    // R20-P2-13: actually PROPAGATE the failure. A swallowed write let saveTrade() return success while a real
+    // trade was silently lost. Callers that must persist (trades, users) now see the error and can fail closed.
+    throw e;
+  }
 };
 
 /* -------------------------------- trades --------------------------------- */
 async function saveTrade(userId, trade) {
+  const uref = userRef(userId);
+  /* R19 + R20-P1-03: a single REAL broker fill must never appear twice, AND one user's row must never be able
+     to collide with (or overwrite) another user's. So the STORED id is always NAMESPACED by the user:
+       - real trade with a broker orderId → deterministic `t_<uref>_ord_<broker>_<orderId>` (server row and the
+         browser's own row for the same fill collapse to ONE; and user A's orderId 123 can't touch user B's).
+       - anything else → the caller's id, but hard-prefixed with `t_<uref>_` so a client-chosen id can never
+         address another user's row. Idempotent: an already-namespaced id is left as-is. */
+  const nsPrefix = `t_${uref}_`;
+  let sid;
+  if (trade && trade.real && trade.orderId != null && String(trade.orderId) !== "") {
+    const brk = String(trade.broker || "x").toLowerCase().replace(/[^a-z0-9]/g, "");
+    sid = `${nsPrefix}ord_${brk}_${String(trade.orderId)}`;
+  } else {
+    const raw = String((trade && trade.id) || crypto.randomUUID());
+    sid = raw.startsWith(nsPrefix) ? raw : `${nsPrefix}${raw}`;
+  }
+  trade = { ...trade, id: sid };
   const ts = trade.exitAt || trade.entryAt || Date.now();
   if (USING_PG) {
-    // Upsert: the app re-posts a trade when risk orders change or when it closes.
-    await pool.query(
+    /* Ownership-safe upsert: only update a row that ALREADY belongs to this user. The namespaced id makes a
+       cross-user collision practically impossible, and this WHERE clause is the belt-and-suspenders guarantee
+       that a write can never mutate another account's row. RETURNING tells us the upsert actually applied. */
+    const r = await pool.query(
       `INSERT INTO trades (id, user_id, ts, data) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts, data = EXCLUDED.data`,
+       ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts, data = EXCLUDED.data
+       WHERE trades.user_id = EXCLUDED.user_id
+       RETURNING id`,
       [trade.id, userId, ts, trade]
     );
+    if (!r.rowCount) {
+      /* The id exists but is owned by a DIFFERENT user (should be impossible with namespacing, but never lose a
+         write or clobber): re-key to a fresh user-namespaced id and insert. Log LOUDLY — hitting this means a
+         namespacing assumption was violated and the row can no longer dedupe by orderId. */
+      console.error(JSON.stringify({ lvl: "fin", evt: "saveTrade_rekey_on_owner_conflict", user: uref, orderId: trade && trade.orderId, sym: trade && trade.sym }));
+      trade = { ...trade, id: `${nsPrefix}${crypto.randomUUID()}` };
+      const rr = await pool.query(`INSERT INTO trades (id, user_id, ts, data) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`, [trade.id, userId, ts, trade]);
+      if (!rr.rowCount) console.error(JSON.stringify({ lvl: "fin", evt: "saveTrade_rekey_insert_dropped", user: uref, id: trade.id }));
+    }
     return trade;
   }
+  // Flat-file mode is already partitioned by user bucket, so cross-user collision is structurally impossible.
   const db = readJSON(FILES.trades);
   const list = db[userId] || [];
   const i = list.findIndex((t) => t.id === trade.id);
@@ -328,6 +369,18 @@ async function setUserApproved(phone, approved) {
   if (USING_PG) { await pool.query(`UPDATE users SET approved=$2 WHERE phone=$1`, [phone, !!approved]); return; }
   const users = readJSON(FILES.users);
   if (users[phone]) { users[phone].approved = !!approved; writeJSON(FILES.users, users); }
+}
+/* R20-P2-01: UN-approval is a single financial kill — flip approval AND rotate token_version in ONE atomic
+   write, so the API can't return success with tokens still valid. Returns the new token version. (Entry-halt
+   lives in a separate store; the route sets it and fails closed if that write can't be persisted.) */
+async function unapproveUserAndRevoke(phone) {
+  if (USING_PG) {
+    const r = await pool.query(`UPDATE users SET approved=FALSE, token_version=COALESCE(token_version,0)+1 WHERE phone=$1 RETURNING token_version`, [phone]);
+    return r.rows[0] ? (Number(r.rows[0].token_version) || 0) : 0;
+  }
+  const users = readJSON(FILES.users);
+  if (users[phone]) { users[phone].approved = false; users[phone].tokenVersion = (Number(users[phone].tokenVersion) || 0) + 1; writeJSON(FILES.users, users); return users[phone].tokenVersion; }
+  return 0;
 }
 // Accounts awaiting approval, for the admin console.
 async function listPendingUsers(limit = 200) {
@@ -1146,4 +1199,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, getTrades, reassignTrades, recordTradeArchive, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

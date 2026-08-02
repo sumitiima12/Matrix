@@ -123,6 +123,29 @@ function logFinancial(event, fields) {
 async function addUserNotice(userId, notice) {
   try { await db.addNotice(String(userId), { ...notice, at: Date.now() }); } catch { /* non-fatal */ }
 }
+/* R19 fix: persist an authoritative trade row for a VERIFIED real fill — and DO NOT silently swallow a
+   write failure. If the row can't be stored, future risk/position maths would run on an incomplete journal
+   (the exact "operate on incomplete history" hazard). So: retry a few times; if still failing, (1) log a
+   financial-severity event for ops, (2) leave a durable user notice, and (3) for UNATTENDED auto-entries,
+   HALT further entries for that user so the engine won't keep trading against a book it can't record.
+   Returns true if the row is durable, false if it could not be persisted. */
+async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null } = {}) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { await db.saveTrade(userKey, trade); return true; }
+    catch (e) {
+      if (attempt === 2) {
+        logFinancial("authoritative_fill_persist_failed", { userKey, orderId: trade && trade.orderId, sym: trade && trade.sym, broker: trade && trade.broker, err: String((e && e.message) || e) });
+        await addUserNotice(userKey, { kind: "reconcile", severity: "high", title: "Recording a filled order failed", body: `A real ${trade && trade.side} fill on ${trade && trade.sym} executed but couldn't be saved to your history. Please reconcile with your broker; automated entries have been paused as a precaution.`, orderId: trade && trade.orderId });
+        if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") {
+          try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); } catch { /* best-effort */ }
+        }
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+    }
+  }
+  return false;
+}
 /* M-02: on SENSITIVE routes, re-check the DB after requireAuth — reject a token whose version is stale
    (PIN reset / block / logout / deletion bumped it) or whose account is now blocked/deleted. A stolen 30-day
    token can't keep trading after the user secures the account. Best-effort: if the lookup fails we allow (the
@@ -193,9 +216,11 @@ app.post("/api/trades", requireAuth, async (req, res) => {
     if (String(trade.sym).length > 64)
       return res.status(400).json({ error: "symbol too long" });
     const rec = { id: trade.id || crypto.randomUUID(), ...trade };   // collision-proof id (P3-09), not time+short-random
-    await db.saveTrade(userId, rec);
+    // R20 follow-up (H1): saveTrade may re-key to a user-namespaced/canonical id — echo the STORED row back so
+    // the client holds the id the DB actually uses (not the raw one it sent), else later deletes/patches miss.
+    const saved = await db.saveTrade(userId, rec);
     rcBust(`trades:${userId}`);
-    res.json({ ok: true, trade: rec });
+    res.json({ ok: true, trade: saved || rec });
   } catch (e) { serverError(res, e); }
 });
 
@@ -869,13 +894,21 @@ app.post("/api/admin/approve", async (req, res) => {
     const phone = cleanPhone(req.body && req.body.phone);
     const approved = req.body && req.body.approved === false ? false : true;
     if (!phone) return res.status(400).json({ error: "phone required" });
-    await db.setUserApproved(phone, approved);
-    /* R19-P2-03: UN-approval is a security transition — revoke existing tokens (bump the version) and halt new
-       automated entries. (Auto-buy already refuses to enter for approved!==true; this also kills live tokens
-       and freezes the kill-switch so nothing armed keeps trading.) */
+    /* R19-P2-03 / R20-P2-01: UN-approval is ONE financial kill and must not report success unless every part
+       is durable. Approval flip + token-version rotation happen ATOMICALLY (one DB write); then the entry
+       halt is set and, if THAT can't be persisted, we FAIL CLOSED (503) rather than returning success with the
+       kill-switch absent. Auto-buy already refuses to enter for approved!==true; this kills live tokens too. */
     if (!approved) {
-      if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
-      if (typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(storageKeyFor(phone), true); } catch { /* non-fatal */ } }
+      if (typeof db.unapproveUserAndRevoke === "function") {
+        await db.unapproveUserAndRevoke(phone);
+      } else {
+        await db.setUserApproved(phone, false);
+        if (typeof db.bumpTokenVersion === "function") await db.bumpTokenVersion(phone);
+      }
+      try { await db.setEntryHalt(storageKeyFor(phone), true); }
+      catch { return res.status(503).json({ error: "Un-approved and tokens revoked, but the automated-entry halt could not be saved — retry so nothing keeps trading." }); }
+    } else {
+      await db.setUserApproved(phone, true);
     }
     res.json({ ok: true, phone, approved });
   } catch (e) { serverError(res, e); }
@@ -4824,10 +4857,13 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
     b: sess.broker, s: req.body?.symbol, d: req.body?.side, q: req.body?.qty,
     t: req.body?.orderType || "MARKET", p: req.body?.product || "CNC",
     px: req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price,
-    sl: Number(req.body?.slPct) || 0, tp: Number(req.body?.tpPct) || 0,
-    tr: Number(req.body?.trailPct ?? req.body?.trailingPct) || 0,
-    ax: req.body?.autoExit ? 1 : 0, ae: req.body?.autoExitStrategyId || req.body?.strategyId || null,
-    iv: req.body?.interval || null, yh: req.body?.yahoo || req.body?.yahooSymbol || null,
+    // Protection settings that change what actually gets placed — must match the fields the handler reads
+    // below (slPct/tpPct/tslPct/autoExit/strategy), or a same-key retry with different protection replays
+    // the old order silently. `strategy` is the full exit-config object, so hash its canonical JSON.
+    sl: Number(req.body?.slPct) || 0, tp: Number(req.body?.tpPct) || 0, tsl: Number(req.body?.tslPct) || 0,
+    ax: req.body?.autoExit === true ? 1 : 0,
+    st: req.body?.strategy != null ? JSON.stringify(req.body.strategy) : null,
+    ep: req.body?.entryPrice != null ? Number(req.body.entryPrice) : null,
   })).digest("hex");
   {
     /* C2-01: the idempotency claim must FAIL CLOSED. If the ledger can't be written (DB incident), we must
@@ -5004,34 +5040,47 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
          exit engine can't later SELL against a holding that doesn't exist. Order placement itself still
          returns to the client; only the auto-exit arming is gated on the fill. */
       let autoExitId = null, fillStatus = "PENDING", autoExitNote = null;
+      /* R20-P2-09: verify the FILL STATUS ONCE, ALWAYS — independent of whether protection was requested. The
+         same filled market order must report FILLED whether or not SL/TP was asked for (previously it only
+         verified inside `if (wantAutoExit)` and returned PENDING for a plain order). This single source of
+         truth drives both the client status and the authoritative journal write. */
+      const c = await verifyFyersFill(sess, d.id, Number(qty));
+      if (c.filled) fillStatus = "FILLED";
+      else if (c.rejected) fillStatus = "REJECTED";
+      else fillStatus = "PENDING";
+
+      /* R19-P1-04 / R20-P1-02: on ANY verified fill (long or short, protection or not) write the authoritative,
+         user-namespaced, dedupe-by-orderId trade row so risk counters include the execution even if the browser
+         never posts a journal row. recordAuthoritativeFill retries and fails loud (notice + log) on write error. */
+      if (c.filled) {
+        await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+          sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
+          qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
+          entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
+        }, { haltUserIdOnFail: sess.userId });   // H2: if the fill can't be journaled, halt AUTOMATED entries so risk isn't computed on an incomplete book
+      }
+
       if (wantAutoExit) {
         /* R10-audit: our FYERS exit path can only SELL — it cannot BUY-to-cover. So we must NOT arm
            app-managed SL/TP on a SHORT (SELL) entry: the exit engine would later fire another SELL and
            GROW the short instead of closing it. Refuse to arm; the user manages a short in their FYERS app. */
         if (String(side).toLowerCase() !== "buy") {
           autoExitNote = "SL/TP not armed — app-managed FYERS exits support long (BUY) entries only. Our exit can't buy-to-cover a short; manage this position in your FYERS app.";
+        } else if (c.filled) {
+          autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice);
+        } else if (c.rejected) {
+          autoExitNote = "SL/TP not armed — entry was rejected.";
         } else {
-          const c = await verifyFyersFill(sess, d.id, Number(qty));
-          if (c.filled) {
-            autoExitId = await registerAutoExit(c.filledQty || Number(qty), c.avgPrice); fillStatus = "FILLED";
-            // R19-P1-04: server-authoritative trade row on a verified FYERS fill, so risk counters include it
-            // even if the browser never posts a journal row (lost response / closed tab).
-            try { await db.saveTrade(storageKeyFor(sess.userId), { id: `fy_${d.id}`, sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0, entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: "Manual", orderId: d.id, serverAuthored: true }); } catch { /* non-fatal */ }
-          }
-          else if (c.rejected) { fillStatus = "REJECTED"; autoExitNote = "SL/TP not armed — entry was rejected."; }
-          else {
-            fillStatus = "PENDING";
-            /* R16-P2-10: don't abandon the requested protection. Park it so the background watcher attaches
-               SL/TP once (if) this LIMIT entry fills later — protection tracks the CONFIRMED filled qty. */
-            const bareSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
-            await db.savePendingProtection({
-              id: `pp_${sess.userId}_${d.id}`, userId: String(sess.userId), broker: "fyers", orderId: d.id,
-              symbol: bareSym, brokerSym: symbol, qty: Number(qty), market: regMarket, product,
-              sl: slPct || null, tp: tpPct || null, tsl: tslPct || null, cfg: exitCfg,
-              yahoo: req.body?.yahoo || `${bareSym}.NS`, interval: req.body?.interval || "5m", short: String(side).toLowerCase() === "sell",
-            }).catch(() => {});
-            autoExitNote = "Entry not filled yet — we'll attach your SL/TP automatically if it fills. You can also re-arm from the position.";
-          }
+          /* R16-P2-10: don't abandon the requested protection. Park it so the background watcher attaches
+             SL/TP once (if) this LIMIT entry fills later — protection tracks the CONFIRMED filled qty. */
+          const bareSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+          await db.savePendingProtection({
+            id: `pp_${sess.userId}_${d.id}`, userId: String(sess.userId), broker: "fyers", orderId: d.id,
+            symbol: bareSym, brokerSym: symbol, qty: Number(qty), market: regMarket, product,
+            sl: slPct || null, tp: tpPct || null, tsl: tslPct || null, cfg: exitCfg,
+            yahoo: req.body?.yahoo || `${bareSym}.NS`, interval: req.body?.interval || "5m", short: String(side).toLowerCase() === "sell",
+          }).catch(() => {});
+          autoExitNote = "Entry not filled yet — we'll attach your SL/TP automatically if it fills. You can also re-arm from the position.";
         }
       }
       return res.json({ orderId: d.id, status: fillStatus, broker, autoExitId, autoExitArmed: !!autoExitId, ...(autoExitNote ? { autoExitNote } : {}) });
@@ -5086,7 +5135,7 @@ app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res)
       }
       const autoExitId = await registerAutoExit();
       // R19-P1-04: server-authoritative trade row on the verified Delta fill (risk counters count it server-side).
-      try { await db.saveTrade(storageKeyFor(sess.userId), { id: `dl_${o.id}`, sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: "Manual", orderId: o.id ?? null, serverAuthored: true }); } catch { /* non-fatal */ }
+      await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: "Manual", orderId: o.id ?? null, serverAuthored: true }, { haltUserIdOnFail: sess.userId });
       return res.json({ ok: true, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, bracket, autoExitId, raw: o });
     }
 
@@ -6659,13 +6708,15 @@ async function runAutoBuyEngine() {
            engine reads (storageKeyFor), so the daily trade-count / daily-loss / cooldown controls count this
            automated entry even though no browser was open to post a journal row. This is the safety source of
            record; the client journal is a display projection. */
-        try {
-          await db.saveTrade(storageKeyFor(st.userId), {
-            id: `ab_${st.id}_${candleKey}`, sym: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty,
-            entry: fillPx, entryAt: Date.now(), market: st.market, real: true, broker: st.broker,
-            tradeType: "Auto Buy", orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
-          });
-        } catch (te) { console.error("[autobuy] authoritative trade write failed:", te.message); }
+        /* Persist with retry; on total failure this HALTS this user's further auto-entries (via
+           haltUserIdOnFail) so the engine never keeps trading against a book it can't record. Fall back to a
+           deterministic ab_ id only when the fill has no broker orderId (saveTrade canonicalizes by orderId
+           otherwise, collapsing any duplicate client post). */
+        await recordAuthoritativeFill(storageKeyFor(st.userId), {
+          id: `ab_${st.id}_${candleKey}`, sym: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty,
+          entry: fillPx, entryAt: Date.now(), market: st.market, real: true, broker: st.broker,
+          tradeType: "Auto Buy", orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
+        }, { haltUserIdOnFail: st.userId });
         posCache.delete(st.userId);   // this user's positions changed — re-read next time it's needed
         bought++;
         logFinancial(r.partial ? "autobuy.partial" : "autobuy.filled", { userId: st.userId, broker: st.broker, symbol: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty, reqQty: qty, price: fillPx, orderId: r.orderId, reason: sig.reason });
