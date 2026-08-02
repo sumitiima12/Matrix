@@ -88,10 +88,18 @@ function isMarketHoliday(market, nowMs = Date.now()) {
    US (holidays are computed, never stale) are always ready. IN/FNO/Commodity need a loaded IN_HOLIDAYS
    table for the current IST year — if it's missing we can't know weekday holidays, so unattended REAL
    entries must FAIL CLOSED rather than trade on a possibly-closed exchange day. */
+/* Years whose IN_HOLIDAYS list is a VERIFIED-COMPLETE exchange calendar. Deliberately EMPTY: the
+   2026/2027 lists are high-confidence SUBSETS (fixed national + Good Friday) that omit lunar holidays,
+   so they are NOT complete. Add a year here only when its list is the full official NSE/F&O/MCX calendar. */
+const IN_HOLIDAYS_COMPLETE = new Set();
 function holidayCalendarReady(market, nowMs = Date.now()) {
   if (market === "Crypto" || market === "US") return true;
   const yr = Number(zoneDateKey(nowMs, "Asia/Kolkata").slice(0, 4));
-  return !!IN_HOLIDAYS[yr];
+  // R6-P1-03: a partial calendar is NOT "ready" — an incomplete year would let unattended entries run on
+  // an omitted holiday. So real IN/FNO/Commodity entries FAIL CLOSED unless the year's calendar is
+  // verified complete. Operators who accept trading on the subset can opt out via env.
+  if (/^(1|true|yes)$/i.test(String(process.env.ALLOW_INCOMPLETE_HOLIDAY_CALENDAR || ""))) return !!IN_HOLIDAYS[yr];
+  return IN_HOLIDAYS_COMPLETE.has(yr);
 }
 
 function marketOpenIST(market, nowMs = Date.now()) {

@@ -28,6 +28,7 @@ const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
+const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
    routes use this — identity is taken from the token when we have it, and we fall back to the
@@ -3377,12 +3378,10 @@ const OAUTH_STATE_TTL = 10 * 60_000;         // 10 minutes to complete the broke
    means "don't change behaviour" so existing BYOA flows keep working. The canonical redirect is also
    stored in the one-time state record and verified at completion when the client echoes it back. */
 const OAUTH_REDIRECT_ALLOW = (process.env.OAUTH_REDIRECT_ALLOWLIST || "").split(",").map((s) => s.trim()).filter(Boolean);
-function redirectAllowed(redirect) {
-  if (!redirect) return true;                // no redirect supplied → nothing to gate
-  if (!OAUTH_REDIRECT_ALLOW.length) return true;   // not configured → opt-in, don't break existing flows
-  try { const u = new URL(redirect); return OAUTH_REDIRECT_ALLOW.some((a) => u.origin === a || redirect.startsWith(a)); }
-  catch { return false; }
-}
+/* R6-P2-03: match on EXACT origin + a PATH BOUNDARY — never a naive startsWith, which would let
+   "https://app.example" prefix-match the attacker origin "https://app.example.evil.com". An allow entry
+   may be a bare origin ("https://app.example") or an origin+path prefix ("https://app.example/oauth"). */
+const redirectAllowed = (redirect) => reconcile.redirectAllowed(redirect, OAUTH_REDIRECT_ALLOW);
 function issueOAuthState(userId, broker, redirect = null) {
   const now = Date.now();
   for (const [k, v] of oauthStates) if (v.exp < now) oauthStates.delete(k);   // prune expired
@@ -3398,8 +3397,10 @@ function consumeOAuthState(nonce, broker, userId, redirect = null) {
   if (s.exp < Date.now()) return { ok: false, reason: "the login expired — please try again" };
   if (s.broker !== broker) return { ok: false, reason: "broker mismatch" };
   if (s.userId && userId && String(s.userId) !== String(userId)) return { ok: false, reason: "this login belongs to a different account" };
-  // Bind the transaction to the redirect that started it — when the client echoes it back at completion.
-  if (redirect && s.redirect && String(s.redirect) !== String(redirect)) return { ok: false, reason: "redirect mismatch" };
+  // R6-P1-02: bind the transaction to the redirect that STARTED it (mismatch always rejected; missing
+  // echo rejected only when OAUTH_ENFORCE_REDIRECT is on). Pure decision in reconcile.js.
+  const rb = reconcile.redirectBindingOk(s.redirect, redirect, /^(1|true|yes)$/i.test(String(process.env.OAUTH_ENFORCE_REDIRECT || "")));
+  if (!rb.ok) return rb;
   return { ok: true };
 }
 
@@ -5401,10 +5402,10 @@ async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, ma
 
 /* R4-P1-01 ADOPT: register a managed position for an order the user CONFIRMS filled but which we never
    linked (the unknown-order case). Places NO new broker order — it only records the position so the exit
-   engine protects it and the strategy won't open a duplicate. For Delta we adopt the broker's ACTUAL
-   open position (real size + entry); for other brokers we adopt a protective placeholder at the
-   strategy's intended size and the live mark (the reduce-only exit later flattens the true size).
-   Returns the managed position, or null if the broker shows FLAT / we can't size it. */
+   engine protects it and the strategy won't open a duplicate. Adoption uses the broker's ACTUAL open
+   position (real size + entry) — supported for Delta today; refused for brokers without a position
+   lookup (R6-P1-01), since guessing quantity/price is unsafe. Returns the managed position, or null if
+   the broker shows FLAT, is unsupported, or we can't read it. */
 async function adoptBrokerPosition(st) {
   const sess = await sessionFromCred(st.userId, st.broker);
   if (!sess) return null;
@@ -5422,13 +5423,27 @@ async function adoptBrokerPosition(st) {
     const short = Number(p.size) < 0;
     return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short });
   }
-  // Non-Delta: protective placeholder at the strategy's intended size.
-  const px = (await liveMarkForOrder(st.brokerSym, st.market).catch(() => 0)) || 0;
-  if (!(px > 0)) return null;
-  const notional = Number(st.notional) || 0;
-  const qty = st.market === "Crypto" ? +(notional / px).toFixed(6) : Math.max(1, Math.floor(notional / px));
-  if (!(qty > 0)) return null;
-  return registerManagedPosition({ sess, symbol: st.symbol, brokerSym: st.brokerSym, qty, entry: px, market: st.market, sl: st.sl, tp: st.tp, tsl: st.tsl, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: !!st.short });
+  // R6-P1-01: for brokers WITHOUT an actual position lookup we refuse to adopt. Synthesizing a managed
+  // position from the intended notional + current price is unsafe — a partial fill, a different fill
+  // price, or pre-existing exposure would make the reduce-only exit under-/over-close or reverse. Better
+  // to keep the strategy paused than to invent real-money position truth. (Delta is handled above.)
+  return null;
+}
+
+/* R6-P2-01: read the broker's open size for a strategy's instrument, so "no fill" can require BROKER
+   EVIDENCE (that the account is flat) rather than a bare user assertion. Returns { size } in contracts
+   (0 = flat) for Delta, or null when we can't read the broker (unsupported broker or a transport error).
+   The caller treats null as "unverifiable → don't clear". */
+async function brokerOpenSize(st) {
+  if (st.broker !== "delta") return null;
+  let held = null;
+  try { const pr = await deltaCall("GET", "/v2/positions/margined", { userId: st.userId }); held = (pr && pr.result); } catch { return null; }
+  if (!Array.isArray(held)) return null;
+  let dprod = null;
+  try { const prods = await deltaCall("GET", "/v2/products", { signed: false }); dprod = (prods.result || []).find((p) => p.symbol === st.brokerSym) || null; } catch { /* ignore */ }
+  const pid = dprod ? dprod.id : null;
+  const p = held.find((x) => (pid != null && Number(x.product_id) === Number(pid)) || String(x.product_symbol || "") === String(st.brokerSym));
+  return { size: p ? Math.abs(Number(p.size) || 0) : 0 };
 }
 
 let autoExitRunning = false;
@@ -5688,12 +5703,14 @@ const DELTA_PROBE_PAGE = 500;
 async function brokerOrderProbe(st) {
   if (st.broker !== "delta" || !st.pendingClientId) return null;
   const cid = String(st.pendingClientId);
+  // R6-P2-02: our order was placed at `pendingSince`, and Delta returns newest-first, so even a FULL page is
+  // conclusive once it contains a record older than that boundary. Conclusiveness + id-match are PURE and
+  // unit-tested in reconcile.js. Timestamps we can't parse only keep the result inconclusive, never clear it.
+  const boundary = Number(st.pendingSince) || 0;
   const scan = async (path) => {
     const resp = await deltaCall("GET", path, { query: `?page_size=${DELTA_PROBE_PAGE}`, userId: st.userId });
-    if (!resp || !Array.isArray(resp.result)) return { found: false, conclusive: false };   // bad schema → inconclusive
-    const found = resp.result.some((o) => String((o && o.client_order_id) || "") === cid);
-    const conclusive = resp.result.length < DELTA_PROBE_PAGE;   // a short page means we saw them all
-    return { found, conclusive };
+    const records = resp && resp.result;
+    return { found: reconcile.hasClientOrderId(records, cid), conclusive: reconcile.pageConclusive(records, DELTA_PROBE_PAGE, boundary) };
   };
   try {
     const live = await scan("/v2/orders");
@@ -5936,12 +5953,23 @@ app.post("/api/autobuy/pause", requireAuth, async (req, res) => {
       logFinancial("autobuy.review.adopted", { userId, id, positionId: adopted.id });
       return res.json({ ok: true, status: "active", adopted: adopted.id, note: "Adopted your open broker position — the exit engine now manages it and no new entry will be placed." });
     }
-    return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason: "No matching OPEN position found at your broker to adopt. If it already closed, choose “Didn't fill”; otherwise flatten it with Stop & sell." });
+    // R6-P1-01: adoption reads the broker's ACTUAL position; only Delta supports it today.
+    const reason = mine.broker === "delta"
+      ? "No matching OPEN position found at your broker to adopt. If it already closed, choose “Didn't fill”; otherwise flatten it with Stop & sell."
+      : `Adopting a real position isn't supported for ${mine.broker} yet (we won't guess quantity/price). Manage the position in your broker app or use “Stop & sell”, then resolve as “Didn't fill” once your account is flat.`;
+    return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason });
   }
   if (resolution === "nofill") {
+    // R6-P2-01: where we CAN get broker evidence (Delta), require the account to be FLAT before clearing.
+    // If the broker shows an open position, the order actually filled → refuse and steer to adopt.
+    if (mine.broker === "delta") {
+      const os = await brokerOpenSize(mine);
+      if (os == null) return res.status(502).json({ ok: false, needsReview: true, reason: "Couldn't confirm with your broker that the account is flat — try again in a moment." });
+      if (os.size > 0) return res.status(409).json({ ok: false, needsReview: true, status: "paused", reason: "Your broker shows an OPEN position for this strategy — the order DID fill. Choose “Order filled” to adopt it (or flatten with Stop & sell)." });
+    }
     await db.updateRealStrategy(id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null });
-    logFinancial("autobuy.review.resolvedNoFill", { userId, id });
-    return res.json({ ok: true, status: "active", note: "Resolved as no-fill — resumed. Watch the next entry closely." });
+    logFinancial("autobuy.review.resolvedNoFill", { userId, id, verified: mine.broker === "delta" });
+    return res.json({ ok: true, status: "active", note: mine.broker === "delta" ? "Broker confirmed no open position — resolved as no-fill and resumed." : "Resolved as no-fill — resumed. Watch the next entry closely." });
   }
   // No explicit resolution → keep blocked and ask the user to choose an outcome.
   return res.status(409).json({

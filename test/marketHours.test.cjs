@@ -94,14 +94,22 @@ test("intradaySquareDue: crypto never squares off", () => {
   assert.equal(intradaySquareDue("Crypto", istEpoch(SAT, 3, 0)), false);
 });
 
-// R4/R5-P2-02: calendar readiness gates fail-closed real entries. Crypto/US are always ready; IN is ready
-// only for years present in IN_HOLIDAYS (2026/2027), and NOT ready for an uncovered future year.
-test("holidayCalendarReady: crypto/US always, IN only for loaded years", () => {
+// R6-P1-03: readiness requires a VERIFIED-COMPLETE calendar. Crypto/US always ready; IN fails closed even
+// for 2026/2027 (those are partial subsets), unless the operator opts into the subset via env.
+test("holidayCalendarReady: crypto/US always; IN fails closed on partial calendars", () => {
+  delete process.env.ALLOW_INCOMPLETE_HOLIDAY_CALENDAR;
   assert.equal(holidayCalendarReady("Crypto", istEpoch("2099-01-05", 12, 0)), true);
   assert.equal(holidayCalendarReady("US", istEpoch("2099-01-05", 12, 0)), true);
-  assert.equal(holidayCalendarReady("IN", istEpoch("2026-06-01", 12, 0)), true);
-  assert.equal(holidayCalendarReady("IN", istEpoch("2027-06-01", 12, 0)), true);
+  assert.equal(holidayCalendarReady("IN", istEpoch("2026-06-01", 12, 0)), false);   // partial subset → not ready (fail closed)
   assert.equal(holidayCalendarReady("IN", istEpoch("2035-06-01", 12, 0)), false);   // no table → not ready
+});
+
+test("holidayCalendarReady: env opt-out re-enables IN on the loaded subset", () => {
+  process.env.ALLOW_INCOMPLETE_HOLIDAY_CALENDAR = "1";
+  try {
+    assert.equal(holidayCalendarReady("IN", istEpoch("2026-06-01", 12, 0)), true);   // opted in → subset counts
+    assert.equal(holidayCalendarReady("IN", istEpoch("2035-06-01", 12, 0)), false);  // still no table for 2035
+  } finally { delete process.env.ALLOW_INCOMPLETE_HOLIDAY_CALENDAR; }
 });
 
 // R3-#7: the Indian calendar now extends past 2026. Republic Day 2027-01-26 is a recognised holiday,
