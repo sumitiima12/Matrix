@@ -24,6 +24,9 @@
 function evalExitPair(sl, tp, events, maxBars = 200, short = false, costPct = 0) {
   const cost = Math.max(0, +costPct || 0);           // round-trip cost as % of notional, netted per trade
   let n = 0, wins = 0, sumWin = 0, sumLoss = 0, sumRet = 0, slHit = 0, tpHit = 0, pnlAbs = 0;
+  // Fixed-stake equity curve (in % points of stake), to measure max drawdown for the return-on-capital
+  // metric — the same model the backtest uses: one fixed stake per trade, gains NOT reinvested.
+  let cum = 0, peak = 0, maxDDpts = 0;
   for (const ev of events) {
     const c = ev.c, e = ev.e;
     // CAUSAL: the entry SIGNAL is on closed bar `e`; a trader fills at the NEXT bar's OPEN, never at
@@ -52,23 +55,41 @@ function evalExitPair(sl, tp, events, maxBars = 200, short = false, costPct = 0)
     ret -= cost;                                      // net the round-trip cost off the % return …
     n++; sumRet += ret; pnlAbs += (short ? (px - exitPx) : (exitPx - px)) - cost / 100 * px;      // … and off the absolute P&L
     if (ret > 0) { wins++; sumWin += ret; } else { sumLoss += ret; }
+    // Fixed-stake cumulative equity (% points) + running max drawdown.
+    cum += ret; if (cum > peak) peak = cum; const dd = peak - cum; if (dd > maxDDpts) maxDDpts = dd;
   }
   if (!n) return null;
   const pf = sumLoss !== 0 ? Math.abs(sumWin / sumLoss) : (sumWin > 0 ? Infinity : 0);
+  // RETURN ON REQUIRED CAPITAL (headline, matches the backtest): total P&L ÷ (100% stake + 1.5 × max
+  // drawdown). e.g. +1/+2/+3 with no drawdown → 6 / 100 = 6%; a drawdown enlarges the denominator.
+  const retCap = riskAdjustedReturnPct(sumRet, 100, maxDDpts);
   return {
     sl, tp, trades: n, wins, slHit, tpHit,
-    winRate: +((wins / n) * 100).toFixed(1), retPct: +sumRet.toFixed(1), pnl: +pnlAbs.toFixed(2),
+    winRate: +((wins / n) * 100).toFixed(1), retPct: +sumRet.toFixed(1), retCap: retCap == null ? null : +retCap.toFixed(1),
+    maxDD: +maxDDpts.toFixed(1), pnl: +pnlAbs.toFixed(2),
     expectancy: +(sumRet / n).toFixed(3), profitFactor: isFinite(pf) ? +pf.toFixed(2) : null,
   };
+}
+
+/* Return on REQUIRED CAPITAL — the risk-adjusted headline return, identical to the frontend backtest.
+   Numerator = total P&L (fixed-stake sum). Denominator = deployed stake + a 1.5× max-drawdown buffer.
+   With `base` = 100 (% stake) and `maxDD` in % points, this yields a percentage directly. */
+function riskAdjustedReturnPct(pnl, base, maxDD) {
+  const denom = (Number(base) || 0) + 1.5 * Math.max(0, Number(maxDD) || 0);
+  return denom > 0 ? (pnl / denom) * 100 : null;
 }
 
 /* Ranking comparators for the two user objectives. "winrate" maximises % of winning trades (tie-break
    by total return); "pnl" maximises total return (tie-break by win rate). Sorts ascending → the better
    candidate compares as "less than" and lands first. */
 function optRanker(objective) {
+  // The return objective ranks by RETURN ON REQUIRED CAPITAL (retCap: P&L ÷ (stake + 1.5×maxDD)), the
+  // same headline the backtest shows — so the optimiser picks the SL/TP or indicator length the backtest
+  // would rate best, not one that just piled up raw return with a brutal drawdown. Falls back to retPct.
+  const ret = (x) => (x.retCap != null ? x.retCap : x.retPct);
   return objective === "winrate"
-    ? (a, b) => b.winRate - a.winRate || b.retPct - a.retPct
-    : (a, b) => b.retPct - a.retPct || b.winRate - a.winRate;
+    ? (a, b) => b.winRate - a.winRate || ret(b) - ret(a)
+    : (a, b) => ret(b) - ret(a) || b.winRate - a.winRate;
 }
 
 /* Candidate lengths the indicator optimiser tries for a given current length: 0.5×, 0.7×, 1×, 1.4×, 2×,
