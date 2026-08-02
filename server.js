@@ -667,18 +667,25 @@ app.post("/api/admin/clear-virtual", async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
-/* ADMIN: wipe ONE trade type's VIRTUAL history for a user — Manual / Auto Buy / Screener Auto Buy /
-   Automate. Real broker trades are NEVER touched. Lets the admin reset a single bucket's dashboard. */
+/* ADMIN: wipe ONE trade type's history for a user — Manual / Auto Buy / Screener Auto Buy / Automate.
+   `scope` = "virtual" (default), "real", or "all". This clears only the JOURNAL rows behind the
+   dashboard/history; it does NOT place any broker order, close any real position, or touch the server's
+   managed positions / armed strategies. Used to drop phantom or duplicated journal records so the
+   displayed P&L reflects reality. Real broker holdings are unaffected. */
 const CLEARABLE_TYPES = new Set(["Manual", "Auto Buy", "Screener Auto Buy", "Automate"]);
+const CLEAR_SCOPES = new Set(["virtual", "real", "all"]);
 app.post("/api/admin/clear-trades", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
     const phone = cleanPhone(req.body && req.body.phone);
     const tradeType = String((req.body && req.body.tradeType) || "");
+    const scope = String((req.body && req.body.scope) || "virtual");
     if (!phone) return res.status(400).json({ error: "phone required" });
     if (!CLEARABLE_TYPES.has(tradeType)) return res.status(400).json({ error: "invalid tradeType" });
-    const removed = await db.clearTradesByType(storageKeyFor(phone), tradeType);
-    res.json({ ok: true, phone, tradeType, removed });
+    if (!CLEAR_SCOPES.has(scope)) return res.status(400).json({ error: "invalid scope" });
+    const removed = await db.clearTradesByType(storageKeyFor(phone), tradeType, scope);
+    logFinancial("admin.clearTrades", { phone: storageKeyFor(phone), tradeType, scope, removed });
+    res.json({ ok: true, phone, tradeType, scope, removed });
   } catch (e) { serverError(res, e); }
 });
 

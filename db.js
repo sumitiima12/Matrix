@@ -184,14 +184,23 @@ async function clearVirtualTrades(userId) {
   return before - db[userId].length;
 }
 
-/* Clear only ONE trade type's VIRTUAL (paper) history for a user — Manual / Auto Buy / Screener Auto
-   Buy / Automate. Real broker trades are never touched. Lets the admin reset one bucket's dashboard
-   without wiping the others. */
-async function clearTradesByType(userId, tradeType) {
+/* Clear ONE trade type's history for a user — Manual / Auto Buy / Screener Auto Buy / Automate.
+   `scope` selects which books to clear: "virtual" (default, paper only — real trades never touched),
+   "real" (only real broker journal entries), or "all" (both). This only wipes JOURNAL rows shown in the
+   dashboard/history — it does NOT touch the broker or the server's managed positions / armed strategies,
+   so it's a safe display reset (used to drop phantom/duplicate journal records). */
+async function clearTradesByType(userId, tradeType, scope = "virtual") {
   const tt = String(tradeType || "");
+  const sc = scope === "real" || scope === "all" ? scope : "virtual";
+  // Predicate on a trade's realness that matches the requested scope.
+  const scopeMatchJS = (t) => sc === "all" ? true : sc === "real" ? (t.real === true) : (t.real !== true);
   if (USING_PG) {
+    // COALESCE((data->>'real')::boolean,false): true=real, false=virtual.
+    const realCond = sc === "all" ? "" : sc === "real"
+      ? "AND COALESCE((data->>'real')::boolean, false) = true"
+      : "AND COALESCE((data->>'real')::boolean, false) = false";
     const r = await pool.query(
-      `DELETE FROM trades WHERE user_id=$1 AND COALESCE((data->>'real')::boolean, false) = false AND COALESCE(data->>'tradeType','Manual') = $2`,
+      `DELETE FROM trades WHERE user_id=$1 ${realCond} AND COALESCE(data->>'tradeType','Manual') = $2`,
       [userId, tt]
     );
     return r.rowCount || 0;
@@ -199,7 +208,7 @@ async function clearTradesByType(userId, tradeType) {
   const db = readJSON(FILES.trades);
   const arr = db[userId] || [];
   const before = arr.length;
-  db[userId] = arr.filter((t) => t && (t.real === true || (t.tradeType || "Manual") !== tt));
+  db[userId] = arr.filter((t) => !(t && scopeMatchJS(t) && (t.tradeType || "Manual") === tt));
   writeJSON(FILES.trades, db);
   return before - db[userId].length;
 }
