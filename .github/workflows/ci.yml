@@ -28,12 +28,13 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - name: Syntax check
-        run: node --check server.js && node --check db.js && node --check auth.js && node --check riskEngine.js
-      - name: Unit tests (risk, parity, reconcile, idempotency, claims)
-        run: npm test
-      - name: Postgres integration tests (journal safety invariants)
+        run: node --check server.js && node --check db.js && node --check auth.js && node --check riskEngine.js && node --check reconcile.js
+      # The FULL suite runs against the ephemeral Postgres so the PG integration + restart-recovery safety
+      # tests actually EXECUTE (they self-skip without DATABASE_URL). With CI=true set by Actions, the
+      # ciPgRequired guard turns any PG skip into a CI failure — safety coverage can't silently vanish.
+      - name: Tests (unit + PostgreSQL integration + fault-injection; skips fail CI)
         env:
           DATABASE_URL: postgres://matrix:matrix@localhost:5432/matrix_test
-        run: node --test test/pgIntegration.test.cjs
+        run: npm test
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
