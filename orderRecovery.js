@@ -28,12 +28,13 @@ async function reconcileUnresolvedAttempts(deps) {
 
   const attempts = await db.listUnresolvedOrderAttempts(limit);
   let resolved = 0, adopted = 0, keptLocked = 0;
+  const lockUsers = new Set();   // users with an attempt we could NOT resolve → re-lock them per-user
 
   for (const a of attempts) {
     let ob;
     try { ob = await probeByTag(a); }
-    catch { keptLocked++; logger("c03.recover.unreachable", { id: a.id, tag: a.orderTag }); continue; }   // broker down ⇒ lock stays
-    if (ob == null) { keptLocked++; logger("c03.recover.inconclusive", { id: a.id, tag: a.orderTag }); continue; }
+    catch { keptLocked++; if (a.userId) lockUsers.add(a.userId); logger("c03.recover.unreachable", { id: a.id, tag: a.orderTag }); continue; }   // broker down ⇒ lock stays
+    if (ob == null) { keptLocked++; if (a.userId) lockUsers.add(a.userId); logger("c03.recover.inconclusive", { id: a.id, tag: a.orderTag }); continue; }
 
     if (ob.status === "filled") {
       // Adopt the fill EXACTLY ONCE (the fills ledger dedupes on the broker key), then resolve terminally.
@@ -51,26 +52,28 @@ async function reconcileUnresolvedAttempts(deps) {
       // so the account stays locked until it settles fully.
       await adoptFill(a, ob);
       await db.finalizeOrderAttempt(a.id, "PARTIAL", { brokerOrderId: ob.orderId || null, filledQty: ob.filledQty, avgPrice: ob.avgPrice });
-      keptLocked++;
+      keptLocked++; if (a.userId) lockUsers.add(a.userId);
       logger("c03.recover.partial", { id: a.id, tag: a.orderTag, filledQty: ob.filledQty });
     } else {
       // pending / unknown → not conclusive → stay locked, retry a later sweep.
-      keptLocked++;
+      keptLocked++; if (a.userId) lockUsers.add(a.userId);
       logger("c03.recover.pending", { id: a.id, tag: a.orderTag, status: ob.status });
     }
   }
 
-  // Re-arm the durable safety state while ANYTHING is still unresolved (recheck the store — a fault could have
-  // left a finalize incomplete). Fail closed: if we can't read/lock, we keep the halt engaged.
-  let stillUnresolved = keptLocked > 0;
-  try { if (!stillUnresolved) stillUnresolved = (await db.listUnresolvedOrderAttempts(1)).length > 0; }
-  catch { stillUnresolved = true; }
-  if (stillUnresolved) {
-    if (setLock) await setLock(true);
-    if (setHalt) await setHalt(true);
+  // Re-arm the durable safety state PER-USER for every account with an unresolved attempt (same signature as
+  // rearmFromUnresolvedAttempts). Fail closed: on a read error we keep every touched user locked.
+  try {
+    const remaining = await db.listUnresolvedOrderAttempts(limit);
+    for (const a of remaining) if (a && a.userId) lockUsers.add(a.userId);
+  } catch { /* keep whatever we already gathered locked */ }
+  for (const uid of lockUsers) {
+    if (setLock) await setLock(uid, true);
+    if (setHalt) await setHalt(uid, true);
   }
-  logger("c03.recover.done", { attempts: attempts.length, resolved, adopted, keptLocked, stillUnresolved });
-  return { owner: true, attempts: attempts.length, resolved, adopted, keptLocked, stillUnresolved };
+  const stillUnresolved = lockUsers.size > 0;
+  logger("c03.recover.done", { attempts: attempts.length, resolved, adopted, keptLocked, stillUnresolved, lockedUsers: lockUsers.size });
+  return { owner: true, attempts: attempts.length, resolved, adopted, keptLocked, stillUnresolved, lockedUsers: [...lockUsers] };
 }
 
 /* C03 slice 2b — the WRITE-BEFORE-SEND submit orchestrator. This is the seam wired into the live FYERS branch

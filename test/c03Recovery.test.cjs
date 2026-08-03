@@ -37,11 +37,13 @@ function makeProbe(fy) {
     return { status: "pending" };
   };
 }
-const spies = () => { const s = { adopt: [], lock: [], halt: [] }; return {
+// setLock/setHalt use the production PER-USER signature (uid, bool). We record the boolean AND the uid so a
+// test can assert both "re-armed true" and "for the right account".
+const spies = () => { const s = { adopt: [], lock: [], halt: [], lockUsers: [], haltUsers: [] }; return {
   s,
   adoptFill: async (a, ob) => { s.adopt.push({ id: a.id, qty: ob.filledQty }); },
-  setLock: async (v) => { s.lock.push(v); },
-  setHalt: async (v) => { s.halt.push(v); },
+  setLock: async (uid, v) => { s.lock.push(v); s.lockUsers.push(uid); },
+  setHalt: async (uid, v) => { s.halt.push(v); s.haltUsers.push(uid); },
 }; };
 
 test("C03R: lost-response order is reconciled by orderTag, fill adopted ONCE, attempt resolved", async () => {
@@ -102,6 +104,7 @@ test("C03R: broker UNREACHABLE at restart ⇒ attempt stays unresolved AND lock 
   assert.equal((await db.getOrderAttempt("R3")).resolved, false, "unresolved until the broker can confirm");
   assert.deepEqual(sp.s.lock.at(-1), true, "risk lock re-armed");
   assert.deepEqual(sp.s.halt.at(-1), true, "entry halt re-armed");
+  assert.ok(sp.s.lockUsers.includes("u1"), "the affected user is re-locked");
 });
 
 test("C03R: partial fill is adopted but the attempt stays unresolved (residual still open)", async () => {

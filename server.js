@@ -77,6 +77,13 @@ function isHouseOwner(req) {
 const stripPh = (s) => String(s || "").replace(/^ph_/, "");   // "ph_9167..." -> "9167..."   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
+/* #441 test seam — when MATRIX_NO_LISTEN=1 the module wires up the FULL Express app (all routes/middleware,
+   schema init, C03 startup re-arm) but does NOT bind a port or start network-touching token timers. A route-level
+   integration test sets DATABASE_URL/ORDER_ATTEMPTS_FILE/C03_ORDER_ATTEMPTS first, requires this module to get the
+   real `app`, drives it over an ephemeral http.Server, and asserts real handler behaviour. Production (flag unset)
+   boots byte-for-byte as before: it listens and runs every timer. This is the createApp() capability without the
+   risk of relocating the 7.6k-line file's scattered schedulers. */
+const MATRIX_NO_LISTEN = /^(1|true|yes)$/i.test(String(process.env.MATRIX_NO_LISTEN || ""));
 
 /* CORS locked to known origins (was wide-open app.use(cors())). The custom broker headers
    MUST stay allowed or every /api/broker/* preflight fails. Extra origins can be added via
@@ -7630,9 +7637,12 @@ async function refreshAllBrokerTokens() {
 }
 
 // Warm the cache shortly after boot (give initDb a moment), then refresh tokens every 6h.
-setTimeout(warmAppCredCache, 3000).unref?.();
-setTimeout(refreshAllBrokerTokens, 15000).unref?.();
-setInterval(refreshAllBrokerTokens, 6 * 60 * 60 * 1000).unref?.();
+// Skipped under the #441 test seam so route tests never make live broker-token network calls.
+if (!MATRIX_NO_LISTEN) {
+  setTimeout(warmAppCredCache, 3000).unref?.();
+  setTimeout(refreshAllBrokerTokens, 15000).unref?.();
+  setInterval(refreshAllBrokerTokens, 6 * 60 * 60 * 1000).unref?.();
+}
 
 /* WARN on missing/weak critical secrets (audit P1-12). A random per-boot JWT secret silently
    logs everyone out on restart; a missing CRED_KEY weakens broker-credential encryption. We log
@@ -7662,4 +7672,9 @@ setInterval(refreshAllBrokerTokens, 6 * 60 * 60 * 1000).unref?.();
   console.warn("[startup] WARNING — missing/weak critical secrets: " + problems.join(", ") + ". Set these in production for secure sessions + credential encryption." + (prod && credWeak ? " Set CRED_KEY_REQUIRED=1 to enforce once configured." : ""));
 })();
 
-app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
+// #441 test seam: export the wired app + the readiness predicate so an integration test can drive real routes
+// against an ephemeral Postgres. Under MATRIX_NO_LISTEN we do NOT bind a port (the test owns the http.Server).
+module.exports = { app, isSchemaReady: () => schemaReady };
+if (!MATRIX_NO_LISTEN) {
+  app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
+}
