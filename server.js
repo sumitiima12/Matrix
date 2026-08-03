@@ -84,6 +84,13 @@ const app = express();
    boots byte-for-byte as before: it listens and runs every timer. This is the createApp() capability without the
    risk of relocating the 7.6k-line file's scattered schedulers. */
 const MATRIX_NO_LISTEN = /^(1|true|yes)$/i.test(String(process.env.MATRIX_NO_LISTEN || ""));
+/* C03 durable write-before-send order attempts. Now ENABLED BY DEFAULT (the literal /api/broker/order route
+   proofs against real Postgres + a fake FYERS pass: write-before-send, DB-fail ⇒ zero broker orders, lost-response
+   ⇒ recover-by-tag/no-duplicate, concurrent-dup ⇒ ≤1 order, restart reconcile adopts once). There is NO silent
+   legacy fallback: when this is on and the durable PREPARED write fails, submitWithAttempt THROWS before the broker
+   is ever called (the order fails closed) — it never quietly reverts to the un-guarded legacy send. Set
+   C03_ORDER_ATTEMPTS=0 as an explicit operational kill switch to fall back to the legacy path. */
+const C03_ORDER_ATTEMPTS_ON = String(process.env.C03_ORDER_ATTEMPTS || "") !== "0";
 
 /* CORS locked to known origins (was wide-open app.use(cors())). The custom broker headers
    MUST stay allowed or every /api/broker/* preflight fails. Extra origins can be added via
@@ -211,6 +218,75 @@ async function recordExitFill(userKey, pos, r, reason) {
     await addUserNotice(pos && pos.userId, { type: "exit_unjournaled", broker: pos && pos.broker, symbol: pos && pos.symbol, msg: `Your ${pos && pos.symbol} position closed at your broker, but recording the closing trade failed — we'll reconcile it. No action needed.` });
   }
 }
+
+/* C01 — AUTHORITATIVE reduce-only CLOSE accounting. A reduce-only fill is an EXIT, never a new position. The
+   browser physically CANNOT close a server-authored real row (saveTrade only merges CLIENT_PRESENTATION_FIELDS
+   onto broker truth), so the close MUST be booked server-side. This:
+     1. appends the immutable EXIT leg to the fills ledger (kind:"exit", entryOrderId), idempotent by the close
+        order id — a replay is a no-op (so no double-close);
+     2. FIFO-consumes the closing quantity across the user's OPEN real rows for this symbol in the OPPOSITE
+        direction (a SELL closes longs, a BUY covers shorts), fully closing a consumed row (exit/exitAt/pnl/status)
+        or SPLITTING a partially-consumed one — the residual stays OPEN and a NEW closed row books the realized
+        P&L for the executed portion;
+     3. NEVER creates opposite exposure in the trade projection.
+   Realized P&L uses the SAME formula as the exit engine: (exit − entry) × qty × dir, dir = +1 long / −1 short.
+   Fail-loud: a ledger-write failure risk-locks the account (like recordAuthoritativeFill) so a close that couldn't
+   be recorded pauses trading rather than silently corrupting the book. Returns { applied, unmatched, alreadyDone }. */
+async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = {}) {
+  const { sym, closeSide, qty, exitPx, orderId, entryOrderId, broker, market, tradeType, strategy } = fill;
+  const bareSym = (s) => String(s || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
+  const wantQty = Number(qty) || 0;
+  // 1 — immutable exit leg (idempotent by close orderId+qty). If it was already recorded, this whole close was
+  //     already booked → do NOT touch the trade rows again (idempotent replay).
+  let inserted = true;
+  try {
+    const r = await db.recordFill(userKey, {
+      id: `exit_ord_${orderId}`, kind: "exit", side: closeSide, qty: wantQty, entry: exitPx, price: exitPx,
+      orderId, entryOrderId: entryOrderId != null ? String(entryOrderId) : null, broker, market: market || "IN",
+      real: true, serverAuthored: true, tradeType: tradeType ? `${tradeType} Exit` : "Manual Exit",
+      ...(strategy ? { strategy } : {}), ts: Date.now(),
+    });
+    inserted = !!(r && r.inserted);
+  } catch (e) {
+    logFinancial("reduceonly_exit.ledger_failed", { userKey, orderId, sym: bareSym(sym), err: String((e && e.message) || e) });
+    try { await db.setRiskLock(userKey, true); } catch { /* best-effort */ }
+    if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); haltedEntries.add(String(storageKeyFor(String(haltUserIdOnFail)))); } catch { /* best-effort */ } }
+    await addUserNotice(userKey, { type: "exit_unjournaled", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed but couldn't be recorded — new orders are paused as a precaution. Please reconcile with your broker.` });
+    return { applied: 0, unmatched: wantQty, error: String((e && e.message) || e) };
+  }
+  if (!inserted) return { applied: 0, unmatched: 0, alreadyDone: true };   // replay — already booked
+
+  // 2 — apply to OPEN real rows for this symbol, OPPOSITE direction, FIFO by entry time.
+  const openDir = String(closeSide).toUpperCase() === "SELL" ? "long" : "short";   // SELL closes a long; BUY covers a short
+  const dir = openDir === "long" ? 1 : -1;
+  let all = [];
+  try { all = await db.getTrades(userKey, 0, Date.now()); } catch { all = []; }
+  const isOpen = (t) => t && t.real === true && t.entryAt != null && t.exitAt == null && t.exit == null && t.status !== "rejected"
+    && bareSym(t.sym) === bareSym(sym)
+    && (openDir === "long"
+      ? (String(t.side || "").toUpperCase() !== "SELL" && t.short !== true)
+      : (String(t.side || "").toUpperCase() === "SELL" || t.short === true));
+  const open = all.filter(isOpen).sort((a, b) => (Number(a.entryAt) || 0) - (Number(b.entryAt) || 0));
+  let remaining = wantQty;
+  for (const row of open) {
+    if (remaining <= 1e-9) break;
+    const rowQty = Number(row.qty) || 0;
+    if (rowQty <= 0) continue;
+    const take = Math.min(rowQty, remaining);
+    const pnl = +(((Number(exitPx) || 0) - (Number(row.entry) || 0)) * take * dir).toFixed(2);
+    if (take >= rowQty - 1e-9) {
+      // full close of this row (keeps its own id/orderId → upserts the SAME row with exit fields)
+      await db.saveTrade(userKey, { ...row, qty: rowQty, exit: exitPx, exitAt: Date.now(), pnl, status: "closed", exitOrderId: orderId, exitReason: "Manual close (reduce-only)" }, { authoritative: true });
+    } else {
+      // partial: reduce the open row (residual stays OPEN) + write a NEW closed row booking the realized portion
+      await db.saveTrade(userKey, { ...row, qty: +(rowQty - take).toFixed(8) }, { authoritative: true });
+      await db.saveTrade(userKey, { ...row, id: `${row.id}__exit_${orderId}_${Math.round(take * 1e4)}`, orderId: null, qty: take, exit: exitPx, exitAt: Date.now(), pnl, status: "closed", exitOrderId: orderId, partialOf: row.id, exitReason: "Partial close (reduce-only)" }, { authoritative: true });
+    }
+    remaining -= take;
+  }
+  if (remaining > 1e-9) logFinancial("reduceonly_exit.unmatched", { userKey, orderId, sym: bareSym(sym), closeSide, unmatched: remaining });
+  return { applied: +(wantQty - remaining).toFixed(8), unmatched: +remaining.toFixed(8) };
+}
 /* R25-C01: park a durable pending-reconciliation row for an ACCEPTED-but-not-yet-filled broker order. The
    broker already holds the order, so if we can't save its tracking row we must NOT pretend it's a normal pending
    success — that would permanently lose the fill/SL-TP reconciliation job (the fill could later be absent from
@@ -294,7 +370,7 @@ let schemaReady = false;
        .catch below and money routes keep returning 503 until a re-arm succeeds. It never resolves anything or
        contacts the broker; resolution is the periodic reconciler + the C02 broker-backed unlock gate. Default OFF
        ⇒ production behaviour is unchanged. */
-    if (process.env.C03_ORDER_ATTEMPTS === "1") {
+    if (C03_ORDER_ATTEMPTS_ON) {
       const r = await require("./orderRecovery").rearmFromUnresolvedAttempts({
         db,
         setLock: (uid, v) => { haltedEntries.add(String(uid)); return db.setRiskLock(String(uid), v); },
@@ -310,7 +386,7 @@ let schemaReady = false;
        this sweep then RESOLVES those attempts against FYERS truth and unlocks the ones that are provably done).
        Single-owner via a pg advisory lock; broker-unreachable/pending/partial keep the lock. Flag-gated + best
        effort so it never blocks boot. A periodic worker (below) repeats it with bounded backoff. */
-    if (process.env.C03_ORDER_ATTEMPTS === "1" && !MATRIX_NO_LISTEN) {
+    if (C03_ORDER_ATTEMPTS_ON && !MATRIX_NO_LISTEN) {
       runC03Reconcile("startup").catch((e) => console.error("[c03] startup reconcile sweep error:", e && e.message));
     }
   })
@@ -356,16 +432,26 @@ async function _fyersProbeByTag(attempt) {
   return { status: "pending" };
 }
 async function _adoptFyersFill(attempt, ob) {
-  // Adopt the recovered fill into the AUTHORITATIVE, dedupe-by-orderId ledger exactly once (recordAuthoritativeFill
-  // is idempotent on the broker order id). It's recorded as a normal entry unless the attempt was reduce-only.
-  const isReduce = attempt && (attempt.protection && attempt.protection.reduceOnly) === true;
+  // Adopt the recovered fill into the AUTHORITATIVE store exactly once (both paths dedupe on the broker order id).
+  // C01: a reduce-only order recovered at startup is booked as an authoritative EXIT (close the referenced open
+  // position + realized P&L), identical to the live route — never a new opposite-side entry.
+  const prot = (attempt && attempt.protection) || null;
+  if (prot && prot.reduceOnly === true) {
+    await applyReduceOnlyExit(String(attempt.userId), {
+      sym: attempt.symbol, closeSide: String(attempt.side || "BUY").toUpperCase(),
+      qty: Number(ob.filledQty) || Number(attempt.qty) || 0, exitPx: Number(ob.avgPrice) || 0,
+      orderId: ob.orderId || (attempt.brokerOrderId || null), entryOrderId: prot.entryOrderId || null,
+      broker: "fyers", market: "IN", tradeType: "Recovery",
+    }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
+    return;
+  }
   await recordAuthoritativeFill(String(attempt.userId), {
     sym: String(attempt.symbol || "").replace(/^NSE:/, "").replace(/-EQ$/, ""),
     side: String(attempt.side || "BUY").toUpperCase(),
     qty: Number(ob.filledQty) || Number(attempt.qty) || 0,
     entry: Number(ob.avgPrice) || 0, entryAt: Date.now(),
     market: "IN", real: true, broker: "fyers", orderId: ob.orderId || (attempt.brokerOrderId || null),
-    tradeType: "Recovery", serverAuthored: true, ...(isReduce ? { kind: "exit", reduceOnly: true } : {}),
+    tradeType: "Recovery", serverAuthored: true,
   }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
 }
 async function runC03Reconcile(reason = "periodic") {
@@ -5405,11 +5491,14 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
          the broker is called ONLY if this request wins the PREPARED→SUBMITTING CAS, and a replayed/in-flight
          attempt returns reconcile-required instead of a second order. On a thrown/ambiguous outcome the attempt
          is left UNKNOWN (unresolved → startup reconciliation resolves it; the account stays locked). */
-      if (process.env.C03_ORDER_ATTEMPTS === "1") {
+      if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "fyers", idemKey,
           orderTag: reconcile.fyersOrderTag(idemKey), fingerprint: idemHash,
-          symbol, side, qty: Number(qty), product, protection: null,
+          // C01: capture reduce-only + the entry order id so a fill RECOVERED at startup is adopted as an EXIT
+          // (kind:"exit"), not a new opposite-side position.
+          symbol, side, qty: Number(qty), product,
+          protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
         const out = await orderRecovery.submitWithAttempt({
           db, attempt, submit: _fyersSubmit,
@@ -5441,27 +5530,40 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       /* C03: finalize the durable attempt with the VERIFIED outcome. FILLED/REJECTED are terminal (resolved);
          a still-PENDING acceptance stays ACCEPTED (unresolved) so the pending-protection watcher / startup
          reconciliation settles it later — the account is not falsely marked done. Flag-gated; best-effort. */
-      if (process.env.C03_ORDER_ATTEMPTS === "1") {
+      if (C03_ORDER_ATTEMPTS_ON) {
         try {
           const st = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "ACCEPTED");
           await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: d.id, ...(c.filled ? { filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice } : {}) });
         } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
       }
 
-      /* R19-P1-04 / R20-P1-02: on ANY verified fill (long or short, protection or not) write the authoritative,
-         user-namespaced, dedupe-by-orderId trade row so risk counters include the execution even if the browser
-         never posts a journal row. recordAuthoritativeFill retries and fails loud (notice + log) on write error. */
+      /* R19-P1-04 / R20-P1-02: on ANY verified fill write the authoritative, user-namespaced record so risk
+         counters include the execution even if the browser never posts a journal row.
+         C01: a REDUCE-ONLY fill is an EXIT, not a new position — book it as an authoritative CLOSE of the
+         referenced open position(s) (immutable exit leg + realized P&L + residual split), never a new
+         opposite-side entry row. A normal (opening) fill still writes the authoritative entry row as before. */
       if (c.filled) {
-        const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
-          sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
-          qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-          entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
-          // R27-P2-02: durable strategy attribution so a real Screener/Automate fill stays on its card after reload.
-          ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
-        }, { haltUserIdOnFail: sess.userId });   // H2: if the fill can't be journaled, halt AUTOMATED entries so risk isn't computed on an incomplete book
-        // R25-H07: a FILLED order whose fill couldn't be journaled must NOT look like an ordinary success — the
-        // account is already risk-locked; surface reconciliation-required so the client shows the paused state.
-        if (!journaled) trackingFailed = true;
+        const isReduceClose = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+        if (isReduceClose) {
+          const ex = await applyReduceOnlyExit(storageKeyFor(sess.userId), {
+            sym: symbol, closeSide: side, qty: c.filledQty || Number(qty), exitPx: Number(c.avgPrice) || Number(price) || 0,
+            orderId: d.id, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null,
+            broker: "fyers", market: regMarket, tradeType: String(req.body?.tradeType || "Manual"),
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (ex && ex.error) trackingFailed = true;   // ledger write failed → account already risk-locked
+        } else {
+          const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+            sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
+            qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
+            entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
+            // R27-P2-02: durable strategy attribution so a real Screener/Automate fill stays on its card after reload.
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });   // H2: if the fill can't be journaled, halt AUTOMATED entries so risk isn't computed on an incomplete book
+          // R25-H07: a FILLED order whose fill couldn't be journaled must NOT look like an ordinary success — the
+          // account is already risk-locked; surface reconciliation-required so the client shows the paused state.
+          if (!journaled) trackingFailed = true;
+        }
       }
 
       if (wantAutoExit) {
@@ -7420,7 +7522,7 @@ async function runProtectionWatcher() {
    soon as FYERS truth is available — no manual/external path required. Single-owner via the pg advisory lock, so
    in a multi-instance deploy only one node sweeps. Flag-gated (attempts exist only when C03 is enabled) and
    skipped under the #441 test seam (tests invoke runC03Reconcile directly). */
-if (process.env.C03_ORDER_ATTEMPTS === "1" && !MATRIX_NO_LISTEN) {
+if (C03_ORDER_ATTEMPTS_ON && !MATRIX_NO_LISTEN) {
   const C03_RECON_MS = Number(process.env.C03_RECON_MS) || 60_000;
   setInterval(() => { runC03Reconcile("periodic").catch((e) => console.error("[c03] periodic reconcile error:", e && e.message)); }, C03_RECON_MS).unref?.();
 }

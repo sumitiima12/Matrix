@@ -77,6 +77,23 @@ function orderHeaders(idemKey, extra = {}) {
 }
 const newKey = () => "idem_" + crypto.randomBytes(8).toString("hex");
 const attemptIdFor = (key) => `oa_${SKEY}_${key}`;
+const bare = (s) => String(s || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
+
+// A FRESH trader (own phone/token/cred/session) so the C01 close journeys are isolated from other tests'
+// risk-lock / unknown-idempotency state. Returns helpers bound to that user.
+async function freshTrader() {
+  const phone = "9" + String(Math.floor(1e8 + Math.random() * 8e8));
+  const skey = "ph_" + phone;
+  await db.createUser(phone, bcrypt.hashSync("1234", 8), "C01 Trader", null, null, null, null, true);
+  const token = auth.signToken(phone, process.env.JWT_SECRET, 24 * 3600 * 1000, 0);
+  await db.saveBrokerCred(skey, "fyers", server.encryptCred({ accessToken: "FYERS-SECRET-TOKEN", refreshToken: null, extra: {} }));
+  const rr = await req("POST", "/api/broker/resume", { token, body: { broker: "fyers" } });
+  const session = rr.body.sessionId;
+  const oh = (idemKey, extra = {}) => ({ "X-Broker-Session": session, "X-Confirm-Live": "yes", "X-Idempotency-Key": idemKey, ...extra });
+  const order = (idemKey, body, extra = {}) => req("POST", "/api/broker/order", { token, headers: oh(idemKey, extra), body });
+  const openTrades = async () => (await db.getTrades(skey, 0, Date.now())).filter((t) => t && t.real && t.entryAt != null && t.exitAt == null && t.exit == null && t.status !== "rejected");
+  return { phone, skey, token, session, order, openTrades };
+}
 
 test.before(async () => {
   DATABASE_URL = await bootPostgres();
@@ -240,4 +257,75 @@ test("Guard: with the flag ON, a successful order MUST create a durable attempt 
   assert.equal(r.status, 200);
   const row = await db.getOrderAttempt(attemptIdFor(key));
   assert.ok(row, "a successful order under the flag creates an order_attempt — proving the C03 path ran, not the legacy path");
+}));
+
+test("C01-full: reduce-only close books an EXIT (realized P&L), NO phantom short, position closed", guard(async () => {
+  const T = await freshTrader();
+  const SYM = "NSE:TCS-EQ";
+  fake.reset(); fake.setMode("fill", { fillPrice: 100 });
+  // Open a long: 5 @ 100.
+  let r = await T.order(newKey(), { symbol: SYM, side: "BUY", qty: 5, orderType: "MARKET", product: "CNC" });
+  assert.equal(r.status, 200, "entry accepted: " + JSON.stringify(r.body));
+  const entryOrderId = r.body.orderId;
+  let open = (await T.openTrades()).filter((t) => bare(t.sym) === "TCS");
+  assert.equal(open.length, 1, "exactly one open TCS long after the entry");
+  assert.equal(open[0].qty, 5);
+  const origId = open[0].id;
+
+  // Reduce-only CLOSE the full 5 @ 120.
+  fake.setMode("fill", { fillPrice: 120 });
+  const closeKey = newKey();
+  r = await T.order(closeKey, { symbol: SYM, side: "SELL", qty: 5, orderType: "MARKET", product: "CNC", reduceOnly: true, entryOrderId }, { "X-Reduce-Only": "yes" });
+  assert.equal(r.status, 200, "reduce-only close accepted: " + JSON.stringify(r.body));
+  const closeOrderId = r.body.orderId;
+
+  const all = await db.getTrades(T.skey, 0, Date.now());
+  // (a) NO phantom open opposite (short) position was created.
+  const phantom = all.find((t) => t.real && bare(t.sym) === "TCS" && t.exitAt == null && t.exit == null && t.status !== "rejected" && (String(t.side).toUpperCase() === "SELL" || t.short === true));
+  assert.ok(!phantom, "reduce-only close must NOT create a phantom open short");
+  // (b) the original long is CLOSED with realized P&L (120-100)*5 = 100.
+  const closed = all.find((t) => t.id === origId);
+  assert.equal(closed.status, "closed", "original position is closed");
+  assert.equal(Number(closed.exit), 120);
+  assert.ok(Math.abs(Number(closed.pnl) - 100) < 1e-6, "realized P&L booked = 100, got " + closed.pnl);
+  // (c) no TCS position remains open.
+  assert.equal((await T.openTrades()).filter((t) => bare(t.sym) === "TCS").length, 0, "no open TCS position remains");
+  // (d) the immutable EXIT leg is in the fills ledger, linked to the entry order.
+  const fills = await db.getFills(T.skey, 0, Date.now());
+  const exitLeg = fills.find((f) => f.kind === "exit" && String(f.orderId) === String(closeOrderId));
+  assert.ok(exitLeg, "an immutable exit fill leg was recorded");
+  assert.equal(String(exitLeg.entryOrderId), String(entryOrderId), "exit leg is linked to its entry order id");
+  // (e) fills-derived risk shows a matched round-trip with realized P&L (no phantom entry).
+  const rk = db.deriveRiskFromFills(fills, { from: 0, to: Date.now() });
+  assert.ok(rk.matched >= 1, "round-trip matched in the authoritative fills-derived risk");
+  assert.ok(Math.abs(rk.realizedPnl - 100) < 1e-6, "fills-derived realized P&L = 100, got " + rk.realizedPnl);
+}));
+
+test("C01-partial: reduce-only partial close reduces the open row + books realized P&L on the closed portion", guard(async () => {
+  const T = await freshTrader();
+  const SYM = "NSE:WIPRO-EQ";
+  fake.reset(); fake.setMode("fill", { fillPrice: 50 });
+  // Open a long: 10 @ 50.
+  let r = await T.order(newKey(), { symbol: SYM, side: "BUY", qty: 10, orderType: "MARKET", product: "CNC" });
+  assert.equal(r.status, 200);
+  const entryOrderId = r.body.orderId;
+  const origId = (await T.openTrades()).find((t) => bare(t.sym) === "WIPRO").id;
+
+  // Reduce-only close 4 of 10 @ 65 → realized (65-50)*4 = 60; 6 stay open.
+  fake.setMode("fill", { fillPrice: 65 });
+  r = await T.order(newKey(), { symbol: SYM, side: "SELL", qty: 4, orderType: "MARKET", product: "CNC", reduceOnly: true, entryOrderId }, { "X-Reduce-Only": "yes" });
+  assert.equal(r.status, 200);
+
+  const all = await db.getTrades(T.skey, 0, Date.now());
+  const residual = all.find((t) => t.id === origId);
+  assert.equal(Number(residual.qty), 6, "residual open quantity is 6");
+  assert.ok(residual.exitAt == null, "residual stays OPEN");
+  const closedPortion = all.find((t) => t.partialOf === origId);
+  assert.ok(closedPortion, "a closed row was booked for the executed portion");
+  assert.equal(Number(closedPortion.qty), 4);
+  assert.ok(Math.abs(Number(closedPortion.pnl) - 60) < 1e-6, "realized P&L on the closed portion = 60, got " + closedPortion.pnl);
+  // No phantom short, and exactly 6 units of WIPRO remain open (only the residual).
+  const openWipro = (await T.openTrades()).filter((t) => bare(t.sym) === "WIPRO");
+  assert.equal(openWipro.length, 1);
+  assert.equal(Number(openWipro[0].qty), 6);
 }));
