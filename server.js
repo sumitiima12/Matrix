@@ -294,22 +294,6 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null, ext
     return { applied: +matched.toFixed(8), unmatched: +(wantQty - matched).toFixed(8), reconcileRequired: true, reason };
   };
 
-  // 1 — AUTHORITATIVE READ. This read DECIDES what we close, so a failure must NOT be swallowed into all=[] (that would
-  //     let a broker-confirmed close commit against ZERO matched rows — R30-P1-02). On read failure, fail closed.
-  let all = null;
-  try { all = await db.getTrades(userKey, 0, Date.now()); } catch (e) { logFinancial("reduceonly_exit.read_failed", { userKey, orderId, err: String((e && e.message) || e) }); all = null; }
-  if (all == null) return parkReconcile("read-failed", 0);
-
-  // READ-based idempotency, independent of write ordering: if a trade row already carries THIS close order's
-  // exitOrderId, the atomic close already committed → just ensure the ledger leg exists and return.
-  if (all.some((t) => t && String(t.exitOrderId || "") === String(orderId))) {
-    try { await db.recordFill(userKey, exitFill); } catch { /* leg already present */ }
-    return { applied: 0, unmatched: 0, alreadyDone: true };
-  }
-
-  // 2 — PLAN the close against OPEN real rows for this symbol, OPPOSITE direction. When an entryOrderId is supplied we
-  //     target EXACTLY that entry row (user+broker+entry order id) — closing strategy B must not consume strategy A's
-  //     older row (R30-P2-01). FIFO is used only for an explicit aggregate close (no entryOrderId).
   const openDir = String(closeSide).toUpperCase() === "SELL" ? "long" : "short";   // SELL closes a long; BUY covers a short
   const dir = openDir === "long" ? 1 : -1;
   const wantEntry = entryOrderId != null ? String(entryOrderId) : null;
@@ -320,37 +304,72 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null, ext
     && (openDir === "long"
       ? (String(t.side || "").toUpperCase() !== "SELL" && t.short !== true)
       : (String(t.side || "").toUpperCase() === "SELL" || t.short === true));
-  const open = all.filter((t) => isOpen(t) && matchesEntry(t)).sort((a, b) => (Number(a.entryAt) || 0) - (Number(b.entryAt) || 0));
-  const rows = [];   // the exact trade-projection writes this close performs
-  let remaining = wantQty;
-  for (const row of open) {
-    if (remaining <= 1e-9) break;
-    const rowQty = Number(row.qty) || 0;
-    if (rowQty <= 0) continue;
-    const take = Math.min(rowQty, remaining);
-    const pnl = +(((Number(exitPx) || 0) - (Number(row.entry) || 0)) * take * dir).toFixed(2);
-    if (take >= rowQty - 1e-9) {
-      rows.push({ ...row, qty: rowQty, exit: exitPx, exitAt: now, pnl, status: "closed", exitOrderId: orderId, exitReason: "Manual close (reduce-only)" });
-    } else {
-      rows.push({ ...row, qty: +(rowQty - take).toFixed(8) });   // residual stays OPEN (no exitOrderId)
-      rows.push({ ...row, id: `${row.id}__exit_${orderId}_${Math.round(take * 1e4)}`, orderId: null, qty: take, exit: exitPx, exitAt: now, pnl, status: "closed", exitOrderId: orderId, partialOf: row.id, exitReason: "Partial close (reduce-only)" });
+
+  /* C02 (R31) — the DECISION (which rows, how much) must be serialized with the WRITE, not just the write. We compute
+     the plan from a fresh read, then recordExitAtomic re-reads the SAME original rows under FOR UPDATE and rejects the
+     commit (STALE_PLAN) if any changed since we planned (a concurrent replica consumed them). On STALE_PLAN we re-read
+     and re-plan. Bounded retries; if contention persists, park for reconciliation rather than risk a stale write. */
+  let committed = false, lastErr = null, appliedQty = 0;
+  for (let attempt = 0; attempt < 4 && !committed; attempt++) {
+    // 1 — AUTHORITATIVE READ. A failure must NOT be swallowed into all=[] (that would let a broker-confirmed close
+    //     commit against ZERO matched rows — R30-P1-02). On read failure, fail closed.
+    let all = null;
+    try { all = await db.getTrades(userKey, 0, Date.now()); } catch (e) { logFinancial("reduceonly_exit.read_failed", { userKey, orderId, err: String((e && e.message) || e) }); all = null; }
+    if (all == null) return parkReconcile("read-failed", 0);
+
+    // READ-based idempotency: if a trade row already carries THIS close order's exitOrderId, the atomic close already
+    // committed → just ensure the ledger leg exists and return.
+    if (all.some((t) => t && String(t.exitOrderId || "") === String(orderId))) {
+      try { await db.recordFill(userKey, exitFill); } catch { /* leg already present */ }
+      return { applied: 0, unmatched: 0, alreadyDone: true };
     }
-    remaining -= take;
-  }
 
-  // 3 — MATCH COMPLETENESS (R30-P1-02 / P2-01). Unless this close EXPLICITLY targets an externally-discovered broker
-  //     position (externalPosition:true, e.g. the C02 orphan-exposure path), the matched quantity MUST equal the
-  //     broker-confirmed exit quantity. Any shortfall — zero match, wrong entryOrderId, drift — must NOT commit; park
-  //     for reconciliation instead so the immutable ledger never claims a leg Matrix couldn't allocate.
-  if (!externalPosition && remaining > 1e-6) {
-    return parkReconcile(wantEntry != null ? "entry-not-matched" : "unmatched-qty", wantQty - remaining);
-  }
+    // 2 — PLAN against OPEN real rows for this symbol/opposite direction. entryOrderId targets EXACTLY that entry row
+    //     (R30-P2-01); FIFO only for an explicit aggregate close (no entryOrderId). Build `expect` = the pre-state of
+    //     every ORIGINAL row we consume, so the commit can re-validate it under the row lock.
+    const open = all.filter((t) => isOpen(t) && matchesEntry(t)).sort((a, b) => (Number(a.entryAt) || 0) - (Number(b.entryAt) || 0));
+    const rows = [];         // the exact trade-projection writes this close performs
+    const expect = [];       // { id, qty } pre-conditions on each consumed original row (C02 stale-plan guard)
+    let remaining = wantQty;
+    for (const row of open) {
+      if (remaining <= 1e-9) break;
+      const rowQty = Number(row.qty) || 0;
+      if (rowQty <= 0) continue;
+      const take = Math.min(rowQty, remaining);
+      const pnl = +(((Number(exitPx) || 0) - (Number(row.entry) || 0)) * take * dir).toFixed(2);
+      expect.push({ id: row.id, qty: rowQty });
+      if (take >= rowQty - 1e-9) {
+        rows.push({ ...row, qty: rowQty, exit: exitPx, exitAt: now, pnl, status: "closed", exitOrderId: orderId, exitReason: "Manual close (reduce-only)" });
+      } else {
+        rows.push({ ...row, qty: +(rowQty - take).toFixed(8) });   // residual stays OPEN (no exitOrderId)
+        rows.push({ ...row, id: `${row.id}__exit_${orderId}_${Math.round(take * 1e4)}`, orderId: null, qty: take, exit: exitPx, exitAt: now, pnl, status: "closed", exitOrderId: orderId, partialOf: row.id, exitReason: "Partial close (reduce-only)" });
+      }
+      remaining -= take;
+    }
 
-  // 4 — COMMIT the exit fill + all trade-row writes ATOMICALLY. A crash mid-transaction rolls back cleanly so a
-  //     replay recomputes from the original open state; the exitOrderId guard above makes a committed close a no-op.
-  try {
-    await db.recordExitAtomic(userKey, { fill: exitFill, rows });
-  } catch (e) {
+    // 3 — MATCH COMPLETENESS (R30-P1-02 / P2-01). Unless this close EXPLICITLY targets an externally-discovered broker
+    //     position, the matched quantity MUST equal the broker-confirmed exit quantity. Any shortfall must NOT commit.
+    if (!externalPosition && remaining > 1e-6) {
+      return parkReconcile(wantEntry != null ? "entry-not-matched" : "unmatched-qty", wantQty - remaining);
+    }
+    appliedQty = wantQty - remaining;
+
+    // 4 — COMMIT atomically WITH the stale-plan precondition. STALE_PLAN ⇒ a concurrent close moved the rows; loop to
+    //     re-read + re-plan. Any other error ⇒ the projection-pending repair path below.
+    try {
+      await db.recordExitAtomic(userKey, { fill: exitFill, rows, expect });
+      committed = true;
+    } catch (e) {
+      if (e && e.code === "STALE_PLAN") { lastErr = e; logFinancial("reduceonly_exit.stale_plan_retry", { userKey, orderId, attempt }); continue; }
+      lastErr = e; break;
+    }
+  }
+  if (committed) return { applied: +appliedQty.toFixed(8), unmatched: +(wantQty - appliedQty).toFixed(8) };
+  // Contention never cleared, or a hard write error. If it was purely STALE_PLAN churn, park for reconciliation so a
+  // human/broker sweep resolves the concurrent state instead of risking a stale write.
+  if (lastErr && lastErr.code === "STALE_PLAN") return parkReconcile("concurrent-close-contention", 0);
+  {
+    const e = lastErr || new Error("exit commit failed");
     logFinancial("reduceonly_exit.ledger_failed", { userKey, orderId, sym: bareSym(sym), err: String((e && e.message) || e) });
     /* S3.2 PROJECTION_PENDING: the broker EXIT is already confirmed but the projection write failed. Park a DURABLE
        repair item (idempotent by exit order id) so a background sweep re-applies it WITHOUT re-contacting the broker.
@@ -364,7 +383,6 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null, ext
     await addUserNotice(userKey, { type: "exit_unjournaled", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed but couldn't be recorded — new orders are paused as a precaution. We'll repair it automatically; please reconcile with your broker.` });
     return { applied: 0, unmatched: wantQty, error: String((e && e.message) || e), projectionPending: true };
   }
-  return { applied: +(wantQty - remaining).toFixed(8), unmatched: +remaining.toFixed(8) };
 }
 
 /* S3.2 — repair PROJECTION_PENDING exits WITHOUT re-contacting the broker. Each parked item holds the confirmed

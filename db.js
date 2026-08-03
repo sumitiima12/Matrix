@@ -435,7 +435,7 @@ async function recordFillAndTrade(userId, trade) {
    recorded", making it unrecoverable on replay. Now either the whole close commits or none of it does. `rows` are
    already-namespaced authoritative trade rows (ids from saveTrade's scheme). Idempotent: the fill is ON CONFLICT
    DO NOTHING and each trade row is an ownership-safe upsert, so a replay of the SAME committed close converges. */
-async function recordExitAtomic(userId, { fill, rows = [] }) {
+async function recordExitAtomic(userId, { fill, rows = [], expect = [] }) {
   const uref = userRef(userId);
   const brk = String((fill && fill.broker) || "x").toLowerCase().replace(/[^a-z0-9]/g, "");
   const oid = String((fill && fill.orderId) != null ? fill.orderId : "");
@@ -447,11 +447,27 @@ async function recordExitAtomic(userId, { fill, rows = [] }) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      // S3.2: LOCK the user-owned position rows this close mutates (SELECT ... FOR UPDATE) so two concurrent
-      // closes on the same position serialize — the second blocks until the first commits, preventing a
-      // double-reduction. New split rows don't exist yet; the residual/original row is what must be serialized.
-      const lockIds = [...new Set(rows.map((r) => r.id).filter(Boolean))];
-      if (lockIds.length) await client.query(`SELECT id FROM trades WHERE user_id=$1 AND id = ANY($2) FOR UPDATE`, [userId, lockIds]);
+      // C02 (R31): LOCK the user-owned rows this close mutates (SELECT ... FOR UPDATE) so two concurrent closes
+      // serialize. The original open rows being consumed (`expect`) are what MUST be locked + re-validated; new
+      // split rows don't exist yet. We lock the ORIGINAL rows and any pre-existing planned ids.
+      const lockIds = [...new Set([...(expect || []).map((e) => e.id), ...rows.map((r) => r.id)].filter(Boolean))];
+      let locked = { rows: [] };
+      if (lockIds.length) locked = await client.query(`SELECT id, data FROM trades WHERE user_id=$1 AND id = ANY($2) FOR UPDATE`, [userId, lockIds]);
+      /* C02 STALE-PLAN GUARD. The plan (rows) was computed from a read taken BEFORE this lock. A concurrent replica
+         could have consumed the same original open row in between. Now that we hold the row lock, RE-READ each
+         consumed original row and confirm it is still open with the quantity the plan assumed. Any mismatch means the
+         plan is stale — abort so the caller re-reads under fresh state and re-plans (the lock serializes the DECISION,
+         not just the write). */
+      if (expect && expect.length) {
+        const byId = new Map(locked.rows.map((r) => [String(r.id), r.data || {}]));
+        for (const e of expect) {
+          const d = byId.get(String(e.id));
+          if (!d) { const err = new Error("STALE_PLAN: a targeted position row no longer exists"); err.code = "STALE_PLAN"; throw err; }
+          const stillOpen = d.exitAt == null && d.exit == null && !d.exitOrderId && d.status !== "closed";
+          const qtyMatch = Math.abs((Number(d.qty) || 0) - (Number(e.qty) || 0)) <= 1e-9;
+          if (!stillOpen || !qtyMatch) { const err = new Error("STALE_PLAN: targeted position changed under concurrent close"); err.code = "STALE_PLAN"; throw err; }
+        }
+      }
       await client.query(
         `INSERT INTO fills (fill_id, user_id, broker, order_id, side, qty, price, market, trade_type, ts, data)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (fill_id) DO NOTHING`,
@@ -580,7 +596,18 @@ function projectFills(fills) {
         entryOrderId = entryOrderId || e.entryOrderId; managedId = managedId || e.managedId;
       }
       const price = qtyPriced > 0 ? notional / qtyPriced : null;
-      out.push({ broker: g.broker, orderId: g.orderId, leg: g.leg, qty, price, fees, side, market, ts, entryOrderId, managedId, executions: g.exec.length });
+      /* C01 (R31) — an INCOMPLETE execution-event set must NEVER override the correct cumulative snapshot and
+         understate quantity/exposure/risk. A best-effort per-execution recorder can drop an event (a failed async
+         write); if so, Σ(executions) < the broker's cumulative snapshot. When that happens we project the SNAPSHOT
+         (the authoritative cumulative qty), keep the larger fee observation, and flag `incompleteExec` so risk stays
+         conservative until the event set reconciles. Only when Σ(executions) ≥ snapshot do the finer per-execution
+         values (weighted price + summed fees) win. A snapshot never present ⇒ executions are the sole truth. */
+      if (g.snap && g.snap.qty > qty + 1e-9) {
+        const s = g.snap;
+        out.push({ broker: g.broker, orderId: g.orderId, leg: g.leg, qty: s.qty, price: s.price != null ? s.price : price, fees: Math.max(fees, s.fees), side: side || s.side, market: market || s.market, ts: Math.max(ts, s.ts), entryOrderId: entryOrderId || s.entryOrderId, managedId: managedId || s.managedId, executions: g.exec.length, incompleteExec: true });
+      } else {
+        out.push({ broker: g.broker, orderId: g.orderId, leg: g.leg, qty, price, fees, side, market, ts, entryOrderId, managedId, executions: g.exec.length });
+      }
     } else if (g.snap) {
       const s = g.snap;
       out.push({ broker: g.broker, orderId: g.orderId, leg: g.leg, qty: s.qty, price: s.price, fees: s.fees, side: s.side, market: s.market, ts: s.ts, entryOrderId: s.entryOrderId, managedId: s.managedId, executions: 0 });
