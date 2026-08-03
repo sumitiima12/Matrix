@@ -442,7 +442,14 @@ async function recordFyersExecutionFills(userKey, sess, orderId, { leg = "entry"
     // A stable per-execution id: prefer the broker trade id; else a deterministic (order, price, qty) key so a
     // re-read of the same execution collapses rather than duplicating.
     const execId = String(t.tradeNumber ?? t.id ?? t.fillId ?? `${orderId}_${px}_${q}`);
-    const fees = Number(t.brokerage ?? t.fees ?? t.tax ?? 0) || 0;   // FYERS equity tradebook usually omits these → 0 (EOD contract note is authoritative)
+    /* M01 (R31 / R30-P2-06): SUM the independent charge components — never pick just one. When the tradebook itemises
+       brokerage / STT / exchange / SEBI / GST / stamp / clearing separately, add them (a non-overlapping set so GST
+       isn't double-counted with its CGST/SGST split). FYERS equity tradebook usually omits all of these (→ 0), in
+       which case we fall back to a single aggregate field; the EOD contract note remains the authoritative post-cost
+       source (contract-note reconciliation tracked separately). */
+    const _itemisedFees = ["brokerage", "stt", "sebiCharges", "exchangeCharges", "gst", "stampDuty", "clearingCharges"]
+      .reduce((a, k) => a + (Number(t[k]) || 0), 0);
+    const fees = _itemisedFees > 0 ? _itemisedFees : (Number(t.charges ?? t.fees ?? t.tax ?? 0) || 0);
     const sideStr = (t.side === -1 || String(t.side).toUpperCase() === "SELL" || String(t.side) === "-1") ? "SELL" : "BUY";
     const tsMs = t.orderDateTime ? (Date.parse(String(t.orderDateTime).replace(" ", "T")) || Date.now()) : (Number(t.tradeTime) || Date.now());
     try {
@@ -6581,9 +6588,28 @@ async function brokerSnapshotForUnlock(userId) {
   try { managed = await db.getManagedPositionsForUser(String(userId)); }
   catch { return { ok: false, reason: "couldn't read managed positions to verify with the broker" }; }
   const openPos = (managed || []).filter((p) => p && (p.status === "open" || p.status === "closing") && Math.abs(Number(p.qty)) > 0);
-  // Nothing Matrix believes is open → no broker position to confirm; the internal reconcile already covered
-  // pending/unknown/exit drift, so this gate is satisfied (don't brick users who simply hold no live positions).
-  if (!openPos.length) return { ok: true, reason: "no open managed positions to verify", checked: 0, verified: 0, watermark: Date.now() };
+  /* M04 (R31): "no local open rows" must NOT blindly unlock. A lost/ambiguous Matrix order leaves NO managed row but
+     CAN leave a real broker position — so when Matrix has no open positions we still inspect broker truth IF there's
+     an UNRESOLVED order attempt (the signature of a lost order). With no unresolved attempt there's no reason to
+     suspect untracked exposure, so the internal reconcile (pending/unknown/exit drift) already satisfies the gate. */
+  if (!openPos.length) {
+    let unresolved = [];
+    try { unresolved = (await db.listUnresolvedOrderAttempts(1000)).filter((a) => a && String(a.userId) === String(userId)); }
+    catch { return { ok: false, reason: "couldn't verify order-attempt state before unlock — the risk lock stays on" }; }
+    if (!unresolved.length) return { ok: true, reason: "no open managed positions and no unresolved attempts", checked: 0, verified: 0, watermark: Date.now() };
+    // An unresolved attempt exists → the broker may hold a position our lost order left behind. Verify it's flat.
+    const susBrokers = [...new Set(unresolved.map((a) => a.broker).filter(Boolean))];
+    if (!susBrokers.length) return { ok: false, reason: "an unresolved order attempt exists but its broker is unknown — reconcile before resuming", orphanBlocked: true };
+    for (const broker of susBrokers) {
+      let sess; try { sess = await sessionFromCred(userId, broker); } catch { sess = null; }
+      if (!sess) return { ok: false, reason: `an unresolved ${broker} order can't be verified — reconnect ${broker}, then resume` };
+      let acct; try { acct = await fetchBrokerAccount(sess); } catch { acct = null; }
+      if (!acct || !Array.isArray(acct.portfolio)) return { ok: false, reason: `couldn't fetch a fresh ${broker} snapshot to verify an unresolved order — the risk lock stays on` };
+      const hasExposure = acct.portfolio.some((p) => Math.abs(Number(p.qty ?? p.netQty ?? p.netQuantity ?? 0)) > 0);
+      if (hasExposure) return { ok: false, reason: `${broker} holds a position that may belong to an unresolved MatrixOne order — reconcile the untracked exposure before resuming`, orphanBlocked: true };
+    }
+    return { ok: true, reason: "no managed positions; unresolved attempts verified flat at broker", checked: susBrokers.length, verified: susBrokers.length, watermark: Date.now() };
+  }
   const brokers = [...new Set(openPos.map((p) => p.broker).filter(Boolean))];
   const started = Date.now();
   let verified = 0;
