@@ -31,6 +31,7 @@ const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth")
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
+const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
 const orderRecovery = require("./orderRecovery");     // C03 durable order-attempt orchestrator (flag-gated wiring)
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
@@ -90,7 +91,20 @@ const MATRIX_NO_LISTEN = /^(1|true|yes)$/i.test(String(process.env.MATRIX_NO_LIS
    legacy fallback: when this is on and the durable PREPARED write fails, submitWithAttempt THROWS before the broker
    is ever called (the order fails closed) — it never quietly reverts to the un-guarded legacy send. Set
    C03_ORDER_ATTEMPTS=0 as an explicit operational kill switch to fall back to the legacy path. */
-const C03_ORDER_ATTEMPTS_ON = String(process.env.C03_ORDER_ATTEMPTS || "") !== "0";
+/* S3.1: ONE validated definition of the C03 flag, used everywhere (submission, startup re-arm, startup +
+   periodic reconciliation, health, tests). Only unset / "1" / "0" are valid; any other value is a config error we
+   refuse to boot with (silent mis-parse of a safety flag is unacceptable). Default ON (unset ⇒ on). */
+const _c03raw = String(process.env.C03_ORDER_ATTEMPTS == null ? "" : process.env.C03_ORDER_ATTEMPTS).trim();
+if (!["", "0", "1"].includes(_c03raw)) {
+  throw new Error(`[startup] C03_ORDER_ATTEMPTS must be unset, "1" or "0" — got ${JSON.stringify(_c03raw)}. Refusing to start with an ambiguous safety flag.`);
+}
+const C03_ORDER_ATTEMPTS_ON = _c03raw !== "0";
+/* S3.1: real trading MUST NOT run on the legacy (non-durable) order path. If live trading is enabled while C03 is
+   explicitly disabled, FAIL startup rather than silently placing real orders without write-before-send + recovery.
+   (Read the env directly — TRADING_ENABLED is defined later in the file.) */
+if (String(process.env.BROKER_TRADING_ENABLED || "").toLowerCase() === "true" && !C03_ORDER_ATTEMPTS_ON) {
+  throw new Error("[startup] BROKER_TRADING_ENABLED=true but C03_ORDER_ATTEMPTS=0 — real trading requires the durable write-before-send + recovery path. Remove C03_ORDER_ATTEMPTS (default on) or set it to 1. Refusing to start.");
+}
 
 /* CORS locked to known origins (was wide-open app.use(cors())). The custom broker headers
    MUST stay allowed or every /api/broker/* preflight fails. Extra origins can be added via
@@ -515,8 +529,16 @@ async function _fyersProbeByTag(attempt) {
   catch { return null; }   // positions unreachable ⇒ stay locked
   const held = pos.find((p) => clean(p.symbol) === clean(attempt.symbol) && Math.abs(Number(p.netQty ?? p.qty) || 0) > 0);
   if (held) return null;   // an open position exists for this symbol — ambiguous, keep locked rather than cancel
-  // Order book + tradebook + positions ALL readable and none reference our order. Only call it ABSENT if the order
-  // was at least accepted (we hold a broker order id); a never-confirmed unknown stays locked (never auto-cancelled).
+  // HOLDINGS (settled/delivery) — a settled holding in the symbol is another sign of a fill we haven't attributed.
+  // (FYERS v3 exposes no paginated multi-day order-history endpoint, so tradebook + positions + holdings are the
+  // authoritative execution-truth sources; any unreadable source above already returned null = stay locked.)
+  let hold;
+  try { const hr = await fyFetch("https://api-t1.fyers.in/api/v3/holdings", { headers: auth }); const hd = await hr.json().catch(() => ({})); if (!hr.ok || hd.s === "error") return null; hold = Array.isArray(hd.holdings) ? hd.holdings : []; }
+  catch { return null; }
+  if (hold.some((h) => clean(h.symbol) === clean(attempt.symbol) && Math.abs(Number(h.quantity ?? h.remainingQuantity ?? 0) || 0) > 0)) return null;
+  // Order book + tradebook + positions + holdings ALL readable and none reference our order. Only call it ABSENT if
+  // the order was at least accepted (we hold a broker order id); a never-confirmed unknown stays locked (never
+  // auto-cancelled), and a bounded age gate below keeps a very-recent unknown locked in case of broker lag.
   if (bid) return { status: "absent" };
   return null;
 }
@@ -3735,8 +3757,24 @@ app.get("/api/health", (req, res) => {
     fyersHouseFeed: Boolean((process.env.FYERS_APP_ID && process.env.FYERS_REFRESH_TOKEN && process.env.FYERS_PIN) || process.env.FYERS_ACCESS_TOKEN),
     deltaProxy: Boolean(process.env.DELTA_PROXY_URL || process.env.DELTA_PROXY),
     fyersProxy: Boolean(process.env.FYERS_PROXY_URL),   // routing FYERS via its own static-IP proxy
+    // S3.1/S15: surface the C03 durable-order state so monitoring can alert if it's ever disabled while live
+    // trading is on. `tradingEnabled && !c03Enabled` is a paging condition (should be impossible — we fail startup).
+    c03Enabled: C03_ORDER_ATTEMPTS_ON,
+    tradingEnabled: String(process.env.BROKER_TRADING_ENABLED || "").toLowerCase() === "true",
+    schemaReady: (typeof schemaReady !== "undefined" ? schemaReady : undefined),
+    brokerCapabilitiesVersion: brokerCaps.CERTIFICATION_VERSION,
     build: "history-thin-fyers-18",   // bump on deploy so we can confirm which build is live
   });
+});
+
+/* S1: SERVER-OWNED broker capability registry. The frontend reads this to decide which REAL operations to offer
+   per broker (it must NOT hard-code them); connection + portfolio + all virtual features are always available
+   regardless. A capability is true only after that broker's route/failure/recovery/exit/protection suite passed. */
+app.get("/api/broker/capabilities", (req, res) => res.json(brokerCaps.capabilitiesView()));
+/* Admin diagnostic — same data, but an explicit admin-gated view for the ops "effective capabilities" page. */
+app.get("/api/admin/broker-capabilities", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  res.json({ ...brokerCaps.capabilitiesView(), tradingEnabled: TRADING_ENABLED, c03Enabled: C03_ORDER_ATTEMPTS_ON });
 });
 
 /* Live diagnostic for the house price feeds. Hits FYERS + Delta right now and reports what

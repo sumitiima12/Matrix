@@ -35,3 +35,31 @@ test("R30-C1: with C03_ORDER_ATTEMPTS unset, recovery is ACTIVE (default-on), no
   catch (e) { assert.fail("recovery-gate child failed: " + (e.stderr || e.message)); }
   assert.match(out, /GATE_OK/, "recovery ran with the flag omitted (default-on)");
 });
+
+function requireServerWith(envOverrides) {
+  const SERVER = path.join(__dirname, "..", "server.js");
+  const script = `require(${JSON.stringify(SERVER)}); console.log("LOADED"); process.exit(0);`;
+  const env = { ...process.env, MATRIX_NO_LISTEN: "1", JWT_SECRET: "gate-secret-000", DATABASE_URL: "", ...envOverrides };
+  return execFileSync(process.execPath, ["-e", script], { env, encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+test("S3.1: BROKER_TRADING_ENABLED=true with C03_ORDER_ATTEMPTS=0 FAILS startup (no silent legacy path)", () => {
+  assert.throws(
+    () => requireServerWith({ BROKER_TRADING_ENABLED: "true", C03_ORDER_ATTEMPTS: "0" }),
+    /C03_ORDER_ATTEMPTS=0|durable write-before-send/,
+    "live trading with C03 disabled must refuse to start",
+  );
+});
+
+test("S3.1: an invalid C03_ORDER_ATTEMPTS value refuses to start (ambiguous safety flag)", () => {
+  assert.throws(
+    () => requireServerWith({ C03_ORDER_ATTEMPTS: "yes" }),
+    /must be unset/,
+    "a non 0/1 value is a hard config error",
+  );
+});
+
+test("S3.1: BROKER_TRADING_ENABLED=true with C03 unset (default-on) starts fine", () => {
+  const out = requireServerWith({ BROKER_TRADING_ENABLED: "true", CRED_KEY: "route-test-cred-key-32bytes-min!!" });
+  assert.match(out, /LOADED/, "default-on C03 satisfies the live-trading requirement");
+});
