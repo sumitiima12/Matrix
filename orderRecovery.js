@@ -73,4 +73,33 @@ async function reconcileUnresolvedAttempts(deps) {
   return { owner: true, attempts: attempts.length, resolved, adopted, keptLocked, stillUnresolved };
 }
 
-module.exports = { reconcileUnresolvedAttempts };
+/* C03 slice 2b — the WRITE-BEFORE-SEND submit orchestrator. This is the seam wired into the live FYERS branch
+   (behind the C03_ORDER_ATTEMPTS flag). It GUARANTEES the broker is never reached without a durable, pre-existing
+   attempt identifying the order:
+     1. commit a PREPARED attempt — if that throws (DB down / fault), we return WITHOUT calling the broker.
+     2. transition PREPARED→SUBMITTING, then call `submit()` (the actual broker placement).
+     3. an ambiguous submit failure (timeout / lost response) finalizes UNKNOWN — recoverable at startup by tag,
+        never a silent duplicate. A thrown-but-conclusive rejection can be finalized REJECTED by the caller.
+     4. a returned result is classified via `classify(res)` → { status, patch } and finalized transactionally.
+   When the flag is OFF this module isn't used at all; the legacy path runs byte-for-byte unchanged. */
+async function submitWithAttempt({ db, attempt, submit, classify }) {
+  // 1 — durable PREPARED. If this throws, the broker is NEVER called (no order can exist without an attempt).
+  await db.prepareOrderAttempt(attempt);
+  // 2 — mark SUBMITTING right before the send, so a crash mid-send leaves a recoverable SUBMITTING row.
+  await db.transitionOrderAttempt(attempt.id, "PREPARED", "SUBMITTING");
+  let res;
+  try {
+    res = await submit();
+  } catch (e) {
+    // 3 — ambiguous outcome: the broker MAY have received it. Mark UNKNOWN (unresolved → startup reconciles by
+    //     tag; the account is kept locked). Best-effort finalize; rethrow so the caller surfaces the failure.
+    try { await db.finalizeOrderAttempt(attempt.id, "UNKNOWN", {}); } catch { /* recovery will still find it SUBMITTING */ }
+    throw e;
+  }
+  // 4 — conclusive result → finalize the mapped terminal/near-terminal state atomically.
+  const c = classify(res) || { status: "UNKNOWN", patch: {} };
+  await db.finalizeOrderAttempt(attempt.id, c.status, c.patch || {});
+  return res;
+}
+
+module.exports = { reconcileUnresolvedAttempts, submitWithAttempt };
