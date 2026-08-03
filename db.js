@@ -430,11 +430,16 @@ function computeExitDrift(closedPositions, fills) {
   const missingExitFill = closed.filter((p) => !exitByManaged.has(String(p.id))).map((p) => String(p.id));
   return { closedPositions: closed.length, exitFills: exitByManaged.size, missingExitFill, drift: missingExitFill.length };
 }
-/* Read both stores for a user and compute the drift (convenience wrapper for a periodic monitor). */
+/* Read both stores for a user and compute the drift.
+   R24-follow-up: this MUST NOT swallow a read failure into an empty array. It is the proof behind the Resume
+   unlock (server.js): if either the journal or the fills read fails during an outage, treating the result as
+   "[] ⇒ zero drift" would FAIL OPEN and clear the risk lock without any real reconciliation. So a read failure
+   now PROPAGATES — the Resume caller wraps this in try/catch and keeps the lock engaged (fail closed) on error.
+   A genuinely empty book (no trades / no fills) still returns cleanly with drift 0, which is a valid unlock. */
 async function reconcileRiskVsLedger(userId, { from = 0, to = Date.now() } = {}) {
   const [trades, fills] = await Promise.all([
-    getTrades(String(userId), from, to).catch(() => []),
-    getFills(String(userId), from, to).catch(() => []),
+    getTrades(String(userId), from, to),
+    getFills(String(userId), from, to),
   ]);
   return computeLedgerDrift(trades, fills);
 }
