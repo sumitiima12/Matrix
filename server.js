@@ -287,6 +287,52 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = 
   if (remaining > 1e-9) logFinancial("reduceonly_exit.unmatched", { userKey, orderId, sym: bareSym(sym), closeSide, unmatched: remaining });
   return { applied: +(wantQty - remaining).toFixed(8), unmatched: +remaining.toFixed(8) };
 }
+
+/* H04 — record the true per-EXECUTION fills for a FYERS order from its TRADEBOOK, as immutable ledger events. An
+   order can fill across several executions at different prices/times; the orderbook only exposes a CUMULATIVE
+   snapshot, so we read /tradebook and append one immutable fill EVENT per execution (execEvent:true), each with
+   its own broker execution id, price, quantity, timestamp and fees. projectFills then sums these (quantity-
+   weighted price + summed fees) instead of the max-observation snapshot — accurate multi-price fills + costs.
+   Additive + best-effort: dedup is by the broker execution id (recordFill keys on fillId), so replays/retries and
+   the periodic sweep never double-record; if the tradebook is unavailable the cumulative snapshot already anchors
+   risk, so we simply record nothing extra. Never throws. Returns { recorded, unavailable }. */
+async function recordFyersExecutionFills(userKey, sess, orderId, { leg = "entry", entryOrderId = null, market = "IN", tradeType = "Manual", strategy = null } = {}) {
+  if (!orderId || !sess || !sess.accessToken) return { recorded: 0 };
+  let book = [];
+  try {
+    const r = await fyFetch("https://api-t1.fyers.in/api/v3/tradebook", { headers: brokerAuth("fyers", sess.accessToken, sess.userId) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") return { recorded: 0, unavailable: true };
+    book = Array.isArray(d.tradeBook) ? d.tradeBook : (Array.isArray(d.trades) ? d.trades : []);
+  } catch { return { recorded: 0, unavailable: true }; }
+  const ours = book.filter((t) => t && String(t.orderNumber ?? t.orderId ?? t.id) === String(orderId));
+  let recorded = 0;
+  for (const t of ours) {
+    const q = Number(t.tradedQty ?? t.qty ?? t.filledQty) || 0;
+    const px = Number(t.tradePrice ?? t.price ?? 0) || 0;
+    if (!(q > 0) || !(px > 0)) continue;
+    // A stable per-execution id: prefer the broker trade id; else a deterministic (order, price, qty) key so a
+    // re-read of the same execution collapses rather than duplicating.
+    const execId = String(t.tradeNumber ?? t.id ?? t.fillId ?? `${orderId}_${px}_${q}`);
+    const fees = Number(t.brokerage ?? t.fees ?? t.tax ?? 0) || 0;   // FYERS equity tradebook usually omits these → 0 (EOD contract note is authoritative)
+    const sideStr = (t.side === -1 || String(t.side).toUpperCase() === "SELL" || String(t.side) === "-1") ? "SELL" : "BUY";
+    const tsMs = t.orderDateTime ? (Date.parse(String(t.orderDateTime).replace(" ", "T")) || Date.now()) : (Number(t.tradeTime) || Date.now());
+    try {
+      const res = await db.recordFill(userKey, {
+        fillId: `x_${userRefSafe(userKey)}_fyers_${execId}`, execEvent: true, execId,
+        ...(leg === "exit" ? { kind: "exit" } : {}), side: sideStr, qty: q, entry: px, price: px, fees,
+        orderId, entryOrderId: entryOrderId != null ? String(entryOrderId) : null,
+        broker: "fyers", market, real: true, serverAuthored: true, tradeType, ...(strategy ? { strategy } : {}), ts: tsMs,
+      });
+      if (res && res.inserted) recorded++;
+    } catch { /* best-effort — cumulative snapshot already anchors risk */ }
+  }
+  if (recorded) logFinancial("h04.executions_recorded", { userKey, orderId, leg, executions: recorded });
+  return { recorded };
+}
+// Short, stable user tag for the execution fillId namespace (mirrors db.userRef so ids are user-scoped).
+function userRefSafe(userId) { try { return crypto.createHash("sha1").update(String(userId)).digest("hex").slice(0, 12); } catch { return "x"; } }
+
 /* R25-C01: park a durable pending-reconciliation row for an ACCEPTED-but-not-yet-filled broker order. The
    broker already holds the order, so if we can't save its tracking row we must NOT pretend it's a normal pending
    success — that would permanently lose the fill/SL-TP reconciliation job (the fill could later be absent from
@@ -5552,6 +5598,8 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });
           if (ex && ex.error) trackingFailed = true;   // ledger write failed → account already risk-locked
+          // H04: also record the true per-execution EXIT fills from the tradebook (execution-accurate ledger + fees).
+          recordFyersExecutionFills(storageKeyFor(sess.userId), sess, d.id, { leg: "exit", entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null, market: regMarket, tradeType: String(req.body?.tradeType || "Manual") }).catch(() => {});
         } else {
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
@@ -5563,6 +5611,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           // R25-H07: a FILLED order whose fill couldn't be journaled must NOT look like an ordinary success — the
           // account is already risk-locked; surface reconciliation-required so the client shows the paused state.
           if (!journaled) trackingFailed = true;
+          // H04: record the true per-execution ENTRY fills from the tradebook so the immutable ledger models
+          // multiple execution prices/times/fees (projectFills sums them, weighted-average). Best-effort; the
+          // cumulative snapshot above already anchors risk if the tradebook is unavailable.
+          recordFyersExecutionFills(storageKeyFor(sess.userId), sess, d.id, { leg: "entry", market: regMarket, tradeType: String(req.body?.tradeType || "Manual"), strategy: req.body?.strategyName ? String(req.body.strategyName).slice(0, 120) : null }).catch(() => {});
         }
       }
 

@@ -14,8 +14,10 @@ function makeFakeFyers() {
     requests: [],             // every received request { method, path, body }
     placeCount: 0,            // number of ACTUAL order-placement calls that reached the broker
     fillPrice: 100,
+    nextExecutions: null,     // H04: [{qty,price}] to split the NEXT order into multiple executions (else one)
+    tradeBook: [],            // H04: per-execution trade lines { orderNumber, tradeNumber, tradePrice, tradedQty, side }
   };
-  let seq = 1000;
+  let seq = 1000, tradeSeq = 5000;
 
   function readBody(req) {
     return new Promise((resolve) => {
@@ -47,6 +49,12 @@ function makeFakeFyers() {
       return send(200, { s: "ok", orderBook: orderBookArray(id) });
     }
 
+    // ---- tradebook (H04: per-execution fills) --------------------------------------------------------
+    if (req.method === "GET" && path === "/api/v3/tradebook") {
+      state.requests.push({ method: "GET", path });
+      return send(200, { s: "ok", tradeBook: state.tradeBook });
+    }
+
     // ---- order placement ----------------------------------------------------------------------------
     if (req.method === "POST" && path === "/api/v3/orders/sync") {
       const body = await readBody(req);
@@ -70,6 +78,13 @@ function makeFakeFyers() {
       // fill / lostResponse / delay ⇒ status 2 (filled) and held in the book under our tag
       if (tag && !state.orders.has(tag)) state.orders.set(tag, { id, orderTag: tag, symbol: body.symbol, qty: Number(body.qty) || 0, side: body.side, status, filledQty, tradedPrice });
       const stored = state.orders.get(tag) || { id };
+      // H04: emit per-execution trade lines for a filled order (default: one execution at fillPrice; a test can
+      // set nextExecutions to split the order across multiple prices). Weighted average must equal the order avg.
+      if (status === 2 && filledQty > 0) {
+        const execs = Array.isArray(state.nextExecutions) && state.nextExecutions.length ? state.nextExecutions : [{ qty: filledQty, price: tradedPrice }];
+        for (const e of execs) state.tradeBook.push({ orderNumber: stored.id, tradeNumber: "T" + (++tradeSeq), tradePrice: Number(e.price), tradedQty: Number(e.qty), side: body.side, orderDateTime: null });
+        state.nextExecutions = null;   // one-shot
+      }
 
       if (state.mode === "lostResponse") {
         // The broker recorded the order, but the RESPONSE is lost — reset the socket after recording. The client
@@ -92,6 +107,8 @@ function makeFakeFyers() {
     async listen() { await new Promise((r) => server.listen(0, "127.0.0.1", r)); return `http://127.0.0.1:${server.address().port}`; },
     async close() { await new Promise((r) => server.close(r)); },
     setMode(m, opts = {}) { state.mode = m; if (opts.delayMs != null) state.delayMs = opts.delayMs; if (opts.fillPrice != null) state.fillPrice = opts.fillPrice; },
+    // H04: split the NEXT filled order into these executions (each {qty, price}); one-shot.
+    setExecutions(execs) { state.nextExecutions = execs; },
     // Later flip a stored order's status (models a broker fill that settles after an earlier pending/lost response).
     settle(tag, status = 2, filledQty = null, tradedPrice = null) {
       const o = state.orders.get(tag); if (!o) return;
@@ -99,7 +116,7 @@ function makeFakeFyers() {
     },
     placeCount() { return state.placeCount; },
     orderPosts() { return state.requests.filter((r) => r.method === "POST" && r.path === "/api/v3/orders/sync"); },
-    reset() { state.orders.clear(); state.requests.length = 0; state.placeCount = 0; state.mode = "fill"; },
+    reset() { state.orders.clear(); state.requests.length = 0; state.placeCount = 0; state.mode = "fill"; state.tradeBook.length = 0; state.nextExecutions = null; },
   };
 }
 

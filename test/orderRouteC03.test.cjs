@@ -329,3 +329,31 @@ test("C01-partial: reduce-only partial close reduces the open row + books realiz
   assert.equal(openWipro.length, 1);
   assert.equal(Number(openWipro[0].qty), 6);
 }));
+
+test("H04: an order filled across TWO executions is recorded as two immutable events; projection = weighted avg", guard(async () => {
+  const T = await freshTrader();
+  const SYM = "NSE:INFY-EQ";
+  fake.reset();
+  fake.setMode("fill", { fillPrice: 104 });                 // cumulative snapshot avg
+  fake.setExecutions([{ qty: 3, price: 100 }, { qty: 2, price: 110 }]);   // real fills: 3@100 + 2@110
+  const r = await T.order(newKey(), { symbol: SYM, side: "BUY", qty: 5, orderType: "MARKET", product: "CNC" });
+  assert.equal(r.status, 200, "entry accepted: " + JSON.stringify(r.body));
+  const oid = r.body.orderId;
+
+  // The per-execution recording is fire-and-forget; poll the ledger until both events land (bounded).
+  let execEvents = [];
+  for (let i = 0; i < 40; i++) {
+    const fills = await db.getFills(T.skey, 0, Date.now());
+    execEvents = fills.filter((f) => f.execEvent === true && String(f.orderId) === String(oid));
+    if (execEvents.length >= 2) break;
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  assert.equal(execEvents.length, 2, "two immutable per-execution fill events recorded from the tradebook");
+
+  const fills = await db.getFills(T.skey, 0, Date.now());
+  const proj = db.projectFills(fills).find((p) => p.leg === "entry" && String(p.orderId) === String(oid));
+  assert.ok(proj, "the order projects to one entry leg");
+  assert.equal(proj.qty, 5, "quantity summed across the two executions");
+  assert.ok(Math.abs(proj.price - 104) < 1e-6, "quantity-weighted price = (3·100 + 2·110)/5 = 104");
+  assert.equal(proj.executions, 2, "projection derived from 2 execution events (not the cumulative snapshot)");
+}));

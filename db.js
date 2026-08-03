@@ -457,27 +457,51 @@ async function getFills(userId, from = 0, to = Date.now()) {
    ledger, by order id. Returns the drift both ways so a monitor can surface a book that is diverging BEFORE it
    loosens/loses a risk control. Exit fills (kind:"exit") are excluded — they're the closing leg, not an entry.
    Pure and side-effect-free (takes already-read arrays) so it unit-tests without a DB. */
-/* R24-P2-01: fills for one order arrive as CUMULATIVE snapshots (a partial qty=2 row, then a fuller qty=5 row) —
-   they are NOT additive executions. Summing them would overstate the position (2+5=7 instead of 5). This projects
-   the ledger to the authoritative fill per (broker, order, leg) by taking the LARGEST observed quantity. */
+/* H04 — project the immutable fills ledger to ONE authoritative fill per (broker, order, leg), from true broker
+   EXECUTION EVENTS when they exist, else from legacy CUMULATIVE snapshots.
+     • Per-execution events (recorded with execEvent:true, each carrying its own broker execution id, price, qty,
+       time and fees) are SUMMED: qty = Σ, price = quantity-weighted average, fees = Σ, ts = latest. This models
+       an order that fills across multiple prices/times accurately (H04). When execution events are present for a
+       group, any cumulative snapshot in the same group is IGNORED (the executions are the finer truth).
+     • Legacy cumulative snapshots (R24-P2-01: a partial qty=2 row then a fuller qty=5 row are NOT additive) keep
+       the MAX-observation behaviour, so historical data projects unchanged.
+   Pure; unit-tested without a DB. Every projected row carries `qty, price, fees, side, market, ts, entryOrderId,
+   managedId, executions` (executions = count of true execution events, 0 for a legacy snapshot). */
 function projectFills(fills) {
-  const byOrder = new Map();
+  const groups = new Map();
   for (const x of (fills || [])) {
     if (!x || x.orderId == null) continue;
     const leg = x.kind === "exit" ? "exit" : "entry";
     const key = `${x.broker || ""}|${String(x.orderId)}|${leg}`;
-    const q = Number(x.qty) || 0;
-    const prev = byOrder.get(key);
-    if (!prev || q > prev.qty) {
-      byOrder.set(key, {
-        broker: x.broker || null, orderId: String(x.orderId), leg, qty: q,
-        price: Number(x.entry != null ? x.entry : x.price) || null, side: x.side || null, market: x.market || null,
-        ts: Number(x.ts != null ? x.ts : x.entryAt) || 0,
-        entryOrderId: x.entryOrderId != null ? String(x.entryOrderId) : null, managedId: x.managedId != null ? String(x.managedId) : null,
-      });
+    let g = groups.get(key);
+    if (!g) { g = { broker: x.broker || null, orderId: String(x.orderId), leg, exec: [], snap: null }; groups.set(key, g); }
+    const rawPx = Number(x.entry != null ? x.entry : x.price);
+    const rec = {
+      qty: Number(x.qty) || 0, price: Number.isFinite(rawPx) ? rawPx : null, fees: Number(x.fees) || 0,
+      side: x.side || null, market: x.market || null, ts: Number(x.ts != null ? x.ts : x.entryAt) || 0,
+      entryOrderId: x.entryOrderId != null ? String(x.entryOrderId) : null, managedId: x.managedId != null ? String(x.managedId) : null,
+    };
+    if (x.execEvent === true) g.exec.push(rec);
+    else if (!g.snap || rec.qty > g.snap.qty) g.snap = rec;   // max-observation cumulative snapshot
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    if (g.exec.length) {
+      let qty = 0, qtyPriced = 0, notional = 0, fees = 0, ts = 0, side = null, market = null, entryOrderId = null, managedId = null;
+      for (const e of g.exec) {
+        qty += e.qty; fees += e.fees; ts = Math.max(ts, e.ts);
+        if (e.price != null) { notional += e.price * e.qty; qtyPriced += e.qty; }
+        side = side || e.side; market = market || e.market;
+        entryOrderId = entryOrderId || e.entryOrderId; managedId = managedId || e.managedId;
+      }
+      const price = qtyPriced > 0 ? notional / qtyPriced : null;
+      out.push({ broker: g.broker, orderId: g.orderId, leg: g.leg, qty, price, fees, side, market, ts, entryOrderId, managedId, executions: g.exec.length });
+    } else if (g.snap) {
+      const s = g.snap;
+      out.push({ broker: g.broker, orderId: g.orderId, leg: g.leg, qty: s.qty, price: s.price, fees: s.fees, side: s.side, market: s.market, ts: s.ts, entryOrderId: s.entryOrderId, managedId: s.managedId, executions: 0 });
     }
   }
-  return [...byOrder.values()];
+  return out;
 }
 /* R25-H03/H04: derive the RISK-relevant counters straight from the immutable FILLS ledger (the authoritative
    event source), instead of the editable `trades` projection. Entries are projected max-observation fills; a
@@ -496,7 +520,7 @@ function deriveRiskFromFills(fills, { from = 0, to = Date.now() } = {}) {
   const windowEntries = entries.filter((e) => inWin(e.ts));
   const entryCount = windowEntries.length;
   const lastEntryTs = windowEntries.reduce((m, e) => Math.max(m, e.ts), 0);
-  let realizedPnl = 0, realizedLoss = 0, matched = 0, unmatchedExits = 0;
+  let realizedPnl = 0, realizedPnlGross = 0, realizedLoss = 0, fees = 0, matched = 0, unmatchedExits = 0;
   for (const x of exits) {
     if (!inWin(x.ts)) continue;
     // Match the exit to its entry by the stamped entryOrderId (broker-scoped), else by managedId fallback.
@@ -505,12 +529,20 @@ function deriveRiskFromFills(fills, { from = 0, to = Date.now() } = {}) {
     if (!e || x.price == null || e.price == null) { unmatchedExits++; continue; }
     const dir = String(e.side || "").toUpperCase() === "SELL" ? -1 : 1;   // short profits when price falls
     const qty = Math.min(Number(e.qty) || 0, Number(x.qty) || 0) || (Number(x.qty) || 0);
-    const pnl = (Number(x.price) - Number(e.price)) * qty * dir;
-    realizedPnl += pnl;
-    if (pnl < 0) realizedLoss += -pnl;
+    const gross = (Number(x.price) - Number(e.price)) * qty * dir;
+    /* H04: NET realized P&L includes costs — the full exit-leg fees plus the entry-leg fees PRORATED by the
+       matched quantity (a partial close only bears its share of the entry cost). deriveRiskFromFills is the
+       authoritative risk source, so the daily-loss / P&L counters must be net of brokerage, taxes and exchange
+       fees carried on the execution events. Legacy snapshots carry fees:0, so net == gross for historical data. */
+    const entryFee = (Number(e.fees) || 0) * ((Number(e.qty) || 0) > 0 ? Math.min(qty, Number(e.qty) || 0) / (Number(e.qty) || 1) : 0);
+    const exitFee = Number(x.fees) || 0;
+    const cost = entryFee + exitFee;
+    const net = gross - cost;
+    realizedPnl += net; realizedPnlGross += gross; fees += cost;
+    if (net < 0) realizedLoss += -net;
     matched++;
   }
-  return { entryCount, lastEntryTs, realizedPnl, realizedLoss, matched, unmatchedExits };
+  return { entryCount, lastEntryTs, realizedPnl: +realizedPnl.toFixed(2), realizedPnlGross: +realizedPnlGross.toFixed(2), fees: +fees.toFixed(2), realizedLoss: +realizedLoss.toFixed(2), matched, unmatchedExits };
 }
 /* R24-P2-02: drift now compares FINANCIAL truth (quantity), not just order-id presence. It matches the risk
    journal's verified entry legs against the ledger's PROJECTED entry fills (max-observation, above) by order id,
