@@ -4544,9 +4544,14 @@ function angelHeaders(apiKey, jwt) {
 /* Set DELTA_TESTNET=true (with TESTNET api keys in DELTA_API_KEY/SECRET) to route ALL Delta
    traffic to the testnet — real API, fake money — so the crypto order + reconciliation path can
    be exercised end-to-end without real funds. Production (india.delta.exchange) is the default. */
-const DELTA_BASE = String(process.env.DELTA_TESTNET || "").toLowerCase() === "true"
-  ? (process.env.DELTA_TESTNET_BASE || "https://cdn-ind.testnet.deltaex.org")
-  : "https://api.india.delta.exchange";
+/* DELTA_API_BASE is a hermetic-test seam (mirrors FYERS_API_BASE): when set, EVERY Delta call — tickers, signed
+   orders, positions, wallet, fills — is redirected to it, so a fake Delta HTTP server can exercise the crypto
+   order → verified-fill → protection → exit → restart journey with zero real funds and no network. Unset in
+   production, where the testnet/prod hosts below apply. */
+const DELTA_BASE = process.env.DELTA_API_BASE
+  || (String(process.env.DELTA_TESTNET || "").toLowerCase() === "true"
+    ? (process.env.DELTA_TESTNET_BASE || "https://cdn-ind.testnet.deltaex.org")
+    : "https://api.india.delta.exchange");
 
 /* ── Delta outbound proxy ─────────────────────────────────────────────────────────
    Delta whitelists API keys by IP. Render's outbound IP isn't (and can't reliably be)
