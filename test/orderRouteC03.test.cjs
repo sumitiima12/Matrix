@@ -134,14 +134,16 @@ test.after(async () => {
   if (pgHandle) { try { await pgHandle.stop(); } catch { /* ignore */ } }
 });
 
-// Evaluate DB availability at RUN time (before() populates DATABASE_URL), not at registration time. Without a DB
-// locally we skip; in CI a missing DB is a hard failure (never a silent pass).
-const guard = (t) => async (...a) => {
+// Evaluate DB availability at RUN time (before() populates DATABASE_URL), not at registration time. R31-H02: without
+// a DB we must call the test context's skip() so the runner reports SKIPPED (honest) — NOT return normally, which Node
+// counts as a PASS (a false green). In CI a missing DB is a hard failure, never a skip.
+const guard = (fn) => async (t, ...rest) => {
   if (!DATABASE_URL) {
     if (IN_CI) throw new Error("route C03 proof requires PostgreSQL in CI");
-    return; // local skip
+    t.skip("no PostgreSQL available — route C03 proof skipped (run in CI with DATABASE_URL)");
+    return undefined;
   }
-  return t(...a);
+  return fn(t, ...rest);
 };
 
 test("J5: auth/PIN/credential failures reject BEFORE any broker order (zero placements)", guard(async () => {

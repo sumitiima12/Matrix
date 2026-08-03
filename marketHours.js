@@ -65,6 +65,10 @@ function usMarketHolidays(y) {
    wrong trade. When trading spills into a year with NO table below, isMarketHoliday() warns ONCE (see
    below) so the omission is loud, not silent — add that year's circular dates before it arrives. */
 const IN_HOLIDAYS = {
+  // R31-M06 — 2025 NSE trading holidays (official circular): Republic Day fell on a Sunday; the traded closures are
+  // Mahashivratri, Holi, Id-ul-Fitr, Mahavir Jayanti, Good Friday, Maharashtra Day, Independence Day, Ganesh Chaturthi,
+  // Gandhi Jayanti/Dussehra, Diwali Balipratipada, Prakash Gurpurb, and Christmas.
+  2025: ["2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14", "2025-04-18", "2025-05-01", "2025-08-15", "2025-08-27", "2025-10-02", "2025-10-21", "2025-10-22", "2025-11-05", "2025-12-25"],
   2026: ["2026-01-26", "2026-04-03", "2026-05-01", "2026-06-26", "2026-09-14", "2026-10-02", "2026-12-25"],
   // 2027 date-certain subset (Republic Day, Good Friday 2027-03-26 via Easter computus, Maharashtra/Labour
   // Day, Independence Day, Gandhi Jayanti, Christmas). Lunar dates still TBD from the 2027 NSE circular.

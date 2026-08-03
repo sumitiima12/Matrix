@@ -562,6 +562,10 @@ let schemaReady = false;
        effort so it never blocks boot. A periodic worker (below) repeats it with bounded backoff. */
     if (C03_ORDER_ATTEMPTS_ON && !MATRIX_NO_LISTEN) {
       runC03Reconcile("startup").catch((e) => console.error("[c03] startup reconcile sweep error:", e && e.message));
+      /* R31-H08: also REPAIR any durable PROJECTION_PENDING exits immediately at readiness — not only on the periodic
+         interval — so a confirmed-exit projection that failed before restart is re-applied at once instead of leaving
+         the account locked with stale state until the first interval fires. Idempotent + advisory-locked; best-effort. */
+      repairProjectionPending("startup").catch((e) => console.error("[projrepair] startup error:", e && e.message));
     }
   })
     .catch((e) => {
