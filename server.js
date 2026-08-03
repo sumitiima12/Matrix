@@ -246,7 +246,7 @@ async function recordExitFill(userKey, pos, r, reason) {
    Realized P&L uses the SAME formula as the exit engine: (exit − entry) × qty × dir, dir = +1 long / −1 short.
    Fail-loud: a ledger-write failure risk-locks the account (like recordAuthoritativeFill) so a close that couldn't
    be recorded pauses trading rather than silently corrupting the book. Returns { applied, unmatched, alreadyDone }. */
-async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = {}) {
+async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null, externalPosition = false } = {}) {
   const { sym, closeSide, qty, exitPx, orderId, entryOrderId, broker, market, tradeType, strategy } = fill;
   const bareSym = (s) => String(s || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
   const wantQty = Number(qty) || 0;
@@ -259,24 +259,50 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = 
     ...(strategy ? { strategy } : {}), ts: now,
   };
 
-  // 1 — READ-based idempotency, independent of write ordering: if a trade row already carries THIS close order's
-  //     exitOrderId, the atomic close already committed → just ensure the ledger leg exists and return.
-  let all = [];
-  try { all = await db.getTrades(userKey, 0, Date.now()); } catch { all = []; }
+  /* R30-P1-02 / P2-01 fail-closed helper: a broker-CONFIRMED close that we cannot fully allocate to local open rows
+     (read failure, projection drift, wrong strategy target, or an external/manual broker position) must NEVER commit a
+     phantom closing leg. Park a durable reconciliation item (idempotent by exit order id), risk-lock, halt entries and
+     return reconcileRequired so the caller/repair path resolves it against the broker — the immutable ledger stays
+     honest. `reason` is for ops; `matched` is how much we could allocate. */
+  const parkReconcile = async (reason, matched = 0) => {
+    logFinancial("reduceonly_exit.reconcile_required", { userKey, orderId, sym: bareSym(sym), reason, wantQty, matched, entryOrderId: entryOrderId != null ? String(entryOrderId) : null });
+    try {
+      await db.saveProjectionPending({ id: `exproj_${orderId}`, kind: "exit", userId: userKey, orderId,
+        payload: { sym, closeSide, qty: wantQty, exitPx, orderId, entryOrderId: entryOrderId != null ? String(entryOrderId) : null, broker, market: market || "IN", tradeType, strategy: strategy || null, reason } });
+    } catch (pe) { logFinancial("reduceonly_exit.projpending_save_failed", { userKey, orderId, err: String((pe && pe.message) || pe) }); }
+    try { await db.setRiskLock(userKey, true); } catch { /* best-effort */ }
+    if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); haltedEntries.add(String(storageKeyFor(String(haltUserIdOnFail)))); } catch { /* best-effort */ } }
+    await addUserNotice(userKey, { type: "exit_unmatched", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed at your broker but Matrix couldn't match it to an open position (${reason}) — new orders are paused as a precaution. Please reconcile with your broker.` });
+    return { applied: +matched.toFixed(8), unmatched: +(wantQty - matched).toFixed(8), reconcileRequired: true, reason };
+  };
+
+  // 1 — AUTHORITATIVE READ. This read DECIDES what we close, so a failure must NOT be swallowed into all=[] (that would
+  //     let a broker-confirmed close commit against ZERO matched rows — R30-P1-02). On read failure, fail closed.
+  let all = null;
+  try { all = await db.getTrades(userKey, 0, Date.now()); } catch (e) { logFinancial("reduceonly_exit.read_failed", { userKey, orderId, err: String((e && e.message) || e) }); all = null; }
+  if (all == null) return parkReconcile("read-failed", 0);
+
+  // READ-based idempotency, independent of write ordering: if a trade row already carries THIS close order's
+  // exitOrderId, the atomic close already committed → just ensure the ledger leg exists and return.
   if (all.some((t) => t && String(t.exitOrderId || "") === String(orderId))) {
     try { await db.recordFill(userKey, exitFill); } catch { /* leg already present */ }
     return { applied: 0, unmatched: 0, alreadyDone: true };
   }
 
-  // 2 — PLAN the close against OPEN real rows for this symbol, OPPOSITE direction, FIFO by entry time (no writes).
+  // 2 — PLAN the close against OPEN real rows for this symbol, OPPOSITE direction. When an entryOrderId is supplied we
+  //     target EXACTLY that entry row (user+broker+entry order id) — closing strategy B must not consume strategy A's
+  //     older row (R30-P2-01). FIFO is used only for an explicit aggregate close (no entryOrderId).
   const openDir = String(closeSide).toUpperCase() === "SELL" ? "long" : "short";   // SELL closes a long; BUY covers a short
   const dir = openDir === "long" ? 1 : -1;
+  const wantEntry = entryOrderId != null ? String(entryOrderId) : null;
+  const matchesEntry = (t) => wantEntry == null
+    || String(t.orderId || "") === wantEntry || String(t.entryOrderId || "") === wantEntry || String(t.id || "") === wantEntry;
   const isOpen = (t) => t && t.real === true && t.entryAt != null && t.exitAt == null && t.exit == null && t.status !== "rejected"
     && bareSym(t.sym) === bareSym(sym)
     && (openDir === "long"
       ? (String(t.side || "").toUpperCase() !== "SELL" && t.short !== true)
       : (String(t.side || "").toUpperCase() === "SELL" || t.short === true));
-  const open = all.filter(isOpen).sort((a, b) => (Number(a.entryAt) || 0) - (Number(b.entryAt) || 0));
+  const open = all.filter((t) => isOpen(t) && matchesEntry(t)).sort((a, b) => (Number(a.entryAt) || 0) - (Number(b.entryAt) || 0));
   const rows = [];   // the exact trade-projection writes this close performs
   let remaining = wantQty;
   for (const row of open) {
@@ -294,7 +320,15 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = 
     remaining -= take;
   }
 
-  // 3 — COMMIT the exit fill + all trade-row writes ATOMICALLY. A crash mid-transaction rolls back cleanly so a
+  // 3 — MATCH COMPLETENESS (R30-P1-02 / P2-01). Unless this close EXPLICITLY targets an externally-discovered broker
+  //     position (externalPosition:true, e.g. the C02 orphan-exposure path), the matched quantity MUST equal the
+  //     broker-confirmed exit quantity. Any shortfall — zero match, wrong entryOrderId, drift — must NOT commit; park
+  //     for reconciliation instead so the immutable ledger never claims a leg Matrix couldn't allocate.
+  if (!externalPosition && remaining > 1e-6) {
+    return parkReconcile(wantEntry != null ? "entry-not-matched" : "unmatched-qty", wantQty - remaining);
+  }
+
+  // 4 — COMMIT the exit fill + all trade-row writes ATOMICALLY. A crash mid-transaction rolls back cleanly so a
   //     replay recomputes from the original open state; the exitOrderId guard above makes a committed close a no-op.
   try {
     await db.recordExitAtomic(userKey, { fill: exitFill, rows });
@@ -312,7 +346,6 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = 
     await addUserNotice(userKey, { type: "exit_unjournaled", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed but couldn't be recorded — new orders are paused as a precaution. We'll repair it automatically; please reconcile with your broker.` });
     return { applied: 0, unmatched: wantQty, error: String((e && e.message) || e), projectionPending: true };
   }
-  if (remaining > 1e-9) logFinancial("reduceonly_exit.unmatched", { userKey, orderId, sym: bareSym(sym), closeSide, unmatched: remaining });
   return { applied: +(wantQty - remaining).toFixed(8), unmatched: +remaining.toFixed(8) };
 }
 
@@ -7374,10 +7407,30 @@ async function fyersOrderProbe(st) {
   } catch { return null; }
 }
 
+/* S7 multi-instance single-owner coordination. Every replica has a stable INSTANCE_ID. A single-owner job acquires a
+   durable, FENCED lease (db.acquireLease) before it runs, so exactly one replica does the work even across N processes
+   — process memory is never authoritative. Fail-CLOSED: if the lease can't be acquired (held elsewhere OR a DB error),
+   the job SKIPS this tick rather than risk two replicas both entering. Single-instance deploys always win the lease, so
+   behaviour is unchanged. `withLease` runs fn only for the owner and best-effort-releases at the end. */
+const INSTANCE_ID = String(process.env.INSTANCE_ID || `${require("os").hostname()}:${process.pid}:${Math.random().toString(36).slice(2, 8)}`);
+async function withLease(name, ttlMs, fn) {
+  let lease = null;
+  try { lease = await db.acquireLease(name, INSTANCE_ID, ttlMs); }
+  catch (e) { logFinancial("lease.error", { name, err: e && e.message }); return { skipped: true, reason: "lease-error" }; }
+  if (!lease || !lease.acquired) return { skipped: true, reason: "not-owner", owner: lease && lease.owner };
+  try { return await fn(lease.fence); }
+  finally { db.renewLease(name, INSTANCE_ID, lease.fence, 0).catch(() => {}); db.releaseLease(name, INSTANCE_ID).catch(() => {}); }
+}
+
 async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
   if (!schemaReady) return;   // R23-P2-12: never trade against an unproven schema (safety tables may be absent)
   autoBuyRunning = true;
+  try {
+    // S7: only the lease-OWNER replica runs the entry sweep. Others stand down this tick (fail-closed).
+    const g = await db.acquireLease("engine:autobuy", INSTANCE_ID, Math.max(AUTO_BUY_MS * 2, 60_000)).catch(() => null);
+    if (!g || !g.acquired) { autoBuyRunning = false; return; }
+  } catch { autoBuyRunning = false; return; }
   const live = autoBuyLiveOn();
   let checked = 0, bought = 0;
   /* One DB read of a user's managed positions per SWEEP, not per strategy. The loop previously called

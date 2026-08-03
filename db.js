@@ -26,9 +26,16 @@ if (USING_PG) {
   // certificate is actually verified. Neon/Supabase/Render all support this.
   const strict = String(process.env.DB_SSL_STRICT || "").toLowerCase() === "true";
   const ca = process.env.DB_CA_CERT || null;
-  const ssl = strict
-    ? (ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true })
-    : { rejectUnauthorized: false };
+  // A LOOPBACK database (local dev, embedded-postgres in tests, a sidecar) does not speak TLS — forcing SSL there
+  // fails with "server does not support SSL connections". Managed providers (Neon/Supabase/Render) are remote and
+  // keep SSL. Detect a local host from the connection string (or an explicit sslmode=disable) and turn SSL off.
+  const _url = String(process.env.DATABASE_URL || "");
+  const _isLocal = /@(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)[:/]/.test(_url) || /[?&]sslmode=disable\b/.test(_url);
+  const ssl = _isLocal
+    ? false
+    : (strict
+      ? (ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true })
+      : { rejectUnauthorized: false });
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl,
@@ -164,6 +171,20 @@ async function initDb() {
     id TEXT PRIMARY KEY, user_id TEXT, kind TEXT, order_id TEXT, data JSONB, attempts INT DEFAULT 0,
     leased_until BIGINT DEFAULT 0, created_at BIGINT)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_projection_pending_user ON projection_pending (user_id, created_at)`);
+  /* S7 multi-instance safety: durable, fenced leases. Process memory is NEVER authoritative — a single-owner job
+     (auto-buy, screener, exit monitor, protection, recovery, token refresh, projection repair) acquires a NAMED lease
+     before it runs, so exactly one replica owns it. `fence` is a monotonically increasing token bumped ONLY on a
+     change of owner (takeover after expiry). Every fenced write validates the token, so a stale worker that lost the
+     lease during a GC pause / network partition cannot resume and double-act. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS leases (
+    name TEXT PRIMARY KEY, owner TEXT, fence BIGINT DEFAULT 0,
+    acquired_at BIGINT, heartbeat_at BIGINT, expiry BIGINT)`);
+  /* S7 signal identity: one deterministic signal → at most ONE claim across restarts AND replicas. The PRIMARY KEY is
+     the deterministic signal id (strategy+version+symbol+timeframe+candle+direction); the first inserter wins, every
+     other replica/retry conflicts and stands down. This is the DB-enforced dedupe behind "one signal = one attempt". */
+  await pool.query(`CREATE TABLE IF NOT EXISTS signal_claims (
+    id TEXT PRIMARY KEY, user_id TEXT, kind TEXT, claimed_at BIGINT)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_signal_claims_user ON signal_claims (user_id, claimed_at)`);
   /* Shared, restart-durable OAuth CSRF state (R16-P2-11 / R15-P2-09). One-time nonce per broker-login
      attempt, stored in Postgres so it survives restarts and is shared across replicas — a login started on
      worker A can complete its callback on worker B. Consumed atomically (DELETE ... RETURNING). */
@@ -1656,6 +1677,87 @@ async function releaseAdvisoryLock(key) {
   try { await pool.query("SELECT pg_advisory_unlock($1)", [Number(key) | 0]); } catch { /* best-effort */ }
 }
 
+/* S7 durable fenced leases. Semantics:
+     • acquireLease(name, owner, ttlMs) → { acquired, fence, owner }. Acquires iff the lease is ABSENT, already held by
+       THIS owner (renew — fence unchanged), or EXPIRED (takeover — fence incremented so the previous holder is fenced
+       out). Held-by-another-and-live ⇒ { acquired:false } plus the current holder's info. The name PK + single UPDATE
+       makes the race atomic: exactly one of two concurrent acquirers wins.
+     • renewLease(name, owner, fence, ttlMs) → new fence, or null if this worker no longer holds it with that fence
+       (it was taken over / expired). A heartbeat that returns null MUST make the worker stand down.
+     • fenceValid(name, fence) → true iff `fence` is the CURRENT live fence. A stale worker holds a lower fence ⇒ false,
+       so its writes are rejected. This is the guard every single-owner side effect checks before acting.
+   Flat-file/dev is a single process, so it is trivially the sole owner (fence persisted in a JSON file for parity). */
+function _leaseFile() { return FILES.leases || (FILES.leases = process.env.LEASES_FILE || path.join(__dirname, "leases.json")); }
+async function acquireLease(name, owner, ttlMs = 30000) {
+  const nm = String(name), ow = String(owner), now = Date.now(), ttl = Number(ttlMs) || 30000;
+  if (USING_PG) {
+    const r = await pool.query(
+      `INSERT INTO leases (name, owner, fence, acquired_at, heartbeat_at, expiry)
+         VALUES ($1,$2,1,$3,$3,$4)
+       ON CONFLICT (name) DO UPDATE
+         SET owner = EXCLUDED.owner,
+             fence = CASE WHEN leases.owner = EXCLUDED.owner THEN leases.fence ELSE leases.fence + 1 END,
+             acquired_at = CASE WHEN leases.owner = EXCLUDED.owner THEN leases.acquired_at ELSE EXCLUDED.acquired_at END,
+             heartbeat_at = EXCLUDED.heartbeat_at,
+             expiry = EXCLUDED.expiry
+         WHERE leases.owner = EXCLUDED.owner OR leases.expiry <= $3
+       RETURNING owner, fence`,
+      [nm, ow, now, now + ttl]);
+    if (r.rows[0]) return { acquired: true, fence: Number(r.rows[0].fence), owner: ow };
+    const cur = await pool.query(`SELECT owner, fence, expiry FROM leases WHERE name=$1`, [nm]);
+    const c = cur.rows[0] || {};
+    return { acquired: false, fence: Number(c.fence || 0), owner: c.owner || null, expiry: Number(c.expiry || 0) };
+  }
+  const f = _leaseFile(), d = readJSON(f), cur = d[nm];
+  if (cur && cur.owner !== ow && Number(cur.expiry || 0) > now) return { acquired: false, fence: Number(cur.fence || 0), owner: cur.owner, expiry: Number(cur.expiry || 0) };
+  const fence = cur ? (cur.owner === ow ? Number(cur.fence || 1) : Number(cur.fence || 0) + 1) : 1;
+  d[nm] = { owner: ow, fence, acquiredAt: cur && cur.owner === ow ? cur.acquiredAt : now, heartbeatAt: now, expiry: now + ttl };
+  writeJSON(f, d); return { acquired: true, fence, owner: ow };
+}
+async function renewLease(name, owner, fence, ttlMs = 30000) {
+  const nm = String(name), ow = String(owner), fc = Number(fence), now = Date.now(), ttl = Number(ttlMs) || 30000;
+  if (USING_PG) {
+    const r = await pool.query(
+      `UPDATE leases SET heartbeat_at=$4, expiry=$5 WHERE name=$1 AND owner=$2 AND fence=$3 AND expiry > $4 RETURNING fence`,
+      [nm, ow, fc, now, now + ttl]);
+    return r.rows[0] ? Number(r.rows[0].fence) : null;
+  }
+  const f = _leaseFile(), d = readJSON(f), cur = d[nm];
+  if (!cur || cur.owner !== ow || Number(cur.fence) !== fc || Number(cur.expiry || 0) <= now) return null;
+  cur.heartbeatAt = now; cur.expiry = now + ttl; writeJSON(f, d); return fc;
+}
+async function releaseLease(name, owner) {
+  const nm = String(name), ow = String(owner);
+  if (USING_PG) { await pool.query(`DELETE FROM leases WHERE name=$1 AND owner=$2`, [nm, ow]); return; }
+  const f = _leaseFile(), d = readJSON(f); if (d[nm] && d[nm].owner === ow) { delete d[nm]; writeJSON(f, d); }
+}
+async function fenceValid(name, fence) {
+  const nm = String(name), fc = Number(fence), now = Date.now();
+  if (USING_PG) { const r = await pool.query(`SELECT 1 FROM leases WHERE name=$1 AND fence=$2 AND expiry > $3`, [nm, fc, now]); return r.rowCount > 0; }
+  const d = readJSON(_leaseFile()), cur = d[nm];
+  return !!(cur && Number(cur.fence) === fc && Number(cur.expiry || 0) > now);
+}
+async function getLease(name) {
+  const nm = String(name);
+  if (USING_PG) { const r = await pool.query(`SELECT owner, fence, acquired_at, heartbeat_at, expiry FROM leases WHERE name=$1`, [nm]); const x = r.rows[0]; return x ? { owner: x.owner, fence: Number(x.fence), acquiredAt: Number(x.acquired_at), heartbeatAt: Number(x.heartbeat_at), expiry: Number(x.expiry) } : null; }
+  const d = readJSON(_leaseFile()); return d[nm] || null;
+}
+
+/* S7 signal identity: claim a deterministic signal id exactly once. Returns true iff THIS caller won the claim (first
+   inserter); false if some replica/retry already claimed it. The DB PRIMARY KEY is the sole arbiter — no process memory. */
+async function claimSignal(id, userId, kind = "signal") {
+  const sid = String(id), now = Date.now();
+  if (!sid) throw new Error("claimSignal requires an id");
+  if (USING_PG) {
+    const r = await pool.query(
+      `INSERT INTO signal_claims (id, user_id, kind, claimed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING RETURNING id`,
+      [sid, String(userId || ""), String(kind || "signal"), now]);
+    return r.rowCount > 0;
+  }
+  const f = FILES.signalClaims || (FILES.signalClaims = process.env.SIGNAL_CLAIMS_FILE || path.join(__dirname, "signal_claims.json"));
+  const d = readJSON(f); if (d[sid]) return false; d[sid] = { id: sid, userId: String(userId || ""), kind, claimedAt: now }; writeJSON(f, d); return true;
+}
+
 /* Every attempt that hasn't been reconciled yet — the startup-recovery work list. Oldest first. */
 async function listUnresolvedOrderAttempts(limit = 500) {
   if (USING_PG) { const r = await pool.query(`SELECT * FROM order_attempts WHERE resolved=FALSE ORDER BY created_at ASC LIMIT $1`, [Number(limit) || 500]); return r.rows.map(_rowFromPg); }
@@ -1935,4 +2037,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, USING_PG };
