@@ -21,6 +21,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
+const { totpCode } = require("./otp");   // R23-P3-05: RFC-6238 TOTP extracted to a tested module
+const { stableStringify, riskEligibleTrades } = require("./orderIntegrity");   // R23-P3-05: pure risk/order helpers
 const strat = require("./strategyEngine");   // server-side port of the strategy exit engine
 const { evalExitPair, optRanker, lenOptions, costPctFor } = require("./optimizerCore");   // pure optimiser scoring math (unit-tested)
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
@@ -118,22 +120,7 @@ function logFinancial(event, fields) {
   try { console.log(JSON.stringify({ ts: new Date().toISOString(), lvl: "fin", evt: event, ...fields })); }
   catch { try { console.log("[fin]", event); } catch { /* noop */ } }
 }
-/* R21-P2-04: deterministic JSON — recursively SORT object keys so two semantically-identical payloads (differing
-   only in property insertion order) serialize identically. Used for the idempotency payload hash so an unchanged
-   strategy object isn't mistaken for a changed order just because the client reordered its keys. */
-function stableStringify(v) {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
-  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(v[k])}`).join(",")}}`;
-}
-/* R22-C01: the server risk gate must derive state ONLY from VERIFIED executions. A client can POST a trade,
-   but a REAL row that the browser authored (not stamped serverAuthored by a verified broker fill) must never
-   feed the daily-loss / trade-count / cooldown maths — otherwise a fabricated `real:true` row with fake P&L
-   could loosen the loss breaker or the cooldown. Virtual (paper) trades and server-verified real fills count;
-   client-authored real rows are display-only. */
-function riskEligibleTrades(trades) {
-  return (trades || []).filter((t) => !(t && t.real === true && t.clientAuthored === true && t.serverAuthored !== true));
-}
+/* stableStringify + riskEligibleTrades now live in ./orderIntegrity (required at top) — see orderIntegrity.js. */
 /* R17-P2-03: write a durable user-facing notice (used by background jobs like delayed-fill protection so the
    user learns the terminal outcome even though it happened server-side). Best-effort; never throws. */
 async function addUserNotice(userId, notice) {
@@ -148,11 +135,13 @@ async function addUserNotice(userId, notice) {
 async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null } = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      /* ARCH-1: the trade projection AND the immutable fills ledger are written under the SAME durability
+         guarantee. Both are idempotent (saveTrade upserts; recordFill appends once on the broker key), so if
+         EITHER fails we retry the pair, and a persistent failure of either falls through to the fail-loud +
+         halt + risk-lock path below. The ledger can therefore never silently miss a fill it must make
+         authoritative — a lost ledger write halts trading exactly like a lost trade write. */
       await db.saveTrade(userKey, trade, { authoritative: true });
-      /* ARCH-1: write-through to the IMMUTABLE fills ledger (append-only, idempotent). This is the server-owned
-         source of truth for reconciliation/audit and future risk derivation; the trades table stays the editable
-         projection. Best-effort relative to the trade write — the trade write is what the retry/halt guards. */
-      if (typeof db.recordFill === "function") { try { await db.recordFill(userKey, trade); } catch { /* ledger append is non-fatal to the trade write */ } }
+      if (typeof db.recordFill === "function") await db.recordFill(userKey, trade);
       return true;
     }
     catch (e) {
@@ -227,7 +216,25 @@ const UA = {
   "Accept": "application/json,text/plain,*/*",
   "Accept-Language": "en-US,en;q=0.9",
 };
-db.initDb().catch((e) => console.error("[db] init failed:", e.message));
+/* R23-P2-12: the schema (including the safety tables — fills, order_idempotency, pending_protection, the
+   risk_lock column) is created by initDb(). Until that RESOLVES we must not accept money-moving traffic: on
+   Postgres a failed/slow/permission-blocked migration would otherwise leave required safety storage absent while
+   we happily place real orders against it. `schemaReady` stays false until init succeeds; a failed init is
+   retried with backoff and never flips the flag. `requireSchemaReady` fails closed (503) on the real-order path.
+   Flat-file/dev has no migration and becomes ready as soon as the (fast) init resolves. */
+let schemaReady = false;
+(function initSchemaWithRetry(attempt = 0) {
+  db.initDb().then(() => { schemaReady = true; if (attempt) console.log(`[db] schema ready after ${attempt} retr${attempt === 1 ? "y" : "ies"}`); })
+    .catch((e) => {
+      console.error(`[db] init failed (attempt ${attempt + 1}):`, e.message);
+      const delay = Math.min(30_000, 2000 * Math.pow(2, attempt));
+      setTimeout(() => initSchemaWithRetry(attempt + 1), delay);
+    });
+})();
+function requireSchemaReady(req, res, next) {
+  if (schemaReady) return next();
+  return res.status(503).json({ error: "Server is starting up and hasn't finished initializing — please retry in a moment." });
+}
 
 /* ------------------------------- trade store ------------------------------ */
 // Save a completed/opened trade:  POST /api/trades   body: { userId, trade }
@@ -1364,22 +1371,7 @@ const fyFetchOpts = fyersDispatcher ? { dispatcher: fyersDispatcher } : {};
    all through the proxy dispatcher; when no proxy is configured this is a plain fetch. */
 function fyFetch(url, opts) { return pfetch(url, { ...(opts || {}), ...fyFetchOpts }); }
 
-/* RFC-6238 TOTP (HMAC-SHA1, 30s step, 6 digits) from a base32 secret — the same 6-digit code your
-   authenticator app shows. Dependency-free so we can log into FYERS unattended. */
-function totpCode(secretB32, atMs = Date.now()) {
-  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let bits = "";
-  for (const ch of String(secretB32 || "").toUpperCase().replace(/[^A-Z2-7]/g, "")) bits += A.indexOf(ch).toString(2).padStart(5, "0");
-  const bytes = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
-  let counter = Math.floor(atMs / 1000 / 30);
-  const cb = Buffer.alloc(8);
-  for (let i = 7; i >= 0; i--) { cb[i] = counter & 0xff; counter = Math.floor(counter / 256); }
-  const h = crypto.createHmac("sha1", Buffer.from(bytes)).update(cb).digest();
-  const o = h[h.length - 1] & 0xf;
-  const code = ((h[o] & 0x7f) << 24) | ((h[o + 1] & 0xff) << 16) | ((h[o + 2] & 0xff) << 8) | (h[o + 3] & 0xff);
-  return (code % 1000000).toString().padStart(6, "0");
-}
+/* RFC-6238 TOTP now lives in ./otp (required at top) — see otp.js. */
 
 /* Fully-automated FYERS login using the TOTP secret + PIN — the ONLY way to keep the house feed
    alive now that FYERS disabled the refresh-token API (SEBI). Mirrors the manual login: send OTP →
@@ -4921,7 +4913,7 @@ async function placeDeltaBracket(prod, side, entryRef, slPct, tpPct, userId = nu
 /* REAL ORDERS. Gated twice: the server must have BROKER_TRADING_ENABLED=true AND
    the client must send X-Confirm-Live: yes. Two locks, because the failure mode
    here is real money moving without the user meaning it. */
-app.post("/api/broker/order", requireAuth, requireFreshSession, async (req, res) => {
+app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSession, async (req, res) => {
   if (!TRADING_ENABLED) {
     return res.status(403).json({
       error: "Live trading is disabled on this server. Set BROKER_TRADING_ENABLED=true to allow real orders.",
@@ -6613,8 +6605,19 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
   const halt = !!(req.body && req.body.halt);
   if (halt) haltedEntries.add(uid); else haltedEntries.delete(uid);
   try { await db.setEntryHalt(uid, halt); } catch (e) { return res.status(500).json({ error: "Could not save — try again." }); }
-  // R21-P1-03: resuming means the user reconciled — also clear the durable risk-ledger lock so manual orders flow again.
-  if (!halt && typeof db.setRiskLock === "function") { try { await db.setRiskLock(uid, false); } catch { /* best-effort */ } }
+  // R21-P1-03 / R23-P1-03: resuming is the user attesting they reconciled with their broker — clear the durable
+  // risk-ledger lock so orders flow again. This write MUST NOT be swallowed: if it fails, the lock is still
+  // engaged (every worker fails closed on it), so we re-halt this worker's cache and tell the UI it's still
+  // locked rather than falsely reporting "resumed". (A future server-side reconciliation transaction can replace
+  // the user attestation — tracked as INC work.)
+  if (!halt && typeof db.setRiskLock === "function") {
+    try { await db.setRiskLock(uid, false); }
+    catch (e) {
+      haltedEntries.add(uid);
+      logFinancial("killswitch.resume_unlock_failed", { userId: uid, err: String((e && e.message) || e) });
+      return res.status(500).json({ error: "Couldn't clear the risk lock — it's still engaged. Please retry once your broker is reconciled." });
+    }
+  }
   logFinancial(halt ? "killswitch.halt" : "killswitch.resume", { userId: uid });
   res.json({ ok: true, halted: halt });
 });
@@ -6685,6 +6688,7 @@ async function fyersOrderProbe(st) {
 
 async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
+  if (!schemaReady) return;   // R23-P2-12: never trade against an unproven schema (safety tables may be absent)
   autoBuyRunning = true;
   const live = autoBuyLiveOn();
   let checked = 0, bought = 0;
@@ -6843,8 +6847,18 @@ async function runAutoBuyEngine() {
            BEFORE we touch the broker — no post-pause order. The candle intent stays consumed so we won't
            re-fire this bar on resume. */
         const fresh = (await db.getRealStrategiesForUser(String(st.userId)).catch(() => [])).find((x) => x && x.id === st.id);
-        if ((fresh && fresh.status !== "active") || haltedEntries.has(String(st.userId))) {
-          await db.updateRealStrategy(st.id, { pendingSince: null, pendingClientId: null, lastOrderStatus: "skipped", lastError: "Paused/cancelled before the order was sent — no entry placed." });
+        /* R23-P1-03: the in-memory `haltedEntries` set is PER-PROCESS — a lock engaged on worker A (e.g. by a
+           journal failure there) is invisible to worker B's cache. So immediately before touching the broker we
+           ALSO read the DURABLE per-user risk lock, which is the cross-instance source of truth, and FAIL CLOSED
+           if we can't read it. This guarantees that once any worker locks a user, no worker will place a new entry
+           for them until a server reconciliation clears the lock. On a positive read we also sync this worker's
+           local set so the rest of the sweep skips this user cheaply. */
+        let riskLockedNow = false;
+        try { if (typeof db.isRiskLocked === "function") riskLockedNow = await db.isRiskLocked(storageKeyFor(String(st.userId))); }
+        catch { riskLockedNow = true; }   // unreadable lock ⇒ do NOT place a real order
+        if (riskLockedNow) haltedEntries.add(String(st.userId));
+        if ((fresh && fresh.status !== "active") || haltedEntries.has(String(st.userId)) || riskLockedNow) {
+          await db.updateRealStrategy(st.id, { pendingSince: null, pendingClientId: null, lastOrderStatus: "skipped", lastError: riskLockedNow ? "Entries are locked (risk halt) — reconcile with your broker to resume." : "Paused/cancelled before the order was sent — no entry placed." });
           continue;
         }
 
@@ -6946,19 +6960,32 @@ async function runProtectionWatcher() {
         /* R21-P1-03: a DELAYED fill is still a real fill — write the authoritative journal event BEFORE we do
            anything else, so the risk ledger includes this entry (previously the watcher attached protection but
            never recorded the fill, under-counting daily trades/loss/cooldown). Dedupes by (user,broker,orderId). */
-        await recordAuthoritativeFill(storageKeyFor(p.userId), {
+        const journaled = await recordAuthoritativeFill(storageKeyFor(p.userId), {
           sym: p.symbol, side: p.short ? "SELL" : "BUY", qty: c.filledQty || Number(p.qty), entry: avg,
           entryAt: Date.now(), market: p.market, real: true, broker: "fyers",
           tradeType: String(p.tradeType || "Manual"), orderId: p.orderId, serverAuthored: true,
-        });
+        }, { haltUserIdOnFail: p.userId });
         /* R22-C02: a `plain` row (a no-SL/TP order parked only to RECONCILE its fill) journals the fill above and
            then stops — there's no protection to attach, so we don't register a managed position. */
         if (!p.plain) {
+          // Attach protection FIRST regardless of the journal result — a real filled position must never sit
+          // unprotected. registerManagedPosition is idempotent on (broker,user,entryOrderId), so a retry is safe.
           await registerManagedPosition({
             sess, symbol: p.symbol, brokerSym: p.brokerSym, qty: c.filledQty || Number(p.qty), entry: avg,
             market: p.market, sl: p.sl || null, tp: p.tp || null, tsl: p.tsl || null, cfg: p.cfg || null,
             yahoo: p.yahoo, interval: p.interval, product: p.product, short: !!p.short, entryOrderId: p.orderId,
           });
+        }
+        /* R23-P2-06: only RETIRE the pending row once the authoritative fill is durably recorded. If the journal
+           write failed (recordAuthoritativeFill returned false — it has already set the risk-lock + halt), we KEEP
+           the row so a later sweep re-attempts the write (saveTrade/recordFill are idempotent). Deleting here would
+           discard the only signal that this executed fill still needs reconciling — the exact "lose recovery work
+           after a failed journal" hazard. The lease lapses and the row is retried next sweep; the aged 8h / 600-
+           attempt horizon eventually expires a permanently-unrecordable row. */
+        if (!journaled) {
+          logFinancial("protection.fill_unjournaled", { userId: p.userId, broker: "fyers", orderId: p.orderId, qty: c.filledQty || p.qty });
+          await addUserNotice(p.userId, { type: "fill_unjournaled", broker: "fyers", symbol: p.symbol, msg: `Your ${p.symbol} order filled but couldn't be recorded yet — protection is attached and we'll keep retrying. New orders are paused as a precaution.` });
+          continue;   // lease lapses → retried next sweep until the authoritative write commits
         }
         await db.deletePendingProtection(p.id);
         logFinancial(p.plain ? "delayed_fill.reconciled" : "protection.attached", { userId: p.userId, broker: "fyers", orderId: p.orderId, qty: c.filledQty || p.qty });

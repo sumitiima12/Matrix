@@ -334,7 +334,25 @@ async function recordFill(userId, fill) {
   const uref = userRef(userId);
   const brk = String((fill && fill.broker) || "x").toLowerCase().replace(/[^a-z0-9]/g, "");
   const oid = String((fill && fill.orderId) != null ? fill.orderId : "");
-  const fillId = String((fill && fill.fillId) || `f_${uref}_${brk}_${oid}`);
+  const serverTid = String((fill && fill.id) != null ? fill.id : "");
+  const filledQ = Number(fill && fill.qty) || 0;
+  /* Dedupe key precedence (R23-P2-02 / P2-03):
+       1. explicit broker EXECUTION id (fill.fillId) — the true per-execution key when a broker reports each fill.
+       2. order id + filled quantity (`..._<oid>_q<qty>`). Keying on the order ALONE made the FIRST observation
+          authoritative forever, so an order first seen PARTIAL (qty 2) then FILLED (qty 5) stayed permanently
+          partial and under-counted. Including the filled quantity makes a partial and a later fuller observation
+          DISTINCT append-only events (reconciliation takes the largest qty for the order), while a pure replay of
+          the same (order, qty) still collapses to one row.
+       3. no broker order id but a server-issued trade id (fill.id, e.g. t_<uref>_...) — stable per trade, so two
+          different orderless trades don't collide (the old fallback collapsed them) yet the SAME trade replayed
+          by a poll/retry dedupes.
+       4. nothing identifying at all — a unique id (nothing to dedupe against anyway). */
+  const fillId = String(
+    (fill && fill.fillId) ? fill.fillId
+      : oid ? `f_${uref}_${brk}_${oid}_q${filledQ}`
+      : serverTid ? `f_${uref}_${brk}_t_${serverTid}`
+      : `f_${uref}_${brk}_u_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+  );
   const ts = Number(fill && (fill.ts || fill.entryAt)) || Date.now();
   const row = { ...fill, fillId };
   if (USING_PG) {
@@ -402,6 +420,10 @@ async function reassignAndArchiveTrades(phone, fromUserId, archiveKey) {
       await client.query(`CREATE TABLE IF NOT EXISTS trade_archives (archive_key TEXT PRIMARY KEY, phone TEXT, created_at BIGINT)`);
       await client.query(`INSERT INTO trade_archives (archive_key, phone, created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [String(archiveKey), String(phone), Date.now()]);
       const r = await client.query(`UPDATE trades SET user_id=$2 WHERE user_id=$1`, [String(fromUserId), String(archiveKey)]);
+      // R23-P2-05: move the previous owner's immutable fills to the SAME archive key IN THIS TRANSACTION, so a
+      // recycled phone number never inherits the prior person's verified executions (they'd otherwise remain under
+      // the phone-derived identity and count toward the new owner's risk/P&L).
+      await client.query(`UPDATE fills SET user_id=$2 WHERE user_id=$1`, [String(fromUserId), String(archiveKey)]).catch(() => {});
       await client.query("COMMIT");
       return r.rowCount || 0;
     } catch (e) {
@@ -1191,16 +1213,25 @@ async function getIdempotencyRecord(userId, key) {
   if (USING_PG) { const r = await pool.query(`SELECT response, req_hash, status, updated_at, created_at FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return r.rows[0] ? { response: r.rows[0].response, reqHash: r.rows[0].req_hash, status: r.rows[0].status, updatedAt: r.rows[0].updated_at != null ? Number(r.rows[0].updated_at) : null, createdAt: r.rows[0].created_at != null ? Number(r.rows[0].created_at) : null } : null; }
   const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"))); const row = d[`${userId}|${key}`]; return row ? { response: row.response, reqHash: row.reqHash, status: row.status, updatedAt: row.updated_at != null ? Number(row.updated_at) : (row.updatedAt || null), createdAt: row.createdAt != null ? Number(row.createdAt) : null } : null;
 }
-/* R21-P2-05: reclaim STALE idempotency records so a key can't block a user forever. An `in_flight` row older
-   than the response deadline means the original request DIED before finalizing (crash/timeout) — its outcome is
-   unknown, so we DON'T silently release it into a fresh order; instead we mark it `unknown` so the UI prompts
-   the user to reconcile with the broker. Rows in `unknown`/`succeeded` past a long TTL (default 24h) are then
-   purged so the key is eventually reusable. Returns counts. Safe to run periodically from any instance. */
-async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000, ttlMs = 24 * 60 * 60 * 1000 } = {}) {
+/* R21-P2-05 / R23-P1-02: reclaim STALE idempotency records so a key can't block a user forever — WITHOUT ever
+   freeing an UNRESOLVED key into a fresh, duplicate order.
+     • An `in_flight` row older than the response deadline means the original request DIED before finalizing
+       (crash/timeout); its outcome is unknown, so we mark it `unknown` (never release it) so the UI prompts the
+       user to reconcile with the broker.
+     • `unknown` rows are NEVER purged. Their whole purpose is to block a same-key retry until a human/broker
+       reconciliation resolves them. The frontend now persists ambiguous action IDs indefinitely, so purging an
+       `unknown` row would let a returning user win a brand-new claim and place the SAME order twice — the exact
+       R23-P1-02 duplicate-order hazard. An `unknown` key becomes reusable only when finalizeIdempotency records a
+       conclusive `rejected` (deletes the row) or `succeeded` (replays the stored response instead of re-placing).
+     • `succeeded` rows are terminal and safe to REPLAY; we keep them for a long archive window (default 30 days)
+       purely to bound storage. Within that window a reused key returns the stored response rather than re-placing.
+   Returns counts. Safe to run periodically from any instance. */
+async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000, archiveMs = 30 * 24 * 60 * 60 * 1000 } = {}) {
   const now = Date.now();
   if (USING_PG) {
     const m = await pool.query(`UPDATE order_idempotency SET status='unknown' WHERE status='in_flight' AND created_at < $1`, [now - inflightMs]).catch(() => ({ rowCount: 0 }));
-    const p = await pool.query(`DELETE FROM order_idempotency WHERE status IN ('unknown','succeeded') AND created_at < $1`, [now - ttlMs]).catch(() => ({ rowCount: 0 }));
+    // Only 'succeeded' (terminal, replayable) rows are archived — 'unknown' rows are retained until reconciled.
+    const p = await pool.query(`DELETE FROM order_idempotency WHERE status='succeeded' AND created_at < $1`, [now - archiveMs]).catch(() => ({ rowCount: 0 }));
     return { markedUnknown: m.rowCount || 0, purged: p.rowCount || 0 };
   }
   const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"));
@@ -1208,7 +1239,8 @@ async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000, ttlMs = 2
   for (const k of Object.keys(d)) {
     const r = d[k]; const created = Number(r.createdAt) || 0;
     if (r.status === "in_flight" && created < now - inflightMs) { r.status = "unknown"; marked++; changed = true; }
-    else if ((r.status === "unknown" || r.status === "succeeded") && created < now - ttlMs) { delete d[k]; purged++; changed = true; }
+    else if (r.status === "succeeded" && created < now - archiveMs) { delete d[k]; purged++; changed = true; }
+    // NOTE: 'unknown' is intentionally never purged here.
   }
   if (changed) writeJSON(f, d);
   return { markedUnknown: marked, purged };
@@ -1230,11 +1262,16 @@ async function purgeLedgersForUser(userId) {
     await pool.query(`DELETE FROM order_idempotency WHERE user_id=$1`, [String(userId)]).catch(() => {});
     await pool.query(`DELETE FROM order_intents WHERE user_id=$1`, [String(userId)]).catch(() => {});
     await pool.query(`DELETE FROM pending_protection WHERE user_id=$1`, [String(userId)]).catch(() => {});
+    // R23-P2-05: the immutable fills ledger holds this user's verified executions — erasure must clear it too,
+    // otherwise `preserveTrades:false` full deletion still leaves fills linked to the old user key.
+    await pool.query(`DELETE FROM fills WHERE user_id=$1`, [String(userId)]).catch(() => {});
     // R19-P2-10: personal in-app notices are personal data — purge them on account deletion too.
     await pool.query(`DELETE FROM user_notices WHERE user_id=$1`, [String(userId)]).catch(() => {});
     return;
   }
   for (const key of ["idem"]) { const f = FILES[key]; if (!f) continue; const d = readJSON(f); let ch = false; for (const k of Object.keys(d)) if (k.startsWith(`${userId}|`)) { delete d[k]; ch = true; } if (ch) writeJSON(f, d); }
+  // R23-P2-05 (flat-file): fills are bucketed by user id — drop this user's bucket on erasure.
+  try { const ff = FILES.fills; if (ff) { const fd = readJSON(ff); if (fd[String(userId)]) { delete fd[String(userId)]; writeJSON(ff, fd); } } } catch { /* non-fatal */ }
   // R19-P2-10 (flat-file): drop this user's notices bucket.
   try { const nf = FILES.notices; if (nf) { const nd = readJSON(nf); if (nd[String(userId)]) { delete nd[String(userId)]; writeJSON(nf, nd); } } } catch { /* non-fatal */ }
 }
@@ -1275,15 +1312,15 @@ async function savePendingProtection(rec) {
   const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); const d = readJSON(f); d[row.id] = row; writeJSON(f, d); return row;
 }
 async function listPendingProtection(limit = 500) {
-  if (USING_PG) { const r = await pool.query(`SELECT data, attempts FROM pending_protection ORDER BY created_at ASC LIMIT $1`, [limit]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts })); }
-  const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); return Object.values(readJSON(f)).map((x) => ({ ...x.data, attempts: x.attempts })).slice(0, limit);
+  if (USING_PG) { const r = await pool.query(`SELECT data, attempts, created_at FROM pending_protection ORDER BY created_at ASC LIMIT $1`, [limit]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts, created_at: Number(x.created_at) || (x.data && x.data.createdAt) || null })); }
+  const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json")); return Object.values(readJSON(f)).map((x) => ({ ...x.data, attempts: x.attempts, created_at: Number(x.created_at) || (x.data && x.data.createdAt) || null })).slice(0, limit);
 }
 /* R19-P2-11: query pending-protection rows for ONE user directly, so a per-user status endpoint isn't
    capped by a global LIMIT (a busy platform could push a user's own rows past the first page). */
 async function listPendingProtectionForUser(userId, limit = 200) {
-  if (USING_PG) { const r = await pool.query(`SELECT data, attempts FROM pending_protection WHERE user_id=$1 ORDER BY created_at ASC LIMIT $2`, [String(userId), limit]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts })); }
+  if (USING_PG) { const r = await pool.query(`SELECT data, attempts, created_at FROM pending_protection WHERE user_id=$1 ORDER BY created_at ASC LIMIT $2`, [String(userId), limit]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts, created_at: Number(x.created_at) || (x.data && x.data.createdAt) || null })); }
   const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json"));
-  return Object.values(readJSON(f)).map((x) => ({ ...x.data, attempts: x.attempts })).filter((x) => String(x.userId) === String(userId)).slice(0, limit);
+  return Object.values(readJSON(f)).map((x) => ({ ...x.data, attempts: x.attempts, created_at: Number(x.created_at) || (x.data && x.data.createdAt) || null })).filter((x) => String(x.userId) === String(userId)).slice(0, limit);
 }
 /* R17-P1-03: atomically LEASE due protection rows so exactly one replica processes each. On Postgres the
    conditional UPDATE (leased_until < now) with RETURNING is the compare-and-set; a leaseholder owns the row
@@ -1295,12 +1332,15 @@ async function claimPendingProtection(leaseMs = 120000, limit = 200) {
     const r = await pool.query(
       `UPDATE pending_protection SET leased_until=$1, attempts=COALESCE(attempts,0)+1
        WHERE id IN (SELECT id FROM pending_protection WHERE COALESCE(leased_until,0) < $2 ORDER BY created_at ASC LIMIT $3 FOR UPDATE SKIP LOCKED)
-       RETURNING data, attempts`, [now + leaseMs, now, limit]);
-    return r.rows.map((x) => ({ ...x.data, attempts: x.attempts }));
+       RETURNING data, attempts, created_at`, [now + leaseMs, now, limit]);
+    // R22-fix: created_at is a top-level column (NOT inside data). The watcher ages rows by p.created_at,
+    // so it MUST be carried through — otherwise every freshly-claimed row reads created_at=0 and the
+    // watcher treats it as >8h old and expires it immediately (plain + protected FYERS fills never reconcile).
+    return r.rows.map((x) => ({ ...x.data, attempts: x.attempts, created_at: Number(x.created_at) || (x.data && x.data.createdAt) || now }));
   }
   const f = FILES.pendingProt || (FILES.pendingProt = path.join(__dirname, "pending_protection.json"));
   const d = readJSON(f); const out = [];
-  for (const k of Object.keys(d)) { const row = d[k]; if ((row.leased_until || 0) < now) { row.leased_until = now + leaseMs; row.attempts = (row.attempts || 0) + 1; out.push({ ...row.data, attempts: row.attempts }); } }
+  for (const k of Object.keys(d)) { const row = d[k]; if ((row.leased_until || 0) < now) { row.leased_until = now + leaseMs; row.attempts = (row.attempts || 0) + 1; out.push({ ...row.data, attempts: row.attempts, created_at: Number(row.created_at) || (row.data && row.data.createdAt) || now }); } }
   writeJSON(f, d); return out.slice(0, limit);
 }
 async function bumpPendingProtection(id) {

@@ -20,3 +20,15 @@ npm-debug.log*
 
 # Test / coverage output
 coverage/
+
+# Flat-file datastore artifacts (dev/no-Postgres mode) — runtime data, never source
+trades.json
+fills.json
+order_idempotency.json
+order_intents.json
+pending_protection.json
+trade_archives.json
+notices.json
+automation_flags.json
+real_strategies.json
+managed_positions.json

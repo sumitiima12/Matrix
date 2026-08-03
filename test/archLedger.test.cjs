@@ -24,6 +24,14 @@ test("ARCH-1: a fill appends once and is idempotent on the broker key", async ()
   assert.strictEqual(rows.filter((x) => x.orderId === "LEDG1").length, 1);
 });
 
+test("ARCH-1: fills lacking an order id do NOT collapse into one row", async () => {
+  const u = "919000000101";
+  await db.recordFill(u, { broker: "delta", orderId: null, side: "BUY", qty: 1, entry: 10, market: "Crypto", entryAt: Date.now() });
+  await db.recordFill(u, { broker: "delta", orderId: null, side: "BUY", qty: 2, entry: 11, market: "Crypto", entryAt: Date.now() });
+  const rows = await db.getFills(u, 0, Date.now() + 60000);
+  assert.strictEqual(rows.length, 2, "two distinct no-order-id fills must both be recorded, not collapsed");
+});
+
 test("ARCH-2: normalizeFill maps FYERS status codes to the canonical contract", () => {
   const filled = normalizeFill("fyers", { id: "1", status: 2, qty: 5, filledQty: 5, tradedPrice: 101, side: 1 });
   assert.strictEqual(filled.status, "filled");
@@ -32,6 +40,22 @@ test("ARCH-2: normalizeFill maps FYERS status codes to the canonical contract", 
   assert.strictEqual(normalizeFill("fyers", { id: "2", status: 6, qty: 5, filledQty: 0 }).status, "pending");
   assert.strictEqual(normalizeFill("fyers", { id: "3", status: 5 }).status, "rejected");
   assert.strictEqual(normalizeFill("fyers", { id: "4", qty: 5, filledQty: 2 }).status, "partial");
+});
+
+test("R23: claimPendingProtection carries created_at so the watcher ages rows correctly", async () => {
+  // Regression: the claim dropped created_at (a top-level column, not inside data), so the delayed-fill
+  // watcher computed ageMs = now - 0 = huge and expired EVERY freshly-parked FYERS order immediately.
+  const rec = { id: `pp_${process.pid}_${Date.now()}`, userId: "919000000200", broker: "fyers", orderId: "PP1", symbol: "SBIN", qty: 1 };
+  const saved = await db.savePendingProtection(rec);
+  const claimed = await db.claimPendingProtection(1000, 50);
+  const mine = claimed.find((x) => x.orderId === "PP1");
+  assert.ok(mine, "the parked row must be claimable");
+  assert.ok(Number.isFinite(mine.created_at) && mine.created_at > 0, "created_at must survive the claim");
+  const ageMs = Date.now() - (mine.created_at || 0);
+  assert.ok(ageMs < 60_000, "a freshly-parked row must NOT read as hours old");
+  assert.ok(ageMs < 8 * 3600 * 1000, "a fresh row must not trip the 8h expiry");
+  assert.strictEqual(mine.created_at, saved.created_at, "claim must report the same created_at that was saved");
+  await db.deletePendingProtection(rec.id);
 });
 
 test("ARCH-2: normalizeFill maps Delta state to the canonical contract", () => {
