@@ -103,6 +103,21 @@ test("R24-P2-02: computeLedgerDrift flags a quantity mismatch, not just presence
   assert.ok(d.drift >= 1);
 });
 
+test("R25-H02: recordFillAndTrade writes BOTH the fill and the trade projection (atomic pair)", async () => {
+  const u = "919000000400";
+  const trade = { broker: "fyers", orderId: "TX1", side: "BUY", qty: 4, entry: 120, market: "IN", tradeType: "Manual", entryAt: Date.now(), real: true };
+  const out = await db.recordFillAndTrade(u, trade);
+  assert.ok(out && out.fillId, "returns the fill id");
+  const fills = await db.getFills(u, 0, Date.now() + 60000);
+  assert.strictEqual(fills.filter((x) => x.orderId === "TX1").length, 1, "one fill event recorded");
+  const trades = await db.getTrades(u, 0, Date.now() + 60000);
+  assert.ok(trades.some((t) => t.orderId === "TX1" && t.serverAuthored === true), "the authoritative trade projection exists");
+  // Idempotent: a replay does not duplicate either store.
+  await db.recordFillAndTrade(u, trade);
+  const fills2 = await db.getFills(u, 0, Date.now() + 60000);
+  assert.strictEqual(fills2.filter((x) => x.orderId === "TX1").length, 1, "replay does not duplicate the fill");
+});
+
 test("R25-H05: drift keys are broker-scoped — same orderId at two brokers does NOT collide", () => {
   const trades = [
     { orderId: "100", broker: "fyers", real: true, serverAuthored: true, qty: 5 },

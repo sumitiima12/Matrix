@@ -140,8 +140,14 @@ async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null
          EITHER fails we retry the pair, and a persistent failure of either falls through to the fail-loud +
          halt + risk-lock path below. The ledger can therefore never silently miss a fill it must make
          authoritative — a lost ledger write halts trading exactly like a lost trade write. */
-      await db.saveTrade(userKey, trade, { authoritative: true });
-      if (typeof db.recordFill === "function") await db.recordFill(userKey, trade);
+      /* R25-H02: one transactional write for the immutable fill event + the trades projection, so they can't
+         diverge. Falls back to the sequential pair only if the combined function isn't present. */
+      if (typeof db.recordFillAndTrade === "function") {
+        await db.recordFillAndTrade(userKey, trade);
+      } else {
+        await db.saveTrade(userKey, trade, { authoritative: true });
+        if (typeof db.recordFill === "function") await db.recordFill(userKey, trade);
+      }
       /* INC-1: opportunistic risk-journal ↔ fills-ledger drift check for this user. Fire-and-forget (no await)
          so it never adds latency to the money path; logs a financial-severity event if the two records have
          diverged, so ops can catch a book going out of sync before it silently loosens a risk control. */
@@ -310,7 +316,16 @@ app.post("/api/trades", requireAuth, async (req, res) => {
     // R22-C01: mark any REAL row the browser posts as clientAuthored so the risk gate ignores it (it can only
     // ANNOTATE a server-verified fill, never feed the daily-loss / count / cooldown maths). Fabricated fake-P&L
     // posts therefore can't loosen the risk controls; they remain display-only.
-    if (rec.real === true) rec.clientAuthored = true;
+    if (rec.real === true) {
+      rec.clientAuthored = true;
+      /* R25-H08: a client-posted REAL row must not ASSERT broker-execution truth. Fields that represent a verified
+         broker result — realized P&L, the average/verified fill price and the confirmed filled quantity — may only
+         ever be set by a server-verified fill. Strip them from a browser post so fabricated performance figures
+         can't pollute portfolio/P&L UX (and, via a server-backed row, saveTrade already merges only presentation
+         fields). The user's own basic record (entry/qty/side/symbol) is preserved so trades on brokers we don't
+         yet journal still display; those rows stay clientAuthored and are excluded from risk maths. */
+      for (const k of ["pnl", "avgPrice", "filledQty", "verifiedFill"]) delete rec[k];
+    }
     // R20 follow-up (H1): saveTrade may re-key to a user-namespaced/canonical id — echo the STORED row back so
     // the client holds the id the DB actually uses (not the raw one it sent), else later deletes/patches miss.
     const saved = await db.saveTrade(userId, rec, { authoritative: false });
@@ -649,7 +664,7 @@ app.post("/api/login", authLimiter, async (req, res) => {
 
 /* ------------------------------- EMAIL ------------------------------------
    Optional contact email the user can add/change from their profile. */
-app.post("/api/email", requireAuth, async (req, res) => {
+app.post("/api/email", requireAuth, requireFreshSession, async (req, res) => {   // R25-H10: identity change needs a fresh session
   try {
     const phone = stripPh(req.authUserId);
     const email = String((req.body && req.body.email) || "").trim().slice(0, 254);
@@ -674,7 +689,7 @@ app.get("/api/username/available", authLimiter, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
-app.post("/api/username", requireAuth, async (req, res) => {
+app.post("/api/username", requireAuth, requireFreshSession, async (req, res) => {   // R25-H10: identity change needs a fresh session
   try {
     const phone = stripPh(req.authUserId);
     const username = cleanUsername(req.body && req.body.username);
@@ -876,7 +891,7 @@ app.get("/api/security-question", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
-app.post("/api/security-question", requireAuth, async (req, res) => {
+app.post("/api/security-question", requireAuth, requireFreshSession, async (req, res) => {   // R25-H10: recovery-credential change needs a fresh session
   try {
     const phone = stripPh(req.authUserId);
     const question = ((req.body && req.body.question) || "").trim();
@@ -891,7 +906,7 @@ app.post("/api/security-question", requireAuth, async (req, res) => {
 });
 
 // Save/load a user's app state blob (automations, watchlists, wallets, profile).
-app.post("/api/state", requireAuth, async (req, res) => {
+app.post("/api/state", requireAuth, requireFreshSession, async (req, res) => {   // R25-H10: persisted account state fails closed on a revoked token
   try {
     const state = (req.body && req.body.state && typeof req.body.state === "object" && !Array.isArray(req.body.state)) ? req.body.state : {};
     /* M-05: bound the app-state blob — it's an opaque per-user document, so cap its serialized size and the
@@ -1067,7 +1082,7 @@ app.post("/api/pin/verify", requireAuth, async (req, res) => {
 
 /* Change your OWN login PIN — requires the CURRENT PIN (so a stolen session can't silently
    change it), derives identity from the verified token, and stores the new PIN bcrypt-hashed. */
-app.post("/api/pin/change", requireAuth, async (req, res) => {
+app.post("/api/pin/change", requireAuth, requireFreshSession, async (req, res) => {   // R25-H10: PIN change needs a fresh session
   try {
     const phone = stripPh(req.authUserId);
     const currentPin = req.body && req.body.currentPin;
@@ -4998,6 +5013,27 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     return res.status(400).json({ error: "A valid idempotency key is required for live orders (update the app if this persists)." });
   }
   const idemUser = storageKeyFor(sess.userId);
+  /* R25-H01: ACCOUNT-WIDE new-entry block while ANY prior order outcome is unknown. An unresolved order means
+     unquantified exposure, so we don't let the account open MORE real entries (any symbol/side/qty) until it's
+     resolved — not just the exact same intent. Two escape hatches keep this from bricking: (1) a CLOSING /
+     reduce-only order is always allowed; (2) retrying the UNKNOWN order itself is exempt — that path probes the
+     broker and resolves it. Fail closed on a read error. */
+  {
+    const isReduceOnlyNow = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+    if (!isReduceOnlyNow && typeof db.countUnknownIdempotency === "function") {
+      let unknownCount;
+      try { unknownCount = await db.countUnknownIdempotency(idemUser); }
+      catch { return res.status(503).json({ error: "Couldn't verify your account's order status right now — please retry in a moment." }); }
+      if (unknownCount > 0) {
+        const incoming = await db.getIdempotencyRecord(idemUser, idemKey).catch(() => null);
+        const resolvingThisUnknown = incoming && incoming.status === "unknown";   // this request IS the unknown being retried
+        const others = unknownCount - (resolvingThisUnknown ? 1 : 0);
+        if (others > 0) {
+          return res.status(423).json({ error: `A previous order's outcome is still unknown (${others} unresolved). Resolve it before placing new orders — closing/exit orders are still allowed.`, unknownOutstanding: others });
+        }
+      }
+    }
+  }
   /* R19-P2-04: the payload hash must cover EVERY field that changes what actually gets placed — not just
      symbol/side/qty/price. Two requests that share a key but differ in SL/TP/trailing/auto-exit/interval
      are DIFFERENT orders and must be rejected as a key-reuse mismatch, never silently replayed. */
@@ -5027,7 +5063,24 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       }
       if (rec && rec.status === "succeeded" && rec.response) return res.status(200).json({ ...rec.response, idempotentReplay: true });
       if (rec && rec.status === "unknown") {
-        return res.status(409).json({ error: "A previous attempt with this key had an UNVERIFIED outcome. Check the order on your broker before retrying — we won't resubmit automatically.", ...(rec.response ? { previous: rec.response } : {}) });
+        /* R25-H01: an UNKNOWN key now has a resolution path — probe the broker's own order book for this order's
+           stamped client id (the idempotency key). A CONCLUSIVE "never landed" (false) finalizes it REJECTED and
+           frees the key so a deliberate retry may proceed; the order landing (true) keeps it blocked but tells the
+           user it's at the broker; an inconclusive probe (null) stays unknown-blocked. Fail closed: only a proven
+           absence releases the key. This is what makes the account-wide unknown block (below) non-bricking. */
+        let landed = null;
+        try { landed = await brokerOrderProbe({ broker: sess.broker, pendingClientId: idemKey, pendingSince: rec.createdAt || 0, userId: sess.userId }); }
+        catch { landed = null; }
+        if (landed === false) {
+          try { await db.releaseIdempotencyKey(idemUser, idemKey); } catch { /* best-effort */ }
+          logFinancial("idempotency.unknown_resolved_absent", { userId: idemUser, key: idemKey, broker: sess.broker });
+          return res.status(409).json({ error: "We verified your broker never received that order — it's cleared. Please place the order again.", resolved: "absent" });
+        }
+        if (landed === true) {
+          logFinancial("idempotency.unknown_resolved_present", { userId: idemUser, key: idemKey, broker: sess.broker });
+          return res.status(409).json({ error: "That order DID reach your broker — check its status there. We won't resubmit it automatically.", resolved: "present", ...(rec.response ? { previous: rec.response } : {}) });
+        }
+        return res.status(409).json({ error: "A previous attempt with this key had an UNVERIFIED outcome, and we couldn't reach your broker to confirm it. Check the order on your broker before retrying — we won't resubmit automatically.", ...(rec.response ? { previous: rec.response } : {}) });
       }
       /* R21-P2-05: a request that's genuinely still in flight blocks for a few seconds — but a record that's
          been in_flight for MINUTES means the original attempt died mid-execution (crash/timeout). We must NOT
