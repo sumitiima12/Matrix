@@ -15,7 +15,7 @@ test("C02: a managed long fully held at the broker verifies", () => {
 test("C02: a broker SHORTFALL fails closed (position reduced/closed at the broker)", () => {
   const r = verifyManagedAgainstBroker([{ symbol: "SBIN", qty: 10 }], [{ sym: "SBIN", qty: 4 }]);
   assert.equal(r.ok, false);
-  assert.deepEqual(r.shortfall, { sym: "SBIN", tracked: 10, broker: 4 });
+  assert.deepEqual(r.shortfall, { sym: "SBIN", dir: "long", tracked: 10, broker: 4 });
 });
 
 test("C02: a position the broker doesn't hold at all fails closed", () => {
@@ -46,4 +46,39 @@ test("C02: an empty managed list is trivially ok (nothing to confirm)", () => {
   const r = verifyManagedAgainstBroker([], [{ sym: "SBIN", qty: 10 }]);
   assert.equal(r.ok, true);
   assert.equal(r.verified, 0);
+});
+
+test("C02-fix: broker quantity is CONSUMED — two tracked rows of 10 cannot both clear one broker lot of 10", () => {
+  const r = verifyManagedAgainstBroker([{ symbol: "SBIN", qty: 10 }, { symbol: "SBIN", qty: 10 }], [{ sym: "SBIN", qty: 10 }]);
+  assert.equal(r.ok, false, "the second row must fail — the first consumed the only 10 shares");
+  assert.equal(r.verified, 1);
+  assert.equal(r.shortfall.broker, 0);
+});
+
+test("C02-fix: two tracked rows summing to the broker lot DO clear (10 + 10 vs broker 20)", () => {
+  const r = verifyManagedAgainstBroker([{ symbol: "SBIN", qty: 10 }, { symbol: "SBIN", qty: 10 }], [{ sym: "SBIN", qty: 20 }]);
+  assert.equal(r.ok, true);
+  assert.equal(r.verified, 2);
+});
+
+test("C02-fix: DIRECTION respected — a tracked LONG cannot clear against a broker SHORT", () => {
+  const r = verifyManagedAgainstBroker([{ symbol: "SBIN", qty: 10, short: false }], [{ sym: "SBIN", qty: -10 }]);
+  assert.equal(r.ok, false, "broker holds a SHORT; our tracked LONG is not confirmed");
+  assert.equal(r.shortfall.dir, "long");
+  assert.equal(r.shortfall.broker, 0);
+});
+
+test("C02-fix: DIRECTION respected — a tracked SHORT cannot clear against a broker LONG", () => {
+  const r = verifyManagedAgainstBroker([{ symbol: "SBIN", qty: 10, short: true }], [{ sym: "SBIN", qty: 10 }]);
+  assert.equal(r.ok, false, "broker holds a LONG; our tracked SHORT is not confirmed");
+  assert.equal(r.shortfall.dir, "short");
+});
+
+test("C02-fix: a hedged book verifies per-direction (broker long 10 + short 5 covers managed long 10 + short 5)", () => {
+  const r = verifyManagedAgainstBroker(
+    [{ symbol: "SBIN", qty: 10, short: false }, { symbol: "SBIN", qty: 5, short: true }],
+    [{ sym: "SBIN", qty: 10 }, { sym: "SBIN", qty: -5 }],
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.verified, 2);
 });

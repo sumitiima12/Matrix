@@ -10,7 +10,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { submitWithAttempt } = require("../orderRecovery.js");
+const { submitWithAttempt, rearmFromUnresolvedAttempts } = require("../orderRecovery.js");
 const faultHook = require("../faultHook.js");
 
 let dir, db;
@@ -63,4 +63,59 @@ test("C03S: the attempt passes through SUBMITTING before the send (crash-mid-sen
   const submit = async () => { statusAtSend = (await db.getOrderAttempt("S4")).status; return { id: "FY4", filledQty: 5, avgPrice: 100 }; };
   await submitWithAttempt({ db, attempt: attempt("S4"), submit, classify: classifyFilled });
   assert.equal(statusAtSend, "SUBMITTING", "row is SUBMITTING during the broker call — a crash there is recoverable");
+});
+
+test("C03S: calling submitWithAttempt TWICE with the same completed attempt does NOT re-submit (R28 idempotency fix)", async () => {
+  let submitCalls = 0;
+  const submit = async () => { submitCalls++; return { id: "FYD", filledQty: 5, avgPrice: 100 }; };
+  const a = attempt("SD");
+  await submitWithAttempt({ db, attempt: a, submit, classify: classifyFilled });
+  assert.equal(submitCalls, 1, "first call submits once");
+  const second = await submitWithAttempt({ db, attempt: a, submit, classify: classifyFilled });
+  assert.equal(submitCalls, 1, "SECOND call must NOT hit the broker again (was the reproduced double-order bug)");
+  assert.equal(second.replay, true);
+  assert.equal(second.submitted, false);
+  assert.equal(second.status, "FILLED");
+});
+
+test("C03S: an in-flight (SUBMITTING) attempt replayed does NOT re-submit", async () => {
+  let submitCalls = 0;
+  const submit = async () => { submitCalls++; return { id: "FYE", filledQty: 5, avgPrice: 100 }; };
+  const a = attempt("SE");
+  await db.prepareOrderAttempt(a);
+  await db.transitionOrderAttempt("SE", "PREPARED", "SUBMITTING");   // simulate a crash mid-send: left SUBMITTING
+  const r = await submitWithAttempt({ db, attempt: a, submit, classify: classifyFilled });
+  assert.equal(submitCalls, 0, "a SUBMITTING attempt is never re-submitted");
+  assert.equal(r.replay, true);
+});
+
+test("C03S: prepareOrderAttempt REJECTS an id collision from a different user (no cross-request finalize)", async () => {
+  await db.prepareOrderAttempt({ id: "COLL1", userId: "userA", broker: "fyers", orderTag: "tA", fingerprint: "fpA", symbol: "SBIN", side: "BUY", qty: 1 });
+  await assert.rejects(
+    () => db.prepareOrderAttempt({ id: "COLL1", userId: "userB", broker: "fyers", orderTag: "tB", fingerprint: "fpB", symbol: "TCS", side: "BUY", qty: 1 }),
+    /id collision/,
+  );
+  // The original owner's row is untouched.
+  const row = await db.getOrderAttempt("COLL1");
+  assert.equal(row.userId, "userA");
+  assert.equal(row.orderTag, "tA");
+});
+
+test("C03S: STARTUP re-arm re-locks every account that has an unresolved attempt (fail closed)", async () => {
+  // Two unresolved attempts for two users; one resolved attempt that must NOT trigger a re-arm.
+  await db.prepareOrderAttempt({ id: "RA1", userId: "ua", broker: "fyers", orderTag: "t1", symbol: "SBIN", side: "BUY", qty: 1 });
+  await db.finalizeOrderAttempt("RA1", "UNKNOWN", {});
+  await db.prepareOrderAttempt({ id: "RA2", userId: "ub", broker: "fyers", orderTag: "t2", symbol: "TCS", side: "BUY", qty: 1 });   // still SUBMITTING/PREPARED → unresolved
+  await db.prepareOrderAttempt({ id: "RA3", userId: "uc", broker: "fyers", orderTag: "t3", symbol: "INFY", side: "BUY", qty: 1 });
+  await db.finalizeOrderAttempt("RA3", "FILLED", { filledQty: 1, avgPrice: 10, resolved: true });   // resolved → no re-arm
+
+  const locked = new Map(); const halted = new Map();
+  const out = await rearmFromUnresolvedAttempts({
+    db, setLock: async (u, v) => { locked.set(u, v); }, setHalt: async (u, v) => { halted.set(u, v); },
+  });
+  assert.ok(out.users.includes("ua") && out.users.includes("ub"), "users with UNRESOLVED attempts are re-armed");
+  assert.equal(locked.get("ua"), true); assert.equal(locked.get("ub"), true);
+  assert.equal(halted.get("ua"), true); assert.equal(halted.get("ub"), true);
+  assert.ok(!out.users.includes("uc"), "a RESOLVED attempt does NOT re-lock its account");
+  assert.ok(!locked.has("uc") && !halted.has("uc"), "resolved user never re-locked");
 });

@@ -279,7 +279,25 @@ const UA = {
    Flat-file/dev has no migration and becomes ready as soon as the (fast) init resolves. */
 let schemaReady = false;
 (function initSchemaWithRetry(attempt = 0) {
-  db.initDb().then(() => { schemaReady = true; if (attempt) console.log(`[db] schema ready after ${attempt} retr${attempt === 1 ? "y" : "ies"}`); })
+  db.initDb().then(async () => {
+    schemaReady = true; if (attempt) console.log(`[db] schema ready after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
+    /* C03 STARTUP SAFETY RE-ARM (flag-gated: C03_ORDER_ATTEMPTS=1). Before money-moving routes serve, any account
+       with an UNRESOLVED durable order attempt (a crash/lost-response left it PREPARED/SUBMITTING/UNKNOWN) is
+       re-locked — fail closed. This NEVER resolves anything or contacts the broker here; resolution is the
+       periodic reconciler + the C02 broker-backed unlock gate, which won't clear the lock without broker truth.
+       Default OFF ⇒ production behaviour is unchanged until the full write-before-send wiring is enabled. */
+    if (process.env.C03_ORDER_ATTEMPTS === "1") {
+      try {
+        const r = await require("./orderRecovery").rearmFromUnresolvedAttempts({
+          db,
+          setLock: (uid, v) => { haltedEntries.add(String(uid)); return db.setRiskLock(String(uid), v); },
+          setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
+          logger: (evt, o) => { try { logFinancial(evt, o); } catch { /* pre-logger */ } },
+        });
+        if (r && r.unresolved) console.warn(`[c03] startup re-armed ${r.users.length} account(s) with ${r.unresolved} unresolved order attempt(s)`);
+      } catch (e) { console.error("[c03] startup re-arm failed (keeping schemaReady; periodic reconciler is the fallback):", e.message); }
+    }
+  })
     .catch((e) => {
       console.error(`[db] init failed (attempt ${attempt + 1}):`, e.message);
       const delay = Math.min(30_000, 2000 * Math.pow(2, attempt));
@@ -6061,7 +6079,9 @@ async function sessionFromCred(userId, broker) {
    broker snapshot and confirm every Matrix-managed OPEN position is actually live at the broker with at least the
    quantity we believe we hold. Any unreachable/timed-out/partial broker response, a missing session, a position
    the broker doesn't confirm, or a stale (slow) snapshot KEEPS THE LOCK — fail closed. Returns
-   { ok, reason, checked, verified, watermark }. Can be disabled with DISABLE_BROKER_UNLOCK_RECON=1 for ops. */
+   { ok, reason, checked, verified, watermark }. Can be disabled with DISABLE_BROKER_UNLOCK_RECON=1 for ops.
+   NOTE: `userId` MUST be the STORAGE KEY (storageKeyFor → "ph_<phone>") — managed positions and broker creds
+   are persisted under that key; passing the bare phone finds nothing and would bypass the gate. */
 async function brokerSnapshotForUnlock(userId) {
   if (process.env.DISABLE_BROKER_UNLOCK_RECON === "1") return { ok: true, reason: "broker recon disabled (ops flag)", checked: 0, verified: 0, watermark: Date.now() };
   let managed = [];
@@ -6828,7 +6848,10 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
        confirm every Matrix-managed open position is actually live at the broker. A missing session, an unreachable
        or partial broker response, a stale snapshot, or a position the broker doesn't confirm keeps the lock. */
     let brokerRecon = null;
-    try { brokerRecon = await brokerSnapshotForUnlock(req.authUserId); }
+    // R27-fix: pass the STORAGE KEY (uid = storageKeyFor(phone) = "ph_<phone>"), NOT the bare phone. Managed
+    // positions and broker credentials are persisted under the storage key; passing the bare phone found zero
+    // managed positions and let the broker gate "pass" without ever contacting the broker — a full bypass.
+    try { brokerRecon = await brokerSnapshotForUnlock(uid); }
     catch (e) {
       haltedEntries.add(uid);
       logFinancial("killswitch.resume_broker_recon_failed", { userId: uid, err: String((e && e.message) || e) });

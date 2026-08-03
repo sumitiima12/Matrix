@@ -1471,17 +1471,33 @@ async function prepareOrderAttempt(attempt) {
     fingerprint: a.fingerprint || null, payload: a.payload || null, symbol: a.symbol || null, side: a.side || null,
     qty: a.qty != null ? Number(a.qty) : null, product: a.product || null, protection: a.protection || null,
     status: "PREPARED", brokerOrderId: null, filledQty: null, avgPrice: null, resolved: false, createdAt: now, updatedAt: now };
+  /* C03 ownership/CAS-collision guard: the attempt id is the PK. If a row with this id ALREADY exists, it must
+     belong to the SAME user AND carry the SAME order fingerprint (a legit same-request retry) — otherwise it is a
+     DIFFERENT request colliding on the id, and proceeding would submit a fresh order while finalizing someone
+     else's attempt row. In that case we THROW (the caller must NOT submit). A matching existing row is returned
+     as-is (idempotent retry). This makes prepare a safe claim, not a silent no-op. */
   if (USING_PG) {
-    await pool.query(
+    const ins = await pool.query(
       `INSERT INTO order_attempts (id,user_id,broker,idem_key,order_tag,fingerprint,payload,symbol,side,qty,product,protection,status,resolved,created_at,updated_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'PREPARED',FALSE,$13,$13)
-       ON CONFLICT (id) DO NOTHING`,
+       ON CONFLICT (id) DO NOTHING RETURNING id`,
       [row.id, row.userId, row.broker, row.idemKey, row.orderTag, row.fingerprint, row.payload ? JSON.stringify(row.payload) : null,
        row.symbol, row.side, row.qty, row.product, row.protection ? JSON.stringify(row.protection) : null, now]);
-    return row;
+    if (ins.rowCount === 1) return row;               // fresh claim
+    const ex = _rowFromPg((await pool.query(`SELECT * FROM order_attempts WHERE id=$1`, [row.id])).rows[0]);
+    if (!ex || ex.userId !== row.userId || String(ex.fingerprint || "") !== String(row.fingerprint || "")) {
+      throw Object.assign(new Error("order_attempt id collision — refusing to reuse another request's attempt"), { code: "ATTEMPT_ID_COLLISION" });
+    }
+    return ex;                                          // same user + same fingerprint → legit retry
   }
-  const f = _attemptFile(); const d = readJSON(f); if (!d[row.id]) { d[row.id] = row; writeJSON(f, d); }
-  return d[row.id];
+  const f = _attemptFile(); const d = readJSON(f); const ex = d[row.id];
+  if (ex) {
+    if (ex.userId !== row.userId || String(ex.fingerprint || "") !== String(row.fingerprint || "")) {
+      throw Object.assign(new Error("order_attempt id collision — refusing to reuse another request's attempt"), { code: "ATTEMPT_ID_COLLISION" });
+    }
+    return ex;
+  }
+  d[row.id] = row; writeJSON(f, d); return row;
 }
 
 /* CAS transition: only moves the row if it is currently in `fromStatus`. Returns the updated row, or null if

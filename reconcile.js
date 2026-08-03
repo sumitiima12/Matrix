@@ -267,15 +267,32 @@ function deltaReconcilePlan(openCryptoRealTrades, book) {
    snapshot [{sym, qty}]. Returns { ok, verified, shortfall }. Fails closed on the FIRST position the broker
    can't confirm (a shortfall means the position was reduced/closed at the broker, or never truly filled). */
 function normUnlockSym(s) { return String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/(USDT|USD|INR)$/i, "").replace(/[^A-Z0-9]/g, ""); }
+// Direction of a MANAGED row: an explicit short flag / SELL side, or a negative tracked qty, is a SHORT.
+function _posDir(p) { return (p.short === true || String(p.side || "").toUpperCase() === "SELL" || Number(p.qty) < 0) ? "short" : "long"; }
+/* Confirm every managed OPEN position is live at the broker with the SAME DIRECTION and enough quantity —
+   CONSUMING broker quantity as it goes. Fixes two holes: (1) the broker lot is decremented per match, so two
+   tracked rows of 10 cannot both clear against a single broker holding of 10; (2) direction is respected via
+   the SIGN of the broker quantity (>=0 long, <0 short), so a tracked long can never be covered by a broker
+   short (or vice-versa). Fails closed on the FIRST row the broker can't cover in the right direction. */
 function verifyManagedAgainstBroker(positions, held) {
-  const map = new Map();
-  for (const h of (held || [])) { const k = normUnlockSym(h.sym); map.set(k, (map.get(k) || 0) + Math.abs(Number(h.qty) || 0)); }
+  // Broker pool keyed by (symbol, direction) with consumable magnitude. Broker qty sign = direction.
+  const pool = new Map();
+  for (const h of (held || [])) {
+    const q = Number(h.qty) || 0; if (q === 0) continue;
+    const key = `${normUnlockSym(h.sym)}|${q >= 0 ? "long" : "short"}`;
+    pool.set(key, (pool.get(key) || 0) + Math.abs(q));
+  }
   let verified = 0;
   for (const p of (positions || [])) {
     const want = Math.abs(Number(p.qty) || 0);
     if (want <= 0) continue;
-    const has = map.get(normUnlockSym(p.symbol || p.brokerSym)) || 0;
-    if (has + 1e-9 < want * 0.999) return { ok: false, verified, shortfall: { sym: p.symbol || p.brokerSym, tracked: want, broker: has } };
+    const dir = _posDir(p);
+    const key = `${normUnlockSym(p.symbol || p.brokerSym)}|${dir}`;
+    const avail = pool.get(key) || 0;
+    if (avail + 1e-9 < want * 0.999) {
+      return { ok: false, verified, shortfall: { sym: p.symbol || p.brokerSym, dir, tracked: want, broker: avail } };
+    }
+    pool.set(key, avail - want);   // CONSUME — a later tracked row can't reuse the same broker quantity
     verified++;
   }
   return { ok: true, verified, shortfall: null };

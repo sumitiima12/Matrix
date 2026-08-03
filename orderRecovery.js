@@ -83,17 +83,28 @@ async function reconcileUnresolvedAttempts(deps) {
      4. a returned result is classified via `classify(res)` → { status, patch } and finalized transactionally.
    When the flag is OFF this module isn't used at all; the legacy path runs byte-for-byte unchanged. */
 async function submitWithAttempt({ db, attempt, submit, classify }) {
-  // 1 — durable PREPARED. If this throws, the broker is NEVER called (no order can exist without an attempt).
-  await db.prepareOrderAttempt(attempt);
-  // 2 — mark SUBMITTING right before the send, so a crash mid-send leaves a recoverable SUBMITTING row.
-  await db.transitionOrderAttempt(attempt.id, "PREPARED", "SUBMITTING");
+  // 1 — durable PREPARED. Throws on an id collision from a DIFFERENT request; returns the existing row on a
+  //     legit same-request retry. If this throws, the broker is NEVER called.
+  const row = await db.prepareOrderAttempt(attempt);
+  // 1a — IDEMPOTENCY GUARD: if the attempt already advanced past PREPARED, a prior call already submitted (or is
+  //      submitting/terminal). Re-submitting here is exactly the double-order bug — do NOT call the broker again.
+  if (row && row.status && row.status !== "PREPARED") {
+    return { replay: true, submitted: false, status: row.status, attempt: row };
+  }
+  // 2 — claim the send via CAS PREPARED→SUBMITTING. ONLY the caller that wins this transition may submit; a null
+  //     result means another worker/request already advanced it, so we must NOT submit (prevents concurrent dupes).
+  const advanced = await db.transitionOrderAttempt(attempt.id, "PREPARED", "SUBMITTING");
+  if (!advanced) {
+    const cur = await db.getOrderAttempt(attempt.id).catch(() => null);
+    return { replay: true, submitted: false, status: cur ? cur.status : "UNKNOWN", attempt: cur || row };
+  }
   let res;
   try {
-    res = await submit();
+    res = await submit();   // reached ONLY after a durable PREPARED + a won SUBMITTING claim
   } catch (e) {
     // 3 — ambiguous outcome: the broker MAY have received it. Mark UNKNOWN (unresolved → startup reconciles by
     //     tag; the account is kept locked). Best-effort finalize; rethrow so the caller surfaces the failure.
-    try { await db.finalizeOrderAttempt(attempt.id, "UNKNOWN", {}); } catch { /* recovery will still find it SUBMITTING */ }
+    try { await db.finalizeOrderAttempt(attempt.id, "UNKNOWN", {}); } catch { /* recovery still finds it SUBMITTING */ }
     throw e;
   }
   // 4 — conclusive result → finalize the mapped terminal/near-terminal state atomically.
@@ -102,4 +113,20 @@ async function submitWithAttempt({ db, attempt, submit, classify }) {
   return res;
 }
 
-module.exports = { reconcileUnresolvedAttempts, submitWithAttempt };
+/* C03 slice 2b — STARTUP SAFETY RE-ARM. Before money-moving routes open, every account with an unresolved
+   order_attempt must be re-locked so a crash/restart can never leave real exposure un-gated. This is PURELY
+   fail-closed: it re-arms the durable risk-lock + entry-halt per affected user and never resolves anything or
+   contacts the broker (resolution is the periodic reconciler + the C02 broker-backed unlock gate). Returns the
+   set of re-armed users. Safe to run on every boot. */
+async function rearmFromUnresolvedAttempts({ db, setLock, setHalt, logger = () => {}, limit = 1000 }) {
+  const attempts = await db.listUnresolvedOrderAttempts(limit);
+  const users = [...new Set(attempts.map((a) => a && a.userId).filter(Boolean))];
+  for (const uid of users) {
+    if (setLock) await setLock(uid, true);
+    if (setHalt) await setHalt(uid, true);
+  }
+  logger("c03.startup_rearm", { unresolved: attempts.length, users: users.length });
+  return { unresolved: attempts.length, users };
+}
+
+module.exports = { reconcileUnresolvedAttempts, submitWithAttempt, rearmFromUnresolvedAttempts };
