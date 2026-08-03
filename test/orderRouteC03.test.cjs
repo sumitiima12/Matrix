@@ -345,6 +345,33 @@ test("R30-C2: recordExitAtomic commits the exit fill + trade rows once and is re
   assert.equal(trades.find((t) => t.id === rowId).status, "closed", "position is closed atomically with the fill");
 }));
 
+test("S3.2: a PROJECTION_PENDING exit is repaired (position closed + realized P&L) with NO broker call", guard(async () => {
+  const T = await freshTrader();
+  const SYM = "NSE:TATA-EQ";
+  fake.reset(); fake.setMode("fill", { fillPrice: 200 });
+  // Open a long 4 @ 200.
+  let r = await T.order(newKey(), { symbol: SYM, side: "BUY", qty: 4, orderType: "MARKET", product: "CNC" });
+  assert.equal(r.status, 200);
+  const entryOrderId = r.body.orderId;
+  const origId = (await T.openTrades()).find((t) => bare(t.sym) === "TATA").id;
+
+  // Simulate the exact PROJECTION_PENDING situation: the broker EXIT is confirmed but the projection write failed,
+  // so a durable repair item was parked (we insert it directly to model that failure deterministically).
+  const closeOid = "PPX" + Math.floor(Math.random() * 1e6);
+  await db.saveProjectionPending({ id: `exproj_${closeOid}`, kind: "exit", userId: T.skey, orderId: closeOid,
+    payload: { sym: SYM, closeSide: "SELL", qty: 4, exitPx: 230, orderId: closeOid, entryOrderId, broker: "fyers", market: "IN", tradeType: "Manual" } });
+
+  const placeBefore = fake.placeCount();
+  const out = await server.repairProjectionPending("test");
+  assert.ok(out && !out.error, "repair ran: " + JSON.stringify(out));
+  assert.equal(fake.placeCount(), placeBefore, "repair must NOT re-contact the broker");
+  // The position is now closed with realized P&L (230-200)*4 = 120, and the pending item is cleared.
+  const closed = (await db.getTrades(T.skey, 0, Date.now())).find((t) => t.id === origId);
+  assert.equal(closed.status, "closed", "the position was closed by the repair");
+  assert.ok(Math.abs(Number(closed.pnl) - 120) < 1e-6, "realized P&L booked by repair = 120, got " + closed.pnl);
+  assert.equal((await db.listProjectionPending(50)).filter((x) => x.orderId === closeOid).length, 0, "pending item cleared after repair");
+}));
+
 test("R30-C3: an order missing from the order book but present in the TRADEBOOK is adopted, NOT cancelled", guard(async () => {
   const T = await freshTrader();
   fake.reset();

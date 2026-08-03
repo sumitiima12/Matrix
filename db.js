@@ -157,6 +157,13 @@ async function initDb() {
     status TEXT NOT NULL, broker_order_id TEXT, filled_qty DOUBLE PRECISION, avg_price DOUBLE PRECISION,
     resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT, updated_at BIGINT)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_attempts_unresolved ON order_attempts (resolved, created_at)`);
+  /* S3.2 PROJECTION_PENDING: a broker EXIT execution is confirmed but the ledger/projection write failed. The
+     payload holds everything needed to REPAIR the projection WITHOUT re-contacting the broker (idempotent by the
+     exit order id). A background sweep retries until it commits; the account stays risk-locked until then. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS projection_pending (
+    id TEXT PRIMARY KEY, user_id TEXT, kind TEXT, order_id TEXT, data JSONB, attempts INT DEFAULT 0,
+    leased_until BIGINT DEFAULT 0, created_at BIGINT)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_projection_pending_user ON projection_pending (user_id, created_at)`);
   /* Shared, restart-durable OAuth CSRF state (R16-P2-11 / R15-P2-09). One-time nonce per broker-login
      attempt, stored in Postgres so it survives restarts and is shared across replicas — a login started on
      worker A can complete its callback on worker B. Consumed atomically (DELETE ... RETURNING). */
@@ -419,6 +426,11 @@ async function recordExitAtomic(userId, { fill, rows = [] }) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // S3.2: LOCK the user-owned position rows this close mutates (SELECT ... FOR UPDATE) so two concurrent
+      // closes on the same position serialize — the second blocks until the first commits, preventing a
+      // double-reduction. New split rows don't exist yet; the residual/original row is what must be serialized.
+      const lockIds = [...new Set(rows.map((r) => r.id).filter(Boolean))];
+      if (lockIds.length) await client.query(`SELECT id FROM trades WHERE user_id=$1 AND id = ANY($2) FOR UPDATE`, [userId, lockIds]);
       await client.query(
         `INSERT INTO fills (fill_id, user_id, broker, order_id, side, qty, price, market, trade_type, ts, data)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (fill_id) DO NOTHING`,
@@ -1649,6 +1661,36 @@ async function listUnresolvedOrderAttempts(limit = 500) {
   if (USING_PG) { const r = await pool.query(`SELECT * FROM order_attempts WHERE resolved=FALSE ORDER BY created_at ASC LIMIT $1`, [Number(limit) || 500]); return r.rows.map(_rowFromPg); }
   const d = readJSON(_attemptFile()); return Object.values(d).filter((x) => x && !x.resolved).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)).slice(0, Number(limit) || 500);
 }
+
+/* S3.2 PROJECTION_PENDING durable-repair store. A confirmed EXIT execution whose ledger/projection write failed is
+   parked here (idempotent on `id`) so a background sweep can REPAIR the projection without re-contacting the broker.
+   Never blocks the caller; a persistent failure keeps the account risk-locked. */
+function _projFile() { return FILES.projectionPending || (FILES.projectionPending = process.env.PROJECTION_PENDING_FILE || path.join(__dirname, "projection_pending.json")); }
+async function saveProjectionPending(item) {
+  const id = String(item && item.id);
+  if (!id) throw new Error("saveProjectionPending requires an id");
+  const now = Date.now();
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO projection_pending (id, user_id, kind, order_id, data, attempts, created_at)
+       VALUES ($1,$2,$3,$4,$5,0,$6) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`,
+      [id, String(item.userId || ""), String(item.kind || "exit"), String(item.orderId || ""), item, now]);
+    return { id };
+  }
+  const f = _projFile(); const d = readJSON(f); d[id] = { ...item, id, attempts: (d[id] && d[id].attempts) || 0, createdAt: (d[id] && d[id].createdAt) || now }; writeJSON(f, d); return { id };
+}
+async function listProjectionPending(limit = 200) {
+  if (USING_PG) { const r = await pool.query(`SELECT data, attempts FROM projection_pending ORDER BY created_at ASC LIMIT $1`, [Number(limit) || 200]); return r.rows.map((x) => ({ ...x.data, attempts: x.attempts })); }
+  const d = readJSON(_projFile()); return Object.values(d).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)).slice(0, Number(limit) || 200);
+}
+async function deleteProjectionPending(id) {
+  if (USING_PG) { await pool.query(`DELETE FROM projection_pending WHERE id=$1`, [String(id)]); return; }
+  const f = _projFile(); const d = readJSON(f); delete d[String(id)]; writeJSON(f, d);
+}
+async function bumpProjectionPending(id) {
+  if (USING_PG) { await pool.query(`UPDATE projection_pending SET attempts=attempts+1 WHERE id=$1`, [String(id)]); return; }
+  const f = _projFile(); const d = readJSON(f); if (d[String(id)]) { d[String(id)].attempts = (d[String(id)].attempts || 0) + 1; writeJSON(f, d); }
+}
 /* R21-P2-05 / R23-P1-02: reclaim STALE idempotency records so a key can't block a user forever — WITHOUT ever
    freeing an UNRESOLVED key into a fresh, duplicate order.
      • An `in_flight` row older than the response deadline means the original request DIED before finalizing
@@ -1893,4 +1935,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, USING_PG };

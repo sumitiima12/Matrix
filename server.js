@@ -300,13 +300,51 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = 
     await db.recordExitAtomic(userKey, { fill: exitFill, rows });
   } catch (e) {
     logFinancial("reduceonly_exit.ledger_failed", { userKey, orderId, sym: bareSym(sym), err: String((e && e.message) || e) });
+    /* S3.2 PROJECTION_PENDING: the broker EXIT is already confirmed but the projection write failed. Park a DURABLE
+       repair item (idempotent by exit order id) so a background sweep re-applies it WITHOUT re-contacting the broker.
+       The account stays risk-locked + halted until the projection is repaired. Never return alreadyDone here. */
+    try {
+      await db.saveProjectionPending({ id: `exproj_${orderId}`, kind: "exit", userId: userKey, orderId,
+        payload: { sym, closeSide, qty: wantQty, exitPx, orderId, entryOrderId: entryOrderId != null ? String(entryOrderId) : null, broker, market: market || "IN", tradeType, strategy: strategy || null } });
+    } catch (pe) { logFinancial("reduceonly_exit.projpending_save_failed", { userKey, orderId, err: String((pe && pe.message) || pe) }); }
     try { await db.setRiskLock(userKey, true); } catch { /* best-effort */ }
     if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); haltedEntries.add(String(storageKeyFor(String(haltUserIdOnFail)))); } catch { /* best-effort */ } }
-    await addUserNotice(userKey, { type: "exit_unjournaled", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed but couldn't be recorded — new orders are paused as a precaution. Please reconcile with your broker.` });
-    return { applied: 0, unmatched: wantQty, error: String((e && e.message) || e) };
+    await addUserNotice(userKey, { type: "exit_unjournaled", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed but couldn't be recorded — new orders are paused as a precaution. We'll repair it automatically; please reconcile with your broker.` });
+    return { applied: 0, unmatched: wantQty, error: String((e && e.message) || e), projectionPending: true };
   }
   if (remaining > 1e-9) logFinancial("reduceonly_exit.unmatched", { userKey, orderId, sym: bareSym(sym), closeSide, unmatched: remaining });
   return { applied: +(wantQty - remaining).toFixed(8), unmatched: +remaining.toFixed(8) };
+}
+
+/* S3.2 — repair PROJECTION_PENDING exits WITHOUT re-contacting the broker. Each parked item holds the confirmed
+   exit facts; we re-run the (idempotent) authoritative close. On success the account can be reconciled/unlocked by
+   the C02 broker-backed gate; a still-failing item stays parked (account stays locked). Single-owner via the pg
+   advisory lock so only one instance repairs at a time. Safe to run on every boot + periodically. */
+const PROJ_REPAIR_ADVISORY_KEY = 0x4331_5052 | 0;
+async function repairProjectionPending(reason = "periodic") {
+  if (!C03_ORDER_ATTEMPTS_ON) return { skipped: true };
+  let owner = false, repaired = 0, failed = 0;
+  try {
+    owner = await db.tryAdvisoryLock(PROJ_REPAIR_ADVISORY_KEY);
+    if (!owner) return { skipped: true, reason: "not-owner" };
+    let items = [];
+    try { items = await db.listProjectionPending(200); } catch { return { error: "list failed" }; }
+    for (const it of items) {
+      const p = (it && it.payload) || null;
+      if (!p || (it.kind && it.kind !== "exit")) continue;
+      try {
+        const res = await applyReduceOnlyExit(String(it.userId || p.userId), {
+          sym: p.sym, closeSide: p.closeSide, qty: p.qty, exitPx: p.exitPx, orderId: p.orderId,
+          entryOrderId: p.entryOrderId, broker: p.broker, market: p.market, tradeType: p.tradeType, strategy: p.strategy,
+        }, { haltUserIdOnFail: stripPh(String(it.userId || p.userId)) });
+        if (res && res.error) { failed++; await db.bumpProjectionPending(it.id).catch(() => {}); }
+        else { await db.deleteProjectionPending(it.id); repaired++; }   // committed (or already applied) → clear
+      } catch (e) { failed++; try { await db.bumpProjectionPending(it.id); } catch { /* ignore */ } }
+    }
+    if (repaired || failed) logFinancial("projection.repair.sweep", { reason, repaired, failed });
+    return { owner: true, repaired, failed };
+  } catch (e) { return { error: (e && e.message) || String(e) }; }
+  finally { if (owner) await db.releaseAdvisoryLock(PROJ_REPAIR_ADVISORY_KEY); }
 }
 
 /* H04 — record the true per-EXECUTION fills for a FYERS order from its TRADEBOOK, as immutable ledger events. An
@@ -7661,6 +7699,9 @@ async function runProtectionWatcher() {
 if (C03_ORDER_ATTEMPTS_ON && !MATRIX_NO_LISTEN) {
   const C03_RECON_MS = Number(process.env.C03_RECON_MS) || 60_000;
   setInterval(() => { runC03Reconcile("periodic").catch((e) => console.error("[c03] periodic reconcile error:", e && e.message)); }, C03_RECON_MS).unref?.();
+  // S3.2: periodically REPAIR any PROJECTION_PENDING exits (broker fill confirmed, projection write failed) without
+  // re-contacting the broker — so a transient DB failure during a close can never leave a stuck-open position.
+  setInterval(() => { repairProjectionPending("periodic").catch((e) => console.error("[projrepair] error:", e && e.message)); }, C03_RECON_MS).unref?.();
 }
 /* R21-P2-05: periodically reconcile stale idempotency records so a dead in-flight request can't block a key
    forever — mark long-in_flight rows 'unknown' (surfaces a reconcile prompt on retry) and purge very old rows. */
@@ -8030,7 +8071,7 @@ if (!MATRIX_NO_LISTEN) {
    they are pure crypto helpers, safe to export. runC03Reconcile lets a test drive the exact production startup /
    periodic reconciliation sweep. None of this changes production behaviour (the app still boots + listens
    identically when MATRIX_NO_LISTEN is unset). */
-module.exports = { app, isSchemaReady: () => schemaReady, runC03Reconcile, encryptCred, decryptCred, putBrokerSession };
+module.exports = { app, isSchemaReady: () => schemaReady, runC03Reconcile, repairProjectionPending, encryptCred, decryptCred, putBrokerSession };
 if (!MATRIX_NO_LISTEN) {
   app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
 }
