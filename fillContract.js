@@ -41,7 +41,10 @@ function normFyers(raw) {
   const requested = num(r.qty ?? r.quantity);
   const st = Number(r.status);
   let status = "unknown";
-  if (st === 2 || (requested != null && filled >= requested && filled > 0)) status = "filled";
+  // Acceptance is NOT execution: only status 2 (traded) WITH a positive filled qty is a fill. This matches
+  // reconcile.classifyFyersOrder exactly (which now delegates here) — a status-2 row with zero filled qty, or a
+  // fill inferred from quantity alone, must never be treated as filled (the safe direction: no phantom entry).
+  if (st === 2 && filled > 0) status = "filled";
   else if (st === 5) status = "rejected";
   else if (st === 1) status = "cancelled";
   else if (filled > 0) status = "partial";
@@ -56,14 +59,16 @@ function normFyers(raw) {
 /* Delta order object: state ∈ open|closed|cancelled|rejected; size / unfilled_size / average_fill_price. */
 function normDelta(raw) {
   const r = raw || {};
-  const size = num(r.size);
-  const unfilled = num(r.unfilled_size);
-  const filled = size != null && unfilled != null ? Math.max(0, size - unfilled) : (r.state === "closed" ? size : null);
+  const size = num(r.size) || 0;
+  // Mirror reconcile.classifyDeltaOrder's arithmetic exactly (which now delegates here): a missing unfilled_size
+  // means "closed ⇒ nothing left, otherwise nothing filled yet". filled = size − unfilled.
+  const unfilled = r.unfilled_size != null ? (num(r.unfilled_size) || 0) : (r.state === "closed" ? 0 : size);
+  const filled = Math.max(0, size - unfilled);
   let status = "unknown";
   if (r.state === "rejected") status = "rejected";
   else if (r.state === "cancelled") status = "cancelled";
-  else if (filled != null && size != null && filled >= size && filled > 0) status = "filled";
-  else if (filled != null && filled > 0) status = "partial";
+  else if (filled > 0 && unfilled <= 0) status = "filled";
+  else if (filled > 0) status = "partial";
   else if (r.state === "open") status = "pending";
   return base("delta", r, {
     status, requestedQty: size, filledQty: filled, remainingQty: unfilled,

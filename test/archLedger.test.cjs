@@ -42,6 +42,44 @@ test("ARCH-2: normalizeFill maps FYERS status codes to the canonical contract", 
   assert.strictEqual(normalizeFill("fyers", { id: "4", qty: 5, filledQty: 2 }).status, "partial");
 });
 
+test("INC-1: an exit fill is recorded once and is idempotent on the managed-position id", async () => {
+  const u = "919000000300";
+  const exitFill = { id: "exit_pos42", broker: "fyers", orderId: "EXIT9", side: "SELL", qty: 3, entry: 110, market: "IN", tradeType: "Auto Buy Exit", kind: "exit", managedId: "pos42", ts: Date.now() };
+  const a = await db.recordFill(u, exitFill);
+  const b = await db.recordFill(u, exitFill);   // stale-close reconcile / second sweep replays it
+  assert.strictEqual(a.inserted, true);
+  assert.strictEqual(b.inserted, false, "the same exit must not append twice");
+  const rows = await db.getFills(u, 0, Date.now() + 60000);
+  const exits = rows.filter((x) => x.kind === "exit");
+  assert.strictEqual(exits.length, 1);
+  assert.strictEqual(exits[0].side, "SELL");
+});
+
+test("INC-1: computeLedgerDrift flags entries in the risk journal that are missing from the ledger", () => {
+  const trades = [
+    { orderId: "A1", real: true, serverAuthored: true, status: "filled" },   // in both → OK
+    { orderId: "A2", real: true, serverAuthored: true, status: "filled" },   // journalled, NOT in ledger → drift
+    { orderId: "V1", real: false },                                          // virtual → ignored
+    { orderId: "C1", real: true, clientAuthored: true },                     // client-authored (not serverAuthored) → ignored
+  ];
+  const fills = [
+    { orderId: "A1", kind: "entry" },
+    { orderId: "X9", kind: "entry" },                                        // in ledger, NOT journalled → drift
+    { orderId: "A2", kind: "exit" },                                         // exit leg → not an entry, ignored
+  ];
+  const d = db.computeLedgerDrift(trades, fills);
+  assert.deepStrictEqual(d.missingInLedger, ["A2"]);
+  assert.deepStrictEqual(d.missingInJournal, ["X9"]);
+  assert.strictEqual(d.drift, 2);
+});
+
+test("INC-1: computeLedgerDrift is clean when journal and ledger agree", () => {
+  const trades = [{ orderId: "A1", real: true, serverAuthored: true }, { orderId: "A2", real: true, serverAuthored: true }];
+  const fills = [{ orderId: "A1" }, { orderId: "A2" }, { orderId: "A1", kind: "exit" }];
+  const d = db.computeLedgerDrift(trades, fills);
+  assert.strictEqual(d.drift, 0);
+});
+
 test("R23: claimPendingProtection carries created_at so the watcher ages rows correctly", async () => {
   // Regression: the claim dropped created_at (a top-level column, not inside data), so the delayed-fill
   // watcher computed ageMs = now - 0 = huge and expired EVERY freshly-parked FYERS order immediately.

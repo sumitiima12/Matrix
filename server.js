@@ -142,6 +142,12 @@ async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null
          authoritative — a lost ledger write halts trading exactly like a lost trade write. */
       await db.saveTrade(userKey, trade, { authoritative: true });
       if (typeof db.recordFill === "function") await db.recordFill(userKey, trade);
+      /* INC-1: opportunistic risk-journal ↔ fills-ledger drift check for this user. Fire-and-forget (no await)
+         so it never adds latency to the money path; logs a financial-severity event if the two records have
+         diverged, so ops can catch a book going out of sync before it silently loosens a risk control. */
+      if (typeof db.reconcileRiskVsLedger === "function") {
+        db.reconcileRiskVsLedger(userKey).then((d) => { if (d && d.drift > 0) logFinancial("risk_ledger.drift", { userKey, journalEntries: d.journalEntries, ledgerEntries: d.ledgerEntries, missingInLedger: d.missingInLedger.length, missingInJournal: d.missingInJournal.length }); }).catch(() => {});
+      }
       return true;
     }
     catch (e) {
@@ -166,6 +172,24 @@ async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null
     }
   }
   return false;
+}
+/* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
+   (entry AND exit) and can be reconciled against the risk journal / broker. Idempotent — keyed by the managed
+   position id (`exit_<posId>`) so a retry, a stale-close reconcile or a second sweep can't double-count the
+   exit. Side is the CLOSING side: SELL closes a long, BUY closes a short. Best-effort and never throws — an
+   exit must never be blocked by a ledger write (the position is already flat at the broker). */
+async function recordExitFill(userKey, pos, r, reason) {
+  if (!pos || typeof db.recordFill !== "function") return;
+  try {
+    const px = Number(r && r.avgPrice) > 0 ? Number(r.avgPrice) : (Number(pos.exit) || Number(pos.lastPrice) || 0);
+    const qty = Number(r && r.filledQty) > 0 ? Number(r.filledQty) : (Number(pos.qty) || 0);
+    await db.recordFill(userKey, {
+      id: `exit_${pos.id}`, broker: pos.broker, orderId: (r && r.orderId) || pos.exitOrderId || null,
+      side: pos.short ? "BUY" : "SELL", qty, entry: px, market: pos.market,
+      tradeType: `${pos.tradeType || "Auto"} Exit`, kind: "exit", exitReason: reason || null,
+      entryOrderId: pos.entryOrderId || null, managedId: pos.id, ts: Date.now(),
+    });
+  } catch (e) { logFinancial("exit_fill.ledger_failed", { userKey, managedId: pos && pos.id, err: String((e && e.message) || e) }); }
 }
 /* M-02: on SENSITIVE routes, re-check the DB after requireAuth — reject a token whose version is stale
    (PIN reset / block / logout / deletion bumped it) or whose account is now blocked/deleted. A stolen 30-day
@@ -6390,7 +6414,7 @@ async function runAutoExitEngine() {
              broker-confirmed (FYERS); Delta is reduce-only so it can't oversell and reports contracts. */
           const patch = { status: "open", exitTag: null, lastError: `Exit not fully filled (state ${r.state}${r.remaining != null ? `, ${r.remaining} left` : (r.remainingContracts != null ? `, ~${r.remainingContracts} left` : "")}) — will retry`, exitOrderId: r.orderId || null };
           if (Number(r.remaining) >= 0 && r.remaining != null) {
-            if (r.remaining === 0) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null }); exited++; continue; }
+            if (r.remaining === 0) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null }); await recordExitFill(storageKeyFor(pos.userId), pos, r, hit.reason); exited++; continue; }
             patch.qty = Number(r.remaining);
           }
           await db.updateManagedPosition(pos.id, patch);
@@ -6398,6 +6422,7 @@ async function runAutoExitEngine() {
           continue;
         }
         await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: hit.reason, exitOrderId: r.orderId || null });
+        await recordExitFill(storageKeyFor(pos.userId), pos, r, hit.reason);   // INC-1: ledger the exit leg
         exited++;
         console.log(`[autoexit] EXITED ${pos.symbol} for ${pos.userId} via ${pos.broker} — ${hit.reason} (order ${r.orderId})`);
       } catch (e) {
@@ -7199,6 +7224,7 @@ app.post("/api/autobuy/close", requireAuth, requireActiveUser, async (req, res) 
       return res.status(409).json({ ok: false, closed: false, orderId: r.orderId || null, error: "Broker didn't confirm a full close — position is still open and will keep retrying. Try again in a moment." });
     }
     await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close", exitOrderId: r.orderId || null, closingSince: null });
+    await recordExitFill(storageKeyFor(pos.userId), pos, r, "manual-close");   // INC-1: ledger the exit leg
     await db.updateRealStrategy(id, { status: "cancelled" });
     res.json({ ok: true, closed: true, orderId: r.orderId || null });
   } catch (e) {

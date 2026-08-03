@@ -378,6 +378,28 @@ async function getFills(userId, from = 0, to = Date.now()) {
   const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
   return Object.values(readJSON(f)[String(userId)] || {}).filter((x) => (x.ts || 0) >= from && (x.ts || 0) <= to).sort((a, b) => (b.ts || 0) - (a.ts || 0));
 }
+/* INC-1: pure comparator for risk-journal ↔ fills-ledger drift. Compares the VERIFIED entry legs the risk
+   engine reads (server-authored real trades with a broker order id) against the entry fills in the immutable
+   ledger, by order id. Returns the drift both ways so a monitor can surface a book that is diverging BEFORE it
+   loosens/loses a risk control. Exit fills (kind:"exit") are excluded — they're the closing leg, not an entry.
+   Pure and side-effect-free (takes already-read arrays) so it unit-tests without a DB. */
+function computeLedgerDrift(trades, fills) {
+  const journalEntry = (trades || []).filter((t) => t && t.real === true && t.serverAuthored === true && t.orderId != null && t.status !== "rejected");
+  const ledgerEntry = (fills || []).filter((x) => x && x.kind !== "exit" && x.orderId != null);
+  const jIds = new Set(journalEntry.map((t) => String(t.orderId)));
+  const lIds = new Set(ledgerEntry.map((x) => String(x.orderId)));
+  const missingInLedger = [...jIds].filter((id) => !lIds.has(id));   // journalled but never made it to the ledger
+  const missingInJournal = [...lIds].filter((id) => !jIds.has(id));  // in the ledger but absent from the risk journal
+  return { journalEntries: jIds.size, ledgerEntries: lIds.size, missingInLedger, missingInJournal, drift: missingInLedger.length + missingInJournal.length };
+}
+/* Read both stores for a user and compute the drift (convenience wrapper for a periodic monitor). */
+async function reconcileRiskVsLedger(userId, { from = 0, to = Date.now() } = {}) {
+  const [trades, fills] = await Promise.all([
+    getTrades(String(userId), from, to).catch(() => []),
+    getFills(String(userId), from, to).catch(() => []),
+  ]);
+  return computeLedgerDrift(trades, fills);
+}
 /* Delete specific trades by their id (scoped to the user). Used by the Delta reconcile to drop phantom
    OPEN real journal records the broker doesn't actually hold. Returns how many were removed. */
 async function deleteTradesByIds(userId, ids) {
@@ -1426,4 +1448,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, getFills, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, getFills, computeLedgerDrift, reconcileRiskVsLedger, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

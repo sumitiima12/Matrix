@@ -5,7 +5,13 @@
  * conclusive about absence? does our client_order_id appear? is a callback redirect allow-listed and
  * bound? — are extracted here so they can be unit-tested without a live broker or a running server
  * (R6-P2-04). server.js imports these and feeds them already-fetched broker payloads.
+ *
+ * INC-2: the FYERS/Delta fill-truth classifiers below DERIVE their canonical status from the single
+ * normalizeFill contract (fillContract.js), so there is exactly ONE place that decides "is this a fill?" for
+ * each broker. classify* keep their existing return shape (callers are unchanged) but the filled/rejected
+ * decision now flows through normalizeFill — the reviewer's "wire normalizeFill into the FYERS/Delta paths".
  */
+const { normalizeFill } = require("./fillContract");
 
 /* Parse a Delta timestamp (created_at) to ms, tolerant of ISO strings and numeric seconds/ms/µs. Returns
    null when it can't parse — callers treat null as "unknown age", never as "old enough to be conclusive". */
@@ -76,12 +82,14 @@ function classifyDeltaOrder(o, requested = 0) {
   const size = Number(o.size) || Number(requested) || 0;
   const unfilled = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : size);
   const filled = Math.max(0, size - unfilled);
-  const rejected = o.state === "cancelled" || o.state === "rejected";
+  // INC-2: fill truth from the canonical contract (normalizeFill), so Delta has ONE fill-decision path.
+  const n = normalizeFill("delta", { ...o, size });
+  const rejected = n.status === "rejected" || n.status === "cancelled";
   return {
     state: o.state || "unknown",
     size, filled, unfilled, rejected,
-    fullyFilled: !rejected && filled > 0 && unfilled <= 0,
-    partial: !rejected && filled > 0 && unfilled > 0,
+    fullyFilled: n.status === "filled",
+    partial: n.status === "partial",
     avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null,
     orderId: o.id != null ? o.id : null,
   };
@@ -97,8 +105,12 @@ function classifyFyersOrder(o) {
   const qty = Number(o.qty) || 0;
   const filledQty = Number(o.filledQty != null ? o.filledQty : o.filled_qty) || 0;
   const avgPrice = (o.tradedPrice != null ? Number(o.tradedPrice) : (o.avgPrice != null ? Number(o.avgPrice) : null));
-  const filled = status === 2 && filledQty > 0;
-  const rejected = status === 5 || status === 1;   // rejected or cancelled → nothing executed
+  // INC-2: fill truth from the canonical contract (normalizeFill), so FYERS has ONE fill-decision path.
+  // normFyers marks "filled" only for status 2 WITH a positive filled qty, and "rejected"/"cancelled" for 5/1 —
+  // identical to the prior inline logic, now single-sourced. avgPrice/qty stay raw so nothing else shifts.
+  const n = normalizeFill("fyers", o);
+  const filled = n.status === "filled";
+  const rejected = n.status === "rejected" || n.status === "cancelled";
   return { status, qty, filledQty, avgPrice: Number.isFinite(avgPrice) ? avgPrice : null, filled, rejected, pending: !filled && !rejected };
 }
 
