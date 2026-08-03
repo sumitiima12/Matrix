@@ -197,6 +197,25 @@ async function recordExitFill(userKey, pos, r, reason) {
     await addUserNotice(pos && pos.userId, { type: "exit_unjournaled", broker: pos && pos.broker, symbol: pos && pos.symbol, msg: `Your ${pos && pos.symbol} position closed at your broker, but recording the closing trade failed — we'll reconcile it. No action needed.` });
   }
 }
+/* R25-C01: park a durable pending-reconciliation row for an ACCEPTED-but-not-yet-filled broker order. The
+   broker already holds the order, so if we can't save its tracking row we must NOT pretend it's a normal pending
+   success — that would permanently lose the fill/SL-TP reconciliation job (the fill could later be absent from
+   the journal + ledger, and requested protection never attached). On failure this engages the account risk-lock
+   + entry halt (manual AND automated, incl. the live in-memory kill switch), emits `accepted_tracking_failed`,
+   leaves a user notice, and returns false so the caller responds with a reconciliation-required outcome instead
+   of a plain pending. Returns true only when the tracking row is durably saved. */
+async function parkPendingProtectionOrHalt(userId, row) {
+  try { await db.savePendingProtection(row); return true; }
+  catch (e) {
+    const key = storageKeyFor(userId);
+    logFinancial("accepted_tracking_failed", { userId, orderId: row && row.orderId, broker: row && row.broker, err: String((e && e.message) || e) });
+    try { await db.setRiskLock(key, true); } catch { /* best-effort */ }
+    try { if (typeof db.setEntryHalt === "function") await db.setEntryHalt(key, true); } catch { /* best-effort */ }
+    try { haltedEntries.add(String(key)); } catch { /* engine may not be up */ }
+    await addUserNotice(userId, { type: "accepted_tracking_failed", broker: row && row.broker, symbol: row && row.symbol, msg: `Your ${row && row.symbol} order was accepted at your broker, but saving its tracking failed — new orders are paused as a precaution. Please reconcile with your broker.` });
+    return false;
+  }
+}
 /* M-02: on SENSITIVE routes, re-check the DB after requireAuth — reject a token whose version is stale
    (PIN reset / block / logout / deletion bumped it) or whose account is now blocked/deleted. A stolen 30-day
    token can't keep trading after the user secures the account. Best-effort: if the lookup fails we allow (the
@@ -5179,7 +5198,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
          position at the REAL filled quantity/price. A rejected or still-pending entry arms nothing — so the
          exit engine can't later SELL against a holding that doesn't exist. Order placement itself still
          returns to the client; only the auto-exit arming is gated on the fill. */
-      let autoExitId = null, fillStatus = "PENDING", autoExitNote = null;
+      let autoExitId = null, fillStatus = "PENDING", autoExitNote = null, trackingFailed = false;
       /* R20-P2-09: verify the FILL STATUS ONCE, ALWAYS — independent of whether protection was requested. The
          same filled market order must report FILLED whether or not SL/TP was asked for (previously it only
          verified inside `if (wantAutoExit)` and returned PENDING for a plain order). This single source of
@@ -5193,11 +5212,14 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
          user-namespaced, dedupe-by-orderId trade row so risk counters include the execution even if the browser
          never posts a journal row. recordAuthoritativeFill retries and fails loud (notice + log) on write error. */
       if (c.filled) {
-        await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+        const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
           sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
           qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
           entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
         }, { haltUserIdOnFail: sess.userId });   // H2: if the fill can't be journaled, halt AUTOMATED entries so risk isn't computed on an incomplete book
+        // R25-H07: a FILLED order whose fill couldn't be journaled must NOT look like an ordinary success — the
+        // account is already risk-locked; surface reconciliation-required so the client shows the paused state.
+        if (!journaled) trackingFailed = true;
       }
 
       if (wantAutoExit) {
@@ -5214,12 +5236,13 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           /* R16-P2-10: don't abandon the requested protection. Park it so the background watcher attaches
              SL/TP once (if) this LIMIT entry fills later — protection tracks the CONFIRMED filled qty. */
           const bareSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
-          await db.savePendingProtection({
+          const parked = await parkPendingProtectionOrHalt(sess.userId, {
             id: `pp_${sess.userId}_${d.id}`, userId: String(sess.userId), broker: "fyers", orderId: d.id,
             symbol: bareSym, brokerSym: symbol, qty: Number(qty), market: regMarket, product,
             sl: slPct || null, tp: tpPct || null, tsl: tslPct || null, cfg: exitCfg,
             yahoo: req.body?.yahoo || `${bareSym}.NS`, interval: req.body?.interval || "5m", short: String(side).toLowerCase() === "sell",
-          }).catch(() => {});
+          });
+          if (!parked) trackingFailed = true;
           autoExitNote = "Entry not filled yet — we'll attach your SL/TP automatically if it fills. You can also re-arm from the position.";
         }
       }
@@ -5228,12 +5251,19 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
          background watcher reconciles the eventual fill exactly once, keeping the risk ledger complete. */
       if (!wantAutoExit && fillStatus === "PENDING") {
         const bareSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
-        await db.savePendingProtection({
+        const parked = await parkPendingProtectionOrHalt(sess.userId, {
           id: `pp_${sess.userId}_${d.id}`, userId: String(sess.userId), broker: "fyers", orderId: d.id,
           symbol: bareSym, brokerSym: symbol, qty: Number(qty), market: regMarket, product,
           sl: null, tp: null, tsl: null, cfg: null, plain: true, tradeType: String(req.body?.tradeType || "Manual"),
           yahoo: req.body?.yahoo || `${bareSym}.NS`, interval: req.body?.interval || "5m", short: String(side).toLowerCase() === "sell",
-        }).catch(() => {});
+        });
+        if (!parked) trackingFailed = true;
+      }
+      /* R25-C01: if the order was accepted but its durable tracking couldn't be saved, do NOT return a normal
+         pending success — return a reconciliation-required outcome (202) so the client shows the paused state.
+         The account risk-lock + entry halt are already engaged inside parkPendingProtectionOrHalt. */
+      if (trackingFailed) {
+        return res.status(202).json({ orderId: d.id, status: fillStatus, broker, reconcileRequired: true, autoExitArmed: false, error: "Your order was accepted, but saving its tracking failed — new orders are paused. Please reconcile with your broker before retrying." });
       }
       return res.json({ orderId: d.id, status: fillStatus, broker, autoExitId, autoExitArmed: !!autoExitId, ...(autoExitNote ? { autoExitNote } : {}) });
     }
@@ -5287,7 +5317,11 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       }
       const autoExitId = await registerAutoExit();
       // R19-P1-04: server-authoritative trade row on the verified Delta fill (risk counters count it server-side).
-      await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: "Manual", orderId: o.id ?? null, serverAuthored: true }, { haltUserIdOnFail: sess.userId });
+      const deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: "Manual", orderId: o.id ?? null, serverAuthored: true }, { haltUserIdOnFail: sess.userId });
+      // R25-H07: a filled Delta order whose fill couldn't be journaled is reconciliation-required, not a plain success.
+      if (!deltaJournaled) {
+        return res.status(202).json({ ok: false, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, reconcileRequired: true, error: "Your order filled but recording it failed — new orders are paused. Please reconcile with your broker." });
+      }
       return res.json({ ok: true, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, bracket, autoExitId, raw: o });
     }
 
@@ -6636,16 +6670,16 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
   const halt = !!(req.body && req.body.halt);
   if (halt) haltedEntries.add(uid); else haltedEntries.delete(uid);
   try { await db.setEntryHalt(uid, halt); } catch (e) { return res.status(500).json({ error: "Could not save — try again." }); }
-  /* R24-P1-03: Resume is NO LONGER a user attestation that clears the risk-ledger lock. The lock is cleared ONLY
-     when a SERVER-side reconciliation proves the book is consistent: we compare the immutable fills ledger against
-     the risk journal (reconcileRiskVsLedger) and clear the lock ONLY when there is zero drift. Any drift (a
-     journalled entry missing from the ledger, or vice-versa, or a quantity mismatch) keeps the lock engaged and
-     tells the user it needs review — a tap can't restore trading against a book we can't prove is complete. A DB
-     error is fail-closed (lock stays on). Entry-halt (the kill switch) still toggles by user action; the risk lock
-     is the stricter gate that requires proof. */
+  /* R24-P1-03 / R25-C02: Resume is NOT a user attestation. The risk lock clears ONLY when a SERVER-side
+     reconciliation (reconcileForUnlock) proves the book is fully consistent — zero ENTRY ledger↔journal drift
+     (presence + quantity, broker-scoped), zero EXIT drift, NO outstanding pending-protection rows, and NO unknown
+     idempotency intents. Any unresolved signal keeps the lock engaged. All reads PROPAGATE errors, so a DB outage
+     fails closed (lock stays on) rather than reading "empty ⇒ zero drift". Entry-halt (the kill switch) still
+     toggles by user action; the risk lock is the stricter gate that requires proof. (A live broker-order/position
+     query is the remaining hardening — tracked; this reconciles against Matrix's authoritative stores.) */
   if (!halt && typeof db.setRiskLock === "function") {
     let drift = null;
-    try { drift = typeof db.reconcileRiskVsLedger === "function" ? await db.reconcileRiskVsLedger(uid) : { drift: 0 }; }
+    try { drift = typeof db.reconcileForUnlock === "function" ? await db.reconcileForUnlock(uid) : (typeof db.reconcileRiskVsLedger === "function" ? await db.reconcileRiskVsLedger(uid) : { drift: 0 }); }
     catch (e) {
       haltedEntries.add(uid);
       logFinancial("killswitch.resume_reconcile_failed", { userId: uid, err: String((e && e.message) || e) });

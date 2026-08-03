@@ -404,19 +404,23 @@ function projectFills(fills) {
    journal's verified entry legs against the ledger's PROJECTED entry fills (max-observation, above) by order id,
    and flags a material quantity mismatch (relative tolerance) in addition to presence gaps. */
 function computeLedgerDrift(trades, fills) {
+  // R25-H05: key by (broker, orderId) end-to-end. Order ids are only unique PER broker — two brokers can hand the
+  // same numeric id to one user, so keying by orderId alone would collide (false zero drift or false mismatch).
+  const bkey = (broker, orderId) => `${String(broker || "").toLowerCase()}|${String(orderId)}`;
   const journalEntry = (trades || []).filter((t) => t && t.real === true && t.serverAuthored === true && t.orderId != null && t.status !== "rejected");
   const projectedEntry = projectFills(fills).filter((p) => p.leg === "entry");
-  const jById = new Map(journalEntry.map((t) => [String(t.orderId), t]));
-  const lById = new Map(projectedEntry.map((p) => [p.orderId, p]));
-  const missingInLedger = [...jById.keys()].filter((id) => !lById.has(id));    // journalled but never made it to the ledger
-  const missingInJournal = [...lById.keys()].filter((id) => !jById.has(id));   // in the ledger but absent from the risk journal
+  const jById = new Map(journalEntry.map((t) => [bkey(t.broker, t.orderId), t]));
+  const lById = new Map(projectedEntry.map((p) => [bkey(p.broker, p.orderId), p]));
+  // Matching is broker-scoped, but the REPORTED ids are the bare broker order ids (not the internal composite key).
+  const missingInLedger = [...jById.entries()].filter(([k]) => !lById.has(k)).map(([, t]) => String(t.orderId));   // journalled but never made it to the ledger
+  const missingInJournal = [...lById.entries()].filter(([k]) => !jById.has(k)).map(([, p]) => String(p.orderId));  // in the ledger but absent from the risk journal
   const qtyMismatch = [];
-  for (const [id, t] of jById) {
-    const p = lById.get(id);
+  for (const [k, t] of jById) {
+    const p = lById.get(k);
     if (!p) continue;
     const jq = Number(t.qty) || 0, lq = Number(p.qty) || 0;
     const diff = Math.abs(jq - lq);
-    if (diff > 1e-9 && diff / Math.max(1, Math.max(jq, lq)) > 0.001) qtyMismatch.push({ orderId: id, journalQty: jq, ledgerQty: lq });
+    if (diff > 1e-9 && diff / Math.max(1, Math.max(jq, lq)) > 0.001) qtyMismatch.push({ orderId: String(t.orderId), broker: t.broker || null, journalQty: jq, ledgerQty: lq });
   }
   return { journalEntries: jById.size, ledgerEntries: lById.size, missingInLedger, missingInJournal, qtyMismatch, drift: missingInLedger.length + missingInJournal.length + qtyMismatch.length };
 }
@@ -442,6 +446,34 @@ async function reconcileRiskVsLedger(userId, { from = 0, to = Date.now() } = {})
     getFills(String(userId), from, to),
   ]);
   return computeLedgerDrift(trades, fills);
+}
+/* R25-C02 / H06: the FULL pre-unlock reconciliation. The Resume unlock must not clear the risk lock while ANY
+   order outcome is unresolved, so this aggregates every unresolved signal we hold:
+     • entry ledger↔journal drift (presence + quantity, broker-scoped),
+     • exit drift (a closed managed position with no recorded exit fill),
+     • outstanding pending-protection rows (accepted-but-unfilled orders still being tracked),
+     • unknown idempotency rows (orders whose broker outcome we never confirmed).
+   ALL reads propagate errors (no catch-to-empty) so a DB outage keeps the lock (fail closed). A genuinely clean,
+   fully-reconciled book returns drift 0 → safe to unlock. NOTE: this is still a comparison of Matrix's own
+   authoritative stores, not a live broker query — a broker-backed watermark is the remaining hardening (tracked). */
+async function reconcileForUnlock(userId) {
+  const uid = String(userId);
+  const [trades, fills, pending, unknownIntents, positions] = await Promise.all([
+    getTrades(uid, 0, Date.now()),
+    getFills(uid, 0, Date.now()),
+    listPendingProtectionForUser(uid, 500),
+    countUnknownIdempotency(uid),
+    getManagedPositionsForUser(uid),
+  ]);
+  const ledger = computeLedgerDrift(trades, fills);
+  const exit = computeExitDrift(positions, fills);
+  const pendingCount = (pending || []).length;
+  const drift = ledger.drift + exit.drift + pendingCount + (unknownIntents || 0);
+  return {
+    drift,
+    ledgerDrift: ledger.drift, exitDrift: exit.drift, pending: pendingCount, unknownIntents: unknownIntents || 0,
+    missingInLedger: ledger.missingInLedger, missingInJournal: ledger.missingInJournal, qtyMismatch: ledger.qtyMismatch, missingExitFill: exit.missingExitFill,
+  };
 }
 /* Delete specific trades by their id (scoped to the user). Used by the Delta reconcile to drop phantom
    OPEN real journal records the broker doesn't actually hold. Returns how many were removed. */
@@ -1323,6 +1355,18 @@ async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000 } = {}) {
   if (changed) writeJSON(f, d);
   return { markedUnknown: marked, purged: 0 };
 }
+/* R25: count a user's UNRESOLVED (unknown) idempotency rows — an outstanding order whose broker outcome we
+   couldn't confirm. Used by the unlock reconciliation and the account-level new-entry gate: while any exist, the
+   book is provably not reconciled. Reads propagate errors (fail closed). */
+async function countUnknownIdempotency(userId) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT COUNT(*)::int AS n FROM order_idempotency WHERE user_id=$1 AND status='unknown'`, [String(userId)]);
+    return (r.rows[0] && r.rows[0].n) || 0;
+  }
+  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")));
+  let n = 0; for (const k of Object.keys(d)) if (k.startsWith(`${userId}|`) && d[k] && d[k].status === "unknown") n++;
+  return n;
+}
 /* Finalize the outcome. status ∈ succeeded | rejected | unknown. A 'rejected' (conclusive) DELETES the row
    so a same-key retry may proceed; 'succeeded'/'unknown' persist the response for replay/blocking. */
 async function finalizeIdempotency(userId, key, status, response) {
@@ -1506,4 +1550,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, getFills, computeLedgerDrift, projectFills, computeExitDrift, reconcileRiskVsLedger, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, getFills, computeLedgerDrift, projectFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

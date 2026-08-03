@@ -103,6 +103,21 @@ test("R24-P2-02: computeLedgerDrift flags a quantity mismatch, not just presence
   assert.ok(d.drift >= 1);
 });
 
+test("R25-H05: drift keys are broker-scoped — same orderId at two brokers does NOT collide", () => {
+  const trades = [
+    { orderId: "100", broker: "fyers", real: true, serverAuthored: true, qty: 5 },
+    { orderId: "100", broker: "delta", real: true, serverAuthored: true, qty: 3 },
+  ];
+  const fills = [
+    { orderId: "100", broker: "fyers", qty: 5, kind: "entry" },
+    { orderId: "100", broker: "delta", qty: 3, kind: "entry" },
+  ];
+  const d = db.computeLedgerDrift(trades, fills);
+  assert.strictEqual(d.journalEntries, 2, "two brokers' order 100 are distinct journal entries");
+  assert.strictEqual(d.ledgerEntries, 2, "two brokers' order 100 are distinct ledger fills");
+  assert.strictEqual(d.drift, 0, "both match per-broker — no false drift from the shared numeric id");
+});
+
 test("R24-P2-03: computeExitDrift finds a closed position with no exit fill", () => {
   const closed = [{ id: "posA", status: "closed" }, { id: "posB", status: "closed" }];
   const fills = [{ kind: "exit", managedId: "posA", orderId: "E1" }];   // posB's exit never recorded
