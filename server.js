@@ -305,6 +305,14 @@ let schemaReady = false;
     }
     schemaReady = true;   // ready ONLY after the durable re-arm (if enabled) has completed
     if (attempt) console.log(`[db] schema ready after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
+    /* C04: IMMEDIATE broker-backed reconciliation sweep at startup (non-blocking — the fail-closed re-arm above
+       already locked every affected account before we became ready, so an ambiguous order can't trade in the gap;
+       this sweep then RESOLVES those attempts against FYERS truth and unlocks the ones that are provably done).
+       Single-owner via a pg advisory lock; broker-unreachable/pending/partial keep the lock. Flag-gated + best
+       effort so it never blocks boot. A periodic worker (below) repeats it with bounded backoff. */
+    if (process.env.C03_ORDER_ATTEMPTS === "1" && !MATRIX_NO_LISTEN) {
+      runC03Reconcile("startup").catch((e) => console.error("[c03] startup reconcile sweep error:", e && e.message));
+    }
   })
     .catch((e) => {
       console.error(`[db] init failed (attempt ${attempt + 1}):`, e.message);
@@ -315,6 +323,73 @@ let schemaReady = false;
 function requireSchemaReady(req, res, next) {
   if (schemaReady) return next();
   return res.status(503).json({ error: "Server is starting up and hasn't finished initializing — please retry in a moment." });
+}
+
+/* C04 — production broker-backed reconciliation of unresolved C03 order attempts. A stable session-level pg
+   advisory lock guarantees a SINGLE owner across instances; the probe reads FYERS' own order book by our durable
+   orderTag and classifies the outcome; a confirmed fill is adopted exactly once into the authoritative ledger and
+   the account is unlocked, a confirmed rejection/absence is closed, and anything the broker can't conclusively
+   confirm (unreachable, still-pending, partial) KEEPS THE ACCOUNT LOCKED. Fail-closed throughout. */
+const C03_RECON_ADVISORY_KEY = 0x4331_0304 | 0;   // stable, app-unique advisory-lock id for the C03 sweep
+async function _fyersProbeByTag(attempt) {
+  // A missing/undecryptable session is UNREACHABLE (throw) → the attempt stays locked, never falsely resolved.
+  const sess = await sessionFromCred(String(attempt.userId), attempt.broker || "fyers");
+  if (!sess || !sess.accessToken) throw new Error("no fyers session to reconcile attempt");
+  const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders", { headers: brokerAuth("fyers", sess.accessToken, sess.userId) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.s === "error") throw new Error("fyers order book unreachable");
+  const book = Array.isArray(d.orderBook) ? d.orderBook : [];
+  const tag = attempt.orderTag;
+  const ours = book.filter((o) => String((o && o.orderTag) || "") === String(tag));
+  if (!ours.length) return { status: "absent" };   // broker conclusively has no order under our tag
+  let anyPending = false, anyFilled = false, anyRejected = false;
+  for (const o of ours) { const c = reconcile.classifyFyersOrder(o); if (c.filled) anyFilled = true; else if (c.rejected) anyRejected = true; else anyPending = true; }
+  const agg = reconcile.attributeFyersFills(ours, tag);   // { filledQty, avgPrice } across OUR tagged rows only
+  const wantQty = Number(attempt.qty) || 0;
+  if (anyFilled && agg.filledQty > 0) {
+    const first = ours.find((o) => reconcile.classifyFyersOrder(o).filled) || ours[0];
+    if (wantQty > 0 && agg.filledQty < wantQty) return { status: "partial", orderId: first.id, filledQty: agg.filledQty, avgPrice: agg.avgPrice };
+    return { status: "filled", orderId: first.id, filledQty: agg.filledQty, avgPrice: agg.avgPrice };
+  }
+  if (anyPending) return { status: "pending" };
+  if (anyRejected) return { status: "rejected", orderId: ours[0].id };
+  return { status: "pending" };
+}
+async function _adoptFyersFill(attempt, ob) {
+  // Adopt the recovered fill into the AUTHORITATIVE, dedupe-by-orderId ledger exactly once (recordAuthoritativeFill
+  // is idempotent on the broker order id). It's recorded as a normal entry unless the attempt was reduce-only.
+  const isReduce = attempt && (attempt.protection && attempt.protection.reduceOnly) === true;
+  await recordAuthoritativeFill(String(attempt.userId), {
+    sym: String(attempt.symbol || "").replace(/^NSE:/, "").replace(/-EQ$/, ""),
+    side: String(attempt.side || "BUY").toUpperCase(),
+    qty: Number(ob.filledQty) || Number(attempt.qty) || 0,
+    entry: Number(ob.avgPrice) || 0, entryAt: Date.now(),
+    market: "IN", real: true, broker: "fyers", orderId: ob.orderId || (attempt.brokerOrderId || null),
+    tradeType: "Recovery", serverAuthored: true, ...(isReduce ? { kind: "exit", reduceOnly: true } : {}),
+  }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
+}
+async function runC03Reconcile(reason = "periodic") {
+  if (process.env.C03_ORDER_ATTEMPTS !== "1") return { skipped: true, reason: "flag-off" };
+  const orderRecovery = require("./orderRecovery");
+  let owner = false;
+  try {
+    const out = await orderRecovery.reconcileUnresolvedAttempts({
+      db,
+      probeByTag: _fyersProbeByTag,
+      adoptFill: _adoptFyersFill,
+      setLock: (uid, v) => { try { haltedEntries.add(String(uid)); } catch { /* engine may not be up */ } return db.setRiskLock(String(uid), v); },
+      setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
+      acquireOwner: async () => { owner = await db.tryAdvisoryLock(C03_RECON_ADVISORY_KEY); return owner; },
+      logger: (evt, o) => { try { logFinancial(evt, o); } catch { /* pre-logger */ } },
+    });
+    if (out && !out.skipped) logFinancial("c03.reconcile.sweep", { reason, ...out });
+    return out;
+  } catch (e) {
+    console.error("[c03] reconcile sweep failed:", e && e.message);
+    return { error: (e && e.message) || String(e) };
+  } finally {
+    if (owner) await db.releaseAdvisoryLock(C03_RECON_ADVISORY_KEY);
+  }
 }
 
 /* ------------------------------- trade store ------------------------------ */
@@ -1459,7 +1534,22 @@ const fyFetchOpts = fyersDispatcher ? { dispatcher: fyersDispatcher } : {};
 /* Every FYERS API call MUST exit from the whitelisted IP — especially ORDER placement, which FYERS
    rejects outright otherwise ("Orders are only allowed from whitelisted IP addresses"). Route them
    all through the proxy dispatcher; when no proxy is configured this is a plain fetch. */
-function fyFetch(url, opts) { return pfetch(url, { ...(opts || {}), ...fyFetchOpts }); }
+/* #441/C03 test seam: when FYERS_API_BASE is set (e.g. http://127.0.0.1:<fakePort>), rewrite the FYERS API
+   hosts to it so route-level integration tests can point every FYERS call — order placement, account snapshot,
+   fill verification and the reconcile probe — at a hermetic fake FYERS HTTP server through this single
+   chokepoint. Unset in production ⇒ the real hosts are used unchanged (no behavioural change). Only the api-t1
+   data/trading host is redirected (that's all the order/account/verify/probe paths use); the auth hosts are
+   left alone. */
+const FYERS_API_BASE = String(process.env.FYERS_API_BASE || "").replace(/\/$/, "");
+function _fyRewrite(url) {
+  if (!FYERS_API_BASE) return url;
+  try {
+    const s = String(url);
+    if (s.startsWith("https://api-t1.fyers.in")) return FYERS_API_BASE + s.slice("https://api-t1.fyers.in".length);
+    return url;
+  } catch { return url; }
+}
+function fyFetch(url, opts) { return pfetch(_fyRewrite(url), { ...(opts || {}), ...fyFetchOpts }); }
 
 /* RFC-6238 TOTP now lives in ./otp (required at top) — see otp.js. */
 
@@ -6150,14 +6240,28 @@ async function brokerSnapshotForUnlock(userId) {
       const s = cmp.shortfall || {};
       return { ok: false, reason: `${s.sym} isn't confirmed open at ${broker} (broker holds ${s.broker}, we track ${s.tracked}) — reconcile before resuming` };
     }
-    /* ORPHAN broker exposure: the broker holds a position Matrix doesn't track (a possible orphaned fill from a
-       lost order). Always surface it; BLOCK the unlock when strict mode is on (UNLOCK_BLOCK_ORPHAN_EXPOSURE=1) —
-       default off so an account with unrelated MANUAL holdings isn't bricked. */
+    /* H01: ORPHAN broker exposure — the broker holds a position Matrix doesn't track. This is exactly the shape a
+       lost/ambiguous Matrix order leaves behind (a fill with no managed-position row), so it now BLOCKS the unlock
+       BY DEFAULT (fail closed). Two things keep this from bricking an account that simply has unrelated personal
+       holdings: (1) if there are NO unresolved Matrix order attempts for this user, an orphan is far more likely a
+       personal holding — we surface it but don't block unless strict mode (UNLOCK_BLOCK_ORPHAN_EXPOSURE=1) is on;
+       (2) an explicit ops escape hatch UNLOCK_ALLOW_ORPHAN_HOLDINGS=1 lets an operator resume an account with known
+       manual holdings. When Matrix HAS an unresolved attempt, an orphan is treated as our untracked exposure and
+       blocks regardless (the C03 lost-order case). */
     if (cmp.orphans && cmp.orphans.length) {
       logFinancial("killswitch.resume_orphan_exposure", { userId: String(userId), broker, orphans: cmp.orphans });
-      if (process.env.UNLOCK_BLOCK_ORPHAN_EXPOSURE === "1") {
+      let hasUnresolvedAttempt = false;
+      try {
+        const uns = await db.listUnresolvedOrderAttempts(1000);
+        hasUnresolvedAttempt = (uns || []).some((a) => a && String(a.userId) === String(userId) && (!a.broker || a.broker === broker));
+      } catch { hasUnresolvedAttempt = true; }   // fail closed: can't check ⇒ treat as ours
+      const allowHoldings = process.env.UNLOCK_ALLOW_ORPHAN_HOLDINGS === "1";
+      const strict = process.env.UNLOCK_BLOCK_ORPHAN_EXPOSURE === "1";
+      // Block when: an unresolved Matrix attempt makes this our exposure, OR strict mode — UNLESS the operator has
+      // explicitly allowed personal holdings for this deployment.
+      if ((hasUnresolvedAttempt || strict) && !allowHoldings) {
         const o = cmp.orphans[0];
-        return { ok: false, reason: `${broker} holds ${o.qty} ${o.dir} ${o.sym} that MatrixOne doesn't track — reconcile the untracked exposure before resuming` };
+        return { ok: false, reason: `${broker} holds ${o.qty} ${o.dir} ${o.sym} that MatrixOne doesn't track — reconcile the untracked exposure before resuming`, orphanBlocked: true };
       }
     }
     verified += cmp.verified;
@@ -7311,6 +7415,15 @@ async function runProtectionWatcher() {
     } catch (e) { console.error("[protection] sweep item failed:", e.message); }
   }
 }
+/* C04: PERIODIC broker-backed reconciliation worker. Repeats the startup sweep so an attempt that was
+   broker-unreachable/pending/partial at boot (and therefore kept its account locked) is retried and resolved as
+   soon as FYERS truth is available — no manual/external path required. Single-owner via the pg advisory lock, so
+   in a multi-instance deploy only one node sweeps. Flag-gated (attempts exist only when C03 is enabled) and
+   skipped under the #441 test seam (tests invoke runC03Reconcile directly). */
+if (process.env.C03_ORDER_ATTEMPTS === "1" && !MATRIX_NO_LISTEN) {
+  const C03_RECON_MS = Number(process.env.C03_RECON_MS) || 60_000;
+  setInterval(() => { runC03Reconcile("periodic").catch((e) => console.error("[c03] periodic reconcile error:", e && e.message)); }, C03_RECON_MS).unref?.();
+}
 /* R21-P2-05: periodically reconcile stale idempotency records so a dead in-flight request can't block a key
    forever — mark long-in_flight rows 'unknown' (surfaces a reconcile prompt on retry) and purge very old rows. */
 if (typeof db.reconcileStaleIdempotency === "function") {
@@ -7674,7 +7787,12 @@ if (!MATRIX_NO_LISTEN) {
 
 // #441 test seam: export the wired app + the readiness predicate so an integration test can drive real routes
 // against an ephemeral Postgres. Under MATRIX_NO_LISTEN we do NOT bind a port (the test owns the http.Server).
-module.exports = { app, isSchemaReady: () => schemaReady };
+/* #441 seam exports. encryptCred/decryptCred are exposed ONLY so a hermetic route test can seed an encrypted
+   broker credential that the REAL /api/broker/resume path then decrypts (exercising the true decryption code) —
+   they are pure crypto helpers, safe to export. runC03Reconcile lets a test drive the exact production startup /
+   periodic reconciliation sweep. None of this changes production behaviour (the app still boots + listens
+   identically when MATRIX_NO_LISTEN is unset). */
+module.exports = { app, isSchemaReady: () => schemaReady, runC03Reconcile, encryptCred, decryptCred, putBrokerSession };
 if (!MATRIX_NO_LISTEN) {
   app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
 }

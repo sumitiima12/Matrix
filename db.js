@@ -1546,6 +1546,20 @@ async function getOrderAttempt(id) {
   const d = readJSON(_attemptFile()); return d[String(id)] || null;
 }
 
+/* C04 single-owner coordination: a session-level pg advisory lock so exactly ONE instance runs the broker-backed
+   reconciliation sweep at a time (others no-op). Flat-file/dev has a single process, so it's trivially the owner.
+   tryAdvisoryLock returns true iff THIS connection acquired it; releaseAdvisoryLock frees it. Best-effort/fail-open
+   on the release; fail-closed (returns false ⇒ not owner ⇒ skip) if the lock can't be acquired. */
+async function tryAdvisoryLock(key) {
+  if (!USING_PG) return true;
+  try { const r = await pool.query("SELECT pg_try_advisory_lock($1) AS ok", [Number(key) | 0]); return r.rows[0] && r.rows[0].ok === true; }
+  catch { return false; }
+}
+async function releaseAdvisoryLock(key) {
+  if (!USING_PG) return;
+  try { await pool.query("SELECT pg_advisory_unlock($1)", [Number(key) | 0]); } catch { /* best-effort */ }
+}
+
 /* Every attempt that hasn't been reconciled yet — the startup-recovery work list. Oldest first. */
 async function listUnresolvedOrderAttempts(limit = 500) {
   if (USING_PG) { const r = await pool.query(`SELECT * FROM order_attempts WHERE resolved=FALSE ORDER BY created_at ASC LIMIT $1`, [Number(limit) || 500]); return r.rows.map(_rowFromPg); }
@@ -1795,4 +1809,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, USING_PG };

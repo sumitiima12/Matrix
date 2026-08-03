@@ -1,0 +1,106 @@
+/* Hermetic FAKE FYERS HTTP server for the literal /api/order route tests. It implements the exact endpoints the
+   production FYERS code path calls (order placement, funds/positions/holdings for the risk snapshot, order-book
+   read for fill verification and the reconcile probe) and RECORDS every request it receives. Behaviour is
+   controllable per test: fill / reject / pending / lost-response (socket reset AFTER the broker recorded the
+   order, i.e. "sent but response lost") / connection-reset-before-record / delayed-response. Server.js is pointed
+   at it via FYERS_API_BASE, so the real fyFetch chokepoint routes every FYERS call here. */
+const http = require("http");
+
+function makeFakeFyers() {
+  const state = {
+    mode: "fill",             // fill | reject | pending | lostResponse | resetBeforeRecord | delay
+    delayMs: 0,
+    orders: new Map(),        // orderTag -> { id, orderTag, symbol, qty, side, status, filledQty, tradedPrice }
+    requests: [],             // every received request { method, path, body }
+    placeCount: 0,            // number of ACTUAL order-placement calls that reached the broker
+    fillPrice: 100,
+  };
+  let seq = 1000;
+
+  function readBody(req) {
+    return new Promise((resolve) => {
+      let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { try { resolve(b ? JSON.parse(b) : {}); } catch { resolve({}); } });
+    });
+  }
+  function orderBookArray(filterId) {
+    const all = [...state.orders.values()].map((o) => ({
+      id: o.id, orderTag: o.orderTag, symbol: o.symbol, qty: o.qty, side: o.side,
+      status: o.status, filledQty: o.filledQty, tradedPrice: o.tradedPrice,
+    }));
+    return filterId ? all.filter((o) => String(o.id) === String(filterId)) : all;
+  }
+
+  const server = http.createServer(async (req, res) => {
+    const u = new URL(req.url, "http://x");
+    const path = u.pathname;
+    const send = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+
+    // ---- account snapshot (risk gate) ---------------------------------------------------------------
+    if (req.method === "GET" && path === "/api/v3/funds") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", fund_limit: [{ title: "Available Balance", equityAmount: 1_000_000 }] }); }
+    if (req.method === "GET" && path === "/api/v3/holdings") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", holdings: [] }); }
+    if (req.method === "GET" && path === "/api/v3/positions") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", netPositions: [] }); }
+
+    // ---- order-book reads (fill verification + reconcile probe) --------------------------------------
+    if (req.method === "GET" && path === "/api/v3/orders") {
+      state.requests.push({ method: "GET", path: req.url });
+      const id = u.searchParams.get("id");
+      return send(200, { s: "ok", orderBook: orderBookArray(id) });
+    }
+
+    // ---- order placement ----------------------------------------------------------------------------
+    if (req.method === "POST" && path === "/api/v3/orders/sync") {
+      const body = await readBody(req);
+      state.requests.push({ method: "POST", path, body });
+      // Write-before-send probe: let the test inspect durable state AT THE MOMENT the broker receives the order.
+      if (typeof state.onPlace === "function") { try { await state.onPlace(body); } catch { /* test hook must never break the fake */ } }
+      const tag = body.orderTag;
+
+      if (state.mode === "resetBeforeRecord") {
+        // The broker NEVER received/recorded the order (connection died before processing). No order stored.
+        req.socket.destroy();
+        return;
+      }
+
+      // Record the order at the broker (this models "the broker received it").
+      state.placeCount++;
+      const id = "FY" + (++seq);
+      let status = 2, filledQty = Number(body.qty) || 0, tradedPrice = state.fillPrice;
+      if (state.mode === "reject") { status = 5; filledQty = 0; tradedPrice = 0; }
+      else if (state.mode === "pending") { status = 6; filledQty = 0; tradedPrice = 0; }
+      // fill / lostResponse / delay ⇒ status 2 (filled) and held in the book under our tag
+      if (tag && !state.orders.has(tag)) state.orders.set(tag, { id, orderTag: tag, symbol: body.symbol, qty: Number(body.qty) || 0, side: body.side, status, filledQty, tradedPrice });
+      const stored = state.orders.get(tag) || { id };
+
+      if (state.mode === "lostResponse") {
+        // The broker recorded the order, but the RESPONSE is lost — reset the socket after recording. The client
+        // sees a transport error; the order truly exists at the broker under our tag (reconcile will find it).
+        req.socket.destroy();
+        return;
+      }
+      if (state.mode === "delay" && state.delayMs > 0) { await new Promise((r) => setTimeout(r, state.delayMs)); }
+      if (state.mode === "reject") { return send(200, { s: "error", code: -99, message: "RMS: order rejected — insufficient margin" }); }
+      return send(200, { s: "ok", code: 1101, message: "Order submitted", id: stored.id });
+    }
+
+    // Any other FYERS endpoint the path might hit → benign empty ok (keeps unrelated calls from throwing).
+    state.requests.push({ method: req.method, path });
+    return send(200, { s: "ok" });
+  });
+
+  return {
+    state,
+    async listen() { await new Promise((r) => server.listen(0, "127.0.0.1", r)); return `http://127.0.0.1:${server.address().port}`; },
+    async close() { await new Promise((r) => server.close(r)); },
+    setMode(m, opts = {}) { state.mode = m; if (opts.delayMs != null) state.delayMs = opts.delayMs; if (opts.fillPrice != null) state.fillPrice = opts.fillPrice; },
+    // Later flip a stored order's status (models a broker fill that settles after an earlier pending/lost response).
+    settle(tag, status = 2, filledQty = null, tradedPrice = null) {
+      const o = state.orders.get(tag); if (!o) return;
+      o.status = status; if (filledQty != null) o.filledQty = filledQty; if (tradedPrice != null) o.tradedPrice = tradedPrice;
+    },
+    placeCount() { return state.placeCount; },
+    orderPosts() { return state.requests.filter((r) => r.method === "POST" && r.path === "/api/v3/orders/sync"); },
+    reset() { state.orders.clear(); state.requests.length = 0; state.placeCount = 0; state.mode = "fill"; },
+  };
+}
+
+module.exports = { makeFakeFyers };
