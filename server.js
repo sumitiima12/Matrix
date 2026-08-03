@@ -32,6 +32,24 @@ const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./ma
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
+/* R30-P1-01 — single enforcement point for the capability registry. Every REAL operation maps to a capability and
+   fails CLOSED here with a structured CAPABILITY_NOT_CERTIFIED (HTTP 403) when that broker isn't certified for it.
+   Connection, portfolio and all VIRTUAL paths never call this. `capabilityBlock` is the non-HTTP form for engines. */
+function capabilityBlock(broker, capability) {
+  if (brokerCaps.brokerCap(broker, capability)) return null;
+  return {
+    error: "CAPABILITY_NOT_CERTIFIED", code: "CAPABILITY_NOT_CERTIFIED",
+    broker: String(broker || ""), capability,
+    message: `Real "${capability}" isn't certified for ${String(broker || "this broker")} yet. Connection, portfolio and virtual trading remain available; use a certified broker for this operation.`,
+    certVersion: brokerCaps.CERTIFICATION_VERSION,
+  };
+}
+function ensureCapability(res, broker, capability) {
+  const blk = capabilityBlock(broker, capability);
+  if (!blk) return true;
+  res.status(403).json(blk);
+  return false;
+}
 const orderRecovery = require("./orderRecovery");     // C03 durable order-attempt orchestrator (flag-gated wiring)
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
@@ -5392,6 +5410,15 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
 
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "no broker session" });
+  /* R30-P1-01 CAPABILITY ENFORCEMENT. A real order only proceeds if THIS broker is certified for THIS operation —
+     manualExit for a reduce-only/closing order, manualEntry otherwise. Uncertified ⇒ fail closed with a structured
+     CAPABILITY_NOT_CERTIFIED; connection, portfolio and all virtual paths never reach here. Exit stays permitted for
+     any broker certified to exit so a user can always flatten risk. */
+  {
+    const isReduceOnlyCap = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+    const needCap = isReduceOnlyCap ? "manualExit" : "manualEntry";
+    if (!ensureCapability(res, sess.broker, needCap)) return undefined;
+  }
   /* R21-P1-03: if a prior verified fill couldn't be journaled, this account's risk history is incomplete. Block
      new REAL ENTRIES until it's reconciled — but always allow a CLOSING/reduce-only order so the user can flatten
      risk. Exit paths set body.reduceOnly or the X-Reduce-Only header. */
@@ -7140,8 +7167,9 @@ app.post("/api/autoexit/register", requireAuth, requireActiveUser, async (req, r
     const { broker, symbol, brokerSym, qty, entry, market, sl, tp, tsl, product } = req.body || {};
     if (!userId || !symbol || !brokerSym || !(Number(qty) > 0)) return res.status(400).json({ error: "userId, symbol, brokerSym and qty are required" });
     if (!(Number(sl) > 0) && !(Number(tp) > 0) && !(Number(tsl) > 0)) return res.status(400).json({ error: "set at least one of stop-loss, take-profit or trailing-stop" });
-    // R14-P1-05/06: only arm an app-managed exit for brokers whose exit path returns VERIFIED fill truth.
-    if (!FILL_VERIFIED_BROKERS.has(broker)) return res.status(400).json({ error: `App-managed SL/TP isn't supported for ${broker} yet (we can't confirm its exit fills). Supported: Delta, FYERS. Manage protection in your broker app.` });
+    // R14-P1-05/06 + R30-P1-01: an app-managed exit is gated by the capability registry (managedProtection) — the
+    // same source of truth as every other real operation — so only a broker certified for managed protection arms it.
+    if (!ensureCapability(res, broker, "managedProtection")) return undefined;
     // R14-P1-04: percentage SL/TP is inert without a usable entry price — require one so protection is real.
     if (!(Number(entry) > 0)) return res.status(400).json({ error: "A valid average/entry price is required to arm SL/TP (percentage levels can't be computed from an unknown entry)." });
     const sess = await sessionFromCred(userId, broker);
@@ -7501,6 +7529,10 @@ async function runAutoBuyEngine() {
            entry. Others return on mere acceptance, which would register a position for an order that may
            never fill. Fail closed. (Dry-run still simulates below.) */
         if (live && !FILL_VERIFIED_BROKERS.has(st.broker)) { await db.updateRealStrategy(st.id, { lastError: `Live auto-buy isn't enabled for ${st.broker} yet — we can't confirm its fills, which risks a phantom position. Supported: Delta, FYERS.`, lastOrderStatus: "blocked" }); continue; }
+        /* R30-P1-01: the LIVE unattended execution path is also gated by the capability registry (same source of
+           truth as registration/UI), so a broker that isn't certified for unattended automation can never place a
+           live auto entry even if a strategy row exists. Fail closed with the structured reason. */
+        if (live) { const _blk = capabilityBlock(st.broker, "unattendedAutomation"); if (_blk) { await db.updateRealStrategy(st.id, { lastError: _blk.message, lastOrderStatus: "blocked" }); continue; } }
         // Cooldown: don't re-fire a still-true signal inside the same candle.
         const intervalMs = (st.interval === "1d" ? 86400 : (Number((st.interval || "5m").replace(/[^\d]/g, "")) || 5) * 60) * 1000;
         if (st.lastOrderAt && Date.now() - st.lastOrderAt < intervalMs) continue;
@@ -7780,7 +7812,10 @@ app.post("/api/autobuy/register", requireAuth, requireActiveUser, async (req, re
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "connect the broker first" });
   const b = sess.broker;
-  if (!["delta", "coindcx", "zerodha", "fyers"].includes(b)) return res.status(400).json({ error: `auto-buy isn't supported for ${b} yet` });
+  // R30-P1-01 / P3-01: arming UNATTENDED automation is derived from the capability registry — one source of truth —
+  // not a separate hard-coded broker list. Uncertified ⇒ structured CAPABILITY_NOT_CERTIFIED (the broker stays fully
+  // usable for connection, portfolio and manual real trading).
+  if (!ensureCapability(res, b, "unattendedAutomation")) return undefined;
   const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product, short } = req.body || {};
   if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
   if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
@@ -7915,6 +7950,9 @@ app.post("/api/autobuy/close", requireAuth, requireActiveUser, async (req, res) 
     if (!userId || !id) return res.status(400).json({ error: "userId and id required" });
     const strat = (await db.getRealStrategiesForUser(userId)).find((s) => s.id === id);
     if (!strat) return res.status(404).json({ error: "not found" });
+    // R30-P1-01: a real close needs the broker certified to EXIT (manualExit). Certified exit brokers (Delta/FYERS)
+    // pass; this never traps a user because uncertified brokers can no longer arm auto-buy in the first place.
+    if (!ensureCapability(res, strat.broker, "manualExit")) return undefined;
     const pos = await openPositionForStrategy(userId, strat);
     // No open position — nothing to sell; just stop the strategy.
     if (!pos) { await db.updateRealStrategy(id, { status: "cancelled" }); return res.json({ ok: true, closed: false, note: "no open position — strategy stopped" }); }
