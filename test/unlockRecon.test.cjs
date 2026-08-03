@@ -74,6 +74,18 @@ test("C02-fix: DIRECTION respected — a tracked SHORT cannot clear against a br
   assert.equal(r.shortfall.dir, "short");
 });
 
+test("C02-fix: ORPHAN broker exposure is reported (broker holds a position Matrix doesn't track)", () => {
+  const r = verifyManagedAgainstBroker([{ symbol: "SBIN", qty: 5 }], [{ sym: "SBIN", qty: 5 }, { sym: "INFY", qty: 10 }]);
+  assert.equal(r.ok, true, "the tracked SBIN long is confirmed");
+  assert.equal(r.orphans.length, 1, "the untracked INFY holding is flagged as orphan exposure");
+  assert.deepEqual(r.orphans[0], { sym: "INFY", dir: "long", qty: 10 });
+});
+
+test("C02-fix: no orphans when the broker holds exactly the tracked positions", () => {
+  const r = verifyManagedAgainstBroker([{ symbol: "SBIN", qty: 5 }], [{ sym: "SBIN", qty: 5 }]);
+  assert.equal(r.orphans.length, 0);
+});
+
 test("C02-fix: a hedged book verifies per-direction (broker long 10 + short 5 covers managed long 10 + short 5)", () => {
   const r = verifyManagedAgainstBroker(
     [{ symbol: "SBIN", qty: 10, short: false }, { symbol: "SBIN", qty: 5, short: true }],

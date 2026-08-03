@@ -295,7 +295,14 @@ function verifyManagedAgainstBroker(positions, held) {
     pool.set(key, avail - want);   // CONSUME — a later tracked row can't reuse the same broker quantity
     verified++;
   }
-  return { ok: true, verified, shortfall: null };
+  // ORPHAN broker exposure: any broker quantity LEFT in the pool after consuming every managed position is
+  // exposure the broker holds that Matrix does not track (e.g. an orphaned fill from a lost order). The caller
+  // decides whether to block on it (strict managed accounts) or just surface it (accounts with manual holdings).
+  const orphans = [];
+  for (const [key, qty] of pool.entries()) {
+    if (qty > 1e-9) { const [sym, dir] = key.split("|"); orphans.push({ sym, dir, qty }); }
+  }
+  return { ok: true, verified, shortfall: null, orphans };
 }
 
 module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, verifyManagedAgainstBroker };

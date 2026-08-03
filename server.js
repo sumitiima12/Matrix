@@ -31,6 +31,7 @@ const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth")
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
+const orderRecovery = require("./orderRecovery");     // C03 durable order-attempt orchestrator (flag-gated wiring)
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
    routes use this — identity is taken from the token when we have it, and we fall back to the
@@ -280,23 +281,23 @@ const UA = {
 let schemaReady = false;
 (function initSchemaWithRetry(attempt = 0) {
   db.initDb().then(async () => {
-    schemaReady = true; if (attempt) console.log(`[db] schema ready after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
-    /* C03 STARTUP SAFETY RE-ARM (flag-gated: C03_ORDER_ATTEMPTS=1). Before money-moving routes serve, any account
-       with an UNRESOLVED durable order attempt (a crash/lost-response left it PREPARED/SUBMITTING/UNKNOWN) is
-       re-locked — fail closed. This NEVER resolves anything or contacts the broker here; resolution is the
-       periodic reconciler + the C02 broker-backed unlock gate, which won't clear the lock without broker truth.
-       Default OFF ⇒ production behaviour is unchanged until the full write-before-send wiring is enabled. */
+    /* C03 STARTUP SAFETY RE-ARM (flag-gated: C03_ORDER_ATTEMPTS=1). This MUST complete BEFORE schemaReady flips
+       true, so money-moving routes never open in the window before accounts with unresolved order attempts are
+       re-locked. Fail closed: if the re-arm THROWS, we do NOT become ready — the error propagates to the retry
+       .catch below and money routes keep returning 503 until a re-arm succeeds. It never resolves anything or
+       contacts the broker; resolution is the periodic reconciler + the C02 broker-backed unlock gate. Default OFF
+       ⇒ production behaviour is unchanged. */
     if (process.env.C03_ORDER_ATTEMPTS === "1") {
-      try {
-        const r = await require("./orderRecovery").rearmFromUnresolvedAttempts({
-          db,
-          setLock: (uid, v) => { haltedEntries.add(String(uid)); return db.setRiskLock(String(uid), v); },
-          setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
-          logger: (evt, o) => { try { logFinancial(evt, o); } catch { /* pre-logger */ } },
-        });
-        if (r && r.unresolved) console.warn(`[c03] startup re-armed ${r.users.length} account(s) with ${r.unresolved} unresolved order attempt(s)`);
-      } catch (e) { console.error("[c03] startup re-arm failed (keeping schemaReady; periodic reconciler is the fallback):", e.message); }
+      const r = await require("./orderRecovery").rearmFromUnresolvedAttempts({
+        db,
+        setLock: (uid, v) => { haltedEntries.add(String(uid)); return db.setRiskLock(String(uid), v); },
+        setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
+        logger: (evt, o) => { try { logFinancial(evt, o); } catch { /* pre-logger */ } },
+      });   // throws ⇒ rejects this .then ⇒ retried by .catch; schemaReady stays FALSE (fail closed)
+      if (r && r.unresolved) console.warn(`[c03] startup re-armed ${r.users.length} account(s) with ${r.unresolved} unresolved order attempt(s)`);
     }
+    schemaReady = true;   // ready ONLY after the durable re-arm (if enabled) has completed
+    if (attempt) console.log(`[db] schema ready after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
   })
     .catch((e) => {
       console.error(`[db] init failed (attempt ${attempt + 1}):`, e.message);
@@ -5279,23 +5280,51 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     }
 
     if (broker === "fyers") {
-      const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
-        method: "POST",
-        headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
-        body: JSON.stringify({
-          symbol, qty: Number(qty),
-          type: orderType === "LIMIT" ? 1 : 2,           // 1 = limit, 2 = market
-          side: side === "BUY" ? 1 : -1,
-          productType: product === "CNC" ? "CNC" : "INTRADAY",
-          limitPrice: orderType === "LIMIT" ? Number(price) : 0,
-          stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false,
-          // R26-P1-01: stamp our durable order tag (derived from the idempotency key) so the unknown-order probe
-          // can later find THIS order in the FYERS book. Without it, an executed order looks absent → duplicate.
-          orderTag: reconcile.fyersOrderTag(idemKey),
-        }),
-      });
-      const d = await r.json();
-      if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
+      /* The raw broker submission — used verbatim by BOTH the legacy path and the C03 write-before-send wrapper.
+         Throws on a conclusive broker error (as before); returns the FYERS acceptance body on success. */
+      const _fyersSubmit = async () => {
+        const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+          method: "POST",
+          headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol, qty: Number(qty),
+            type: orderType === "LIMIT" ? 1 : 2,           // 1 = limit, 2 = market
+            side: side === "BUY" ? 1 : -1,
+            productType: product === "CNC" ? "CNC" : "INTRADAY",
+            limitPrice: orderType === "LIMIT" ? Number(price) : 0,
+            stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false,
+            // R26-P1-01: stamp our durable order tag (derived from the idempotency key) so the unknown-order probe
+            // can later find THIS order in the FYERS book. Without it, an executed order looks absent → duplicate.
+            orderTag: reconcile.fyersOrderTag(idemKey),
+          }),
+        });
+        const dd = await r.json();
+        if (!r.ok || dd.s === "error") throw new Error(dd.message || `fyers ${r.status}`);
+        return dd;
+      };
+      let d;
+      /* C03 (flag C03_ORDER_ATTEMPTS, default OFF ⇒ byte-identical legacy path). WRITE-BEFORE-SEND: a PREPARED
+         order_attempt is committed BEFORE the broker call (so a crash/lost-response is recoverable by orderTag),
+         the broker is called ONLY if this request wins the PREPARED→SUBMITTING CAS, and a replayed/in-flight
+         attempt returns reconcile-required instead of a second order. On a thrown/ambiguous outcome the attempt
+         is left UNKNOWN (unresolved → startup reconciliation resolves it; the account stays locked). */
+      if (process.env.C03_ORDER_ATTEMPTS === "1") {
+        const attempt = {
+          id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "fyers", idemKey,
+          orderTag: reconcile.fyersOrderTag(idemKey), fingerprint: idemHash,
+          symbol, side, qty: Number(qty), product, protection: null,
+        };
+        const out = await orderRecovery.submitWithAttempt({
+          db, attempt, submit: _fyersSubmit,
+          classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.id } }),
+        });
+        if (out && out.replay) {
+          return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
+        }
+        d = out;
+      } else {
+        d = await _fyersSubmit();
+      }
       // The order carries our tag → the probe may safely resolve absence/presence for it later.
       await db.markIdempotencyTagged(idemUser, idemKey);
       /* R9-P1-02: NEVER arm app-managed SL/TP on mere acceptance. If the user asked for auto-exit, confirm
@@ -5312,6 +5341,15 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (c.filled) fillStatus = "FILLED";
       else if (c.rejected) fillStatus = "REJECTED";
       else fillStatus = "PENDING";
+      /* C03: finalize the durable attempt with the VERIFIED outcome. FILLED/REJECTED are terminal (resolved);
+         a still-PENDING acceptance stays ACCEPTED (unresolved) so the pending-protection watcher / startup
+         reconciliation settles it later — the account is not falsely marked done. Flag-gated; best-effort. */
+      if (process.env.C03_ORDER_ATTEMPTS === "1") {
+        try {
+          const st = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "ACCEPTED");
+          await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: d.id, ...(c.filled ? { filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice } : {}) });
+        } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
+      }
 
       /* R19-P1-04 / R20-P1-02: on ANY verified fill (long or short, protection or not) write the authoritative,
          user-namespaced, dedupe-by-orderId trade row so risk counters include the execution even if the browser
@@ -6104,6 +6142,16 @@ async function brokerSnapshotForUnlock(userId) {
     if (!cmp.ok) {
       const s = cmp.shortfall || {};
       return { ok: false, reason: `${s.sym} isn't confirmed open at ${broker} (broker holds ${s.broker}, we track ${s.tracked}) — reconcile before resuming` };
+    }
+    /* ORPHAN broker exposure: the broker holds a position Matrix doesn't track (a possible orphaned fill from a
+       lost order). Always surface it; BLOCK the unlock when strict mode is on (UNLOCK_BLOCK_ORPHAN_EXPOSURE=1) —
+       default off so an account with unrelated MANUAL holdings isn't bricked. */
+    if (cmp.orphans && cmp.orphans.length) {
+      logFinancial("killswitch.resume_orphan_exposure", { userId: String(userId), broker, orphans: cmp.orphans });
+      if (process.env.UNLOCK_BLOCK_ORPHAN_EXPOSURE === "1") {
+        const o = cmp.orphans[0];
+        return { ok: false, reason: `${broker} holds ${o.qty} ${o.dir} ${o.sym} that MatrixOne doesn't track — reconcile the untracked exposure before resuming` };
+      }
     }
     verified += cmp.verified;
   }
