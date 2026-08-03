@@ -330,6 +330,57 @@ test("C01-partial: reduce-only partial close reduces the open row + books realiz
   assert.equal(Number(openWipro[0].qty), 6);
 }));
 
+test("R30-C2: recordExitAtomic commits the exit fill + trade rows once and is replay-idempotent", guard(async () => {
+  const T = await freshTrader();
+  const oid = "EX" + Math.floor(Math.random() * 1e6);
+  const fill = { orderId: oid, kind: "exit", side: "SELL", qty: 5, entry: 120, price: 120, broker: "fyers", market: "IN", tradeType: "Manual Exit", ts: Date.now() };
+  const rowId = `t_${crypto.randomBytes(6).toString("hex")}_closed`;
+  const rows = [{ id: rowId, real: true, sym: "SBIN", side: "BUY", qty: 5, entry: 100, exit: 120, exitAt: Date.now(), pnl: 100, status: "closed", exitOrderId: oid, broker: "fyers", serverAuthored: true }];
+  await db.recordExitAtomic(T.skey, { fill, rows });
+  await db.recordExitAtomic(T.skey, { fill, rows });   // REPLAY (crash-then-retry) must not double-apply
+  const fills = await db.getFills(T.skey, 0, Date.now());
+  assert.equal(fills.filter((f) => String(f.orderId) === String(oid)).length, 1, "exit fill leg recorded exactly once");
+  const trades = await db.getTrades(T.skey, 0, Date.now());
+  assert.equal(trades.filter((t) => t.id === rowId).length, 1, "closed trade row upserted once (no duplicate)");
+  assert.equal(trades.find((t) => t.id === rowId).status, "closed", "position is closed atomically with the fill");
+}));
+
+test("R30-C3: an order missing from the order book but present in the TRADEBOOK is adopted, NOT cancelled", guard(async () => {
+  const T = await freshTrader();
+  fake.reset();
+  const tag = "MXOLD" + Math.floor(Math.random() * 1e6);
+  const bid = "FYOLD" + Math.floor(Math.random() * 1e6);
+  // An unresolved ACCEPTED attempt whose order is NO LONGER in today's order book, but whose fill is in the tradebook.
+  const aid = `oa_${T.skey}_recoveryTB_${Math.floor(Math.random() * 1e6)}`;
+  await db.prepareOrderAttempt({ id: aid, userId: T.skey, broker: "fyers", orderTag: tag, fingerprint: "fp", symbol: "NSE:INFY-EQ", side: "BUY", qty: 4 });
+  await db.finalizeOrderAttempt(aid, "ACCEPTED", { brokerOrderId: bid });
+  fake.seedTrade({ orderNumber: bid, orderTag: tag, tradedQty: 4, tradePrice: 90, side: 1 });   // in tradebook, not order book
+
+  const before = fake.placeCount();
+  await server.runC03Reconcile("test-tradebook");
+  const row = await db.getOrderAttempt(aid);
+  assert.equal(row.resolved, true, "the order is adopted from the tradebook, not left/cancelled");
+  assert.notEqual(row.status, "CANCELLED", "must NOT be declared absent/cancelled when the tradebook has the fill");
+  assert.equal(fake.placeCount(), before, "no duplicate order placed");
+  const fills = await db.getFills(T.skey, 0, Date.now());
+  assert.ok(fills.some((f) => bare(f.sym) === "INFY"), "the recovered fill was journaled");
+}));
+
+test("R30-C3: an unconfirmed order absent from book+tradebook+positions with NO broker id stays LOCKED (never cancelled)", guard(async () => {
+  const T = await freshTrader();
+  fake.reset();
+  const tag = "MXGHOST" + Math.floor(Math.random() * 1e6);
+  const aid = `oa_${T.skey}_ghost_${Math.floor(Math.random() * 1e6)}`;
+  // UNKNOWN attempt, no broker order id — the broker may or may not have received it. Nothing anywhere references it.
+  await db.prepareOrderAttempt({ id: aid, userId: T.skey, broker: "fyers", orderTag: tag, fingerprint: "fp", symbol: "NSE:INFY-EQ", side: "BUY", qty: 2 });
+  await db.finalizeOrderAttempt(aid, "UNKNOWN", {});
+  await server.runC03Reconcile("test-ghost");
+  const row = await db.getOrderAttempt(aid);
+  assert.equal(row.resolved, false, "a never-confirmed order (no broker id) is NOT auto-cancelled — stays locked for reconcile");
+  assert.notEqual(row.status, "CANCELLED");
+  assert.equal(await db.isRiskLocked(T.skey), true, "account remains risk-locked while the outcome is unproven");
+}));
+
 test("H04: an order filled across TWO executions is recorded as two immutable events; projection = weighted avg", guard(async () => {
   const T = await freshTrader();
   const SYM = "NSE:INFY-EQ";

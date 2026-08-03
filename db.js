@@ -400,6 +400,58 @@ async function recordFillAndTrade(userId, trade) {
   await recordFill(userId, trade);
   return { trade: row, fillId };
 }
+
+/* R30-C2: ATOMICALLY write a reduce-only CLOSE — the immutable EXIT fill leg AND every trade-projection row the
+   close touches (the reduced residual + the booked closed portion, or the fully-closed row) — in ONE transaction.
+   Previously these were separate writes, so a crash after the exit fill left the position open but "already
+   recorded", making it unrecoverable on replay. Now either the whole close commits or none of it does. `rows` are
+   already-namespaced authoritative trade rows (ids from saveTrade's scheme). Idempotent: the fill is ON CONFLICT
+   DO NOTHING and each trade row is an ownership-safe upsert, so a replay of the SAME committed close converges. */
+async function recordExitAtomic(userId, { fill, rows = [] }) {
+  const uref = userRef(userId);
+  const brk = String((fill && fill.broker) || "x").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const oid = String((fill && fill.orderId) != null ? fill.orderId : "");
+  const filledQ = Number(fill && fill.qty) || 0;
+  const fillId = String((fill && fill.fillId) ? fill.fillId : oid ? `f_${uref}_${brk}_${oid}_q${filledQ}` : `f_${uref}_${brk}_u_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`);
+  const fillTs = Number(fill && (fill.ts || fill.entryAt)) || Date.now();
+  const fillRow = { ...fill, fillId };
+  if (USING_PG) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO fills (fill_id, user_id, broker, order_id, side, qty, price, market, trade_type, ts, data)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (fill_id) DO NOTHING`,
+        [fillId, String(userId), brk, oid, String(fill.side || ""), filledQ, Number(fill.entry != null ? fill.entry : fill.price) || 0, String(fill.market || ""), String(fill.tradeType || ""), fillTs, fillRow]);
+      for (const row of rows) {
+        const ts = row.exitAt || row.entryAt || Date.now();
+        const r = await client.query(
+          `INSERT INTO trades (id, user_id, ts, data) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (id) DO UPDATE SET ts=EXCLUDED.ts, data=EXCLUDED.data WHERE trades.user_id=EXCLUDED.user_id
+           RETURNING id`, [row.id, userId, ts, { ...row, serverAuthored: true }]);
+        if (!r.rowCount) throw new Error("recordExitAtomic: trade upsert persisted no row (owner conflict) — refusing to split the close");
+      }
+      await client.query("COMMIT");
+      return { fillId, rows: rows.length };
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw e;
+    } finally { client.release(); }
+  }
+  // Flat-file: apply all trade rows (single atomic bucket write), then the immutable fill. On a crash before the
+  // fill, the exitOrderId marker on the rows still makes replay idempotent; each writeJSON is atomic.
+  const dbf = readJSON(FILES.trades);
+  const list = dbf[userId] || [];
+  for (const row of rows) {
+    const r = { ...row, serverAuthored: true };
+    const i = list.findIndex((t) => t.id === r.id);
+    if (i >= 0) list[i] = r; else list.unshift(r);
+  }
+  dbf[userId] = list.slice(0, 5000);
+  writeJSON(FILES.trades, dbf);
+  await recordFill(userId, fillRow);
+  return { fillId, rows: rows.length };
+}
 /* ARCH-1: append a VERIFIED broker fill to the immutable ledger. Idempotent on the natural broker key
    (`user_broker_order[_fillId]`) so the same fill — replayed by a retry, a poll and the delayed watcher — is
    recorded exactly once. Never updates an existing row. Returns { inserted } so callers can tell first-write
@@ -1841,4 +1893,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, USING_PG };

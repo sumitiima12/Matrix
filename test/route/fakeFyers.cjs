@@ -40,7 +40,7 @@ function makeFakeFyers() {
     // ---- account snapshot (risk gate) ---------------------------------------------------------------
     if (req.method === "GET" && path === "/api/v3/funds") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", fund_limit: [{ title: "Available Balance", equityAmount: 1_000_000 }] }); }
     if (req.method === "GET" && path === "/api/v3/holdings") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", holdings: [] }); }
-    if (req.method === "GET" && path === "/api/v3/positions") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", netPositions: [] }); }
+    if (req.method === "GET" && path === "/api/v3/positions") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", netPositions: state.netPositions || [] }); }
 
     // ---- order-book reads (fill verification + reconcile probe) --------------------------------------
     if (req.method === "GET" && path === "/api/v3/orders") {
@@ -109,6 +109,13 @@ function makeFakeFyers() {
     setMode(m, opts = {}) { state.mode = m; if (opts.delayMs != null) state.delayMs = opts.delayMs; if (opts.fillPrice != null) state.fillPrice = opts.fillPrice; },
     // H04: split the NEXT filled order into these executions (each {qty, price}); one-shot.
     setExecutions(execs) { state.nextExecutions = execs; },
+    // R30-C3: seed a tradebook execution WITHOUT any matching current order-book row — models an older executed
+    // order that has dropped out of the day's order book but still exists in the tradebook/history.
+    seedTrade({ orderNumber, orderTag = null, tradedQty, tradePrice, side = 1 }) {
+      state.tradeBook.push({ orderNumber, orderTag, tradeNumber: "T" + (++tradeSeq), tradePrice: Number(tradePrice), tradedQty: Number(tradedQty), side, orderDateTime: null });
+    },
+    // R30-C3: seed a live position WITHOUT any order/tradebook trace (ambiguous fill → recovery must stay locked).
+    seedPosition({ symbol, netQty }) { state.netPositions = state.netPositions || []; state.netPositions.push({ symbol, netQty: Number(netQty) }); },
     // Later flip a stored order's status (models a broker fill that settles after an earlier pending/lost response).
     settle(tag, status = 2, filledQty = null, tradedPrice = null) {
       const o = state.orders.get(tag); if (!o) return;
@@ -116,7 +123,7 @@ function makeFakeFyers() {
     },
     placeCount() { return state.placeCount; },
     orderPosts() { return state.requests.filter((r) => r.method === "POST" && r.path === "/api/v3/orders/sync"); },
-    reset() { state.orders.clear(); state.requests.length = 0; state.placeCount = 0; state.mode = "fill"; state.tradeBook.length = 0; state.nextExecutions = null; },
+    reset() { state.orders.clear(); state.requests.length = 0; state.placeCount = 0; state.mode = "fill"; state.tradeBook.length = 0; state.nextExecutions = null; state.netPositions = []; },
   };
 }
 

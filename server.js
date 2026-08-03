@@ -236,37 +236,34 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = 
   const { sym, closeSide, qty, exitPx, orderId, entryOrderId, broker, market, tradeType, strategy } = fill;
   const bareSym = (s) => String(s || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
   const wantQty = Number(qty) || 0;
-  // 1 — immutable exit leg (idempotent by close orderId+qty). If it was already recorded, this whole close was
-  //     already booked → do NOT touch the trade rows again (idempotent replay).
-  let inserted = true;
-  try {
-    const r = await db.recordFill(userKey, {
-      id: `exit_ord_${orderId}`, kind: "exit", side: closeSide, qty: wantQty, entry: exitPx, price: exitPx,
-      orderId, entryOrderId: entryOrderId != null ? String(entryOrderId) : null, broker, market: market || "IN",
-      real: true, serverAuthored: true, tradeType: tradeType ? `${tradeType} Exit` : "Manual Exit",
-      ...(strategy ? { strategy } : {}), ts: Date.now(),
-    });
-    inserted = !!(r && r.inserted);
-  } catch (e) {
-    logFinancial("reduceonly_exit.ledger_failed", { userKey, orderId, sym: bareSym(sym), err: String((e && e.message) || e) });
-    try { await db.setRiskLock(userKey, true); } catch { /* best-effort */ }
-    if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); haltedEntries.add(String(storageKeyFor(String(haltUserIdOnFail)))); } catch { /* best-effort */ } }
-    await addUserNotice(userKey, { type: "exit_unjournaled", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed but couldn't be recorded — new orders are paused as a precaution. Please reconcile with your broker.` });
-    return { applied: 0, unmatched: wantQty, error: String((e && e.message) || e) };
-  }
-  if (!inserted) return { applied: 0, unmatched: 0, alreadyDone: true };   // replay — already booked
+  const now = Date.now();
+  // The immutable exit leg for the fills ledger (recorded ATOMICALLY with the trade-row updates below).
+  const exitFill = {
+    id: `exit_ord_${orderId}`, kind: "exit", side: closeSide, qty: wantQty, entry: exitPx, price: exitPx,
+    orderId, entryOrderId: entryOrderId != null ? String(entryOrderId) : null, broker, market: market || "IN",
+    real: true, serverAuthored: true, tradeType: tradeType ? `${tradeType} Exit` : "Manual Exit",
+    ...(strategy ? { strategy } : {}), ts: now,
+  };
 
-  // 2 — apply to OPEN real rows for this symbol, OPPOSITE direction, FIFO by entry time.
-  const openDir = String(closeSide).toUpperCase() === "SELL" ? "long" : "short";   // SELL closes a long; BUY covers a short
-  const dir = openDir === "long" ? 1 : -1;
+  // 1 — READ-based idempotency, independent of write ordering: if a trade row already carries THIS close order's
+  //     exitOrderId, the atomic close already committed → just ensure the ledger leg exists and return.
   let all = [];
   try { all = await db.getTrades(userKey, 0, Date.now()); } catch { all = []; }
+  if (all.some((t) => t && String(t.exitOrderId || "") === String(orderId))) {
+    try { await db.recordFill(userKey, exitFill); } catch { /* leg already present */ }
+    return { applied: 0, unmatched: 0, alreadyDone: true };
+  }
+
+  // 2 — PLAN the close against OPEN real rows for this symbol, OPPOSITE direction, FIFO by entry time (no writes).
+  const openDir = String(closeSide).toUpperCase() === "SELL" ? "long" : "short";   // SELL closes a long; BUY covers a short
+  const dir = openDir === "long" ? 1 : -1;
   const isOpen = (t) => t && t.real === true && t.entryAt != null && t.exitAt == null && t.exit == null && t.status !== "rejected"
     && bareSym(t.sym) === bareSym(sym)
     && (openDir === "long"
       ? (String(t.side || "").toUpperCase() !== "SELL" && t.short !== true)
       : (String(t.side || "").toUpperCase() === "SELL" || t.short === true));
   const open = all.filter(isOpen).sort((a, b) => (Number(a.entryAt) || 0) - (Number(b.entryAt) || 0));
+  const rows = [];   // the exact trade-projection writes this close performs
   let remaining = wantQty;
   for (const row of open) {
     if (remaining <= 1e-9) break;
@@ -275,14 +272,24 @@ async function applyReduceOnlyExit(userKey, fill, { haltUserIdOnFail = null } = 
     const take = Math.min(rowQty, remaining);
     const pnl = +(((Number(exitPx) || 0) - (Number(row.entry) || 0)) * take * dir).toFixed(2);
     if (take >= rowQty - 1e-9) {
-      // full close of this row (keeps its own id/orderId → upserts the SAME row with exit fields)
-      await db.saveTrade(userKey, { ...row, qty: rowQty, exit: exitPx, exitAt: Date.now(), pnl, status: "closed", exitOrderId: orderId, exitReason: "Manual close (reduce-only)" }, { authoritative: true });
+      rows.push({ ...row, qty: rowQty, exit: exitPx, exitAt: now, pnl, status: "closed", exitOrderId: orderId, exitReason: "Manual close (reduce-only)" });
     } else {
-      // partial: reduce the open row (residual stays OPEN) + write a NEW closed row booking the realized portion
-      await db.saveTrade(userKey, { ...row, qty: +(rowQty - take).toFixed(8) }, { authoritative: true });
-      await db.saveTrade(userKey, { ...row, id: `${row.id}__exit_${orderId}_${Math.round(take * 1e4)}`, orderId: null, qty: take, exit: exitPx, exitAt: Date.now(), pnl, status: "closed", exitOrderId: orderId, partialOf: row.id, exitReason: "Partial close (reduce-only)" }, { authoritative: true });
+      rows.push({ ...row, qty: +(rowQty - take).toFixed(8) });   // residual stays OPEN (no exitOrderId)
+      rows.push({ ...row, id: `${row.id}__exit_${orderId}_${Math.round(take * 1e4)}`, orderId: null, qty: take, exit: exitPx, exitAt: now, pnl, status: "closed", exitOrderId: orderId, partialOf: row.id, exitReason: "Partial close (reduce-only)" });
     }
     remaining -= take;
+  }
+
+  // 3 — COMMIT the exit fill + all trade-row writes ATOMICALLY. A crash mid-transaction rolls back cleanly so a
+  //     replay recomputes from the original open state; the exitOrderId guard above makes a committed close a no-op.
+  try {
+    await db.recordExitAtomic(userKey, { fill: exitFill, rows });
+  } catch (e) {
+    logFinancial("reduceonly_exit.ledger_failed", { userKey, orderId, sym: bareSym(sym), err: String((e && e.message) || e) });
+    try { await db.setRiskLock(userKey, true); } catch { /* best-effort */ }
+    if (haltUserIdOnFail != null && typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(storageKeyFor(String(haltUserIdOnFail)), true); haltedEntries.add(String(storageKeyFor(String(haltUserIdOnFail)))); } catch { /* best-effort */ } }
+    await addUserNotice(userKey, { type: "exit_unjournaled", broker, symbol: bareSym(sym), msg: `A close on ${bareSym(sym)} executed but couldn't be recorded — new orders are paused as a precaution. Please reconcile with your broker.` });
+    return { applied: 0, unmatched: wantQty, error: String((e && e.message) || e) };
   }
   if (remaining > 1e-9) logFinancial("reduceonly_exit.unmatched", { userKey, orderId, sym: bareSym(sym), closeSide, unmatched: remaining });
   return { applied: +(wantQty - remaining).toFixed(8), unmatched: +remaining.toFixed(8) };
@@ -457,25 +464,61 @@ async function _fyersProbeByTag(attempt) {
   // A missing/undecryptable session is UNREACHABLE (throw) → the attempt stays locked, never falsely resolved.
   const sess = await sessionFromCred(String(attempt.userId), attempt.broker || "fyers");
   if (!sess || !sess.accessToken) throw new Error("no fyers session to reconcile attempt");
-  const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders", { headers: brokerAuth("fyers", sess.accessToken, sess.userId) });
+  const auth = brokerAuth("fyers", sess.accessToken, sess.userId);
+  const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders", { headers: auth });
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d.s === "error") throw new Error("fyers order book unreachable");
   const book = Array.isArray(d.orderBook) ? d.orderBook : [];
   const tag = attempt.orderTag;
-  const ours = book.filter((o) => String((o && o.orderTag) || "") === String(tag));
-  if (!ours.length) return { status: "absent" };   // broker conclusively has no order under our tag
-  let anyPending = false, anyFilled = false, anyRejected = false;
-  for (const o of ours) { const c = reconcile.classifyFyersOrder(o); if (c.filled) anyFilled = true; else if (c.rejected) anyRejected = true; else anyPending = true; }
-  const agg = reconcile.attributeFyersFills(ours, tag);   // { filledQty, avgPrice } across OUR tagged rows only
+  const bid = attempt.brokerOrderId != null ? String(attempt.brokerOrderId) : null;
+  const ours = book.filter((o) => String((o && o.orderTag) || "") === String(tag) || (bid && String(o && o.id) === bid));
   const wantQty = Number(attempt.qty) || 0;
-  if (anyFilled && agg.filledQty > 0) {
-    const first = ours.find((o) => reconcile.classifyFyersOrder(o).filled) || ours[0];
-    if (wantQty > 0 && agg.filledQty < wantQty) return { status: "partial", orderId: first.id, filledQty: agg.filledQty, avgPrice: agg.avgPrice };
-    return { status: "filled", orderId: first.id, filledQty: agg.filledQty, avgPrice: agg.avgPrice };
+  if (ours.length) {
+    let anyPending = false, anyFilled = false, anyRejected = false;
+    for (const o of ours) { const c = reconcile.classifyFyersOrder(o); if (c.filled) anyFilled = true; else if (c.rejected) anyRejected = true; else anyPending = true; }
+    const agg = reconcile.attributeFyersFills(ours, tag);   // { filledQty, avgPrice } across OUR tagged rows only
+    if (anyFilled && agg.filledQty > 0) {
+      const first = ours.find((o) => reconcile.classifyFyersOrder(o).filled) || ours[0];
+      if (wantQty > 0 && agg.filledQty < wantQty) return { status: "partial", orderId: first.id, filledQty: agg.filledQty, avgPrice: agg.avgPrice };
+      return { status: "filled", orderId: first.id, filledQty: agg.filledQty, avgPrice: agg.avgPrice };
+    }
+    if (anyPending) return { status: "pending" };
+    if (anyRejected) return { status: "rejected", orderId: ours[0].id };
+    return { status: "pending" };
   }
-  if (anyPending) return { status: "pending" };
-  if (anyRejected) return { status: "rejected", orderId: ours[0].id };
-  return { status: "pending" };
+
+  /* R30-C3: the tag isn't in the CURRENT order book — but the FYERS order book is day/window-scoped, so an OLDER
+     executed order can be missing here while still having a real fill. NEVER declare "absent" (→ CANCELLED) from
+     the order book alone. Corroborate against the TRADEBOOK (executions) and POSITIONS; only conclude absent when
+     ALL of them are readable AND conclusively lack our order AND we at least hold a broker order id (proof the
+     order was ever accepted). Anything unreadable or ambiguous ⇒ inconclusive (null) ⇒ the account stays locked
+     and is retried — the safe direction. */
+  let tb;
+  try { const tr = await fyFetch("https://api-t1.fyers.in/api/v3/tradebook", { headers: auth }); const td = await tr.json().catch(() => ({})); if (!tr.ok || td.s === "error") return null; tb = Array.isArray(td.tradeBook) ? td.tradeBook : (Array.isArray(td.trades) ? td.trades : []); }
+  catch { return null; }   // tradebook unreachable ⇒ can't prove absence ⇒ stay locked
+  const trades = tb.filter((t) => String((t && t.orderTag) || "") === String(tag) || (bid && String(t && (t.orderNumber ?? t.orderId ?? t.id)) === bid));
+  if (trades.length) {
+    let filledQty = 0, notional = 0, first = null;
+    for (const t of trades) { const q = Number(t.tradedQty ?? t.qty) || 0; const px = Number(t.tradePrice ?? t.price) || 0; if (q > 0) { filledQty += q; notional += q * px; first = first || t; } }
+    if (filledQty > 0) {
+      const avg = filledQty > 0 ? notional / filledQty : 0;
+      const oid = first ? (first.orderNumber ?? first.orderId ?? first.id) : bid;
+      if (wantQty > 0 && filledQty < wantQty) return { status: "partial", orderId: oid, filledQty, avgPrice: avg };
+      return { status: "filled", orderId: oid, filledQty, avgPrice: avg };
+    }
+  }
+  // Not in order book or tradebook. Check POSITIONS: a live position for this symbol/direction means a fill exists
+  // that we haven't attributed — do NOT declare absent (stay locked for a human/later sweep to resolve).
+  const clean = (s) => String(s || "").replace(/^NSE:/, "").replace(/-EQ$/, "");
+  let pos;
+  try { const pr = await fyFetch("https://api-t1.fyers.in/api/v3/positions", { headers: auth }); const pd = await pr.json().catch(() => ({})); if (!pr.ok || pd.s === "error") return null; pos = Array.isArray(pd.netPositions) ? pd.netPositions : []; }
+  catch { return null; }   // positions unreachable ⇒ stay locked
+  const held = pos.find((p) => clean(p.symbol) === clean(attempt.symbol) && Math.abs(Number(p.netQty ?? p.qty) || 0) > 0);
+  if (held) return null;   // an open position exists for this symbol — ambiguous, keep locked rather than cancel
+  // Order book + tradebook + positions ALL readable and none reference our order. Only call it ABSENT if the order
+  // was at least accepted (we hold a broker order id); a never-confirmed unknown stays locked (never auto-cancelled).
+  if (bid) return { status: "absent" };
+  return null;
 }
 async function _adoptFyersFill(attempt, ob) {
   // Adopt the recovered fill into the AUTHORITATIVE store exactly once (both paths dedupe on the broker order id).
@@ -501,7 +544,10 @@ async function _adoptFyersFill(attempt, ob) {
   }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
 }
 async function runC03Reconcile(reason = "periodic") {
-  if (process.env.C03_ORDER_ATTEMPTS !== "1") return { skipped: true, reason: "flag-off" };
+  // R30-C1: recovery MUST use the SAME gate as submission (default-on unless C03_ORDER_ATTEMPTS=0). Previously
+  // this required the var to equal "1", so with the var omitted submission created attempts that recovery then
+  // silently skipped — leaving accounts locked with unreconciled orders. Now they're consistent.
+  if (!C03_ORDER_ATTEMPTS_ON) return { skipped: true, reason: "flag-off" };
   const orderRecovery = require("./orderRecovery");
   let owner = false;
   try {
