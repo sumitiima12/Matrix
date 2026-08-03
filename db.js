@@ -10,6 +10,7 @@
  */
 const fs = require("fs");
 const path = require("path");
+const faultHook = require("./faultHook");   // C03: no-op fault seam (only tests arm boundaries)
 const crypto = require("crypto");
 
 const USING_PG = !!process.env.DATABASE_URL;
@@ -144,6 +145,18 @@ async function initDb() {
   // The unknown-order probe may only declare a broker "never received it" (release the key) for a TAGGED order —
   // a legacy/untagged order's absent tag is NOT proof of absence, so it must never be released as absent.
   await pool.query(`ALTER TABLE order_idempotency ADD COLUMN IF NOT EXISTS tagged BOOLEAN NOT NULL DEFAULT FALSE`);
+  /* C03 — durable WRITE-BEFORE-SEND order-attempt ledger. A row is committed as PREPARED BEFORE any broker
+     submission, so a crash/DB-outage after FYERS accepts is always recoverable: startup finds the attempt by
+     its deterministic order_tag and reconciles against the broker. Statuses:
+       PREPARED → SUBMITTING → (ACCEPTED | PARTIAL | FILLED | REJECTED | CANCELLED | UNKNOWN).
+     `resolved` flips true only after broker-backed reconciliation completes. Non-resolved rows re-arm the
+     risk-lock at startup. This table is NOT yet wired into the live order path (flag-gated) — see orderRecovery.js. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_attempts (
+    id TEXT PRIMARY KEY, user_id TEXT, broker TEXT, idem_key TEXT, order_tag TEXT,
+    fingerprint TEXT, payload JSONB, symbol TEXT, side TEXT, qty DOUBLE PRECISION, product TEXT, protection JSONB,
+    status TEXT NOT NULL, broker_order_id TEXT, filled_qty DOUBLE PRECISION, avg_price DOUBLE PRECISION,
+    resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT, updated_at BIGINT)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_attempts_unresolved ON order_attempts (resolved, created_at)`);
   /* Shared, restart-durable OAuth CSRF state (R16-P2-11 / R15-P2-09). One-time nonce per broker-login
      attempt, stored in Postgres so it survives restarts and is shared across replicas — a login started on
      worker A can complete its callback on worker B. Consumed atomically (DELETE ... RETURNING). */
@@ -1428,6 +1441,100 @@ async function markIdempotencyTagged(userId, key) {
   if (USING_PG) { await pool.query(`UPDATE order_idempotency SET tagged=TRUE WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]).catch(() => {}); return; }
   const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const row = d[`${userId}|${key}`]; if (row) { row.tagged = true; writeJSON(f, d); }
 }
+
+/* ─────────────────────────── C03 durable order-attempt state machine ───────────────────────────
+   WRITE-BEFORE-SEND: the caller commits a PREPARED attempt (prepareOrderAttempt) and, ONLY if that commits,
+   submits to the broker. A crash/outage anywhere after that is recoverable because the attempt (with its
+   deterministic order_tag) is already durable. All boundaries consult faultHook so tests can inject failures.
+   NOT yet wired into the live order path — flag-gated in orderRecovery.js until the fault-injection suite passes.
+   Terminal statuses: FILLED, REJECTED, CANCELLED. Non-terminal (need reconciliation): PREPARED, SUBMITTING,
+   ACCEPTED, PARTIAL, UNKNOWN. `resolved` flips true only after broker-backed reconciliation. */
+const _ATTEMPT_TERMINAL = new Set(["FILLED", "REJECTED", "CANCELLED"]);
+function _attemptFile() { return FILES.orderAttempts || (FILES.orderAttempts = process.env.ORDER_ATTEMPTS_FILE || path.join(__dirname, "order_attempts.json")); }
+function _rowFromPg(r) {
+  if (!r) return null;
+  return { id: r.id, userId: r.user_id, broker: r.broker, idemKey: r.idem_key, orderTag: r.order_tag,
+    fingerprint: r.fingerprint, payload: r.payload, symbol: r.symbol, side: r.side, qty: r.qty != null ? Number(r.qty) : null,
+    product: r.product, protection: r.protection, status: r.status, brokerOrderId: r.broker_order_id,
+    filledQty: r.filled_qty != null ? Number(r.filled_qty) : null, avgPrice: r.avg_price != null ? Number(r.avg_price) : null,
+    resolved: r.resolved === true, createdAt: r.created_at != null ? Number(r.created_at) : null, updatedAt: r.updated_at != null ? Number(r.updated_at) : null };
+}
+
+/* Commit a PREPARED attempt. Consults the fault boundary FIRST — if it (or the DB) fails, this THROWS and the
+   caller must NOT touch the broker (no durable identity ⇒ no send). Idempotent on `id`. */
+async function prepareOrderAttempt(attempt) {
+  faultHook.gate("db.attempt.prepare");
+  const a = attempt || {};
+  if (!a.id || !a.userId || !a.orderTag) throw new Error("prepareOrderAttempt requires id, userId, orderTag");
+  const now = Date.now();
+  const row = { id: String(a.id), userId: String(a.userId), broker: a.broker || null, idemKey: a.idemKey || null, orderTag: String(a.orderTag),
+    fingerprint: a.fingerprint || null, payload: a.payload || null, symbol: a.symbol || null, side: a.side || null,
+    qty: a.qty != null ? Number(a.qty) : null, product: a.product || null, protection: a.protection || null,
+    status: "PREPARED", brokerOrderId: null, filledQty: null, avgPrice: null, resolved: false, createdAt: now, updatedAt: now };
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO order_attempts (id,user_id,broker,idem_key,order_tag,fingerprint,payload,symbol,side,qty,product,protection,status,resolved,created_at,updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'PREPARED',FALSE,$13,$13)
+       ON CONFLICT (id) DO NOTHING`,
+      [row.id, row.userId, row.broker, row.idemKey, row.orderTag, row.fingerprint, row.payload ? JSON.stringify(row.payload) : null,
+       row.symbol, row.side, row.qty, row.product, row.protection ? JSON.stringify(row.protection) : null, now]);
+    return row;
+  }
+  const f = _attemptFile(); const d = readJSON(f); if (!d[row.id]) { d[row.id] = row; writeJSON(f, d); }
+  return d[row.id];
+}
+
+/* CAS transition: only moves the row if it is currently in `fromStatus`. Returns the updated row, or null if
+   the guard didn't match (someone else already advanced it) — the caller must treat null as "not my turn". */
+async function transitionOrderAttempt(id, fromStatus, toStatus, patch = {}) {
+  faultHook.gate("db.attempt.transition");
+  const now = Date.now();
+  if (USING_PG) {
+    const r = await pool.query(
+      `UPDATE order_attempts SET status=$3, broker_order_id=COALESCE($4,broker_order_id), updated_at=$5
+       WHERE id=$1 AND status=$2 RETURNING *`,
+      [String(id), String(fromStatus), String(toStatus), patch.brokerOrderId || null, now]);
+    return _rowFromPg(r.rows[0]);
+  }
+  const f = _attemptFile(); const d = readJSON(f); const row = d[String(id)];
+  if (!row || row.status !== fromStatus) return null;
+  row.status = toStatus; if (patch.brokerOrderId != null) row.brokerOrderId = patch.brokerOrderId; row.updatedAt = now;
+  writeJSON(f, d); return row;
+}
+
+/* Record the broker outcome. Sets status + broker fields; marks `resolved` when the outcome is terminal (or the
+   caller passes resolved:true after a full reconciliation). Idempotent — safe to replay during recovery. */
+async function finalizeOrderAttempt(id, status, patch = {}) {
+  faultHook.gate("db.attempt.finalize");
+  const now = Date.now();
+  const resolved = patch.resolved === true || _ATTEMPT_TERMINAL.has(String(status));
+  if (USING_PG) {
+    const r = await pool.query(
+      `UPDATE order_attempts SET status=$2, broker_order_id=COALESCE($3,broker_order_id),
+         filled_qty=COALESCE($4,filled_qty), avg_price=COALESCE($5,avg_price), resolved=$6, updated_at=$7
+       WHERE id=$1 RETURNING *`,
+      [String(id), String(status), patch.brokerOrderId || null, patch.filledQty != null ? Number(patch.filledQty) : null,
+       patch.avgPrice != null ? Number(patch.avgPrice) : null, !!resolved, now]);
+    return _rowFromPg(r.rows[0]);
+  }
+  const f = _attemptFile(); const d = readJSON(f); const row = d[String(id)]; if (!row) return null;
+  row.status = String(status);
+  if (patch.brokerOrderId != null) row.brokerOrderId = patch.brokerOrderId;
+  if (patch.filledQty != null) row.filledQty = Number(patch.filledQty);
+  if (patch.avgPrice != null) row.avgPrice = Number(patch.avgPrice);
+  row.resolved = !!resolved; row.updatedAt = now; writeJSON(f, d); return row;
+}
+
+async function getOrderAttempt(id) {
+  if (USING_PG) { const r = await pool.query(`SELECT * FROM order_attempts WHERE id=$1`, [String(id)]); return _rowFromPg(r.rows[0]); }
+  const d = readJSON(_attemptFile()); return d[String(id)] || null;
+}
+
+/* Every attempt that hasn't been reconciled yet — the startup-recovery work list. Oldest first. */
+async function listUnresolvedOrderAttempts(limit = 500) {
+  if (USING_PG) { const r = await pool.query(`SELECT * FROM order_attempts WHERE resolved=FALSE ORDER BY created_at ASC LIMIT $1`, [Number(limit) || 500]); return r.rows.map(_rowFromPg); }
+  const d = readJSON(_attemptFile()); return Object.values(d).filter((x) => x && !x.resolved).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)).slice(0, Number(limit) || 500);
+}
 /* R21-P2-05 / R23-P1-02: reclaim STALE idempotency records so a key can't block a user forever — WITHOUT ever
    freeing an UNRESOLVED key into a fresh, duplicate order.
      • An `in_flight` row older than the response deadline means the original request DIED before finalizing
@@ -1672,4 +1779,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, USING_PG };
