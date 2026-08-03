@@ -262,4 +262,23 @@ function deltaReconcilePlan(openCryptoRealTrades, book) {
   return { phantomDelta: allocate(deltaTagged), phantomUnknown: allocate(untagged) };
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan };
+/* R27-P1-03 / C02 (pure): confirm each Matrix-managed OPEN position is present at the broker with at least the
+   tracked quantity. `positions` = [{symbol|brokerSym, qty}] for ONE broker; `held` = that broker's portfolio
+   snapshot [{sym, qty}]. Returns { ok, verified, shortfall }. Fails closed on the FIRST position the broker
+   can't confirm (a shortfall means the position was reduced/closed at the broker, or never truly filled). */
+function normUnlockSym(s) { return String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/(USDT|USD|INR)$/i, "").replace(/[^A-Z0-9]/g, ""); }
+function verifyManagedAgainstBroker(positions, held) {
+  const map = new Map();
+  for (const h of (held || [])) { const k = normUnlockSym(h.sym); map.set(k, (map.get(k) || 0) + Math.abs(Number(h.qty) || 0)); }
+  let verified = 0;
+  for (const p of (positions || [])) {
+    const want = Math.abs(Number(p.qty) || 0);
+    if (want <= 0) continue;
+    const has = map.get(normUnlockSym(p.symbol || p.brokerSym)) || 0;
+    if (has + 1e-9 < want * 0.999) return { ok: false, verified, shortfall: { sym: p.symbol || p.brokerSym, tracked: want, broker: has } };
+    verified++;
+  }
+  return { ok: true, verified, shortfall: null };
+}
+
+module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, verifyManagedAgainstBroker };

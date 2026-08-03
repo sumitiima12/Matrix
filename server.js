@@ -6071,7 +6071,6 @@ async function brokerSnapshotForUnlock(userId) {
   // Nothing Matrix believes is open → no broker position to confirm; the internal reconcile already covered
   // pending/unknown/exit drift, so this gate is satisfied (don't brick users who simply hold no live positions).
   if (!openPos.length) return { ok: true, reason: "no open managed positions to verify", checked: 0, verified: 0, watermark: Date.now() };
-  const norm = (s) => String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/(USDT|USD|INR)$/i, "").replace(/[^A-Z0-9]/g, "");
   const brokers = [...new Set(openPos.map((p) => p.broker).filter(Boolean))];
   const started = Date.now();
   let verified = 0;
@@ -6080,16 +6079,13 @@ async function brokerSnapshotForUnlock(userId) {
     if (!sess) return { ok: false, reason: `no live ${broker} session to verify positions — reconnect your broker, then resume` };
     let acct; try { acct = await fetchBrokerAccount(sess); } catch { acct = null; }
     if (!acct || !Array.isArray(acct.portfolio)) return { ok: false, reason: `couldn't fetch a fresh ${broker} snapshot — the risk lock stays on` };
-    const held = new Map();
-    for (const h of acct.portfolio) { const k = norm(h.sym); held.set(k, (held.get(k) || 0) + Math.abs(Number(h.qty) || 0)); }
-    for (const p of openPos.filter((x) => x.broker === broker)) {
-      const brokerQty = held.get(norm(p.symbol || p.brokerSym)) || 0;
-      // A shortfall means the position was reduced/closed at the broker (or never truly filled) → keep the lock.
-      if (brokerQty + 1e-9 < Math.abs(Number(p.qty)) * 0.999) {
-        return { ok: false, reason: `${p.symbol || p.brokerSym} isn't confirmed open at ${broker} (broker holds ${brokerQty}, we track ${p.qty}) — reconcile before resuming` };
-      }
-      verified++;
+    // Pure, unit-tested comparison: every managed open position for this broker must be confirmed live at it.
+    const cmp = reconcile.verifyManagedAgainstBroker(openPos.filter((x) => x.broker === broker), acct.portfolio);
+    if (!cmp.ok) {
+      const s = cmp.shortfall || {};
+      return { ok: false, reason: `${s.sym} isn't confirmed open at ${broker} (broker holds ${s.broker}, we track ${s.tracked}) — reconcile before resuming` };
     }
+    verified += cmp.verified;
   }
   const MAX_SNAPSHOT_MS = Number(process.env.UNLOCK_SNAPSHOT_MAX_MS) || 30000;
   if (Date.now() - started > MAX_SNAPSHOT_MS) return { ok: false, reason: "broker snapshot was too slow to be trustworthy — try again in a moment" };
