@@ -5685,17 +5685,39 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     if (!check.ok) {
       return res.status(422).json({ error: "Order blocked by risk checks: " + (check.reasons[0] || "not allowed"), reasons: check.reasons });
     }
-    /* R25-H03/H04 SHADOW MODE: derive the SAME risk inputs (today's entry count, realized loss, cooldown) from the
-       IMMUTABLE FILLS ledger — the authoritative event source — and log them next to the trades-based decision the
-       gate actually used. This is LOG-ONLY (no behavior change) so we can compare fills-derived risk against the
-       current projection in production before making fills the source of truth. Fire-and-forget → zero added
-       latency; never blocks or alters an order. */
+    /* R31-H05: the IMMUTABLE FILLS ledger is now AUTHORITATIVE and ENFORCED for real-order risk — not shadow. We derive
+       today's executed entry count and last-entry time from the executions and enforce the daily-trade and cooldown
+       caps against them IN ADDITION to the projection-based check above. The gate now passes only if BOTH the mutable
+       projection AND the immutable executions agree the order is within limits (fail-CLOSED on drift — fills can only
+       make it stricter, never looser). A read failure refuses (never risk-check real money blind). Divergence between
+       the two views is alerted for reconciliation. Daily-loss% stays enforced by the account-based check above. */
     if (typeof db.deriveRiskFromFills === "function") {
       const uidKey = storageKeyFor(sess.userId);
-      const dayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime();
-      db.getFills(uidKey, dayStart, Date.now())
-        .then((fills) => { const rk = db.deriveRiskFromFills(fills, { from: dayStart, to: Date.now() }); logFinancial("risk.shadow_from_fills", { userId: uidKey, entryCount: rk.entryCount, realizedLoss: Math.round(rk.realizedLoss), realizedPnl: Math.round(rk.realizedPnl), matched: rk.matched, unmatchedExits: rk.unmatchedExits }); })
-        .catch(() => {});
+      // R31-M03: the daily risk boundary resets at IST (exchange/account tz) midnight, NOT the deployment host's local
+      // midnight — otherwise a server in UTC would classify late-evening IST trades into the wrong risk day and let the
+      // daily-trade / loss caps roll over early. IST is UTC+5:30 with no DST (19,800,000 ms).
+      const IST_OFFSET_MS = 19800000;
+      const dayStart = Math.floor((Date.now() + IST_OFFSET_MS) / 86400000) * 86400000 - IST_OFFSET_MS;
+      let fillsRk = null;
+      try { const fills = await db.getFills(uidKey, dayStart, Date.now()); fillsRk = db.deriveRiskFromFills(fills, { from: dayStart, to: Date.now() }); }
+      catch { return res.status(503).json({ error: "Couldn't read your execution ledger to safely risk-check this order (temporary). Please retry in a moment." }); }
+      const isEntryOrder = !(req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes");
+      if (isEntryOrder && userLimits) {
+        const maxTrades = Number(userLimits.maxTradesPerDay) || 0;
+        if (maxTrades > 0 && fillsRk.entryCount >= maxTrades) {
+          logFinancial("risk.fills_block", { userId: uidKey, cap: "maxTradesPerDay", entryCount: fillsRk.entryCount, max: maxTrades });
+          return res.status(422).json({ error: `Order blocked by risk checks: today's executed entries (${fillsRk.entryCount}) have reached your daily-trade cap (${maxTrades}).`, reasons: ["daily trade cap (execution-ledger authoritative)"] });
+        }
+        const cooldownMs = Number(userLimits.cooldownMs) || 0;
+        if (cooldownMs > 0 && fillsRk.lastEntryTs > 0 && (Date.now() - fillsRk.lastEntryTs) < cooldownMs) {
+          const waitS = Math.ceil((cooldownMs - (Date.now() - fillsRk.lastEntryTs)) / 1000);
+          logFinancial("risk.fills_block", { userId: uidKey, cap: "cooldownMs", sinceLastMs: Date.now() - fillsRk.lastEntryTs, cooldownMs });
+          return res.status(422).json({ error: `Order blocked by risk checks: cooldown active — wait ~${waitS}s before your next entry (execution-ledger authoritative).`, reasons: ["cooldown (execution-ledger authoritative)"] });
+        }
+      }
+      // Divergence alert (both directions) — the projection's real entries today vs the ledger's executed entries.
+      const projEntries = (Array.isArray(rkTrades) ? rkTrades : []).filter((t) => t && t.real === true && Number(t.entryAt) >= dayStart).length;
+      if (projEntries !== fillsRk.entryCount) logFinancial("risk.fills_divergence", { userId: uidKey, projEntries, fillsEntries: fillsRk.entryCount, realizedLossFills: Math.round(fillsRk.realizedLoss) });
     }
   }
 
