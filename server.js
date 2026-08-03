@@ -5303,6 +5303,8 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
           qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
           entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
+          // R27-P2-02: durable strategy attribution so a real Screener/Automate fill stays on its card after reload.
+          ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
         }, { haltUserIdOnFail: sess.userId });   // H2: if the fill can't be journaled, halt AUTOMATED entries so risk isn't computed on an incomplete book
         // R25-H07: a FILLED order whose fill couldn't be journaled must NOT look like an ordinary success — the
         // account is already risk-locked; surface reconciliation-required so the client shows the paused state.
@@ -5381,7 +5383,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           size: sendSize,
           side: isBuy ? "buy" : "sell",
           order_type: "market_order",
-          ...(isBuy ? {} : { reduce_only: true }),
+          // R27-P1-02: a SELL always reduces a long, and ANY explicitly reduce-only request (a close — incl. a
+          // BUY-to-cover of a short) must carry the exchange reduce_only flag so it can only shrink exposure,
+          // never open/reverse it. (Previously reduce_only was set on SELL only, so a short-cover BUY omitted it.)
+          ...((!isBuy || req.body?.reduceOnly === true) ? { reduce_only: true } : {}),
           // R26-P1-01: stamp our durable client_order_id (the idempotency key) so the unknown-order probe can
           // later find THIS order in Delta's order book. Without it, an executed order looks absent → duplicate.
           client_order_id: String(idemKey).slice(0, 64),
@@ -5409,7 +5414,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       }
       const autoExitId = await registerAutoExit();
       // R19-P1-04: server-authoritative trade row on the verified Delta fill (risk counters count it server-side).
-      const deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: "Manual", orderId: o.id ?? null, serverAuthored: true }, { haltUserIdOnFail: sess.userId });
+      const deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}) }, { haltUserIdOnFail: sess.userId });
       // R25-H07: a filled Delta order whose fill couldn't be journaled is reconciliation-required, not a plain success.
       if (!deltaJournaled) {
         return res.status(202).json({ ok: false, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, reconcileRequired: true, error: "Your order filled but recording it failed — new orders are paused. Please reconcile with your broker." });
