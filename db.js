@@ -140,6 +140,10 @@ async function initDb() {
   // status (in_flight | succeeded | rejected | unknown). An ambiguous/unknown outcome is NEVER released.
   await pool.query(`ALTER TABLE order_idempotency ADD COLUMN IF NOT EXISTS req_hash TEXT`);
   await pool.query(`ALTER TABLE order_idempotency ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'in_flight'`);
+  // R26-P1-01: whether the ORIGINAL broker order carried our durable tag (FYERS orderTag / Delta client_order_id).
+  // The unknown-order probe may only declare a broker "never received it" (release the key) for a TAGGED order —
+  // a legacy/untagged order's absent tag is NOT proof of absence, so it must never be released as absent.
+  await pool.query(`ALTER TABLE order_idempotency ADD COLUMN IF NOT EXISTS tagged BOOLEAN NOT NULL DEFAULT FALSE`);
   /* Shared, restart-durable OAuth CSRF state (R16-P2-11 / R15-P2-09). One-time nonce per broker-login
      attempt, stored in Postgres so it survives restarts and is shared across replicas — a login started on
      worker A can complete its callback on worker B. Consumed atomically (DELETE ... RETURNING). */
@@ -452,10 +456,48 @@ function projectFills(fills) {
     const q = Number(x.qty) || 0;
     const prev = byOrder.get(key);
     if (!prev || q > prev.qty) {
-      byOrder.set(key, { broker: x.broker || null, orderId: String(x.orderId), leg, qty: q, price: Number(x.entry != null ? x.entry : x.price) || null, side: x.side || null, market: x.market || null });
+      byOrder.set(key, {
+        broker: x.broker || null, orderId: String(x.orderId), leg, qty: q,
+        price: Number(x.entry != null ? x.entry : x.price) || null, side: x.side || null, market: x.market || null,
+        ts: Number(x.ts != null ? x.ts : x.entryAt) || 0,
+        entryOrderId: x.entryOrderId != null ? String(x.entryOrderId) : null, managedId: x.managedId != null ? String(x.managedId) : null,
+      });
     }
   }
   return [...byOrder.values()];
+}
+/* R25-H03/H04: derive the RISK-relevant counters straight from the immutable FILLS ledger (the authoritative
+   event source), instead of the editable `trades` projection. Entries are projected max-observation fills; a
+   round-trip's realized P&L is the matched entry↔exit legs (exit fills carry entryOrderId/managedId set by
+   recordExitFill). Direction: a BUY entry profits when the exit price is higher, a SELL (short) when lower.
+   Returns the daily entry count, last-entry timestamp, net realized P&L and realized loss over [from,to] — the
+   inputs a risk gate needs (trade-count / cooldown / daily-loss). Pure; unit-tests without a DB.
+   Currently run in SHADOW MODE (logged, compared to the trades-based gate) before it becomes the source. */
+function deriveRiskFromFills(fills, { from = 0, to = Date.now() } = {}) {
+  const proj = projectFills(fills);
+  const entries = proj.filter((p) => p.leg === "entry");
+  const exits = proj.filter((p) => p.leg === "exit");
+  const entryById = new Map();
+  for (const e of entries) entryById.set(`${e.broker || ""}|${e.orderId}`, e);
+  const inWin = (ts) => ts >= from && ts <= to;
+  const windowEntries = entries.filter((e) => inWin(e.ts));
+  const entryCount = windowEntries.length;
+  const lastEntryTs = windowEntries.reduce((m, e) => Math.max(m, e.ts), 0);
+  let realizedPnl = 0, realizedLoss = 0, matched = 0, unmatchedExits = 0;
+  for (const x of exits) {
+    if (!inWin(x.ts)) continue;
+    // Match the exit to its entry by the stamped entryOrderId (broker-scoped), else by managedId fallback.
+    let e = x.entryOrderId != null ? entryById.get(`${x.broker || ""}|${x.entryOrderId}`) : null;
+    if (!e && x.managedId != null) e = entries.find((y) => y.managedId === x.managedId);
+    if (!e || x.price == null || e.price == null) { unmatchedExits++; continue; }
+    const dir = String(e.side || "").toUpperCase() === "SELL" ? -1 : 1;   // short profits when price falls
+    const qty = Math.min(Number(e.qty) || 0, Number(x.qty) || 0) || (Number(x.qty) || 0);
+    const pnl = (Number(x.price) - Number(e.price)) * qty * dir;
+    realizedPnl += pnl;
+    if (pnl < 0) realizedLoss += -pnl;
+    matched++;
+  }
+  return { entryCount, lastEntryTs, realizedPnl, realizedLoss, matched, unmatchedExits };
 }
 /* R24-P2-02: drift now compares FINANCIAL truth (quantity), not just order-id presence. It matches the risk
    journal's verified entry legs against the ledger's PROJECTED entry fills (max-observation, above) by order id,
@@ -1376,8 +1418,15 @@ async function claimIdempotencyKey(userId, key, reqHash = null) {
   d[k] = { response: null, reqHash, status: "in_flight", createdAt: Date.now() }; writeJSON(FILES.idem, d); return true;
 }
 async function getIdempotencyRecord(userId, key) {
-  if (USING_PG) { const r = await pool.query(`SELECT response, req_hash, status, updated_at, created_at FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return r.rows[0] ? { response: r.rows[0].response, reqHash: r.rows[0].req_hash, status: r.rows[0].status, updatedAt: r.rows[0].updated_at != null ? Number(r.rows[0].updated_at) : null, createdAt: r.rows[0].created_at != null ? Number(r.rows[0].created_at) : null } : null; }
-  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"))); const row = d[`${userId}|${key}`]; return row ? { response: row.response, reqHash: row.reqHash, status: row.status, updatedAt: row.updated_at != null ? Number(row.updated_at) : (row.updatedAt || null), createdAt: row.createdAt != null ? Number(row.createdAt) : null } : null;
+  if (USING_PG) { const r = await pool.query(`SELECT response, req_hash, status, updated_at, created_at, tagged FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return r.rows[0] ? { response: r.rows[0].response, reqHash: r.rows[0].req_hash, status: r.rows[0].status, updatedAt: r.rows[0].updated_at != null ? Number(r.rows[0].updated_at) : null, createdAt: r.rows[0].created_at != null ? Number(r.rows[0].created_at) : null, tagged: r.rows[0].tagged === true } : null; }
+  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"))); const row = d[`${userId}|${key}`]; return row ? { response: row.response, reqHash: row.reqHash, status: row.status, updatedAt: row.updated_at != null ? Number(row.updated_at) : (row.updatedAt || null), createdAt: row.createdAt != null ? Number(row.createdAt) : null, tagged: row.tagged === true } : null;
+}
+/* R26-P1-01: record that the ORIGINAL broker order carried our durable tag (FYERS orderTag / Delta
+   client_order_id). Only a TAGGED order may later be resolved as "broker never received it" — an untagged
+   (legacy) order's missing tag is not proof of absence. Best-effort (never blocks placement). */
+async function markIdempotencyTagged(userId, key) {
+  if (USING_PG) { await pool.query(`UPDATE order_idempotency SET tagged=TRUE WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]).catch(() => {}); return; }
+  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const row = d[`${userId}|${key}`]; if (row) { row.tagged = true; writeJSON(f, d); }
 }
 /* R21-P2-05 / R23-P1-02: reclaim STALE idempotency records so a key can't block a user forever — WITHOUT ever
    freeing an UNRESOLVED key into a fresh, duplicate order.
@@ -1415,6 +1464,22 @@ async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000 } = {}) {
 /* R25: count a user's UNRESOLVED (unknown) idempotency rows — an outstanding order whose broker outcome we
    couldn't confirm. Used by the unlock reconciliation and the account-level new-entry gate: while any exist, the
    book is provably not reconciled. Reads propagate errors (fail closed). */
+/* R25-M04: monitoring for the (intentionally never-auto-deleted) idempotency ledger. Retention is unbounded by
+   design — deleting terminal keys would let a lost success become a duplicate — so growth must be OBSERVED and
+   governed by a defined archive policy (see docs/DATA_GOVERNANCE.md): succeeded rows older than the archive
+   window are candidates for a compact archive table that is still consulted for replay/uniqueness; unknown rows
+   feed an operational resolution queue. This returns the counts a periodic monitor logs. */
+async function idempotencyStats() {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT status, COUNT(*)::int AS n FROM order_idempotency GROUP BY status`).catch(() => ({ rows: [] }));
+    const by = {}; for (const row of r.rows) by[row.status] = row.n;
+    const total = Object.values(by).reduce((a, b) => a + b, 0);
+    return { total, unknown: by.unknown || 0, succeeded: by.succeeded || 0, inFlight: by.in_flight || 0 };
+  }
+  const d = readJSON(FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")));
+  const by = {}; for (const k of Object.keys(d)) { const s = (d[k] && d[k].status) || "?"; by[s] = (by[s] || 0) + 1; }
+  return { total: Object.keys(d).length, unknown: by.unknown || 0, succeeded: by.succeeded || 0, inFlight: by.in_flight || 0 };
+}
 async function countUnknownIdempotency(userId) {
   if (USING_PG) {
     const r = await pool.query(`SELECT COUNT(*)::int AS n FROM order_idempotency WHERE user_id=$1 AND status='unknown'`, [String(userId)]);
@@ -1607,4 +1672,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, getFills, computeLedgerDrift, projectFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

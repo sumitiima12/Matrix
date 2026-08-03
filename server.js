@@ -5071,10 +5071,18 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         let landed = null;
         try { landed = await brokerOrderProbe({ broker: sess.broker, pendingClientId: idemKey, pendingSince: rec.createdAt || 0, userId: sess.userId }); }
         catch { landed = null; }
-        if (landed === false) {
+        /* R26-P1-01: a "never landed" (false) may ONLY release the key when the ORIGINAL order actually carried
+           our durable tag (FYERS orderTag / Delta client_order_id). For a legacy/untagged order the broker book
+           cannot prove absence — a real fill exists there under no tag we can query — so its missing tag is NOT
+           evidence. Untagged unknowns therefore stay blocked (reconcile-only), never released as absent. */
+        if (landed === false && rec.tagged === true) {
           try { await db.releaseIdempotencyKey(idemUser, idemKey); } catch { /* best-effort */ }
           logFinancial("idempotency.unknown_resolved_absent", { userId: idemUser, key: idemKey, broker: sess.broker });
           return res.status(409).json({ error: "We verified your broker never received that order — it's cleared. Please place the order again.", resolved: "absent" });
+        }
+        if (landed === false && rec.tagged !== true) {
+          logFinancial("idempotency.unknown_untagged_blocked", { userId: idemUser, key: idemKey, broker: sess.broker });
+          return res.status(409).json({ error: "A previous attempt with this key had an UNVERIFIED outcome and predates order-tagging, so we can't prove your broker didn't receive it. Check the order on your broker before retrying — we won't resubmit automatically." });
         }
         if (landed === true) {
           logFinancial("idempotency.unknown_resolved_present", { userId: idemUser, key: idemKey, broker: sess.broker });
@@ -5190,15 +5198,24 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       return res.status(503).json({ error: "Could not verify your account state with the broker to risk-check this order. Try again in a moment." + (lastAcctError ? ` (${lastAcctError})` : "") });
     }
     const orderSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
-    const rkTrades = await db.getTrades(storageKeyFor(sess.userId), 0, Date.now()).catch(() => []);
+    /* R26-P1-03: the risk gate must FAIL CLOSED on a database read failure. Previously a failed trade-history
+       read fell back to `[]` (empty history) and a failed policy read to `null` (default/no caps) — both would
+       let a real order through on a stale/blind risk view (e.g. over the daily-trade or daily-loss cap). If we
+       can't read the authoritative history or policy, we refuse rather than risk-check against nothing. */
+    let rkTrades, serverPolicy;
+    try {
+      rkTrades = await db.getTrades(storageKeyFor(sess.userId), 0, Date.now());
+      serverPolicy = await db.getRiskPolicy(storageKeyFor(sess.userId));
+    } catch {
+      return res.status(503).json({ error: "Couldn't read your trade history / risk limits to safely risk-check this order (temporary). Please retry in a moment." });
+    }
     let rkPrice = price != null ? Number(price) : (account.portfolio.find((h) => h.sym === orderSym) ? account.portfolio.find((h) => h.sym === orderSym).price : null);
     // Market order, new position: no limit price and nothing held. Fetch a live mark so the
     // risk engine can size the order instead of refusing it for "No live price".
     if (rkPrice == null) rkPrice = await liveMarkForOrder(symbol, rkMarket);
-    /* R15-P1-02: caps come from the SERVER-OWNED policy (loaded here, authoritative), NOT the request body.
+    /* R15-P1-02: caps come from the SERVER-OWNED policy (loaded above, authoritative), NOT the request body.
        A per-order client override may only make them STRICTER — omitting/altering the body can never drop a
        cap the user configured. */
-    const serverPolicy = await db.getRiskPolicy(storageKeyFor(sess.userId)).catch(() => null);
     const clientOverride = cleanRiskPolicy(req.body?.riskLimits);
     const effLimits = strictestRiskPolicy(serverPolicy, clientOverride);
     const userLimits = Object.keys(effLimits).length ? effLimits : null;
@@ -5208,6 +5225,18 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     );
     if (!check.ok) {
       return res.status(422).json({ error: "Order blocked by risk checks: " + (check.reasons[0] || "not allowed"), reasons: check.reasons });
+    }
+    /* R25-H03/H04 SHADOW MODE: derive the SAME risk inputs (today's entry count, realized loss, cooldown) from the
+       IMMUTABLE FILLS ledger — the authoritative event source — and log them next to the trades-based decision the
+       gate actually used. This is LOG-ONLY (no behavior change) so we can compare fills-derived risk against the
+       current projection in production before making fills the source of truth. Fire-and-forget → zero added
+       latency; never blocks or alters an order. */
+    if (typeof db.deriveRiskFromFills === "function") {
+      const uidKey = storageKeyFor(sess.userId);
+      const dayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime();
+      db.getFills(uidKey, dayStart, Date.now())
+        .then((fills) => { const rk = db.deriveRiskFromFills(fills, { from: dayStart, to: Date.now() }); logFinancial("risk.shadow_from_fills", { userId: uidKey, entryCount: rk.entryCount, realizedLoss: Math.round(rk.realizedLoss), realizedPnl: Math.round(rk.realizedPnl), matched: rk.matched, unmatchedExits: rk.unmatchedExits }); })
+        .catch(() => {});
     }
   }
 
@@ -5242,10 +5271,15 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           productType: product === "CNC" ? "CNC" : "INTRADAY",
           limitPrice: orderType === "LIMIT" ? Number(price) : 0,
           stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false,
+          // R26-P1-01: stamp our durable order tag (derived from the idempotency key) so the unknown-order probe
+          // can later find THIS order in the FYERS book. Without it, an executed order looks absent → duplicate.
+          orderTag: reconcile.fyersOrderTag(idemKey),
         }),
       });
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
+      // The order carries our tag → the probe may safely resolve absence/presence for it later.
+      await db.markIdempotencyTagged(idemUser, idemKey);
       /* R9-P1-02: NEVER arm app-managed SL/TP on mere acceptance. If the user asked for auto-exit, confirm
          the entry actually FILLED first (same verification the auto-buy path uses) and register the managed
          position at the REAL filled quantity/price. A rejected or still-pending entry arms nothing — so the
@@ -5348,8 +5382,13 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           side: isBuy ? "buy" : "sell",
           order_type: "market_order",
           ...(isBuy ? {} : { reduce_only: true }),
+          // R26-P1-01: stamp our durable client_order_id (the idempotency key) so the unknown-order probe can
+          // later find THIS order in Delta's order book. Without it, an executed order looks absent → duplicate.
+          client_order_id: String(idemKey).slice(0, 64),
         },
       });
+      // The order carries our tag → the probe may safely resolve absence/presence for it later.
+      await db.markIdempotencyTagged(idemUser, idemKey);
       /* A 200 is NOT a fill. Verify execution (all sizes here are CONTRACTS). */
       const o = d.result || {};
       const sizeC = Number(o.size) || sendSize;
@@ -6947,11 +6986,15 @@ async function runAutoBuyEngine() {
            can't be verified — never trade blind with real money. */
         const abMarketKind = st.market === "Crypto" ? "Crypto" : (st.market === "US" ? "US" : "IN");
         const abStoreKey = storageKeyFor(st.userId);   // same key manual orders + /api/risk-policy use
-        const abPolicy = cleanRiskPolicy(await db.getRiskPolicy(abStoreKey).catch(() => null));
+        /* R26-P1-03: FAIL CLOSED on a policy/history read failure — never risk-check an unattended real entry
+           against empty history or a dropped policy. A DB error skips this cycle (retried next sweep). */
+        let abPolicyRaw, abTrades;
+        try { abPolicyRaw = await db.getRiskPolicy(abStoreKey); abTrades = await db.getTrades(abStoreKey, 0, Date.now()); }
+        catch { await db.updateRealStrategy(st.id, { lastError: "Couldn't read risk limits / trade history to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }).catch(() => {}); continue; }
+        const abPolicy = cleanRiskPolicy(abPolicyRaw);
         {
           const abAccount = await fetchBrokerAccount(sess).catch(() => null);
           if (!abAccount) { await db.updateRealStrategy(st.id, { lastError: "Couldn't verify account with broker to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }); continue; }
-          const abTrades = await db.getTrades(abStoreKey, 0, Date.now()).catch(() => []);
           const abCheck = serverValidateOrder(
             { sym: String(st.brokerSym).replace(/^NSE:/, "").replace(/-EQ$/, ""), side: st.short ? "SELL" : "BUY", qty, price: px, market: abMarketKind },
             { wallet: abAccount.wallet, portfolio: abAccount.portfolio, trades: riskEligibleTrades(abTrades), ...(Object.keys(abPolicy).length ? { limits: abPolicy } : {}) },
@@ -7136,6 +7179,13 @@ async function runProtectionWatcher() {
    forever — mark long-in_flight rows 'unknown' (surfaces a reconcile prompt on retry) and purge very old rows. */
 if (typeof db.reconcileStaleIdempotency === "function") {
   setInterval(() => { db.reconcileStaleIdempotency().then((r) => { if (r && (r.markedUnknown || r.purged)) logFinancial("idempotency.reconcile", r); }).catch(() => {}); }, 5 * 60 * 1000);
+  /* R25-M04: the idempotency ledger is never auto-deleted (a purge could turn a lost success into a duplicate),
+     so its growth must be OBSERVED. Log size + unknown/succeeded counts periodically; a rising `unknown` count is
+     also the operational resolution-queue signal. The archive policy for aged succeeded rows is defined in
+     docs/DATA_GOVERNANCE.md. */
+  if (typeof db.idempotencyStats === "function") {
+    setInterval(() => { db.idempotencyStats().then((s) => { if (s) logFinancial("idempotency.stats", s); }).catch(() => {}); }, 30 * 60 * 1000);
+  }
 }
 const PROTECTION_MS = Math.max(30_000, Number(process.env.PROTECTION_MS) || 60_000);
 if (process.env.EXIT_MONITOR !== "off") {

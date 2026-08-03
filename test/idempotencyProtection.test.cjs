@@ -51,6 +51,16 @@ test("SUCCESS persists the response for replay", async () => {
   assert.equal(rec.response.orderId, "X1");
 });
 
+test("R26-P1-01: a record is UNTAGGED until the order is stamped, then TAGGED", async () => {
+  await db.claimIdempotencyKey("ph_1", "key-tag", "h");
+  await db.finalizeIdempotency("ph_1", "key-tag", "unknown", { error: "timeout" });
+  let rec = await db.getIdempotencyRecord("ph_1", "key-tag");
+  assert.equal(rec.tagged, false, "a fresh/legacy record is untagged — its broker-book absence is NOT proof");
+  await db.markIdempotencyTagged("ph_1", "key-tag");
+  rec = await db.getIdempotencyRecord("ph_1", "key-tag");
+  assert.equal(rec.tagged, true, "after stamping the order tag, the record is tagged and may be resolved by the probe");
+});
+
 test("protection lease: a leased row is not handed to a second worker", async () => {
   await db.savePendingProtection({ id: "pp1", userId: "ph_1", broker: "fyers", orderId: "O1", symbol: "SBIN", qty: 1 });
   const first = await db.claimPendingProtection(60000, 10);
