@@ -383,14 +383,52 @@ async function getFills(userId, from = 0, to = Date.now()) {
    ledger, by order id. Returns the drift both ways so a monitor can surface a book that is diverging BEFORE it
    loosens/loses a risk control. Exit fills (kind:"exit") are excluded — they're the closing leg, not an entry.
    Pure and side-effect-free (takes already-read arrays) so it unit-tests without a DB. */
+/* R24-P2-01: fills for one order arrive as CUMULATIVE snapshots (a partial qty=2 row, then a fuller qty=5 row) —
+   they are NOT additive executions. Summing them would overstate the position (2+5=7 instead of 5). This projects
+   the ledger to the authoritative fill per (broker, order, leg) by taking the LARGEST observed quantity. */
+function projectFills(fills) {
+  const byOrder = new Map();
+  for (const x of (fills || [])) {
+    if (!x || x.orderId == null) continue;
+    const leg = x.kind === "exit" ? "exit" : "entry";
+    const key = `${x.broker || ""}|${String(x.orderId)}|${leg}`;
+    const q = Number(x.qty) || 0;
+    const prev = byOrder.get(key);
+    if (!prev || q > prev.qty) {
+      byOrder.set(key, { broker: x.broker || null, orderId: String(x.orderId), leg, qty: q, price: Number(x.entry != null ? x.entry : x.price) || null, side: x.side || null, market: x.market || null });
+    }
+  }
+  return [...byOrder.values()];
+}
+/* R24-P2-02: drift now compares FINANCIAL truth (quantity), not just order-id presence. It matches the risk
+   journal's verified entry legs against the ledger's PROJECTED entry fills (max-observation, above) by order id,
+   and flags a material quantity mismatch (relative tolerance) in addition to presence gaps. */
 function computeLedgerDrift(trades, fills) {
   const journalEntry = (trades || []).filter((t) => t && t.real === true && t.serverAuthored === true && t.orderId != null && t.status !== "rejected");
-  const ledgerEntry = (fills || []).filter((x) => x && x.kind !== "exit" && x.orderId != null);
-  const jIds = new Set(journalEntry.map((t) => String(t.orderId)));
-  const lIds = new Set(ledgerEntry.map((x) => String(x.orderId)));
-  const missingInLedger = [...jIds].filter((id) => !lIds.has(id));   // journalled but never made it to the ledger
-  const missingInJournal = [...lIds].filter((id) => !jIds.has(id));  // in the ledger but absent from the risk journal
-  return { journalEntries: jIds.size, ledgerEntries: lIds.size, missingInLedger, missingInJournal, drift: missingInLedger.length + missingInJournal.length };
+  const projectedEntry = projectFills(fills).filter((p) => p.leg === "entry");
+  const jById = new Map(journalEntry.map((t) => [String(t.orderId), t]));
+  const lById = new Map(projectedEntry.map((p) => [p.orderId, p]));
+  const missingInLedger = [...jById.keys()].filter((id) => !lById.has(id));    // journalled but never made it to the ledger
+  const missingInJournal = [...lById.keys()].filter((id) => !jById.has(id));   // in the ledger but absent from the risk journal
+  const qtyMismatch = [];
+  for (const [id, t] of jById) {
+    const p = lById.get(id);
+    if (!p) continue;
+    const jq = Number(t.qty) || 0, lq = Number(p.qty) || 0;
+    const diff = Math.abs(jq - lq);
+    if (diff > 1e-9 && diff / Math.max(1, Math.max(jq, lq)) > 0.001) qtyMismatch.push({ orderId: id, journalQty: jq, ledgerQty: lq });
+  }
+  return { journalEntries: jById.size, ledgerEntries: lById.size, missingInLedger, missingInJournal, qtyMismatch, drift: missingInLedger.length + missingInJournal.length + qtyMismatch.length };
+}
+/* R24-P2-03: exit drift — a CLOSED managed position whose closing leg never reached the immutable ledger. The
+   entry-only drift comparator can't see this (exits are excluded there by design), so a lost exit fill would be
+   invisible. This matches closed positions to exit fills by managed-position id and reports the ones with no
+   recorded exit — a durable repair signal. Pure. */
+function computeExitDrift(closedPositions, fills) {
+  const exitByManaged = new Set((fills || []).filter((x) => x && x.kind === "exit" && x.managedId != null).map((x) => String(x.managedId)));
+  const closed = (closedPositions || []).filter((p) => p && p.status === "closed" && p.id != null);
+  const missingExitFill = closed.filter((p) => !exitByManaged.has(String(p.id))).map((p) => String(p.id));
+  return { closedPositions: closed.length, exitFills: exitByManaged.size, missingExitFill, drift: missingExitFill.length };
 }
 /* Read both stores for a user and compute the drift (convenience wrapper for a periodic monitor). */
 async function reconcileRiskVsLedger(userId, { from = 0, to = Date.now() } = {}) {
@@ -442,10 +480,11 @@ async function reassignAndArchiveTrades(phone, fromUserId, archiveKey) {
       await client.query(`CREATE TABLE IF NOT EXISTS trade_archives (archive_key TEXT PRIMARY KEY, phone TEXT, created_at BIGINT)`);
       await client.query(`INSERT INTO trade_archives (archive_key, phone, created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [String(archiveKey), String(phone), Date.now()]);
       const r = await client.query(`UPDATE trades SET user_id=$2 WHERE user_id=$1`, [String(fromUserId), String(archiveKey)]);
-      // R23-P2-05: move the previous owner's immutable fills to the SAME archive key IN THIS TRANSACTION, so a
-      // recycled phone number never inherits the prior person's verified executions (they'd otherwise remain under
-      // the phone-derived identity and count toward the new owner's risk/P&L).
-      await client.query(`UPDATE fills SET user_id=$2 WHERE user_id=$1`, [String(fromUserId), String(archiveKey)]).catch(() => {});
+      // R23-P2-05 / R24-P2-05: move the previous owner's immutable fills to the SAME archive key IN THIS
+      // TRANSACTION, so a recycled phone number never inherits the prior person's verified executions. This is NOT
+      // swallowed — if the fills move fails, the whole handoff (trade reassign + archive record) rolls back, so we
+      // never commit a half-migrated identity that leaves fills on the reusable phone key.
+      await client.query(`UPDATE fills SET user_id=$2 WHERE user_id=$1`, [String(fromUserId), String(archiveKey)]);
       await client.query("COMMIT");
       return r.rowCount || 0;
     } catch (e) {
@@ -456,6 +495,17 @@ async function reassignAndArchiveTrades(phone, fromUserId, archiveKey) {
   // Flat-file: reassign then record; if the record write throws, the reassign already happened but we surface
   // the error so the caller aborts and can retry (idempotent — the archive key is deterministic).
   const n = await reassignTrades(fromUserId, archiveKey);
+  // R24-P2-05 (flat-file): move the previous owner's fills bucket to the archive key too, so a recycled number
+  // doesn't inherit their verified executions. Deterministic/idempotent — merges into any existing archive bucket.
+  try {
+    const ff = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+    const fd = readJSON(ff);
+    if (fd[String(fromUserId)]) {
+      fd[String(archiveKey)] = { ...(fd[String(archiveKey)] || {}), ...fd[String(fromUserId)] };
+      delete fd[String(fromUserId)];
+      writeJSON(ff, fd);
+    }
+  } catch (e) { throw new Error(`fills migration failed during account handoff: ${e.message}`); }
   await recordTradeArchive(phone, archiveKey);
   return n;
 }
@@ -698,7 +748,7 @@ async function deleteAccount(userId, phone, { preserveTrades = true } = {}) {
     await del("user_screeners", `DELETE FROM user_screeners WHERE user_id=$1`, [uid]);
     await del("ideas", `DELETE FROM ideas WHERE owner=$1`, [uid]);
     await del("public_strategies", `DELETE FROM public_strategies WHERE owner=$1`, [uid]);
-    try { await purgeLedgersForUser(uid); } catch (e) { failed.push("ledgers"); console.error("[delete] ledgers failed", e.message); }
+    try { await purgeLedgersForUser(uid, { preserveFills: preserveTrades }); } catch (e) { failed.push("ledgers"); console.error("[delete] ledgers failed", e.message); }
     if (failed.length) throw new Error(`Account deletion incomplete — these stores could not be cleared: ${failed.join(", ")}. Retry.`);
     if (preserveTrades) {
       // Keep the stub (so admin can still see the retained history) but make the account unusable. Bump the
@@ -1245,27 +1295,28 @@ async function getIdempotencyRecord(userId, key) {
        `unknown` row would let a returning user win a brand-new claim and place the SAME order twice — the exact
        R23-P1-02 duplicate-order hazard. An `unknown` key becomes reusable only when finalizeIdempotency records a
        conclusive `rejected` (deletes the row) or `succeeded` (replays the stored response instead of re-placing).
-     • `succeeded` rows are terminal and safe to REPLAY; we keep them for a long archive window (default 30 days)
-       purely to bound storage. Within that window a reused key returns the stored response rather than re-placing.
+     • `succeeded` rows are terminal and are NEVER deleted (R24-P1-02). A client that retained an ambiguous action
+       through a lost success response would, after a purge, get `status:none` on reload and could resubmit the
+       SAME historical order. So the idempotency identity of a succeeded order is kept permanently — the stored
+       response is replayed on any reused key, and `none` never appears for an order that actually went through.
    Returns counts. Safe to run periodically from any instance. */
-async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000, archiveMs = 30 * 24 * 60 * 60 * 1000 } = {}) {
+async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000 } = {}) {
   const now = Date.now();
   if (USING_PG) {
     const m = await pool.query(`UPDATE order_idempotency SET status='unknown' WHERE status='in_flight' AND created_at < $1`, [now - inflightMs]).catch(() => ({ rowCount: 0 }));
-    // Only 'succeeded' (terminal, replayable) rows are archived — 'unknown' rows are retained until reconciled.
-    const p = await pool.query(`DELETE FROM order_idempotency WHERE status='succeeded' AND created_at < $1`, [now - archiveMs]).catch(() => ({ rowCount: 0 }));
-    return { markedUnknown: m.rowCount || 0, purged: p.rowCount || 0 };
+    // Nothing is deleted: 'unknown' rows block until reconciled, 'succeeded' rows are kept forever to replay.
+    return { markedUnknown: m.rowCount || 0, purged: 0 };
   }
   const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json"));
-  const d = readJSON(f); let marked = 0, purged = 0, changed = false;
+  const d = readJSON(f); let marked = 0, changed = false;
   for (const k of Object.keys(d)) {
     const r = d[k]; const created = Number(r.createdAt) || 0;
     if (r.status === "in_flight" && created < now - inflightMs) { r.status = "unknown"; marked++; changed = true; }
-    else if (r.status === "succeeded" && created < now - archiveMs) { delete d[k]; purged++; changed = true; }
-    // NOTE: 'unknown' is intentionally never purged here.
+    // NOTE: neither 'unknown' nor 'succeeded' is ever purged — terminal identity must survive so a lost success
+    // can't become a duplicate, and an unresolved key stays blocked until a broker reconciliation resolves it.
   }
   if (changed) writeJSON(f, d);
-  return { markedUnknown: marked, purged };
+  return { markedUnknown: marked, purged: 0 };
 }
 /* Finalize the outcome. status ∈ succeeded | rejected | unknown. A 'rejected' (conclusive) DELETES the row
    so a same-key retry may proceed; 'succeeded'/'unknown' persist the response for replay/blocking. */
@@ -1278,22 +1329,24 @@ async function releaseIdempotencyKey(userId, key) {
   if (USING_PG) { await pool.query(`DELETE FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return; }
   const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); if (d[`${userId}|${key}`]) { delete d[`${userId}|${key}`]; writeJSON(f, d); }
 }
-/* R17-P2-09 retention: drop a user's idempotency + order-intent ledger rows (called during erasure). */
-async function purgeLedgersForUser(userId) {
+/* R17-P2-09 retention: drop a user's idempotency + order-intent ledger rows (called during erasure).
+   R24-P2-04: `preserveFills` keeps the immutable fills ledger when trade history is being RETAINED — the fills
+   are the audit evidence FOR those retained trades, so deleting them would leave a projection with no proof.
+   Only a genuine full erasure (preserveFills=false) removes the fills. */
+async function purgeLedgersForUser(userId, { preserveFills = false } = {}) {
   if (USING_PG) {
     await pool.query(`DELETE FROM order_idempotency WHERE user_id=$1`, [String(userId)]).catch(() => {});
     await pool.query(`DELETE FROM order_intents WHERE user_id=$1`, [String(userId)]).catch(() => {});
     await pool.query(`DELETE FROM pending_protection WHERE user_id=$1`, [String(userId)]).catch(() => {});
-    // R23-P2-05: the immutable fills ledger holds this user's verified executions — erasure must clear it too,
-    // otherwise `preserveTrades:false` full deletion still leaves fills linked to the old user key.
-    await pool.query(`DELETE FROM fills WHERE user_id=$1`, [String(userId)]).catch(() => {});
+    // The immutable fills ledger is the verification source for retained trades — only wipe it on full erasure.
+    if (!preserveFills) await pool.query(`DELETE FROM fills WHERE user_id=$1`, [String(userId)]).catch(() => {});
     // R19-P2-10: personal in-app notices are personal data — purge them on account deletion too.
     await pool.query(`DELETE FROM user_notices WHERE user_id=$1`, [String(userId)]).catch(() => {});
     return;
   }
   for (const key of ["idem"]) { const f = FILES[key]; if (!f) continue; const d = readJSON(f); let ch = false; for (const k of Object.keys(d)) if (k.startsWith(`${userId}|`)) { delete d[k]; ch = true; } if (ch) writeJSON(f, d); }
-  // R23-P2-05 (flat-file): fills are bucketed by user id — drop this user's bucket on erasure.
-  try { const ff = FILES.fills; if (ff) { const fd = readJSON(ff); if (fd[String(userId)]) { delete fd[String(userId)]; writeJSON(ff, fd); } } } catch { /* non-fatal */ }
+  // R23-P2-05 / R24-P2-04 (flat-file): fills are bucketed by user id — drop this user's bucket ONLY on full erasure.
+  if (!preserveFills) { try { const ff = FILES.fills; if (ff) { const fd = readJSON(ff); if (fd[String(userId)]) { delete fd[String(userId)]; writeJSON(ff, fd); } } } catch { /* non-fatal */ } }
   // R19-P2-10 (flat-file): drop this user's notices bucket.
   try { const nf = FILES.notices; if (nf) { const nd = readJSON(nf); if (nd[String(userId)]) { delete nd[String(userId)]; writeJSON(nf, nd); } } } catch { /* non-fatal */ }
 }
@@ -1448,4 +1501,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, getFills, computeLedgerDrift, reconcileRiskVsLedger, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, getFills, computeLedgerDrift, projectFills, computeExitDrift, reconcileRiskVsLedger, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, USING_PG };

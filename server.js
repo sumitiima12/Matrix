@@ -189,7 +189,13 @@ async function recordExitFill(userKey, pos, r, reason) {
       tradeType: `${pos.tradeType || "Auto"} Exit`, kind: "exit", exitReason: reason || null,
       entryOrderId: pos.entryOrderId || null, managedId: pos.id, ts: Date.now(),
     });
-  } catch (e) { logFinancial("exit_fill.ledger_failed", { userKey, managedId: pos && pos.id, err: String((e && e.message) || e) }); }
+  } catch (e) {
+    /* R24-P2-03: an exit that couldn't be ledgered is a DURABLE repair item, not a silent log. Emit a
+       financial-severity event AND a user-facing notice so the missing closing leg is visible and repairable;
+       the exit-drift monitor (computeExitDrift) also catches it by comparing closed positions to exit fills. */
+    logFinancial("exit_fill.ledger_failed", { userKey, managedId: pos && pos.id, orderId: (r && r.orderId) || (pos && pos.exitOrderId), err: String((e && e.message) || e) });
+    await addUserNotice(pos && pos.userId, { type: "exit_unjournaled", broker: pos && pos.broker, symbol: pos && pos.symbol, msg: `Your ${pos && pos.symbol} position closed at your broker, but recording the closing trade failed — we'll reconcile it. No action needed.` });
+  }
 }
 /* M-02: on SENSITIVE routes, re-check the DB after requireAuth — reject a token whose version is stale
    (PIN reset / block / logout / deletion bumped it) or whose account is now blocked/deleted. A stolen 30-day
@@ -6630,21 +6636,36 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
   const halt = !!(req.body && req.body.halt);
   if (halt) haltedEntries.add(uid); else haltedEntries.delete(uid);
   try { await db.setEntryHalt(uid, halt); } catch (e) { return res.status(500).json({ error: "Could not save — try again." }); }
-  // R21-P1-03 / R23-P1-03: resuming is the user attesting they reconciled with their broker — clear the durable
-  // risk-ledger lock so orders flow again. This write MUST NOT be swallowed: if it fails, the lock is still
-  // engaged (every worker fails closed on it), so we re-halt this worker's cache and tell the UI it's still
-  // locked rather than falsely reporting "resumed". (A future server-side reconciliation transaction can replace
-  // the user attestation — tracked as INC work.)
+  /* R24-P1-03: Resume is NO LONGER a user attestation that clears the risk-ledger lock. The lock is cleared ONLY
+     when a SERVER-side reconciliation proves the book is consistent: we compare the immutable fills ledger against
+     the risk journal (reconcileRiskVsLedger) and clear the lock ONLY when there is zero drift. Any drift (a
+     journalled entry missing from the ledger, or vice-versa, or a quantity mismatch) keeps the lock engaged and
+     tells the user it needs review — a tap can't restore trading against a book we can't prove is complete. A DB
+     error is fail-closed (lock stays on). Entry-halt (the kill switch) still toggles by user action; the risk lock
+     is the stricter gate that requires proof. */
   if (!halt && typeof db.setRiskLock === "function") {
+    let drift = null;
+    try { drift = typeof db.reconcileRiskVsLedger === "function" ? await db.reconcileRiskVsLedger(uid) : { drift: 0 }; }
+    catch (e) {
+      haltedEntries.add(uid);
+      logFinancial("killswitch.resume_reconcile_failed", { userId: uid, err: String((e && e.message) || e) });
+      return res.status(503).json({ error: "Couldn't reconcile your book right now — the risk lock stays on. Try again in a moment." });
+    }
+    if (drift && drift.drift > 0) {
+      haltedEntries.add(uid);   // keep this worker consistent with the still-locked durable state
+      logFinancial("killswitch.resume_blocked_drift", { userId: uid, drift: drift.drift, missingInLedger: (drift.missingInLedger || []).length, missingInJournal: (drift.missingInJournal || []).length });
+      return res.status(409).json({ ok: false, halted: false, riskLocked: true, error: `Your order book doesn't reconcile yet (${drift.drift} unmatched record${drift.drift === 1 ? "" : "s"}) — the risk lock stays on until it's resolved. Please reconcile with your broker or contact support.` });
+    }
     try { await db.setRiskLock(uid, false); }
     catch (e) {
       haltedEntries.add(uid);
       logFinancial("killswitch.resume_unlock_failed", { userId: uid, err: String((e && e.message) || e) });
-      return res.status(500).json({ error: "Couldn't clear the risk lock — it's still engaged. Please retry once your broker is reconciled." });
+      return res.status(500).json({ error: "Couldn't clear the risk lock — it's still engaged. Please retry in a moment." });
     }
+    logFinancial("killswitch.resume_reconciled_unlock", { userId: uid });
   }
   logFinancial(halt ? "killswitch.halt" : "killswitch.resume", { userId: uid });
-  res.json({ ok: true, halted: halt });
+  res.json({ ok: true, halted: halt, riskLocked: false });
 });
 
 /* R3-#1 DURABLE RECONCILIATION. When an order times out we can't tell if the broker accepted it.

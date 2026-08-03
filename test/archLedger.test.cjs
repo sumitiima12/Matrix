@@ -80,6 +80,37 @@ test("INC-1: computeLedgerDrift is clean when journal and ledger agree", () => {
   assert.strictEqual(d.drift, 0);
 });
 
+test("R24-P2-01: projectFills takes the MAX cumulative snapshot per order, not the sum", () => {
+  const fills = [
+    { broker: "fyers", orderId: "P1", qty: 2, kind: "entry" },   // partial snapshot
+    { broker: "fyers", orderId: "P1", qty: 5, kind: "entry" },   // fuller snapshot of the SAME order
+    { broker: "delta", orderId: "D1", qty: 3, kind: "exit" },
+  ];
+  const proj = db.projectFills(fills);
+  const p1 = proj.find((p) => p.orderId === "P1" && p.leg === "entry");
+  assert.strictEqual(p1.qty, 5, "cumulative snapshots collapse to the largest (5), never summed (7)");
+  assert.strictEqual(proj.filter((p) => p.leg === "exit").length, 1);
+});
+
+test("R24-P2-02: computeLedgerDrift flags a quantity mismatch, not just presence", () => {
+  const trades = [{ orderId: "Q1", real: true, serverAuthored: true, qty: 5 }];
+  const fills = [{ orderId: "Q1", qty: 2, kind: "entry" }];   // journal says 5, ledger only saw 2
+  const d = db.computeLedgerDrift(trades, fills);
+  assert.strictEqual(d.missingInLedger.length, 0);
+  assert.strictEqual(d.qtyMismatch.length, 1);
+  assert.strictEqual(d.qtyMismatch[0].journalQty, 5);
+  assert.strictEqual(d.qtyMismatch[0].ledgerQty, 2);
+  assert.ok(d.drift >= 1);
+});
+
+test("R24-P2-03: computeExitDrift finds a closed position with no exit fill", () => {
+  const closed = [{ id: "posA", status: "closed" }, { id: "posB", status: "closed" }];
+  const fills = [{ kind: "exit", managedId: "posA", orderId: "E1" }];   // posB's exit never recorded
+  const d = db.computeExitDrift(closed, fills);
+  assert.deepStrictEqual(d.missingExitFill, ["posB"]);
+  assert.strictEqual(d.drift, 1);
+});
+
 test("R23: claimPendingProtection carries created_at so the watcher ages rows correctly", async () => {
   // Regression: the claim dropped created_at (a top-level column, not inside data), so the delayed-fill
   // watcher computed ageMs = now - 0 = huge and expired EVERY freshly-parked FYERS order immediately.
