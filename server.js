@@ -6056,6 +6056,46 @@ async function sessionFromCred(userId, broker) {
   return { userId: String(userId), broker, accessToken: c.accessToken, refreshToken: c.refreshToken, extra: c.extra || {} };
 }
 
+/* R27-P1-03 / C02: BROKER-BACKED unlock gate. Matrix-store reconciliation (reconcileForUnlock) proves our OWN
+   books agree; this proves they agree with the BROKER. Before the risk lock can clear we take a FRESH, SUCCESSFUL
+   broker snapshot and confirm every Matrix-managed OPEN position is actually live at the broker with at least the
+   quantity we believe we hold. Any unreachable/timed-out/partial broker response, a missing session, a position
+   the broker doesn't confirm, or a stale (slow) snapshot KEEPS THE LOCK — fail closed. Returns
+   { ok, reason, checked, verified, watermark }. Can be disabled with DISABLE_BROKER_UNLOCK_RECON=1 for ops. */
+async function brokerSnapshotForUnlock(userId) {
+  if (process.env.DISABLE_BROKER_UNLOCK_RECON === "1") return { ok: true, reason: "broker recon disabled (ops flag)", checked: 0, verified: 0, watermark: Date.now() };
+  let managed = [];
+  try { managed = await db.getManagedPositionsForUser(String(userId)); }
+  catch { return { ok: false, reason: "couldn't read managed positions to verify with the broker" }; }
+  const openPos = (managed || []).filter((p) => p && (p.status === "open" || p.status === "closing") && Math.abs(Number(p.qty)) > 0);
+  // Nothing Matrix believes is open → no broker position to confirm; the internal reconcile already covered
+  // pending/unknown/exit drift, so this gate is satisfied (don't brick users who simply hold no live positions).
+  if (!openPos.length) return { ok: true, reason: "no open managed positions to verify", checked: 0, verified: 0, watermark: Date.now() };
+  const norm = (s) => String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/(USDT|USD|INR)$/i, "").replace(/[^A-Z0-9]/g, "");
+  const brokers = [...new Set(openPos.map((p) => p.broker).filter(Boolean))];
+  const started = Date.now();
+  let verified = 0;
+  for (const broker of brokers) {
+    let sess; try { sess = await sessionFromCred(userId, broker); } catch { sess = null; }
+    if (!sess) return { ok: false, reason: `no live ${broker} session to verify positions — reconnect your broker, then resume` };
+    let acct; try { acct = await fetchBrokerAccount(sess); } catch { acct = null; }
+    if (!acct || !Array.isArray(acct.portfolio)) return { ok: false, reason: `couldn't fetch a fresh ${broker} snapshot — the risk lock stays on` };
+    const held = new Map();
+    for (const h of acct.portfolio) { const k = norm(h.sym); held.set(k, (held.get(k) || 0) + Math.abs(Number(h.qty) || 0)); }
+    for (const p of openPos.filter((x) => x.broker === broker)) {
+      const brokerQty = held.get(norm(p.symbol || p.brokerSym)) || 0;
+      // A shortfall means the position was reduced/closed at the broker (or never truly filled) → keep the lock.
+      if (brokerQty + 1e-9 < Math.abs(Number(p.qty)) * 0.999) {
+        return { ok: false, reason: `${p.symbol || p.brokerSym} isn't confirmed open at ${broker} (broker holds ${brokerQty}, we track ${p.qty}) — reconcile before resuming` };
+      }
+      verified++;
+    }
+  }
+  const MAX_SNAPSHOT_MS = Number(process.env.UNLOCK_SNAPSHOT_MAX_MS) || 30000;
+  if (Date.now() - started > MAX_SNAPSHOT_MS) return { ok: false, reason: "broker snapshot was too slow to be trustworthy — try again in a moment" };
+  return { ok: true, reason: "broker-confirmed", checked: brokers.length, verified, watermark: Date.now() };
+}
+
 /* Map the app's product choice to each broker's code. "Intraday" auto-square-off (MIS) vs
    carry-forward / delivery (CNC on equity, NRML on F&O). Crypto ignores it. */
 function mapProduct(broker, product) {
@@ -6772,8 +6812,9 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
      (presence + quantity, broker-scoped), zero EXIT drift, NO outstanding pending-protection rows, and NO unknown
      idempotency intents. Any unresolved signal keeps the lock engaged. All reads PROPAGATE errors, so a DB outage
      fails closed (lock stays on) rather than reading "empty ⇒ zero drift". Entry-halt (the kill switch) still
-     toggles by user action; the risk lock is the stricter gate that requires proof. (A live broker-order/position
-     query is the remaining hardening — tracked; this reconciles against Matrix's authoritative stores.) */
+     toggles by user action; the risk lock is the stricter gate that requires proof. R27-P1-03/C02: after the
+     internal stores agree, a FRESH broker snapshot (brokerSnapshotForUnlock) must also confirm every managed open
+     position is live at the broker — so the lock can no longer clear on internally-consistent-but-wrong records. */
   if (!halt && typeof db.setRiskLock === "function") {
     let drift = null;
     try { drift = typeof db.reconcileForUnlock === "function" ? await db.reconcileForUnlock(uid) : (typeof db.reconcileRiskVsLedger === "function" ? await db.reconcileRiskVsLedger(uid) : { drift: 0 }); }
@@ -6787,6 +6828,22 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
       logFinancial("killswitch.resume_blocked_drift", { userId: uid, drift: drift.drift, missingInLedger: (drift.missingInLedger || []).length, missingInJournal: (drift.missingInJournal || []).length });
       return res.status(409).json({ ok: false, halted: false, riskLocked: true, error: `Your order book doesn't reconcile yet (${drift.drift} unmatched record${drift.drift === 1 ? "" : "s"}) — the risk lock stays on until it's resolved. Please reconcile with your broker or contact support.` });
     }
+    /* R27-P1-03 / C02: internal books agree — now require BROKER TRUTH. A fresh, successful broker snapshot must
+       confirm every Matrix-managed open position is actually live at the broker. A missing session, an unreachable
+       or partial broker response, a stale snapshot, or a position the broker doesn't confirm keeps the lock. */
+    let brokerRecon = null;
+    try { brokerRecon = await brokerSnapshotForUnlock(req.authUserId); }
+    catch (e) {
+      haltedEntries.add(uid);
+      logFinancial("killswitch.resume_broker_recon_failed", { userId: uid, err: String((e && e.message) || e) });
+      return res.status(503).json({ ok: false, halted: false, riskLocked: true, error: "Couldn't verify your positions with the broker right now — the risk lock stays on. Try again in a moment." });
+    }
+    if (!brokerRecon.ok) {
+      haltedEntries.add(uid);
+      logFinancial("killswitch.resume_blocked_broker", { userId: uid, reason: brokerRecon.reason });
+      return res.status(409).json({ ok: false, halted: false, riskLocked: true, error: `Broker check didn't clear — the risk lock stays on. ${brokerRecon.reason}` });
+    }
+    logFinancial("killswitch.resume_broker_confirmed", { userId: uid, checked: brokerRecon.checked, verified: brokerRecon.verified, watermark: brokerRecon.watermark });
     try { await db.setRiskLock(uid, false); }
     catch (e) {
       haltedEntries.add(uid);
