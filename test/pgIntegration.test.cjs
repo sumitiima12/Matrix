@@ -20,9 +20,11 @@ const U_B = "test_pg_userB_919900000002";
 test.before(async () => { if (!HAS_PG) return; db = require("../db.js"); await db.initDb(); });
 test.after(async () => {
   if (!HAS_PG || !db) return;
-  // Best-effort cleanup of the synthetic users' rows.
-  try { await db.clearTradesByType(U_A, "all", "all"); } catch { /* ignore */ }
-  try { await db.clearTradesByType(U_B, "all", "all"); } catch { /* ignore */ }
+  // Best-effort cleanup of the synthetic users' rows (trades + fills + idempotency + pending).
+  for (const u of [U_A, U_B]) {
+    try { await db.clearTradesByType(u, "all", "all"); } catch { /* ignore */ }
+    try { await db.purgeLedgersForUser(u, { preserveFills: false }); } catch { /* ignore */ }
+  }
 });
 
 test("PG: server↔browser rows for the same broker fill collapse to one", opts, async () => {
@@ -49,4 +51,50 @@ test("PG: a client-chosen id cannot address another user's row", opts, async () 
   const aRows = await db.getTrades(U_A, 0, Date.now() + 60000);
   assert.ok(aRows.some((t) => t.sym === "AAA"));
   assert.ok(!aRows.some((t) => t.sym === "BBB"));
+});
+
+/* R25-M03 — Postgres coverage for the R24/R25 safety invariants that only a real transactional DB exercises. */
+
+test("PG-M03: recordFillAndTrade commits BOTH the trade and the fill in one transaction", opts, async () => {
+  const t = { broker: "fyers", orderId: "PGTX1", side: "BUY", qty: 4, entry: 120, market: "IN", tradeType: "Manual", entryAt: Date.now(), real: true };
+  await db.recordFillAndTrade(U_A, t);
+  const trades = await db.getTrades(U_A, 0, Date.now() + 60000);
+  const fills = await db.getFills(U_A, 0, Date.now() + 60000);
+  assert.ok(trades.some((x) => x.orderId === "PGTX1" && x.serverAuthored === true), "authoritative trade committed");
+  assert.strictEqual(fills.filter((x) => x.orderId === "PGTX1").length, 1, "fill committed exactly once");
+  await db.recordFillAndTrade(U_A, t);   // idempotent replay
+  const fills2 = await db.getFills(U_A, 0, Date.now() + 60000);
+  assert.strictEqual(fills2.filter((x) => x.orderId === "PGTX1").length, 1, "replay does not duplicate the fill");
+});
+
+test("PG-M03: recycled-number handoff moves fills to the archive key in the same transaction", opts, async () => {
+  await db.recordFill(U_B, { broker: "fyers", orderId: "PGMIG1", side: "BUY", qty: 1, entry: 10, market: "IN", entryAt: Date.now() });
+  const archiveKey = `arch_${Date.now()}`;
+  await db.reassignAndArchiveTrades("919900000002", U_B, archiveKey);
+  const oldFills = await db.getFills(U_B, 0, Date.now() + 60000);
+  const movedFills = await db.getFills(archiveKey, 0, Date.now() + 60000);
+  assert.ok(!oldFills.some((x) => x.orderId === "PGMIG1"), "fills left the recycled key");
+  assert.ok(movedFills.some((x) => x.orderId === "PGMIG1"), "fills moved to the archive key");
+  try { await db.purgeLedgersForUser(archiveKey, { preserveFills: false }); } catch { /* ignore */ }
+});
+
+test("PG-M03: retained-history deletion KEEPS fills; full erasure removes them", opts, async () => {
+  const uid = `test_pg_del_${Date.now()}`;
+  const phone = uid.replace(/[^0-9]/g, "").slice(-10) || "9999999999";
+  await db.recordFill(uid, { broker: "delta", orderId: "PGDEL1", side: "BUY", qty: 1, entry: 5, market: "Crypto", entryAt: Date.now() });
+  await db.purgeLedgersForUser(uid, { preserveFills: true });   // retained-history path
+  assert.strictEqual((await db.getFills(uid, 0, Date.now() + 60000)).length, 1, "fills preserved with retained trades");
+  await db.purgeLedgersForUser(uid, { preserveFills: false });  // full erasure
+  assert.strictEqual((await db.getFills(uid, 0, Date.now() + 60000)).length, 0, "fills removed on full erasure");
+});
+
+test("PG-M03: countUnknownIdempotency reflects unresolved order intents", opts, async () => {
+  const uid = `test_pg_idem_${Date.now()}`;
+  await db.claimIdempotencyKey(uid, "pg_key_unknown_1", "hash1");
+  await db.finalizeIdempotency(uid, "pg_key_unknown_1", "unknown", null);
+  assert.strictEqual(await db.countUnknownIdempotency(uid), 1, "one unknown counted");
+  await db.claimIdempotencyKey(uid, "pg_key_ok_1", "hash2");
+  await db.finalizeIdempotency(uid, "pg_key_ok_1", "succeeded", { orderId: "x" });
+  assert.strictEqual(await db.countUnknownIdempotency(uid), 1, "succeeded rows are not counted as unknown");
+  try { await db.purgeLedgersForUser(uid, { preserveFills: false }); } catch { /* ignore */ }
 });

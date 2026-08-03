@@ -118,6 +118,36 @@ test("R25-H02: recordFillAndTrade writes BOTH the fill and the trade projection 
   assert.strictEqual(fills2.filter((x) => x.orderId === "TX1").length, 1, "replay does not duplicate the fill");
 });
 
+test("H03/H04: deriveRiskFromFills derives count, cooldown and realized P&L from matched executions", () => {
+  const t0 = Date.UTC(2026, 6, 1, 4, 0);
+  const fills = [
+    // Round-trip 1 (long): buy 5 @100 entry, sell 5 @110 exit → +50
+    { broker: "fyers", orderId: "E1", kind: "entry", side: "BUY", qty: 5, entry: 100, ts: t0 },
+    { broker: "fyers", orderId: "X1", kind: "exit", side: "SELL", qty: 5, entry: 110, ts: t0 + 3600000, entryOrderId: "E1" },
+    // Round-trip 2 (long): buy 2 @50 entry, sell 2 @40 exit → −20 (a loss)
+    { broker: "fyers", orderId: "E2", kind: "entry", side: "BUY", qty: 2, entry: 50, ts: t0 + 7200000 },
+    { broker: "fyers", orderId: "X2", kind: "exit", side: "SELL", qty: 2, entry: 40, ts: t0 + 10800000, entryOrderId: "E2" },
+    // Open entry, no exit yet
+    { broker: "delta", orderId: "E3", kind: "entry", side: "BUY", qty: 1, entry: 10, ts: t0 + 14400000 },
+  ];
+  const r = db.deriveRiskFromFills(fills, { from: t0 - 1000, to: t0 + 20000000 });
+  assert.strictEqual(r.entryCount, 3, "three entries today");
+  assert.strictEqual(r.matched, 2, "two round-trips matched");
+  assert.strictEqual(r.realizedPnl, 30, "net realized = +50 − 20");
+  assert.strictEqual(r.realizedLoss, 20, "realized loss = 20");
+  assert.strictEqual(r.lastEntryTs, t0 + 14400000, "last entry ts is the open Delta entry");
+});
+
+test("H03/H04: a SHORT round-trip realizes profit when price falls", () => {
+  const t0 = Date.UTC(2026, 6, 1, 4, 0);
+  const fills = [
+    { broker: "delta", orderId: "S1", kind: "entry", side: "SELL", qty: 3, entry: 100, ts: t0 },
+    { broker: "delta", orderId: "SX1", kind: "exit", side: "BUY", qty: 3, entry: 90, ts: t0 + 3600000, entryOrderId: "S1" },
+  ];
+  const r = db.deriveRiskFromFills(fills, { from: 0, to: t0 + 10000000 });
+  assert.strictEqual(r.realizedPnl, 30, "short profits when price drops 100→90 on 3 units");
+});
+
 test("R25-H05: drift keys are broker-scoped — same orderId at two brokers does NOT collide", () => {
   const trades = [
     { orderId: "100", broker: "fyers", real: true, serverAuthored: true, qty: 5 },
