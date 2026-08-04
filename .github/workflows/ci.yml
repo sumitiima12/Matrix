@@ -157,9 +157,12 @@ jobs:
           # R38: brokers this deployment certifies. Default both; narrow via vars.CERT_BROKERS (e.g. "delta").
           CB=$(echo "${CERT_BROKERS:-delta,fyers}" | tr 'A-Z' 'a-z')
           WANT_FYERS=0; echo "$CB" | grep -qw fyers && WANT_FYERS=1
-          WANT_DELTA=0; echo "$CB" | grep -qw delta && WANT_DELTA=1
-          if [ "$WANT_FYERS" = "0" ] && [ "$WANT_DELTA" = "0" ]; then
-            echo "::error::CERT_BROKERS='${CERT_BROKERS}' names no known broker (expected delta and/or fyers)"; exit 1
+          # R39-P1-03: DELTA is IP-whitelisted at the exchange, so it can NEVER be certified from a GitHub shared runner.
+          # It is certified by the dedicated self-hosted `broker-sandbox-delta` job instead. This shared job is FYERS-only.
+          WANT_DELTA=0
+          if [ "$WANT_FYERS" = "0" ]; then
+            echo "broker_sandbox=fyers-not-requested (Delta is certified by the self-hosted broker-sandbox-delta job)" | tee -a artifacts/broker-sandbox.txt
+            exit 0
           fi
           # A broker is "requested" for certification only if it has its COMPLETE credential set. A partial set is treated
           # as MISSING (never a partial certification).
@@ -214,6 +217,113 @@ jobs:
           path: artifacts/
           retention-days: 90
 
+  # R39-P1-03: DELTA testnet CERTIFICATION on the STATIC-IP self-hosted runner (Delta whitelists egress IPs, so the raw
+  # Delta order-lifecycle + fill-verification cert can't run on GitHub's shared runners). Produces the per-SHA
+  # `broker-sandbox-delta-evidence-<sha>` artifact the reviewer wants for P1-01. Gated on vars.CERT_DELTA=1 + secrets.
+  broker-sandbox-delta:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 15
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.CERT_DELTA == '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Delta testnet order + fill certification (self-hosted, whitelisted IP)
+        env:
+          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
+          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
+          DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
+          DELTA_SANDBOX_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
+          DELTA_SANDBOX_MAX_SIZE: ${{ vars.DELTA_SANDBOX_MAX_SIZE }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [ -z "${DELTA_SANDBOX_KEY:-}" ] || [ -z "${DELTA_SANDBOX_SECRET:-}" ] || [ -z "${DELTA_SANDBOX_BASE:-}" ]; then
+            echo "broker_delta=NOT_CONFIGURED" | tee artifacts/broker-sandbox-delta.txt
+            echo "::error::CERT_DELTA=1 but Delta testnet secrets/base are missing"; exit 1
+          fi
+          ls test/deltaTestnet*.cjs >/dev/null 2>&1 || { echo "::error::delta sandbox suite file missing"; exit 1; }
+          BROKER_SANDBOX=1 node --test test/deltaTestnet*.cjs 2>&1 | tee artifacts/broker-sandbox-delta.tap
+          PASS=$(grep -c '^ok ' artifacts/broker-sandbox-delta.tap || true)
+          FAIL=$(grep -c '^not ok ' artifacts/broker-sandbox-delta.tap || true)
+          SKIP=$(grep -Ec '# (SKIP|skip)' artifacts/broker-sandbox-delta.tap || true)
+          echo "commit=${GITHUB_SHA} want_delta=1 pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee artifacts/broker-sandbox-delta.txt
+          if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
+            echo "broker_delta=NOT_CERTIFIED" | tee -a artifacts/broker-sandbox-delta.txt
+            echo "::error::Delta certification invalid (need pass>0, fail=0, skipped=0)"; exit 1
+          fi
+          echo "broker_delta=CERTIFIED" | tee -a artifacts/broker-sandbox-delta.txt
+      - name: Upload Delta certification evidence (per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-sandbox-delta-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90
+
+  # R39-P1-03: MatrixOne-PATH real-broker E2E on a STATIC-IP self-hosted runner. Delta whitelists egress IPs, so this
+  # can't run on GitHub's shared runners — it targets `runs-on: [self-hosted, linux]` (register the Oracle VM as a
+  # repo runner with those labels). It boots a REAL PostgreSQL service + drives an order through MatrixOne's own route
+  # against the Delta TESTNET, proving entry→journal→protection→reduce-only close→idempotency→recovery→single-owner.
+  # Gated: runs only when vars.RUN_BROKER_E2E=1 AND the Delta testnet secrets are present; otherwise it no-ops.
+  broker-e2e:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 20
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: matrix
+          POSTGRES_PASSWORD: matrix
+          POSTGRES_DB: matrix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: MatrixOne-path Delta testnet E2E
+        env:
+          CI: 'true'
+          BROKER_E2E: '1'
+          DATABASE_URL: postgres://matrix:matrix@localhost:5432/matrix_test
+          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
+          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
+          DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
+          DELTA_SANDBOX_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
+          DELTA_SANDBOX_MAX_SIZE: ${{ vars.DELTA_SANDBOX_MAX_SIZE }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [ -z "${DELTA_SANDBOX_KEY:-}" ] || [ -z "${DELTA_SANDBOX_SECRET:-}" ] || [ -z "${DELTA_SANDBOX_BASE:-}" ]; then
+            echo "::error::broker-e2e is enabled (RUN_BROKER_E2E=1) but Delta testnet secrets/base are missing"; exit 1
+          fi
+          node --test --test-force-exit test/brokerPipelineE2E.sandbox.cjs 2>&1 | tee artifacts/broker-e2e.tap
+          PASS=$(grep -c '^ok ' artifacts/broker-e2e.tap || true)
+          FAIL=$(grep -c '^not ok ' artifacts/broker-e2e.tap || true)
+          SKIP=$(grep -Ec '# (SKIP|skip)' artifacts/broker-e2e.tap || true)
+          echo "commit=${GITHUB_SHA} pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee artifacts/broker-e2e.txt
+          # A real certification: pass>0, fail=0, skipped=0 (no vacuous run).
+          if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
+            echo "::error::MatrixOne-path E2E invalid (need pass>0, fail=0, skipped=0)"; exit 1
+          fi
+      - name: Upload broker-e2e evidence (per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-e2e-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90
+
   # R39-P3-01: PROTECTED real-money deployment gate. This job is the enforcement point the docs described but the
   # workflow lacked. It runs ONLY on the release branch when vars.REAL_MONEY_RELEASE=1, `needs:` the backend + broker
   # certification jobs (so it can't start unless both SUCCEEDED), and binds to a PROTECTED `environment:` — configure
@@ -233,31 +343,61 @@ jobs:
         with:
           name: backend-evidence-${{ github.sha }}
           path: ev-backend
-      - name: Download broker-sandbox evidence (this SHA)
+      - name: Download FYERS broker-sandbox evidence (this SHA)
         uses: actions/download-artifact@v4
         with:
           name: broker-sandbox-evidence-${{ github.sha }}
           path: ev-broker
+      - name: Download Delta certification evidence (this SHA)
+        if: ${{ vars.CERT_DELTA == '1' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: broker-sandbox-delta-evidence-${{ github.sha }}
+          path: ev-delta
+      - name: Download MatrixOne-path E2E evidence (this SHA)
+        if: ${{ vars.RUN_BROKER_E2E == '1' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: broker-e2e-evidence-${{ github.sha }}
+          path: ev-e2e
       - name: Verify certified evidence before real-money activation
         env:
           CERT_BROKERS: ${{ vars.CERT_BROKERS }}
+          CERT_DELTA: ${{ vars.CERT_DELTA }}
+          RUN_BROKER_E2E: ${{ vars.RUN_BROKER_E2E }}
         run: |
           set -euo pipefail
           BE=ev-backend/backend-evidence.txt
-          BS=ev-broker/broker-sandbox.txt
           [ -f "$BE" ] || { echo "::error::missing backend evidence for ${GITHUB_SHA}"; exit 1; }
-          [ -f "$BS" ] || { echo "::error::missing broker-sandbox evidence for ${GITHUB_SHA}"; exit 1; }
           # 1) Backend evidence must be for THIS commit, green, zero-skip.
           grep -q "commit=${GITHUB_SHA}" "$BE" || { echo "::error::backend evidence commit mismatch (artifact is not for ${GITHUB_SHA})"; exit 1; }
           grep -q "^fail=0" "$BE" || { echo "::error::backend evidence shows failures"; exit 1; }
           grep -q "^skipped=0" "$BE" || { echo "::error::backend evidence shows skipped tests"; exit 1; }
-          # 2) Broker certification must have actually happened — never a NOT_CERTIFIED / NOT_CONFIGURED artifact.
-          if grep -Eq 'NOT_CERTIFIED|NOT_CONFIGURED' "$BS"; then echo "::error::broker-sandbox was not certified for a real-money release"; exit 1; fi
-          grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$BS" || { echo "::error::broker-sandbox evidence is not a clean pass>0/fail=0/skipped=0"; exit 1; }
-          # 3) Every broker named in CERT_BROKERS must be one the certification run actually WANTED and ran.
-          CB=$(echo "${CERT_BROKERS:-delta,fyers}" | tr 'A-Z' 'a-z')
-          echo "$CB" | grep -qw fyers && ! grep -q 'want_fyers=1' "$BS" && { echo "::error::fyers is in CERT_BROKERS but was not certified"; exit 1; } || true
-          echo "$CB" | grep -qw delta && ! grep -q 'want_delta=1' "$BS" && { echo "::error::delta is in CERT_BROKERS but was not certified"; exit 1; } || true
-          echo "deploy_gate=GO commit=${GITHUB_SHA} cert_brokers=${CB}"
-          echo "::notice::Real-money release evidence verified for ${GITHUB_SHA} (backend green+zero-skip; brokers ${CB} certified). Proceeding to protected deployment."
+          CB=$(echo "${CERT_BROKERS:-fyers}" | tr 'A-Z' 'a-z')
+          # 2) FYERS (shared runner) — required only if named in CERT_BROKERS.
+          if echo "$CB" | grep -qw fyers; then
+            BS=ev-broker/broker-sandbox.txt
+            [ -f "$BS" ] || { echo "::error::missing FYERS broker-sandbox evidence"; exit 1; }
+            if grep -Eq 'NOT_CERTIFIED|NOT_CONFIGURED|fyers-not-requested' "$BS"; then echo "::error::FYERS was not certified for a real-money release"; exit 1; fi
+            grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$BS" || { echo "::error::FYERS evidence is not a clean pass>0/fail=0/skipped=0"; exit 1; }
+            grep -q 'want_fyers=1' "$BS" || { echo "::error::FYERS evidence does not confirm it ran"; exit 1; }
+          fi
+          # 3) DELTA (self-hosted, whitelisted IP) — required if named in CERT_BROKERS. Its evidence comes from the
+          #    dedicated broker-sandbox-delta job, which only runs when CERT_DELTA=1.
+          if echo "$CB" | grep -qw delta; then
+            [ "${CERT_DELTA:-0}" = "1" ] || { echo "::error::delta is in CERT_BROKERS but CERT_DELTA!=1 (the self-hosted Delta cert job did not run)"; exit 1; }
+            DS=ev-delta/broker-sandbox-delta.txt
+            [ -f "$DS" ] || { echo "::error::missing Delta certification evidence for ${GITHUB_SHA}"; exit 1; }
+            grep -q "commit=${GITHUB_SHA}" "$DS" || { echo "::error::Delta evidence commit mismatch"; exit 1; }
+            grep -q 'broker_delta=CERTIFIED' "$DS" || { echo "::error::Delta was not CERTIFIED"; exit 1; }
+          fi
+          # 4) MatrixOne-path E2E — required for unattended automation; gated by RUN_BROKER_E2E.
+          if [ "${RUN_BROKER_E2E:-0}" = "1" ]; then
+            EE=ev-e2e/broker-e2e.txt
+            [ -f "$EE" ] || { echo "::error::missing MatrixOne-path E2E evidence for ${GITHUB_SHA}"; exit 1; }
+            grep -q "commit=${GITHUB_SHA}" "$EE" || { echo "::error::E2E evidence commit mismatch"; exit 1; }
+            grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$EE" || { echo "::error::MatrixOne-path E2E is not a clean pass>0/fail=0/skipped=0"; exit 1; }
+          fi
+          echo "deploy_gate=GO commit=${GITHUB_SHA} cert_brokers=${CB} cert_delta=${CERT_DELTA:-0} e2e=${RUN_BROKER_E2E:-0}"
+          echo "::notice::Real-money release evidence verified for ${GITHUB_SHA}. Proceeding to protected deployment."
           # (Real deployment / capability activation step goes here — kept as the single gated point.)
