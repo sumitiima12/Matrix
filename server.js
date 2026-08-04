@@ -8127,6 +8127,122 @@ app.post("/api/autobuy/close", requireAuth, requireActiveUser, async (req, res) 
   }
 });
 
+/* §5 — CANONICAL REAL EXIT LIFECYCLE. A dedicated, position-addressable close. A close is NOT a generic
+   opposite-side entry: it targets a specific server-owned position, reduces it, and books the exit leg linked to
+   that position/entry. Contract (spec §5):
+     • Requires the server-owned positionId (URL), a stable exit intent id (idempotency), and derives the user
+       from the verified token (never the body). entryOrderId + requested quantity + reason are optional inputs.
+     • Locks/validates the referenced position; refuses if entryOrderId doesn't match (won't close the wrong row).
+     • Requires the broker's manualExit capability.
+     • Clamps the requested quantity to the OPEN tracked quantity AND to fresh broker exposure (never sends a
+       reduce order larger than the broker actually holds; if the broker is already flat, reconciles closed with
+       no new order).
+     • Atomically claims the position (open→closing) so a concurrent close / the exit engine can't double-submit;
+       the durable exit tag makes a crash mid-close idempotent.
+     • Uses the certified reduce-only exit path; records each confirmed execution as kind=exit linked to
+       entryOrderId/positionId; returns AUTHORITATIVE filled + remaining quantity.
+     • A partial close reduces the tracked quantity and keeps the residual OPEN (never a false full close); an
+       unconfirmed/pending/partial broker result keeps the position visible and retryable. */
+app.post("/api/real-positions/:positionId/close", requireAuth, requireActiveUser, requireFreshSession, async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const positionId = String(req.params.positionId || "");
+    const { entryOrderId = null, quantity = null, reason = "manual-close", exitIntentId = null } = req.body || {};
+    if (!userId || !positionId) return res.status(400).json({ error: "positionId is required" });
+    // A stable exit intent id (idempotency key) is mandatory so a retry replays one close, never a second order.
+    const intentId = String(exitIntentId || req.get("X-Idempotency-Key") || "").trim();
+    if (!intentId) return res.status(400).json({ error: "a stable exitIntentId (or X-Idempotency-Key) is required for a real close" });
+
+    // Lock + validate the referenced position — it must belong to THIS authenticated user.
+    let positions; try { positions = await db.getManagedPositionsForUser(userId); }
+    catch { return res.status(503).json({ error: "couldn't read your positions to close this — retry in a moment" }); }
+    const pos = (positions || []).find((p) => String(p.id) === positionId);
+    if (!pos) return res.status(404).json({ error: "position not found for this account" });
+    if (pos.status === "closed" || pos.exitAt != null) return res.json({ ok: true, closed: true, alreadyClosed: true, filledQty: 0, remainingQty: 0 });
+    // §5: honor the referenced entryOrderId first — a mismatch means the client is trying to close a different
+    // position; refuse rather than flatten the wrong row.
+    if (entryOrderId != null && pos.entryOrderId != null && String(entryOrderId) !== String(pos.entryOrderId)) {
+      return res.status(409).json({ error: "entryOrderId does not match this position — refusing to close the wrong position" });
+    }
+    if (!ensureCapability(res, pos.broker, "manualExit")) return undefined;
+
+    const openQty = Math.abs(Number(pos.qty) || 0);
+    if (openQty <= 0) return res.status(400).json({ error: "this position has no open quantity to close" });
+    let requestedQty = quantity != null ? Math.abs(Number(quantity)) : openQty;
+    if (!Number.isFinite(requestedQty) || requestedQty <= 0) requestedQty = openQty;
+    requestedQty = Math.min(requestedQty, openQty);   // never close more than we track
+
+    const sess = await sessionFromCred(userId, pos.broker);
+    if (!sess) return res.status(400).json({ error: `no stored ${pos.broker} credentials — reconnect it first` });
+
+    // §5: clamp to FRESH broker exposure so we never send a reduce order larger than the broker holds.
+    const _n = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "").replace(/[^A-Z0-9]/g, "");
+    let brokerQty = null;
+    try {
+      const acct = await fetchBrokerAccount(sess);
+      if (acct && Array.isArray(acct.portfolio)) {
+        const held = acct.portfolio.find((h) => _n(h.sym) === _n(pos.brokerSym || pos.symbol));
+        // A SUCCESSFUL read with the symbol absent means the broker holds ZERO of it (already flat) — that is
+        // authoritative, so brokerQty=0 (not null). Only a THROWN read leaves brokerQty=null (unknown exposure).
+        brokerQty = held ? Math.abs(Number(held.qty ?? held.netQty ?? 0)) : 0;
+      }
+    } catch { brokerQty = null; }   // couldn't read exposure → fall back to the tracked quantity
+    if (brokerQty != null && brokerQty <= 0) {
+      // The broker holds nothing for this symbol → already flat there. Reconcile closed WITHOUT a new order.
+      await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: `${reason} (broker already flat)`, closingSince: null });
+      return res.json({ ok: true, closed: true, filledQty: 0, remainingQty: 0, note: "broker holds no exposure for this symbol — position reconciled closed without placing an order" });
+    }
+    const closeQty = brokerQty != null ? Math.min(requestedQty, brokerQty) : requestedQty;
+
+    const live = String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true";
+    if (!live) {
+      await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: `${reason} (dry-run)`, closingSince: null });
+      return res.json({ ok: true, closed: true, dryRun: true, filledQty: closeQty, remainingQty: openQty - closeQty });
+    }
+
+    // ATOMIC claim (open→closing) so a second close / the exit engine can't also submit; exitTag ⇒ crash-idempotent.
+    const exitTag = reconcile.fyersOrderTag(`mxc${pos.id}x${intentId.slice(0, 12)}`);
+    const claimed = await db.claimManagedForExit(pos.id, { closingSince: Date.now(), exitTag });
+    if (!claimed) return res.status(409).json({ ok: false, closed: false, error: "a close is already in progress for this position — it won't be submitted twice" });
+
+    let r;
+    try {
+      r = await placeExitOrder(sess, pos.brokerSym, closeQty, pos.market, pos.product, !!pos.short, exitTag);
+    } catch (exitErr) {
+      // A thrown exit must not strand the position. FYERS keeps "closing" so tag-reconcile finishes it (never a
+      // duplicate SELL); other brokers reopen to retry. Either way protection/monitoring continues.
+      if (pos.broker === "fyers") await db.updateManagedPosition(pos.id, { status: "closing", closingSince: null, lastError: `Close failed (${String(exitErr.message || exitErr)}) — reconciling by exit tag.` });
+      else await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, lastError: `Close failed (${String(exitErr.message || exitErr)}) — kept open, will retry.` });
+      return res.status(502).json({ ok: false, closed: false, filledQty: 0, remainingQty: closeQty, error: "couldn't confirm the close with your broker — the position is kept open and will keep retrying" });
+    }
+
+    // Fill truth: brokers that report fill status must CONFIRM a full fill; a partial/pending broker fill leaves
+    // real exposure, so we never mark it closed.
+    if (("filled" in r) && r.filled !== true) {
+      if (r.pending && pos.broker === "fyers") {
+        await db.updateManagedPosition(pos.id, { status: "closing", closingSince: null, exitOrderId: r.orderId || null, lastError: `Close pending at broker (state ${r.state}) — awaiting fill; not resubmitting.` });
+        return res.status(202).json({ ok: false, closed: false, pending: true, orderId: r.orderId || null, filledQty: 0, remainingQty: closeQty, error: "close placed and pending at your broker — awaiting fill; it won't be submitted twice" });
+      }
+      await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, exitTag: null, exitOrderId: r.orderId || null, lastError: `Close not fully filled (state ${r.state}) — will retry.` });
+      return res.status(409).json({ ok: false, closed: false, orderId: r.orderId || null, filledQty: 0, remainingQty: closeQty, error: "broker didn't confirm a full close — the position is still open and will keep retrying" });
+    }
+
+    // Confirmed close of closeQty. Book the exit leg linked to entryOrderId/positionId, then update the position.
+    const filledQty = closeQty;
+    const remainingQty = openQty - filledQty;
+    await recordExitFill(storageKeyFor(pos.userId), { ...pos, entryOrderId: pos.entryOrderId }, { orderId: r.orderId, filledQty, avgPrice: r.avgPrice }, reason);
+    if (remainingQty <= 1e-9) {
+      await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: reason, exitOrderId: r.orderId || null, closingSince: null });
+    } else {
+      // §5: a PARTIAL close (requested < open, or broker exposure < open) reduces the tracked quantity and keeps
+      // the residual OPEN — the exposure is never hidden behind a false full close.
+      await db.updateManagedPosition(pos.id, { qty: remainingQty, status: "open", closingSince: null, exitTag: null, exitOrderId: r.orderId || null, exitReason: `${reason} (partial)` });
+    }
+    logFinancial("real_close.confirmed", { userId: String(userId), positionId, broker: pos.broker, filledQty, remainingQty, orderId: r.orderId || null });
+    return res.json({ ok: true, closed: remainingQty <= 1e-9, filledQty, remainingQty, orderId: r.orderId || null });
+  } catch (e) { serverError(res, e); }
+});
+
 /* UPDATE SL/TP — change the strategy's stop-loss / take-profit and push the new levels onto its open
    managed position so the exit engine acts on them. */
 app.post("/api/autobuy/update", requireAuth, requireActiveUser, async (req, res) => {
