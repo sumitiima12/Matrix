@@ -15,6 +15,12 @@
  */
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;   // paise/cents
+// R38-P2-01 — the IST trading day (YYYY-MM-DD) of a fill, from its execution timestamp. Fee reconciliation is
+// partitioned by (broker, trading-day) so each day's fills are matched ONLY against that day's settled statement — a
+// delayed prior-day note still finalizes, and reused order/exec IDs on different days never cross-match.
+const IST_OFFSET_MS = 19800000;
+const istTradingDay = (ms) => new Date(Number(ms) + IST_OFFSET_MS).toISOString().slice(0, 10);
+const fillTradingDay = (f, fallbackMs) => istTradingDay(f && (f.ts ?? f.createdAt ?? f.created_at ?? f.at) != null ? (f.ts ?? f.createdAt ?? f.created_at ?? f.at) : fallbackMs);
 
 // Match provisional fills to contract-note charges.
 //   • EXACT execution match (execId line) → that execution's charge, verbatim.
@@ -163,34 +169,52 @@ async function runEodFeeReconcile({ userKeys = [], listReconcilableFills, listPr
     const unfinalized = real.filter((f) => f.feeFinalized !== true);
     if (!unfinalized.length) continue;   // nothing left to finalize for this user
     usersTouched++;
-    // Fetch each involved broker's contract note ONCE, then reconcile against the union of lines. R33-P2-02: TAG each
-    // line with the broker it came from so the matcher scopes charges per broker (broker IDs aren't globally unique).
-    const brokers = [...new Set(real.map((f) => String(f.broker || "")))];
-    let note = [];
-    for (const broker of brokers) {
-      try { const n = await fetchContractNote(uk, broker); if (Array.isArray(n)) note = note.concat(n.map((ln) => ({ ...ln, broker: (ln && ln.broker != null) ? ln.broker : broker }))); }
-      catch (e) { errors++; log("eodfee.note_failed", { userKey: uk, broker, err: String((e && e.message) || e) }); }
+
+    /* R38-P2-01/P2-02 — PARTITION by (broker, IST trading-day). Each group is reconciled ONLY against that broker's
+       statement for THAT day, fetched per group with the day passed to the importer. This finalizes a delayed prior-day
+       statement (older fills are no longer stranded because we fetch each day, not just the newest), and reused
+       order/exec IDs on different days can never cross-match (the candidate set is a single day's fills). The matcher
+       still receives that day's COMPLETE real set (finalized + not) so order-level allocation stays convergent. */
+    const groups = new Map();   // `${broker}${day}` -> { broker, day, fills: [] }
+    for (const f of real) {
+      const broker = String(f.broker || "");
+      const day = fillTradingDay(f, now);
+      const gk = broker + SEP + day;
+      if (!groups.has(gk)) groups.set(gk, { broker, day, fills: [] });
+      groups.get(gk).fills.push(f);
     }
-    // Pass the COMPLETE real set so order-level allocation is deterministic + convergent; mk() emits only the missing overlays.
-    const finals = reconcileEodFees({ fills: real, contractNote: note, now });
-    // R36-P3-01: track how many of THIS user's unfinalized fills became DURABLY resolved (a new insert, or a verified
-    // identical replay). stillProvisional is then unfinalized MINUS durably-resolved — NOT unfinalized minus proposed
-    // finalizations. So a persistence failure or a conflict leaves the fill counted as still-provisional, and the
-    // monitor can never report a false-empty backlog during a DB failure or collision.
-    let resolvedThisUser = 0;
-    for (const fin of finals) {
+
+    let resolvedThisUser = 0, unfinalizedConsidered = 0;
+    for (const { broker, day, fills: grpFills } of groups.values()) {
+      const grpUnfinalized = grpFills.filter((f) => f.feeFinalized !== true);
+      if (!grpUnfinalized.length) continue;   // this (broker, day) is fully finalized already
+      unfinalizedConsidered += grpUnfinalized.length;
+      // Fetch THIS day's statement for THIS broker. R33-P2-02: tag each line with its broker; R38-P2-01: stamp the
+      // trading day for audit/identity. The importer receives the day so it requests + validates the correct statement.
+      let note = [];
       try {
-        // R33-P2-01: recordFeeFinal returns { inserted, conflict }. A finalization only counts (and its delta only
-        // moves net P&L) when a NEW immutable row is actually written. inserted:false with identical content is an
-        // idempotent replay (alreadyFinal); inserted:false with DIFFERENT content is a collision alert (conflict).
-        const r = await recordFeeFinal(uk, fin);
-        if (r && r.inserted === false) {
-          if (r.conflict) { conflicts++; log("eodfee.conflict", { userKey: uk, fillId: fin.fillId, broker: fin.broker }); }   // UNresolved
-          else { alreadyFinal++; resolvedThisUser++; }   // verified identical overlay ⇒ durably resolved
-        } else { finalized++; resolvedThisUser++; netFeeCorrection += Number(fin.feeDelta) || 0; }   // new durable insert
-      } catch (e) { errors++; log("eodfee.persist_failed", { userKey: uk, fillId: fin.fillId, err: String((e && e.message) || e) }); }   // failed write ⇒ UNresolved
+        const n = await fetchContractNote(uk, broker, day);
+        if (Array.isArray(n)) note = n.map((ln) => ({ ...ln, broker: (ln && ln.broker != null) ? ln.broker : broker, tradingDate: (ln && ln.tradingDate != null) ? ln.tradingDate : day }));
+      } catch (e) { errors++; log("eodfee.note_failed", { userKey: uk, broker, tradingDate: day, err: String((e && e.message) || e) }); }
+      // Reconcile ONLY this day's complete real set against this day's note. Order-level allocation is convergent.
+      const finals = reconcileEodFees({ fills: grpFills, contractNote: note, now });
+      for (const fin of finals) {
+        fin.tradingDate = day;   // R38-P2-01: carry the verified trading day into the immutable fee-final record
+        try {
+          // R33-P2-01: recordFeeFinal returns { inserted, conflict }. A finalization only counts (and its delta only
+          // moves net P&L) when a NEW immutable row is actually written. inserted:false + identical ⇒ idempotent replay
+          // (alreadyFinal); inserted:false + DIFFERENT ⇒ collision alert (conflict).
+          const r = await recordFeeFinal(uk, fin);
+          if (r && r.inserted === false) {
+            if (r.conflict) { conflicts++; log("eodfee.conflict", { userKey: uk, fillId: fin.fillId, broker: fin.broker, tradingDate: day }); }   // UNresolved
+            else { alreadyFinal++; resolvedThisUser++; }   // verified identical overlay ⇒ durably resolved
+          } else { finalized++; resolvedThisUser++; netFeeCorrection += Number(fin.feeDelta) || 0; }   // new durable insert
+        } catch (e) { errors++; log("eodfee.persist_failed", { userKey: uk, fillId: fin.fillId, tradingDate: day, err: String((e && e.message) || e) }); }   // failed write ⇒ UNresolved
+      }
     }
-    stillProvisional += Math.max(0, unfinalized.length - resolvedThisUser);
+    // R36-P3-01: stillProvisional = the day-groups' unfinalized fills MINUS durably-resolved. A failed write or conflict
+    // leaves the fill counted, so the monitor never reports a false-empty backlog.
+    stillProvisional += Math.max(0, unfinalizedConsidered - resolvedThisUser);
   }
   const summary = { usersTouched, finalized, alreadyFinal, conflicts, netFeeCorrection: +netFeeCorrection.toFixed(6), stillProvisional, errors };
   log("eodfee.done", summary);

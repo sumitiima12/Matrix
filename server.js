@@ -8148,11 +8148,12 @@ async function fetchBrokerContractNote(userKey, broker, opts = {}) {
       const stmtUrl = process.env.FYERS_STATEMENT_URL;
       if (!stmtUrl) return [];
       const acctExpected = String(sess.userId || userKey);
-      /* R37-P2-02 — pass the EXPECTED trading date to the importer so a statement fetched for the wrong day can't be
-         requested-then-silently-accepted. We send the newest allowed IST day as `tradingDate` (best-effort hint), and —
-         authoritatively — enforce the returned envelope's tradingDate against the allowed window below. */
-      const allowedDates = Array.isArray(opts.allowedDates) ? opts.allowedDates : null;
-      const expectDay = allowedDates && allowedDates.length ? allowedDates[allowedDates.length - 1] : null;
+      /* R37-P2-02 + R38-P2-01 — pass the EXPECTED trading date to the importer so a statement fetched for the wrong day
+         can't be requested-then-silently-accepted. The reconciler now calls us PER (broker, day), so `opts.tradingDate`
+         is the exact day being reconciled and `allowedDates` is that single day — the returned envelope's tradingDate
+         must equal it (validated below). Falls back to the window set only if called without a specific day. */
+      const expectDay = feeStatement.parseIsoDate(opts.tradingDate) || null;
+      const allowedDates = expectDay ? [expectDay] : (Array.isArray(opts.allowedDates) ? opts.allowedDates : null);
       const nowMs = opts.nowMs != null ? opts.nowMs : Date.now();
       const q = `user=${encodeURIComponent(acctExpected)}${expectDay ? `&tradingDate=${encodeURIComponent(expectDay)}` : ""}`;
       const sr = await withTimeout(fetch(`${stmtUrl}${stmtUrl.includes("?") ? "&" : "?"}${q}`, { headers: brokerAuth("fyers", sess.accessToken, sess.userId) }), 8000).catch(() => null);
@@ -8169,14 +8170,29 @@ async function fetchBrokerContractNote(userKey, broker, opts = {}) {
       return out;
     }
     if (broker === "delta") {
-      // Delta's /v2/fills carries the SETTLED per-fill commission (its authoritative execution cost). Each line is
-      // validated with the same strict normalizer — an invalid/negative commission is rejected, never finalized as 0.
-      const fills = await withTimeout(deltaCall("GET", "/v2/fills", { userId: sess.userId }), 8000).catch(() => null);
-      const rows = (fills && fills.result) || [];
-      const out = []; let rejected = 0;
-      for (const f of rows) { const n = feeStatement.normStatementLine({ execId: f.id, orderId: f.order_id, charges: (f.commission ?? f.fee) }); if (n) out.push(n); else rejected++; }
-      if (rejected) logFinancial("eodfee.stmt_line_rejected", { userKey, broker: "delta", rejected, accepted: out.length });
-      return out;
+      /* R38-P2-02 — Delta's /v2/fills carries the SETTLED per-fill commission (its authoritative execution cost), but a
+         single request is DEFAULT-LIMITED and spans multiple days. We now PAGINATE TO EXHAUSTION (bounded), then hand
+         the full page set to the pure `normalizeDeltaFills` adapter, which: partitions to the requested trading DAY,
+         validates account + strict commission, de-dupes, and — critically — refuses to finalize (completeness watermark)
+         unless pagination provably reached the end. An incomplete page set leaves fills PROVISIONAL, never partial. */
+      const expectDay = feeStatement.parseIsoDate(opts.tradingDate) || null;
+      const acctExpected = String(sess.userId || userKey);
+      const PAGE = 200, MAX_PAGES = 50;
+      const rows = []; let complete = false, after = null;
+      for (let p = 0; p < MAX_PAGES; p++) {
+        const q = { userId: sess.userId, page_size: PAGE };
+        if (after) q.after = after;
+        const resp = await withTimeout(deltaCall("GET", "/v2/fills", q), 8000).catch(() => null);
+        const batch = (resp && resp.result) || [];
+        rows.push(...batch);
+        after = resp && resp.meta && (resp.meta.after || resp.meta.next);
+        if (!after || batch.length === 0 || batch.length < PAGE) { complete = true; break; }   // reached exhaustion
+      }
+      const norm = feeStatement.normalizeDeltaFills(rows, { tradingDate: expectDay, account: acctExpected, complete });
+      if (!norm.ok) { logFinancial("eodfee.delta_incomplete", { userKey, broker: "delta", reason: norm.reason, tradingDate: expectDay, pages: rows.length ? "capped" : "empty" }); return []; }
+      if (norm.rejected) logFinancial("eodfee.stmt_line_rejected", { userKey, broker: "delta", rejected: norm.rejected, accepted: norm.kept, tradingDate: expectDay });
+      logFinancial("eodfee.stmt_imported", { userKey, broker: "delta", tradingDate: expectDay, accepted: norm.kept, rejected: norm.rejected, offday: norm.offday, complete });
+      return norm.lines;
     }
   } catch { /* fall through to [] */ }
   return [];
@@ -8211,9 +8227,10 @@ async function runEodFeeReconcileJob(reason = "scheduled") {
       // allocate order-level charges deterministically and converge (finish the remaining fills after a partial prior
       // write) instead of refusing forever.
       listReconcilableFills: (uk) => db.getReconcilableFills(uk, windowStart, Date.now()),
-      // R37-P2-02: bind the allowed IST reconciliation-day window so the statement's tradingDate is validated against
-      // the day(s) being reconciled — a settled statement for the wrong day is rejected, not silently finalized.
-      fetchContractNote: (uk, broker) => fetchBrokerContractNote(uk, broker, { allowedDates: feeStatement.istDayWindow(windowStart, Date.now()), nowMs: Date.now() }),
+      // R37-P2-02 + R38-P2-01: the reconciler now calls PER (broker, trading-day), passing the exact IST day. We bind
+      // that day through as both the requested statement date and the single-element allowed-date set, so each day's
+      // fills are validated against — and finalized only from — that day's own settled statement.
+      fetchContractNote: (uk, broker, tradingDate) => fetchBrokerContractNote(uk, broker, { tradingDate, nowMs: Date.now() }),
       /* R32-P2-02: the fee-final event is a fee-DELTA overlay, NOT an execution. It carries no qty and is NOT an
          execEvent, so projectFills never groups it as an entry/exit leg (which would double-count fees or add a
          phantom zero-qty leg). It records the net feeDelta, the referenced fill, and the leg it corrects; projectFills

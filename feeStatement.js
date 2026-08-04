@@ -108,4 +108,52 @@ function istDayWindow(windowStartMs, nowMs, offsetMs = 19800000) {
   return Array.from(out);
 }
 
-module.exports = { strictCharge, nzId, parseIsoDate, normStatementLine, validateStatement, istDayWindow };
+// R38-P2-02 — the IST trading day (YYYY-MM-DD) for a broker timestamp. Accepts epoch seconds, epoch millis, or an ISO
+// string; returns null if it can't be parsed to a real instant (so an undated fill is never mis-attributed to a day).
+function brokerTradingDay(v, offsetMs = 19800000) {
+  let ms = null;
+  if (typeof v === "number" && Number.isFinite(v)) ms = v < 1e12 ? v * 1000 : v;         // seconds vs millis heuristic
+  else if (typeof v === "string" && v.trim() !== "") { const p = Date.parse(v.trim()); if (Number.isFinite(p)) ms = p; }
+  if (ms == null) return null;
+  return new Date(ms + offsetMs).toISOString().slice(0, 10);
+}
+
+/* R38-P2-02 — PURE Delta fills → contract-note adapter with per-day partitioning and a completeness watermark.
+ *   normalizeDeltaFills(rows, { tradingDate, account?, complete })
+ *     rows        — the FULLY-PAGINATED (to exhaustion) /v2/fills result rows for the account.
+ *     tradingDate — the IST day being reconciled; ONLY fills whose broker timestamp resolves to this day are kept, so a
+ *                   default-limited or cross-day response can never finalize another day's executions.
+ *     account     — optional expected account id; a fill carrying a different account is rejected.
+ *     complete    — the caller's proof that pagination reached exhaustion. If FALSE we refuse to finalize (return
+ *                   ok:false) — an incomplete page set must leave fills provisional, never partially finalize (watermark).
+ *   Returns { ok:false, reason } or { ok:true, tradingDate, lines:[{execId,orderId,charges,tradingDate}], kept, rejected }.
+ */
+function normalizeDeltaFills(rows, opts = {}) {
+  const { tradingDate, account, complete } = opts;
+  if (complete === false) return { ok: false, reason: "incomplete-pagination" };            // completeness watermark
+  if (!Array.isArray(rows)) return { ok: false, reason: "no-rows" };
+  const wantDay = parseIsoDate(tradingDate);
+  if (tradingDate != null && !wantDay) return { ok: false, reason: "bad-trading-date" };
+  const lines = [];
+  let rejected = 0, offday = 0;
+  const seen = new Set();                                                                    // de-dupe by fill id
+  for (const f of rows) {
+    if (!f || typeof f !== "object") { rejected++; continue; }
+    if (account != null) { const a = nzId(f.account_id ?? f.account ?? f.user_id); if (a != null && String(a) !== String(account)) { rejected++; continue; } }
+    const day = brokerTradingDay(f.created_at ?? f.timestamp ?? f.fill_time ?? f.time);
+    if (wantDay && day !== wantDay) { offday++; continue; }                                   // per-day partition
+    const charges = strictCharge(f.commission ?? f.fee ?? f.charges);
+    if (charges == null) { rejected++; continue; }                                            // strict, never coerce
+    const execId = nzId(f.id ?? f.fill_id);
+    const orderId = nzId(f.order_id ?? f.orderId);
+    if (execId == null && orderId == null) { rejected++; continue; }
+    const dedupeKey = execId != null ? `e:${execId}` : `o:${orderId}:${lines.length}`;
+    if (execId != null) { if (seen.has(dedupeKey)) continue; seen.add(dedupeKey); }           // duplicate exec line ⇒ once
+    const line = { charges, source: "delta-fills", tradingDate: day || wantDay || null };
+    if (execId != null) { line.execId = execId; line.orderId = orderId || null; } else { line.orderId = orderId; }
+    lines.push(line);
+  }
+  return { ok: true, tradingDate: wantDay || null, lines, kept: lines.length, rejected, offday };
+}
+
+module.exports = { strictCharge, nzId, parseIsoDate, normStatementLine, validateStatement, istDayWindow, brokerTradingDay, normalizeDeltaFills };

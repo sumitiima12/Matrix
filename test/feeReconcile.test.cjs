@@ -223,6 +223,79 @@ test("R36-P3-01: stillProvisional reflects DURABLE inserts — a persistence fai
   assert.equal(summary.stillProvisional, 2, "the failed + conflicted fills remain provisional (not falsely zero)");
 });
 
+// R38-P2-01 — helpers: two distinct IST trading days derived from the pinned NOW.
+const DAY_A_MS = NOW;                       // "today"
+const DAY_B_MS = NOW - 86400000;            // "yesterday"
+const IST = 19800000;
+const istDay = (ms) => new Date(ms + IST).toISOString().slice(0, 10);
+const DAY_A = istDay(DAY_A_MS), DAY_B = istDay(DAY_B_MS);
+
+test("R38-P2-01: reconciliation fetches ONE statement per (broker, trading-day) and finalizes each day", async () => {
+  const fetchDays = [];
+  const persisted = [];
+  const summary = await runEodFeeReconcile({
+    userKeys: ["u1"],
+    now: NOW,
+    listReconcilableFills: async () => [
+      { fillId: "y", execId: "E1", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: DAY_B_MS }, // yesterday
+      { fillId: "t", execId: "E2", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: DAY_A_MS }, // today
+    ],
+    fetchContractNote: async (uk, broker, tradingDate) => {
+      fetchDays.push(tradingDate);
+      if (tradingDate === DAY_B) return [{ execId: "E1", charges: 5 }];
+      if (tradingDate === DAY_A) return [{ execId: "E2", charges: 7 }];
+      return [];
+    },
+    recordFeeFinal: async (uk, fin) => { persisted.push({ fillId: fin.fillId, tradingDate: fin.tradingDate, finalFees: fin.finalFees }); return { inserted: true }; },
+  });
+  assert.equal(summary.finalized, 2, "both days' fills finalize");
+  assert.deepEqual(fetchDays.sort(), [DAY_B, DAY_A].sort(), "one statement fetched per distinct trading day");
+  // Each finalization carries its own verified trading day (audit identity).
+  assert.deepEqual(persisted.find((p) => p.fillId === "y").tradingDate, DAY_B);
+  assert.deepEqual(persisted.find((p) => p.fillId === "t").tradingDate, DAY_A);
+});
+
+test("R38-P2-01: same order/exec IDs on DIFFERENT days never cross-match (per-day candidate set)", async () => {
+  // Both days have an execution with id "E1", but the statements differ by day. Day A's E1 must get Day A's charge and
+  // Day B's E1 must get Day B's charge — a single-window match would have mixed them.
+  const persisted = [];
+  await runEodFeeReconcile({
+    userKeys: ["u1"],
+    now: NOW,
+    listReconcilableFills: async () => [
+      { fillId: "fb", execId: "E1", broker: "fyers", real: true, fees: 0, feeFinalized: false, ts: DAY_B_MS },
+      { fillId: "fa", execId: "E1", broker: "fyers", real: true, fees: 0, feeFinalized: false, ts: DAY_A_MS },
+    ],
+    fetchContractNote: async (uk, broker, tradingDate) => tradingDate === DAY_B ? [{ execId: "E1", charges: 2 }] : [{ execId: "E1", charges: 9 }],
+    recordFeeFinal: async (uk, fin) => { persisted.push({ fillId: fin.fillId, finalFees: fin.finalFees }); return { inserted: true }; },
+  });
+  assert.equal(persisted.find((p) => p.fillId === "fb").finalFees, 2, "yesterday's E1 got yesterday's charge");
+  assert.equal(persisted.find((p) => p.fillId === "fa").finalFees, 9, "today's E1 got today's charge");
+});
+
+test("R38-P2-01: a DELAYED prior-day statement finalizes on a later run (older fills not stranded)", async () => {
+  const fills = [{ fillId: "old", execId: "EO", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: DAY_B_MS }];
+  // First run: yesterday's statement isn't ready yet → stays provisional.
+  const s1 = await runEodFeeReconcile({
+    userKeys: ["u1"], now: NOW,
+    listReconcilableFills: async () => fills,
+    fetchContractNote: async () => [],                       // no statement yet
+    recordFeeFinal: async () => { throw new Error("should not persist"); },
+  });
+  assert.equal(s1.finalized, 0);
+  assert.equal(s1.stillProvisional, 1, "unmatched prior-day fill remains provisional");
+  // Later run: yesterday's statement has arrived for DAY_B → it finalizes.
+  const persisted = [];
+  const s2 = await runEodFeeReconcile({
+    userKeys: ["u1"], now: NOW,
+    listReconcilableFills: async () => fills,
+    fetchContractNote: async (uk, broker, tradingDate) => tradingDate === DAY_B ? [{ execId: "EO", charges: 4 }] : [],
+    recordFeeFinal: async (uk, fin) => { persisted.push(fin.fillId); return { inserted: true }; },
+  });
+  assert.equal(s2.finalized, 1, "the delayed prior-day statement finalizes the older fill");
+  assert.deepEqual(persisted, ["old"]);
+});
+
 test("R31-P2-08: runEodFeeReconcile orchestrates per-user, persists finalizations, and is fail-soft", async () => {
   const persisted = [];
   const summary = await runEodFeeReconcile({

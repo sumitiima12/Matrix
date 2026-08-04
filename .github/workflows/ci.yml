@@ -3,9 +3,16 @@ on:
   push:
     branches: [main, master]
   pull_request:
+# R38-P1-03: cancel superseded revisions so old runs don't pile up for hours and get cancelled at ~6h. One in-flight run
+# per ref; a new push cancels the previous one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # R38-P1-03: bound the whole job so a hung suite fails fast (visible) instead of running until the 6h platform cap.
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:16
@@ -35,12 +42,21 @@ jobs:
       # full TAP output is captured, the pass/fail/skip counts are extracted, and the run is REJECTED if any safety
       # suite skipped. The report is published as an artifact tied to this exact commit SHA.
       - name: Tests (unit + PostgreSQL integration + two-instance + fault-injection; skips fail CI)
+        # R38-P1-03: bound the step, add a per-TEST timeout so one hung integration test fails visibly (instead of the
+        # whole job hanging to the platform cap), and a hard `timeout` wrapper as a backstop that still lets the gate run.
+        timeout-minutes: 18
         env:
           DATABASE_URL: postgres://matrix:matrix@localhost:5432/matrix_test
         run: |
           set -o pipefail
           mkdir -p artifacts
-          npm test 2>&1 | tee artifacts/backend-tests.tap
+          # --test-timeout=120000 → any single test exceeding 2 min is failed by the runner (not left hanging).
+          # `timeout --kill-after` → hard backstop; on expiry Node is killed, the ephemeral PG service is torn down by
+          # Actions, and the zero-skip gate below still runs against whatever TAP was captured.
+          # R38-P1-03: the *.sandbox.cjs broker-certification + E2E suites are EXCLUDED here (they run in their own
+          # dedicated jobs) so the main suite has NO intentional skips — a skip in this run is now a real problem.
+          FILES=$(ls test/*.cjs | grep -Ev '\.sandbox\.cjs$')
+          timeout --kill-after=30s 15m node --test --test-timeout=120000 $FILES 2>&1 | tee artifacts/backend-tests.tap
       - name: Zero-skip safety gate + evidence summary
         if: always()
         run: |
@@ -78,6 +94,7 @@ jobs:
   # broker-call outcomes. Enable by setting the *_SANDBOX_* secrets in the repo/environment.
   broker-sandbox:
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # R38-P1-03: a real broker lifecycle is seconds-to-minutes; cap it so a hung network call fails fast.
     if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
     steps:
       - uses: actions/checkout@v4

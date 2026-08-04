@@ -33,6 +33,18 @@ const READY = APP_ID && TOKEN;
 // R37-P2-01: during a certification run placement is REQUIRED. FYERS_SANDBOX_PLACE can only turn it OFF for manual dev.
 const PLACE = CERT ? !/^(0|false|no)$/i.test(String(process.env.FYERS_SANDBOX_PLACE ?? "1")) : /^(1|true|yes)$/i.test(String(process.env.FYERS_SANDBOX_PLACE || ""));
 
+/* R38-P1-04 — APPROVED TEST/UAT-HOST ALLOW-LIST. A certification run that places REAL market INTRADAY orders must never
+ * default to a trading endpoint via a misnamed/absent FYERS_SANDBOX_BASE. The resolved base host must EXACTLY match a
+ * known FYERS UAT host (or an explicitly allow-listed extra host). Anything else refuses to run. */
+const APPROVED_HOSTS = new Set(
+  ["api-t1.fyers.in", "api-t2.fyers.in", "api-uat.fyers.in"]
+    .concat(String(process.env.FYERS_SANDBOX_ALLOWED_HOSTS || "").split(",").map((s) => s.trim()).filter(Boolean))
+);
+function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
+const BASE_HOST = hostOf(BASE);
+// A UAT host is api-t*/uat; the production host is api.fyers.in — which is NOT on the list, so it can never be targeted.
+const HOST_OK = APPROVED_HOSTS.has(BASE_HOST) && /(-t\d|uat)\./i.test(BASE_HOST);
+
 const calls = { read: 0, verify: 0, placement: 0, fillVerify: 0, close: 0, reject: 0, cancel: 0 };
 
 async function fy(method, path, { body = null, kind = "read" } = {}) {
@@ -50,15 +62,31 @@ const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 test.before(() => {
   if (!CERT) return;
   if (!READY) throw new Error("FYERS_SANDBOX_APP_ID/TOKEN required for a BROKER_SANDBOX=1 certification run");
+  // R38-P1-04: a placement certification run must target an approved UAT host — never api.fyers.in (production).
+  if (PLACE && !HOST_OK) throw new Error(`refusing to place: FYERS_SANDBOX_BASE host "${BASE_HOST}" is not an approved FYERS UAT host (allow-list: ${[...APPROVED_HOSTS].join(", ")})`);
 });
 
-function guard(t) { if (CERT && READY) return true; if (CERT) throw new Error("fyers sandbox creds missing"); t.skip("BROKER_SANDBOX not set / no FYERS sandbox creds"); return false; }
+function guard(t) { if (CERT && READY && (!PLACE || HOST_OK)) return true; if (CERT) throw new Error(HOST_OK || !PLACE ? "fyers sandbox creds missing" : `unapproved host ${BASE_HOST}`); t.skip("BROKER_SANDBOX not set / no FYERS sandbox creds"); return false; }
 
 async function netQtyFor(symbol) {
   const pos = await fy("GET", "/positions", { kind: "verify" });
   const rows = (pos.json && pos.json.netPositions) || [];
   const mine = rows.filter((p) => String(p.symbol) === String(symbol));
   return mine.reduce((s, p) => s + Number(p.netQty || 0), 0);
+}
+
+// R38-P1-04 — bounded best-effort emergency SQUARE-OFF used in teardown: repeatedly flatten the symbol's net qty with an
+// opposite-side market INTRADAY order and re-read /positions until flat. Returns true only if it PROVED flat.
+async function emergencySquareOff(symbol) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    let q = 0;
+    try { q = await netQtyFor(symbol); } catch { /* retry */ }
+    if (q === 0) return true;
+    const side = q > 0 ? -1 : 1;
+    try { await fy("POST", "/orders", { kind: "close", body: { symbol, qty: Math.abs(q), type: 2, side, productType: "INTRADAY", validity: "DAY", disclosedQty: 0, offlineOrder: false } }); } catch { /* retry */ }
+    await sleep(500);
+  }
+  try { return (await netQtyFor(symbol)) === 0; } catch { return false; }
 }
 
 test("fyers-sandbox: authenticated profile + funds read (connectivity + auth)", async (t) => {
@@ -92,36 +120,49 @@ test("fyers-sandbox: REAL fill (tradebook-verified) → square-off CLOSE → fla
   const startQty = await netQtyFor(SYMBOL);
   assert.equal(startQty, 0, "starting flat (no residual UAT position)");
 
-  // 1) OPEN with a MARKET (type 2) INTRADAY BUY so it actually FILLS.
-  const place = await fy("POST", "/orders", { kind: "placement", body: { symbol: SYMBOL, qty, type: 2, side: 1, productType: "INTRADAY", validity: "DAY", disclosedQty: 0, offlineOrder: false } });
-  assert.ok(place.json && place.json.s === "ok" && place.json.id, "sandbox accepted the market order and returned an id");
-  const oid = place.json.id;
+  /* R38-P1-04 — the whole open lifecycle is wrapped in try/finally. Once the market order is accepted, ANY later failure
+     still runs a bounded emergency square-off in `finally` and PROVES flat; if it can't, the test fails loudly with a
+     MANUAL-INTERVENTION marker rather than exiting with a live intraday position. */
+  let opened = false, cleanupProven = true;
+  try {
+    // 1) OPEN with a MARKET (type 2) INTRADAY BUY so it actually FILLS.
+    const place = await fy("POST", "/orders", { kind: "placement", body: { symbol: SYMBOL, qty, type: 2, side: 1, productType: "INTRADAY", validity: "DAY", disclosedQty: 0, offlineOrder: false } });
+    assert.ok(place.json && place.json.s === "ok" && place.json.id, "sandbox accepted the market order and returned an id");
+    const oid = place.json.id;
+    opened = true;   // exposure may now exist → finally must square off
 
-  // 2) VERIFY the fill from BROKER TRUTH (/tradebook): nonzero traded qty + positive traded price.
-  let tradedQty = 0, tradePx = 0;
-  for (let attempt = 0; attempt < 8 && tradedQty <= 0; attempt++) {
-    await sleep(400);
-    const tb = await fy("GET", "/tradebook", { kind: "fillVerify" });
-    const rows = (tb.json && tb.json.tradeBook) || [];
-    const mine = rows.filter((r) => String(r.orderNumber || r.id) === String(oid));
-    tradedQty = mine.reduce((s, r) => s + Math.abs(Number(r.tradedQty || r.qty || 0)), 0);
-    if (mine.length) tradePx = Number(mine[0].tradePrice || mine[0].price || 0);
+    // 2) VERIFY the fill from BROKER TRUTH (/tradebook): nonzero traded qty + positive traded price.
+    let tradedQty = 0, tradePx = 0;
+    for (let attempt = 0; attempt < 8 && tradedQty <= 0; attempt++) {
+      await sleep(400);
+      const tb = await fy("GET", "/tradebook", { kind: "fillVerify" });
+      const rows = (tb.json && tb.json.tradeBook) || [];
+      const mine = rows.filter((r) => String(r.orderNumber || r.id) === String(oid));
+      tradedQty = mine.reduce((s, r) => s + Math.abs(Number(r.tradedQty || r.qty || 0)), 0);
+      if (mine.length) tradePx = Number(mine[0].tradePrice || mine[0].price || 0);
+    }
+    assert.ok(tradedQty > 0, "FYERS /tradebook confirms a nonzero TRADED qty (real execution, not just acceptance)");
+    assert.ok(tradePx > 0, "broker trade carries a positive traded price");
+
+    const openQty = await netQtyFor(SYMBOL);
+    assert.ok(openQty > 0, "intraday position opened net long after the fill");
+
+    // 3) SQUARE-OFF CLOSE — opposite-side (SELL) market INTRADAY sized to the open qty (the real auto-exit path).
+    const close = await fy("POST", "/orders", { kind: "close", body: { symbol: SYMBOL, qty: Math.abs(openQty), type: 2, side: -1, productType: "INTRADAY", validity: "DAY", disclosedQty: 0, offlineOrder: false } });
+    assert.ok(close.json && close.json.s === "ok" && close.json.id, "square-off order accepted");
+
+    // 4) VERIFY FLAT — re-read /positions until netQty nets to zero.
+    let endQty = openQty;
+    for (let attempt = 0; attempt < 8 && endQty !== 0; attempt++) { await sleep(400); endQty = await netQtyFor(SYMBOL); }
+    assert.equal(endQty, 0, "position is flat after the square-off (verified from broker truth)");
+
+    assert.ok(calls.placement > 0 && calls.fillVerify > 0 && calls.close > 0, "nonzero placement/fillVerify/close broker calls");
+    console.log(`fyers-sandbox call counts: ${JSON.stringify(calls)} traded=${tradedQty} px=${tradePx} place=${PLACE}`);
+  } finally {
+    if (opened) {
+      cleanupProven = await emergencySquareOff(SYMBOL);
+      if (!cleanupProven) console.error(`::error::FYERS-SANDBOX MANUAL INTERVENTION REQUIRED — could not prove flat for ${SYMBOL}; check the UAT account for open intraday exposure`);
+    }
   }
-  assert.ok(tradedQty > 0, "FYERS /tradebook confirms a nonzero TRADED qty (real execution, not just acceptance)");
-  assert.ok(tradePx > 0, "broker trade carries a positive traded price");
-
-  const openQty = await netQtyFor(SYMBOL);
-  assert.ok(openQty > 0, "intraday position opened net long after the fill");
-
-  // 3) SQUARE-OFF CLOSE — opposite-side (SELL) market INTRADAY sized to the open qty (the real auto-exit path).
-  const close = await fy("POST", "/orders", { kind: "close", body: { symbol: SYMBOL, qty: Math.abs(openQty), type: 2, side: -1, productType: "INTRADAY", validity: "DAY", disclosedQty: 0, offlineOrder: false } });
-  assert.ok(close.json && close.json.s === "ok" && close.json.id, "square-off order accepted");
-
-  // 4) VERIFY FLAT — re-read /positions until netQty nets to zero.
-  let endQty = openQty;
-  for (let attempt = 0; attempt < 8 && endQty !== 0; attempt++) { await sleep(400); endQty = await netQtyFor(SYMBOL); }
-  assert.equal(endQty, 0, "position is flat after the square-off (verified from broker truth)");
-
-  assert.ok(calls.placement > 0 && calls.fillVerify > 0 && calls.close > 0, "nonzero placement/fillVerify/close broker calls");
-  console.log(`fyers-sandbox call counts: ${JSON.stringify(calls)} traded=${tradedQty} px=${tradePx} place=${PLACE}`);
+  assert.ok(cleanupProven, "emergency square-off proved the UAT position is flat (no leaked exposure)");
 });

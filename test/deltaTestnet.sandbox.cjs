@@ -30,6 +30,17 @@ const SYMBOL = process.env.DELTA_SANDBOX_SYMBOL || "BTCUSD";
 const MAX_SIZE = Math.max(1, Number(process.env.DELTA_SANDBOX_MAX_SIZE) || 1);
 const READY = KEY && SECRET;
 
+/* R38-P1-04 — APPROVED TEST-HOST ALLOW-LIST. A certification run that opens a REAL market position must NEVER be able
+ * to target a production endpoint via a misnamed/absent DELTA_SANDBOX_BASE. The resolved base host must EXACTLY match a
+ * known Delta TESTNET host (or an explicitly allow-listed extra host). Anything else refuses to run. */
+const APPROVED_HOSTS = new Set(
+  ["cdn-ind.testnet.deltaex.org", "cdn.testnet.deltaex.org", "api.testnet.deltaex.org"]
+    .concat(String(process.env.DELTA_SANDBOX_ALLOWED_HOSTS || "").split(",").map((s) => s.trim()).filter(Boolean))
+);
+function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
+const BASE_HOST = hostOf(BASE);
+const HOST_OK = APPROVED_HOSTS.has(BASE_HOST) && /testnet/i.test(BASE_HOST);   // must be a testnet host, on the allow-list
+
 // Literal, INDEPENDENT broker-call counters published in the certification artifact.
 const calls = { placement: 0, read: 0, verify: 0, fillVerify: 0, close: 0, reject: 0, cancel: 0 };
 
@@ -56,9 +67,25 @@ const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 test.before(() => {
   if (!CERT) return;   // not a certification run; individual tests self-skip below
   if (!READY) throw new Error("DELTA_SANDBOX_KEY/SECRET required for a BROKER_SANDBOX=1 certification run");
+  // R38-P1-04: a certification run that opens REAL positions must target an approved TESTNET host — never production.
+  if (!HOST_OK) throw new Error(`refusing to run: DELTA_SANDBOX_BASE host "${BASE_HOST}" is not an approved Delta testnet host (allow-list: ${[...APPROVED_HOSTS].join(", ")})`);
 });
 
-function guard(t) { if (CERT && READY) return true; if (CERT) throw new Error("delta sandbox creds missing"); t.skip("BROKER_SANDBOX not set / no Delta sandbox creds"); return false; }
+function guard(t) { if (CERT && READY && HOST_OK) return true; if (CERT) throw new Error(HOST_OK ? "delta sandbox creds missing" : `unapproved host ${BASE_HOST}`); t.skip("BROKER_SANDBOX not set / no Delta sandbox creds"); return false; }
+
+// R38-P1-04 — bounded best-effort EMERGENCY FLATTEN used in teardown. Repeatedly places a reduce-only market close and
+// re-reads the position until flat. Returns true if it PROVED the position is flat, false otherwise (caller fails loud).
+async function emergencyFlatten(productId) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    let sz = 0;
+    try { sz = await netPositionSize(productId); } catch { /* retry */ }
+    if (sz === 0) return true;
+    const side = sz > 0 ? "sell" : "buy";
+    try { await delta("POST", "/v2/orders", { kind: "close", body: { product_id: productId, size: Math.abs(sz), side, order_type: "market_order", reduce_only: true } }); } catch { /* retry */ }
+    await sleep(500);
+  }
+  try { return (await netPositionSize(productId)) === 0; } catch { return false; }
+}
 
 async function resolveProduct() {
   const prod = await delta("GET", "/v2/products", { kind: "read" });
@@ -98,40 +125,52 @@ test("delta-sandbox: REAL fill (broker-truth verified) → reduce-only CLOSE →
   const startSize = await netPositionSize(p.id);
   assert.equal(startSize, 0, "starting flat (no residual testnet position)");
 
-  // 1) OPEN with a MARKET order so it actually FILLS (not a resting limit). Testnet paper funds only.
-  const open = await delta("POST", "/v2/orders", { kind: "placement", body: { product_id: p.id, size, side: "buy", order_type: "market_order" } });
-  assert.ok([200, 201].includes(open.status), "market open accepted by the sandbox");
-  const oid = open.json && open.json.result && open.json.result.id;
-  assert.ok(oid, "sandbox returned a broker order id");
+  /* R38-P1-04 — the ENTIRE open lifecycle is wrapped in try/finally. The moment the market order is accepted we hold the
+     product id, so ANY subsequent failure (fills delay, assertion, transient read error, runner cancellation, close
+     rejection) still runs a bounded emergency flatten in `finally` and PROVES flat. If cleanup can't be proven, the test
+     fails loudly with a MANUAL-INTERVENTION marker rather than exiting with live exposure. */
+  let opened = false, cleanupProven = true;
+  try {
+    // 1) OPEN with a MARKET order so it actually FILLS (not a resting limit). Testnet paper funds only.
+    const open = await delta("POST", "/v2/orders", { kind: "placement", body: { product_id: p.id, size, side: "buy", order_type: "market_order" } });
+    assert.ok([200, 201].includes(open.status), "market open accepted by the sandbox");
+    const oid = open.json && open.json.result && open.json.result.id;
+    assert.ok(oid, "sandbox returned a broker order id");
+    opened = true;   // from here on, exposure may exist → finally must flatten
 
-  // 2) VERIFY the fill from BROKER TRUTH (/v2/fills): nonzero filled size + positive average price.
-  let filledSize = 0, avgPx = 0;
-  for (let attempt = 0; attempt < 8 && filledSize <= 0; attempt++) {
-    await sleep(400);
-    const fills = await delta("GET", "/v2/fills", { query: `product_ids=${p.id}`, kind: "fillVerify" });
-    const rows = (fills.json && fills.json.result) || [];
-    const mine = rows.filter((f) => String(f.order_id) === String(oid));
-    filledSize = mine.reduce((s, f) => s + Math.abs(Number(f.size || 0)), 0);
-    if (mine.length) { const f = mine[0]; avgPx = Number(f.price || f.fill_price || 0); }
+    // 2) VERIFY the fill from BROKER TRUTH (/v2/fills): nonzero filled size + positive average price.
+    let filledSize = 0, avgPx = 0;
+    for (let attempt = 0; attempt < 8 && filledSize <= 0; attempt++) {
+      await sleep(400);
+      const fills = await delta("GET", "/v2/fills", { query: `product_ids=${p.id}`, kind: "fillVerify" });
+      const rows = (fills.json && fills.json.result) || [];
+      const mine = rows.filter((f) => String(f.order_id) === String(oid));
+      filledSize = mine.reduce((s, f) => s + Math.abs(Number(f.size || 0)), 0);
+      if (mine.length) { const f = mine[0]; avgPx = Number(f.price || f.fill_price || 0); }
+    }
+    assert.ok(filledSize > 0, "broker /v2/fills confirms a nonzero FILLED size (real execution, not just acceptance)");
+    assert.ok(avgPx > 0, "broker fill carries a positive average fill price");
+
+    // Confirm the position actually opened (net long).
+    const openPos = await netPositionSize(p.id);
+    assert.ok(openPos > 0, "position opened net long after the fill");
+
+    // 3) REDUCE-ONLY CLOSE — opposite side, reduce_only, sized to the open position (the real auto-exit path).
+    const close = await delta("POST", "/v2/orders", { kind: "close", body: { product_id: p.id, size: Math.abs(openPos), side: "sell", order_type: "market_order", reduce_only: true } });
+    assert.ok([200, 201].includes(close.status), "reduce-only close accepted");
+
+    // 4) VERIFY FLAT — re-read the position until it nets to zero.
+    let endSize = openPos;
+    for (let attempt = 0; attempt < 8 && endSize !== 0; attempt++) { await sleep(400); endSize = await netPositionSize(p.id); }
+    assert.equal(endSize, 0, "position is flat after the reduce-only close (verified from broker truth)");
+
+    assert.ok(calls.placement > 0 && calls.fillVerify > 0 && calls.close > 0, "nonzero placement/fillVerify/close broker calls");
+    console.log(`delta-sandbox call counts: ${JSON.stringify(calls)} filled=${filledSize} avg=${avgPx} orderId=${String(oid).slice(-6)}`);
+  } finally {
+    if (opened) {
+      cleanupProven = await emergencyFlatten(p.id);
+      if (!cleanupProven) console.error(`::error::DELTA-SANDBOX MANUAL INTERVENTION REQUIRED — could not prove flat for product ${p.id}; check the testnet account for open exposure`);
+    }
   }
-  assert.ok(filledSize > 0, "broker /v2/fills confirms a nonzero FILLED size (real execution, not just acceptance)");
-  assert.ok(avgPx > 0, "broker fill carries a positive average fill price");
-
-  // Confirm the position actually opened (net long).
-  const openPos = await netPositionSize(p.id);
-  assert.ok(openPos > 0, "position opened net long after the fill");
-
-  // 3) REDUCE-ONLY CLOSE — opposite side, reduce_only, sized to the open position. This is the real close path used by
-  //    the auto-exit executor (not a cancel of a resting order).
-  const close = await delta("POST", "/v2/orders", { kind: "close", body: { product_id: p.id, size: Math.abs(openPos), side: "sell", order_type: "market_order", reduce_only: true } });
-  assert.ok([200, 201].includes(close.status), "reduce-only close accepted");
-
-  // 4) VERIFY FLAT — re-read the position until it nets to zero.
-  let endSize = openPos;
-  for (let attempt = 0; attempt < 8 && endSize !== 0; attempt++) { await sleep(400); endSize = await netPositionSize(p.id); }
-  assert.equal(endSize, 0, "position is flat after the reduce-only close (verified from broker truth)");
-
-  // Independent counters must ALL be nonzero: we placed, we verified a real fill, and we closed.
-  assert.ok(calls.placement > 0 && calls.fillVerify > 0 && calls.close > 0, "nonzero placement/fillVerify/close broker calls");
-  console.log(`delta-sandbox call counts: ${JSON.stringify(calls)} filled=${filledSize} avg=${avgPx} orderId=${String(oid).slice(-6)}`);
+  assert.ok(cleanupProven, "emergency flatten proved the testnet position is flat (no leaked exposure)");
 });

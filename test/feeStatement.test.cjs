@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const feeStatement = require("../feeStatement");
-const { strictCharge, parseIsoDate, normStatementLine, validateStatement, istDayWindow } = feeStatement;
+const { strictCharge, parseIsoDate, normStatementLine, validateStatement, istDayWindow, brokerTradingDay, normalizeDeltaFills } = feeStatement;
 
 // A canonical, well-formed settled statement for trading day 2026-08-04 on account "FY-123".
 function goodEnvelope(over = {}) {
@@ -153,10 +153,58 @@ test("istDayWindow: covers each IST day across the lookback window (inclusive of
   for (const d of ["2026-08-02", "2026-08-03", "2026-08-04"]) assert.ok(win.includes(d), `window should include ${d}`);
 });
 
+// ---- R38-P2-02: brokerTradingDay ---------------------------------------------------------------
+test("brokerTradingDay: parses epoch seconds, epoch millis and ISO to an IST day; null on garbage", () => {
+  const iso = "2026-08-04T09:30:00Z"; // 15:00 IST on 2026-08-04
+  assert.equal(brokerTradingDay(iso), "2026-08-04");
+  assert.equal(brokerTradingDay(Math.floor(Date.parse(iso) / 1000)), "2026-08-04"); // seconds
+  assert.equal(brokerTradingDay(Date.parse(iso)), "2026-08-04");                    // millis
+  // 2026-08-04T20:00Z = 01:30 IST next day ⇒ 2026-08-05
+  assert.equal(brokerTradingDay("2026-08-04T20:00:00Z"), "2026-08-05");
+  for (const bad of ["", "  ", "not-a-date", null, undefined, NaN]) assert.equal(brokerTradingDay(bad), null);
+});
+
+// ---- R38-P2-02: normalizeDeltaFills ------------------------------------------------------------
+test("normalizeDeltaFills: refuses to finalize when pagination is incomplete (watermark)", () => {
+  const r = normalizeDeltaFills([{ id: "1", commission: "1", created_at: "2026-08-04T05:00:00Z" }], { tradingDate: "2026-08-04", complete: false });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "incomplete-pagination");
+});
+
+test("normalizeDeltaFills: keeps only the requested trading day; drops other days", () => {
+  const rows = [
+    { id: "a", order_id: "OA", commission: "1.50", created_at: "2026-08-04T05:00:00Z" }, // 04
+    { id: "b", order_id: "OB", commission: "2.00", created_at: "2026-08-03T05:00:00Z" }, // 03 (off-day)
+    { id: "c", order_id: "OC", commission: "3.00", created_at: "2026-08-04T06:00:00Z" }, // 04
+  ];
+  const r = normalizeDeltaFills(rows, { tradingDate: "2026-08-04", complete: true });
+  assert.equal(r.ok, true);
+  assert.equal(r.kept, 2);
+  assert.equal(r.offday, 1);
+  assert.deepEqual(r.lines.map((l) => l.execId).sort(), ["a", "c"]);
+  assert.ok(r.lines.every((l) => l.tradingDate === "2026-08-04"));
+});
+
+test("normalizeDeltaFills: rejects malformed rows + wrong account; strict commission; de-dupes exec ids", () => {
+  const rows = [
+    { id: "a", commission: "1.50", created_at: "2026-08-04T05:00:00Z", account_id: "ACC1" }, // good
+    { id: "a", commission: "1.50", created_at: "2026-08-04T05:00:00Z", account_id: "ACC1" }, // duplicate exec id ⇒ once
+    { id: "b", commission: true, created_at: "2026-08-04T05:00:00Z", account_id: "ACC1" },   // boolean ⇒ reject
+    { id: "c", commission: "2", created_at: "2026-08-04T05:00:00Z", account_id: "OTHER" },   // wrong account ⇒ reject
+    "garbage",                                                                                // not object ⇒ reject
+    { commission: "2", created_at: "2026-08-04T05:00:00Z" },                                  // no id ⇒ reject
+  ];
+  const r = normalizeDeltaFills(rows, { tradingDate: "2026-08-04", account: "ACC1", complete: true });
+  assert.equal(r.ok, true);
+  assert.equal(r.kept, 1, "only the single good, de-duped line survives");
+  assert.equal(r.lines[0].execId, "a");
+  assert.ok(r.rejected >= 3);
+});
+
 // ---- module presence sanity --------------------------------------------------------------------
 test("feeStatement module file exists at backend root and exports the pure API", () => {
   assert.ok(fs.existsSync(path.join(__dirname, "..", "feeStatement.js")));
-  for (const fn of ["strictCharge", "nzId", "parseIsoDate", "normStatementLine", "validateStatement", "istDayWindow"]) {
+  for (const fn of ["strictCharge", "nzId", "parseIsoDate", "normStatementLine", "validateStatement", "istDayWindow", "brokerTradingDay", "normalizeDeltaFills"]) {
     assert.equal(typeof feeStatement[fn], "function", `exports ${fn}`);
   }
 });
