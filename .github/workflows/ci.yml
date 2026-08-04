@@ -59,7 +59,12 @@ jobs:
           # R38-P1-03: the *.sandbox.cjs broker-certification + E2E suites are EXCLUDED here (they run in their own
           # dedicated jobs) so the main suite has NO intentional skips — a skip in this run is now a real problem.
           FILES=$(ls test/*.cjs | grep -Ev '\.sandbox\.cjs$')
-          timeout --kill-after=30s 22m node --test --test-timeout=600000 $FILES 2>&1 | tee artifacts/backend-tests.tap
+          # R38: run test FILES SERIALLY (--test-concurrency=1). The heavy real-Postgres route suites
+          # (deltaRouteH07/orderRouteC03/realPositionsCloseS5) share the one CI database; run in parallel they deadlock
+          # on each other's row/advisory locks and hang to the timeout, and a concurrent reconciliation test can read
+          # mid-another-suite's-transaction. Serial execution isolates each suite against a quiescent DB. --test-timeout
+          # is a per-test hang bound (5 min); the step `timeout` is the overall backstop.
+          timeout --kill-after=30s 22m node --test --test-concurrency=1 --test-timeout=300000 $FILES 2>&1 | tee artifacts/backend-tests.tap
       - name: Zero-skip safety gate + evidence summary
         if: always()
         run: |
