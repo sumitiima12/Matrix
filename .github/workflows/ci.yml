@@ -28,13 +28,95 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - name: Syntax check
-        run: node --check server.js && node --check db.js && node --check auth.js && node --check riskEngine.js && node --check reconcile.js
-      # The FULL suite runs against the ephemeral Postgres so the PG integration + restart-recovery safety
-      # tests actually EXECUTE (they self-skip without DATABASE_URL). With CI=true set by Actions, the
-      # ciPgRequired guard turns any PG skip into a CI failure — safety coverage can't silently vanish.
-      - name: Tests (unit + PostgreSQL integration + fault-injection; skips fail CI)
+        run: node --check server.js && node --check db.js && node --check auth.js && node --check riskEngine.js && node --check reconcile.js && node --check feeReconcile.js && node --check orderRecovery.js
+      # The FULL suite runs against the ephemeral Postgres so the PG integration + two-instance/lease + restart-recovery
+      # + route safety tests actually EXECUTE (they self-skip without DATABASE_URL). With CI=true set by Actions, the
+      # ciPgRequired guard turns any PG skip into a CI failure — safety coverage can't silently vanish. R34-P3-06: the
+      # full TAP output is captured, the pass/fail/skip counts are extracted, and the run is REJECTED if any safety
+      # suite skipped. The report is published as an artifact tied to this exact commit SHA.
+      - name: Tests (unit + PostgreSQL integration + two-instance + fault-injection; skips fail CI)
         env:
           DATABASE_URL: postgres://matrix:matrix@localhost:5432/matrix_test
-        run: npm test
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          npm test 2>&1 | tee artifacts/backend-tests.tap
+      - name: Zero-skip safety gate + evidence summary
+        if: always()
+        run: |
+          TAP=artifacts/backend-tests.tap
+          PASS=$(grep -c '^ok ' "$TAP" || true)
+          FAIL=$(grep -c '^not ok ' "$TAP" || true)
+          SKIP=$(grep -Ec '# (SKIP|skip)' "$TAP" || true)
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "database=postgres:16 (ephemeral service)"
+            echo "ci_pg_required=true"
+            echo "pass=${PASS}"
+            echo "fail=${FAIL}"
+            echo "skipped=${SKIP}"
+          } | tee artifacts/backend-evidence.txt
+          # Safety suites must never skip in a release run.
+          if grep -Eq '(realPositionsCloseS5|leasesTwoProcess|fenceToSend|orderRouteC03|deltaRouteH07|migrations|eodPgReconcile|R35-P2-04|R35-P3-04).*# (SKIP|skip)' "$TAP"; then
+            echo "::error::a safety-tagged suite was SKIPPED — release evidence is invalid"; exit 1
+          fi
+          if [ "${FAIL:-0}" != "0" ]; then echo "::error::backend tests failed"; exit 1; fi
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
+      - name: Upload backend evidence (TAP + summary, per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90
+
+  # R34-P3-06: broker-sandbox certification. Runs the FYERS/Delta SANDBOX order-lifecycle + fill-verification tests
+  # against the brokers' test environments. It is GATED on repository secrets so forks/PRs without creds don't fail,
+  # but when the secrets are present (release runs) it MUST pass and publishes a per-SHA artifact with the literal
+  # broker-call outcomes. Enable by setting the *_SANDBOX_* secrets in the repo/environment.
+  broker-sandbox:
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Broker sandbox order + fill verification
+        env:
+          # R35 reviewer note: set the repo/environment VARIABLE `REQUIRE_BROKER_CERT=1` for a real-money release run.
+          # When certification is REQUIRED but the sandbox secrets are absent, this job FAILS with an explicit
+          # NOT CERTIFIED / NO-GO status (a green pipeline can never imply broker certification). When not required
+          # (ordinary PR/dev), it records NOT_CONFIGURED and passes so unrelated work isn't blocked.
+          REQUIRE_BROKER_CERT: ${{ vars.REQUIRE_BROKER_CERT }}
+          FYERS_SANDBOX_APP_ID: ${{ secrets.FYERS_SANDBOX_APP_ID }}
+          FYERS_SANDBOX_TOKEN: ${{ secrets.FYERS_SANDBOX_TOKEN }}
+          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
+          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
+        run: |
+          mkdir -p artifacts
+          REQUIRED=$(echo "${REQUIRE_BROKER_CERT:-0}" | grep -Eiq '^(1|true|yes)$' && echo 1 || echo 0)
+          if [ -z "$DELTA_SANDBOX_KEY" ] && [ -z "$FYERS_SANDBOX_TOKEN" ]; then
+            if [ "$REQUIRED" = "1" ]; then
+              echo "broker_sandbox=NOT_CERTIFIED (real-money certification REQUESTED but *_SANDBOX_* secrets are absent)" | tee artifacts/broker-sandbox.txt
+              echo "::error::NO-GO — broker certification requested but sandbox secrets are missing; real order paths NOT certified"
+              exit 1
+            fi
+            echo "broker_sandbox=NOT_CONFIGURED (set *_SANDBOX_* secrets + vars.REQUIRE_BROKER_CERT=1 to certify real order paths)" | tee artifacts/broker-sandbox.txt
+            echo "::warning::broker-sandbox secrets absent — real order paths NOT certified this run"
+            exit 0
+          fi
+          echo "commit=${GITHUB_SHA}" | tee artifacts/broker-sandbox.txt
+          # Sandbox-tagged suites read the *_SANDBOX_* creds and exercise real testnet order + verify calls.
+          BROKER_SANDBOX=1 node --test test/deltaTestnet*.cjs test/fyersSandbox*.cjs 2>&1 | tee -a artifacts/broker-sandbox.txt
+      - name: Upload broker-sandbox evidence (per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-sandbox-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90

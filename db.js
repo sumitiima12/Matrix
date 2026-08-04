@@ -164,8 +164,10 @@ async function initDb() {
     status TEXT NOT NULL, broker_order_id TEXT, filled_qty DOUBLE PRECISION, avg_price DOUBLE PRECISION,
     resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT, updated_at BIGINT)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_attempts_unresolved ON order_attempts (resolved, created_at)`);
-  // R33 follow-up: a JSONB slot for a durable resolution record (e.g. the MANUAL_RECONCILIATION_REQUIRED evidence).
-  // finalizeOrderAttempt previously accepted `evidence`/`manual` but silently dropped them — this column persists them.
+  // R33/R35-P3-01: JSONB slot for a durable resolution record (the MANUAL_RECONCILIATION_REQUIRED evidence). This is
+  // ALSO registered in the versioned migration chain (migrations.js "2026-08-04-002-order-attempts-resolution") so
+  // readiness is tied to it; this inline idempotent ADD stays for rolling-deploy compatibility during the supported
+  // upgrade window and is removed a release later once every replica is at that version.
   await pool.query(`ALTER TABLE order_attempts ADD COLUMN IF NOT EXISTS resolution JSONB`);
   /* S3.2 PROJECTION_PENDING: a broker EXIT execution is confirmed but the ledger/projection write failed. The
      payload holds everything needed to REPAIR the projection WITHOUT re-contacting the broker (idempotent by the
@@ -676,6 +678,40 @@ async function getProvisionalFills(userId, from = 0, to = Date.now()) {
   const bucket = readJSON(f)[String(userId)] || {};
   const finalized = _finalizedRefIds(bucket);
   return Object.values(bucket).filter((row) => _isUnfinalizedSource(row) && !finalized.has(String(row.fillId)) && (row.ts || 0) >= from && (row.ts || 0) <= to);
+}
+/* R35-P2-04 — the COMPLETE real execution set for a window (paginated to exhaustion), each row annotated with
+   `feeFinalized` = whether a fee_final overlay already references it. The EOD matcher needs the full set (finalized +
+   not) to allocate order-level charges deterministically and CONVERGE: it computes each execution's share across the
+   whole order but only emits overlays for the not-yet-finalized ones. Unlike getProvisionalFills (which drops
+   finalized rows), this KEEPS them so partial prior writes can still finish. */
+async function getReconcilableFills(userId, from = 0, to = Date.now()) {
+  if (USING_PG) {
+    const out = []; const pageSize = 5000; let offset = 0;
+    for (;;) {
+      const r = await pool.query(
+        `SELECT s.data,
+                EXISTS (SELECT 1 FROM fills o
+                         WHERE o.user_id=s.user_id AND o.broker=s.broker
+                           AND (o.data->>'kind')='fee_final'
+                           AND (o.data->>'refFillId')=s.fill_id) AS finalized
+           FROM fills s
+          WHERE s.user_id=$1 AND s.ts>=$2 AND s.ts<=$3
+            AND (s.data->>'real')='true'
+            AND COALESCE(s.data->>'kind','')<>'fee_final'
+          ORDER BY s.ts ASC, s.fill_id ASC LIMIT $4 OFFSET $5`,
+        [String(userId), from, to, pageSize, offset]);
+      out.push(...r.rows.map((x) => ({ ...x.data, feeFinalized: x.finalized === true })));
+      if (r.rows.length < pageSize) break;
+      offset += pageSize;
+    }
+    return out;
+  }
+  const f = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
+  const bucket = readJSON(f)[String(userId)] || {};
+  const finalized = _finalizedRefIds(bucket);
+  return Object.values(bucket)
+    .filter((row) => row && row.real === true && row.kind !== "fee_final" && (row.ts || 0) >= from && (row.ts || 0) <= to)
+    .map((row) => ({ ...row, feeFinalized: finalized.has(String(row.fillId)) }));
 }
 /* R34-P2-02 — total EXECUTION count per (broker, orderId) in a window, counting ALL executions of the order (finalized
    or not). The EOD matcher uses this to REFUSE order-level allocation when the visible (unfinalized) execution set is
@@ -2273,4 +2309,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };

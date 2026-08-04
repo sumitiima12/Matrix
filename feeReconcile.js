@@ -31,22 +31,26 @@ const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;   //
 // Returns one finalization per matched, not-yet-final real fill.
 const SEP = "\u001F";  // R34-P4-01: escaped unit-separator (0x1F), not a raw NUL, keeps the file text for git/diff/scanners
 const bkey = (broker, id) => String(broker == null ? "" : broker).toLowerCase() + SEP + String(id);
-function reconcileEodFees({ fills = [], contractNote = [], now = Date.now(), orderExecTotals = null } = {}) {
-  // R34-P2-02 — order-level allocation is only correct when we hold the COMPLETE execution set for that order.
-  // `orderExecTotals` (optional) maps `(broker,orderId)` → the TOTAL number of executions the ledger knows for that
-  // order. If provided and the visible bucket is smaller than that total (executions split by a read cap, or some
-  // already finalized in a prior sweep), we REFUSE to allocate that order this pass — leaving it provisional — rather
-  // than dividing the whole order charge across an incomplete subset and overstating those fills. When not provided
-  // (pure unit fixtures), behavior is unchanged.
-  const okeyForTotals = (broker, orderId) => bkey(broker, orderId);
+// R35-P2-01: an id present only as "" / whitespace is ABSENT. Used for BOTH contract-note lines and fills so a blank
+// execution id never routes an order-level charge into the execution map (where it would never match).
+const nzId = (v) => { const s = v == null ? "" : String(v).trim(); return s === "" ? null : s; };
+function reconcileEodFees({ fills = [], contractNote = [], now = Date.now() } = {}) {
+  /* R35-P2-04 — CONVERGENT order-level allocation. The input `fills` is the COMPLETE execution set for the window (a
+     fill already carrying a fee_final overlay is included and flagged `feeFinalized:true`). Order-level charges are
+     allocated deterministically across the FULL set of an order's executions (stable sort by fill id, so the split is
+     identical on every run regardless of how many are already finalized), and a finalization is EMITTED ONLY for the
+     executions that don't yet have an overlay. This prevents over-allocation AND converges: once every execution has
+     its overlay, subsequent passes emit nothing. (Replaces the R34 "refuse when incomplete" gate, which could never
+     finalize the remainder after a partial prior write.) */
   const byExec = new Map();       // (broker,execId) -> exact charge   [broker "" = wildcard]
   const byOrderTotal = new Map(); // (broker,orderId) -> total charge from ORDER-LEVEL lines only
   for (const c of (contractNote || [])) {
     const charges = Number(c && (c.charges ?? c.fees));
-    if (!Number.isFinite(charges)) continue;
+    if (!Number.isFinite(charges) || charges < 0) continue;   // R35-P2-02: never accept a non-finite/negative charge
     const brk = c.broker;
-    if (c.execId != null) byExec.set(bkey(brk, c.execId), charges);
-    else if (c.orderId != null) { const k = bkey(brk, c.orderId); byOrderTotal.set(k, (byOrderTotal.get(k) || 0) + charges); }
+    const eId = nzId(c.execId), oId = nzId(c.orderId);
+    if (eId != null) byExec.set(bkey(brk, eId), charges);
+    else if (oId != null) { const k = bkey(brk, oId); byOrderTotal.set(k, (byOrderTotal.get(k) || 0) + charges); }
   }
   // Look up a fill's charge in a broker-scoped map: prefer the fill's OWN broker line, fall back to a wildcard
   // (untagged) line for the same id. Returns { key, charge } of the matched entry, or null.
@@ -59,24 +63,28 @@ function reconcileEodFees({ fills = [], contractNote = [], now = Date.now(), ord
     return null;
   };
 
-  const provisionalFills = (fills || []).filter((f) => f && f.real === true && f.feeFinal !== true);
+  // Candidate = every real execution (kind fee_final rows are excluded by the caller). We use `feeFinalized` (overlay
+  // already present) — NOT the source row's own feeFinal (append-only, always false) — to decide EMISSION.
+  const candidateFills = (fills || []).filter((f) => f && f.real === true && f.kind !== "fee_final");
   const out = [];
   const mk = (f, finalFees) => {
+    if (f.feeFinalized === true || f.feeFinal === true) return;   // already finalized (overlay present, or legacy flag) → don't re-emit
     const provisional = Number(f.fees) || 0;
     out.push({
-      fillId: f.fillId ?? f.id ?? null, execId: f.execId ?? null, orderId: f.orderId ?? null, broker: f.broker ?? null,
+      fillId: f.fillId ?? f.id ?? null, execId: nzId(f.execId), orderId: nzId(f.orderId), broker: f.broker ?? null,
       leg: f.kind === "exit" ? "exit" : "entry",   // R32-P2-02: which leg's fee this corrects (for the projection overlay)
       provisionalFees: provisional, finalFees: round2(finalFees), feeDelta: +(round2(finalFees) - provisional).toFixed(6),
       feeStatus: "contract-note", feeFinal: true, at: now,
     });
   };
 
-  // Pass 1 — exact per-execution matches; collect the rest (order-level fallback) grouped by (broker, orderId).
+  // Pass 1 — exact per-execution matches; collect the rest (order-level fallback) grouped by (broker, orderId). Blank
+  // execution/order ids are treated as ABSENT (nzId), so an order-level line never mis-routes into the execution map.
   const orderBuckets = new Map();   // matched-order-key -> [fills awaiting allocation]
-  for (const f of provisionalFills) {
-    const exec = scopedLookup(byExec, f.broker, f.execId);
+  for (const f of candidateFills) {
+    const exec = scopedLookup(byExec, f.broker, nzId(f.execId));
     if (exec) { mk(f, exec.charge); continue; }
-    const ord = scopedLookup(byOrderTotal, f.broker, f.orderId);
+    const ord = scopedLookup(byOrderTotal, f.broker, nzId(f.orderId));
     if (ord) {
       if (!orderBuckets.has(ord.key)) orderBuckets.set(ord.key, []);
       orderBuckets.get(ord.key).push(f);
@@ -84,15 +92,12 @@ function reconcileEodFees({ fills = [], contractNote = [], now = Date.now(), ord
     // else: no contract-note line for this fill yet → leave provisional (retried next run).
   }
 
-  // Pass 2 — allocate each order's total across its bucket by |qty| (equal split if no qty), remainder on the last.
-  for (const [okey, bucket] of orderBuckets) {
-    // R34-P2-02: completeness gate. If we know how many executions this order truly has and the visible bucket is
-    // short, skip it (stays provisional) — never allocate a full order charge over an incomplete execution set.
-    if (orderExecTotals) {
-      const f0 = bucket[0];
-      const knownTotal = Number(orderExecTotals[okeyForTotals(f0 && f0.broker, f0 && f0.orderId)]);
-      if (Number.isFinite(knownTotal) && knownTotal > bucket.length) continue;
-    }
+  // Pass 2 — allocate each order's total across its COMPLETE bucket, DETERMINISTICALLY (stable sort by fill id), by
+  // |qty| weight (equal split if no qty), remainder on the last. mk() emits ONLY for not-yet-finalized fills, so the
+  // per-fill share is identical whether the pass runs before or after some executions were already finalized ⇒ it
+  // CONVERGES: the remaining executions finalize with the correct share and re-runs become no-ops (R35-P2-04).
+  for (const [okey, bucketRaw] of orderBuckets) {
+    const bucket = bucketRaw.slice().sort((a, b) => String(a.fillId ?? a.id ?? "").localeCompare(String(b.fillId ?? b.id ?? "")));
     const total = round2(byOrderTotal.get(okey));
     const weights = bucket.map((f) => Math.abs(Number(f.qty)) || 0);
     const wsum = weights.reduce((a, b) => a + b, 0);
@@ -135,32 +140,32 @@ function summarizeFinalizations(finalizations = [], totalProvisionalFills = 0) {
         kind:"fee_final", refFillId: fin.fillId, fees: fin.finalFees, feeDelta: fin.feeDelta, feeStatus:"contract-note",
         feeFinal:true, execEvent:true, real:true, ts: fin.at }). The deterministic id makes re-runs idempotent.
      • schedule: once daily AFTER market close per exchange (and once more late, to catch delayed statements). */
-async function runEodFeeReconcile({ userKeys = [], listProvisionalFills, fetchContractNote, recordFeeFinal, getOrderExecTotals = null, now = Date.now(), log = () => {} } = {}) {
-  if (typeof listProvisionalFills !== "function" || typeof fetchContractNote !== "function" || typeof recordFeeFinal !== "function") {
-    throw new Error("runEodFeeReconcile requires listProvisionalFills, fetchContractNote and recordFeeFinal functions");
+async function runEodFeeReconcile({ userKeys = [], listReconcilableFills, listProvisionalFills, fetchContractNote, recordFeeFinal, now = Date.now(), log = () => {} } = {}) {
+  // R35-P2-04: the matcher now needs the COMPLETE execution set (finalized + not) with a `feeFinalized` flag so it can
+  // allocate order-level charges deterministically and converge. `listReconcilableFills` supplies that. For backward
+  // compatibility, fall back to the older `listProvisionalFills` (which returns only unfinalized fills).
+  const listFills = listReconcilableFills || listProvisionalFills;
+  if (typeof listFills !== "function" || typeof fetchContractNote !== "function" || typeof recordFeeFinal !== "function") {
+    throw new Error("runEodFeeReconcile requires listReconcilableFills (or listProvisionalFills), fetchContractNote and recordFeeFinal functions");
   }
   let usersTouched = 0, finalized = 0, alreadyFinal = 0, conflicts = 0, netFeeCorrection = 0, stillProvisional = 0, errors = 0;
   for (const uk of userKeys) {
     let fills = [];
-    try { fills = await listProvisionalFills(uk); } catch (e) { errors++; log("eodfee.list_failed", { userKey: uk, err: String((e && e.message) || e) }); continue; }
-    const provisional = (fills || []).filter((f) => f && f.real === true && f.feeFinal !== true);
-    if (!provisional.length) continue;
+    try { fills = await listFills(uk); } catch (e) { errors++; log("eodfee.list_failed", { userKey: uk, err: String((e && e.message) || e) }); continue; }
+    const real = (fills || []).filter((f) => f && f.real === true && f.kind !== "fee_final");
+    const unfinalized = real.filter((f) => f.feeFinalized !== true);
+    if (!unfinalized.length) continue;   // nothing left to finalize for this user
     usersTouched++;
     // Fetch each involved broker's contract note ONCE, then reconcile against the union of lines. R33-P2-02: TAG each
     // line with the broker it came from so the matcher scopes charges per broker (broker IDs aren't globally unique).
-    const brokers = [...new Set(provisional.map((f) => String(f.broker || "")))];
+    const brokers = [...new Set(real.map((f) => String(f.broker || "")))];
     let note = [];
     for (const broker of brokers) {
       try { const n = await fetchContractNote(uk, broker); if (Array.isArray(n)) note = note.concat(n.map((ln) => ({ ...ln, broker: (ln && ln.broker != null) ? ln.broker : broker }))); }
       catch (e) { errors++; log("eodfee.note_failed", { userKey: uk, broker, err: String((e && e.message) || e) }); }
     }
-    // R34-P2-02: fetch the TRUE per-order execution counts (all executions, finalized or not) so order-level
-    // allocation is refused unless we hold the complete set. Fail-soft: on error, omit → matcher behaves as before.
-    let orderExecTotals = null;
-    if (typeof getOrderExecTotals === "function") {
-      try { orderExecTotals = await getOrderExecTotals(uk); } catch { orderExecTotals = null; }
-    }
-    const finals = reconcileEodFees({ fills: provisional, contractNote: note, now, orderExecTotals });
+    // Pass the COMPLETE real set so order-level allocation is deterministic + convergent; mk() emits only the missing overlays.
+    const finals = reconcileEodFees({ fills: real, contractNote: note, now });
     for (const fin of finals) {
       try {
         // R33-P2-01: recordFeeFinal returns { inserted, conflict }. A finalization only counts (and its delta only
@@ -173,7 +178,7 @@ async function runEodFeeReconcile({ userKeys = [], listProvisionalFills, fetchCo
         } else { finalized++; netFeeCorrection += Number(fin.feeDelta) || 0; }
       } catch (e) { errors++; log("eodfee.persist_failed", { userKey: uk, fillId: fin.fillId, err: String((e && e.message) || e) }); }
     }
-    stillProvisional += summarizeFinalizations(finals, provisional.length).stillProvisional;
+    stillProvisional += summarizeFinalizations(finals, unfinalized.length).stillProvisional;
   }
   const summary = { usersTouched, finalized, alreadyFinal, conflicts, netFeeCorrection: +netFeeCorrection.toFixed(6), stillProvisional, errors };
   log("eodfee.done", summary);

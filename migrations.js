@@ -33,6 +33,15 @@ const SCHEMA_MIGRATIONS = [
     name: "expand: index fills(user_id, order_id) for order-scoped fee/drift reconciliation",
     up: async (query) => { await query(`CREATE INDEX IF NOT EXISTS fills_user_order ON fills (user_id, order_id)`); },
   },
+  {
+    // R35-P3-01: the manual-reconciliation evidence column (order_attempts.resolution JSONB) is now part of the ORDERED
+    // versioned chain, so readiness can be tied to it and migration artifacts prove when it was applied. EXPAND-only,
+    // idempotent. db.initDb() also keeps an inline `ADD COLUMN IF NOT EXISTS` for rolling-deploy compatibility during
+    // the supported upgrade window; that inline DDL is removed a release LATER once every replica is at this version.
+    version: "2026-08-04-002-order-attempts-resolution",
+    name: "expand: order_attempts.resolution JSONB for durable manual-reconciliation evidence",
+    up: async (query) => { await query(`ALTER TABLE order_attempts ADD COLUMN IF NOT EXISTS resolution JSONB`); },
+  },
 ];
 
 // The version the code EXPECTS to be live — readiness can gate real-money features on reaching it.
