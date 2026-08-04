@@ -579,6 +579,46 @@ async function getFills(userId, from = 0, to = Date.now()) {
   const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
   return Object.values(readJSON(f)[String(userId)] || {}).filter((x) => (x.ts || 0) >= from && (x.ts || 0) <= to).sort((a, b) => (b.ts || 0) - (a.ts || 0));
 }
+/* R33-P2-01: read one ledger fill by its immutable fill_id (used to verify an on-conflict fee-final write carries
+   identical content — an idempotent replay — vs a changed correction that must be flagged, not silently dropped). */
+async function getFillById(userId, fillId) {
+  if (!fillId) return null;
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM fills WHERE user_id=$1 AND fill_id=$2 LIMIT 1`, [String(userId), String(fillId)]);
+    return r.rows[0] ? r.rows[0].data : null;
+  }
+  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  return (readJSON(f)[String(userId)] || {})[String(fillId)] || null;
+}
+/* R33-P2-03: discover the DISTINCT storage keys that have PROVISIONAL real fills in a window — the true set of users
+   whose fees still need finalizing, regardless of whether they still have an active strategy or ever ran automation
+   (manual `/api/broker/order` traders included). Strategy state must never gate accounting finality. Paginated;
+   returns [{ userKey, oldest }] where oldest is the earliest provisional ts (for an ops "oldest unfinalized" alert). */
+async function getUsersWithProvisionalFills(from = 0, to = Date.now(), limit = 1000, offset = 0) {
+  if (USING_PG) {
+    const r = await pool.query(
+      `SELECT user_id, MIN(ts) AS oldest FROM fills
+        WHERE ts>=$1 AND ts<=$2
+          AND (data->>'real')='true'
+          AND COALESCE(data->>'feeFinal','false')<>'true'
+          AND COALESCE(data->>'kind','')<>'fee_final'
+        GROUP BY user_id ORDER BY user_id LIMIT $3 OFFSET $4`,
+      [from, to, limit, offset]
+    );
+    return r.rows.map((x) => ({ userKey: x.user_id, oldest: Number(x.oldest) || 0 }));
+  }
+  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  const d = readJSON(f); const out = [];
+  for (const [uid, bucket] of Object.entries(d)) {
+    let oldest = Infinity;
+    for (const row of Object.values(bucket || {})) {
+      if (row && row.real === true && row.feeFinal !== true && row.kind !== "fee_final" && (row.ts || 0) >= from && (row.ts || 0) <= to) oldest = Math.min(oldest, row.ts || 0);
+    }
+    if (oldest !== Infinity) out.push({ userKey: uid, oldest });
+  }
+  out.sort((a, b) => (a.userKey < b.userKey ? -1 : 1));
+  return out.slice(offset, offset + limit);
+}
 /* INC-1: pure comparator for risk-journal ↔ fills-ledger drift. Compares the VERIFIED entry legs the risk
    engine reads (server-authored real trades with a broker order id) against the entry fills in the immutable
    ledger, by order id. Returns the drift both ways so a monitor can surface a book that is diverging BEFORE it
@@ -2137,4 +2177,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };

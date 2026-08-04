@@ -60,6 +60,15 @@ async function reconcileUnresolvedAttempts(deps) {
       await db.finalizeOrderAttempt(a.id, "PARTIAL", { brokerOrderId: ob.orderId || null, filledQty: ob.filledQty, avgPrice: ob.avgPrice });
       keptLocked++; if (a.userId) lockUsers.add(a.userId);
       logger("c03.recover.partial", { id: a.id, tag: a.orderTag, filledQty: ob.filledQty });
+    } else if (ob.status === "manual") {
+      /* R33-P3-01: the broker was fully readable but CANNOT prove this (previous-session) order's outcome — no
+         endpoint covers it. This is NOT transient, so we do not leave it silently pending forever. Stamp a durable,
+         AUDITABLE MANUAL_RECONCILIATION_REQUIRED state (kept UNRESOLVED so the account stays locked) with the exact
+         evidence, and emit an operator alert. A human / EOD statement resolves it; automation never fabricates an
+         outcome. Idempotent: re-stamping the same state on a later sweep is a no-op that keeps the lock. */
+      await db.finalizeOrderAttempt(a.id, "MANUAL_RECONCILIATION_REQUIRED", { manual: true, evidence: ob.evidence || null });
+      keptLocked++; if (a.userId) lockUsers.add(a.userId);
+      logger("c03.recover.manual_required", { id: a.id, tag: a.orderTag, reason: ob.reason || null, evidence: ob.evidence || null });
     } else {
       // pending / unknown → not conclusive → stay locked, retry a later sweep.
       keptLocked++; if (a.userId) lockUsers.add(a.userId);

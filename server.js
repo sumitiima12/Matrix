@@ -412,11 +412,27 @@ async function repairProjectionPending(reason = "periodic") {
       if (it.kind === "managed_exit") {
         try {
           const mid = p.managedId;
+          /* R33-P2-04: only DELETE the durable repair item when the managed row was ACTUALLY updated to the expected
+             residual/status. updateManagedPosition returns null when the target row is missing; a missing/incorrect
+             managedId, a deleted row, or any inconsistency must NOT be acknowledged as "repaired" — that would destroy
+             the only durable instruction while the canonical projection stays wrong. On any such miss we retain the
+             item, bump attempts, keep the account locked, and alert. */
+          let updated = null;
           if (mid) {
-            if (p.closed) await db.updateManagedPosition(mid, { status: "closed", closedAt: p.closedAt || Date.now(), exitReason: p.exitReason || "reconciled-close", exitOrderId: p.exitOrderId || null, closingSince: null, exitTag: null });
-            else await db.updateManagedPosition(mid, { qty: p.remainingQty, status: "open", closingSince: null, exitTag: null, exitOrderId: p.exitOrderId || null, exitReason: `${p.exitReason || "reconciled-close"} (partial)` });
+            if (p.closed) updated = await db.updateManagedPosition(mid, { status: "closed", closedAt: p.closedAt || Date.now(), exitReason: p.exitReason || "reconciled-close", exitOrderId: p.exitOrderId || null, closingSince: null, exitTag: null });
+            else updated = await db.updateManagedPosition(mid, { qty: p.remainingQty, status: "open", closingSince: null, exitTag: null, exitOrderId: p.exitOrderId || null, exitReason: `${p.exitReason || "reconciled-close"} (partial)` });
           }
-          await db.deleteProjectionPending(it.id); repaired++;
+          const verified = updated && (p.closed
+            ? updated.status === "closed"
+            : (updated.status === "open" && Number(updated.qty) === Number(p.remainingQty)));
+          if (verified) { await db.deleteProjectionPending(it.id); repaired++; }
+          else {
+            failed++;
+            try { await db.bumpProjectionPending(it.id); } catch { /* ignore */ }
+            const uk = String(it.userId || p.userId || "");
+            if (uk && typeof db.setEntryHalt === "function") { try { await db.setEntryHalt(uk, true); haltedEntries.add(uk); } catch { /* best-effort */ } }
+            logFinancial("projection.repair.managed_unverified", { id: it.id, managedId: mid || null, expectClosed: !!p.closed, expectQty: p.remainingQty ?? null, gotStatus: (updated && updated.status) || "missing" });
+          }
         } catch (e) { failed++; try { await db.bumpProjectionPending(it.id); } catch { /* ignore */ } }
         continue;
       }
@@ -702,6 +718,20 @@ async function _fyersProbeByTag(attempt) {
   const IST_OFFSET_MS = 19800000;
   const sessionStart = Math.floor((Date.now() + IST_OFFSET_MS) / 86400000) * 86400000 - IST_OFFSET_MS;
   if (bid && reconcile.safeToDeclareAbsent(attempt, { now: Date.now(), minAgeMs: FYERS_ABSENCE_MIN_AGE_MS, coverageStartMs: sessionStart })) return { status: "absent" };
+  /* R33-P3-01 — PREVIOUS-SESSION, UNCOVERABLE, BUT ACCEPTED. All of orders/tradebook/positions/holdings were readable
+     and none referenced our order, the order WAS accepted (we hold a broker order id), and it is old enough that lag
+     can't be hiding it — yet it predates today's day-scoped books, so NO FYERS endpoint can prove its outcome. Rather
+     than return `null` and lock the account FOREVER as if the condition were transient, surface an explicit, durable
+     MANUAL_RECONCILIATION_REQUIRED outcome carrying the evidence. The account stays locked, but the state is now
+     auditable and actionable by an operator/statement — not an invisible permanent lock. A same-session too-recent
+     unknown still returns null (genuinely transient, retried on a later sweep). */
+  const created = Number(attempt.createdAt ?? attempt.created_at);
+  const prevSession = Number.isFinite(created) && created > 0 && created < sessionStart;
+  const oldEnough = Number.isFinite(created) && created > 0 && (Date.now() - created) >= FYERS_ABSENCE_MIN_AGE_MS;
+  if (bid && prevSession && oldEnough) {
+    return { status: "manual", reason: "prev_session_uncoverable",
+      evidence: { orderTag: tag, brokerOrderId: bid, createdAt: created, sessionStart, checked: ["orders", "tradebook", "positions", "holdings"] } };
+  }
   return null;
 }
 async function _adoptFyersFill(attempt, ob) {
@@ -8131,25 +8161,51 @@ async function runEodFeeReconcileJob(reason = "scheduled") {
   try {
     owner = await db.tryAdvisoryLock(EOD_FEE_RECONCILE_LOCK_KEY);
     if (!owner) return { skipped: true, reason: "not-owner" };
-    // Users with real trading today: derive from active real strategies (their storage keys).
-    const strategies = await db.getActiveRealStrategies(1000).catch(() => []);
-    const userKeys = [...new Set((strategies || []).map((s) => storageKeyFor(s.userId)).filter(Boolean))];
     const IST_OFFSET_MS = 19800000;
     const dayStart = Math.floor((Date.now() + IST_OFFSET_MS) / 86400000) * 86400000 - IST_OFFSET_MS;
+    // R33-P2-03: discover work from the PROVISIONAL FILLS themselves, not from active real strategies. Fee finality
+    // must not depend on strategy state — a manual `/api/broker/order` trader, a user whose strategy was paused or
+    // cancelled after trading, or one beyond a strategy-row limit still has real fills whose fees must be finalized.
+    // Look back a few days so a delayed/late contract note still gets applied. Paginated.
+    const lookbackDays = Math.max(1, Number(process.env.EOD_FEE_LOOKBACK_DAYS) || 3);
+    const windowStart = dayStart - lookbackDays * 86400000;
+    const discovered = [];
+    for (let off = 0; ; off += 1000) {
+      const page = await db.getUsersWithProvisionalFills(windowStart, Date.now(), 1000, off).catch(() => []);
+      discovered.push(...page);
+      if (page.length < 1000) break;
+    }
+    const userKeys = [...new Set(discovered.map((r) => r.userKey).filter(Boolean))];
+    const oldestProvisional = discovered.reduce((m, r) => Math.min(m, r.oldest || Infinity), Infinity);
     const summary = await feeReconcile.runEodFeeReconcile({
       userKeys, now: Date.now(), log: (ev, d) => logFinancial(ev, { reason, ...d }),
-      listProvisionalFills: (uk) => db.getFills(uk, dayStart, Date.now()),
+      listProvisionalFills: (uk) => db.getFills(uk, windowStart, Date.now()),
       fetchContractNote: fetchBrokerContractNote,
       /* R32-P2-02: the fee-final event is a fee-DELTA overlay, NOT an execution. It carries no qty and is NOT an
          execEvent, so projectFills never groups it as an entry/exit leg (which would double-count fees or add a
          phantom zero-qty leg). It records the net feeDelta, the referenced fill, and the leg it corrects; projectFills
-         applies exactly this delta once per (broker, orderId, leg). Deterministic fillId ⇒ idempotent re-runs. */
-      recordFeeFinal: (uk, fin) => db.recordFill(uk, {
-        fillId: `feefinal_${fin.broker || "x"}_${fin.execId || fin.orderId}`, kind: "fee_final",
-        refFillId: fin.fillId, orderId: fin.orderId || null, leg: fin.leg || "entry",
-        feeDelta: fin.feeDelta, feeStatus: "contract-note", feeFinal: true, broker: fin.broker || null, real: true, ts: fin.at,
-      }),
+         applies exactly this delta once per (broker, orderId, leg).
+         R33-P2-01: key the immutable row by the REFERENCED FILL (feefinal_<broker>_<leg>_<refFillId>), NOT by
+         execId||orderId — order-level multi-fill corrections previously collided on one key and ON CONFLICT DO NOTHING
+         dropped all but the first. Each provisional fill has a distinct immutable fillId, so each correction gets its
+         own row. On conflict (a re-run), verify the existing row carries the SAME feeDelta before treating it as an
+         idempotent success; a DIFFERENT amount is a collision the job flags rather than silently loses. */
+      recordFeeFinal: async (uk, fin) => {
+        const refId = fin.fillId ?? fin.execId ?? fin.orderId;
+        const key = `feefinal_${String(fin.broker || "x").toLowerCase()}_${fin.leg || "entry"}_${refId}`;
+        const r = await db.recordFill(uk, {
+          fillId: key, kind: "fee_final", refFillId: fin.fillId, orderId: fin.orderId || null, leg: fin.leg || "entry",
+          feeDelta: fin.feeDelta, feeStatus: "contract-note", feeFinal: true, broker: fin.broker || null, real: true, ts: fin.at,
+        });
+        if (r && r.inserted) return { inserted: true };
+        const existing = await db.getFillById(uk, (r && r.fillId) || key).catch(() => null);
+        const same = existing && Math.abs((Number(existing.feeDelta) || 0) - (Number(fin.feeDelta) || 0)) < 1e-6
+          && String(existing.refFillId ?? "") === String(fin.fillId ?? "");
+        return { inserted: false, conflict: !same };
+      },
     });
+    if (Number.isFinite(oldestProvisional)) summary.oldestProvisionalAgeMs = Math.max(0, Date.now() - oldestProvisional);
+    summary.affectedUsers = userKeys.length;
     logFinancial("eodfee.sweep", { reason, ...summary });
     return summary;
   } catch (e) { return { error: (e && e.message) || String(e) }; }
@@ -8162,7 +8218,7 @@ if (/^(1|true|yes)$/i.test(String(process.env.EOD_FEE_RECONCILE || "")) && !MATR
 
 /* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
    the creds the engine will act with). Supported brokers only. */
-app.post("/api/autobuy/register", requireAuth, requireActiveUser, async (req, res) => {
+app.post("/api/autobuy/register", requireAuth, requireSchemaReady, requireActiveUser, async (req, res) => {
   const sess = getBrokerSession(req);
   if (!sess) return res.status(401).json({ error: "connect the broker first" });
   const b = sess.broker;
@@ -8297,7 +8353,7 @@ async function openPositionForStrategy(userId, strat) {
 /* CLOSE NOW — flatten an auto-buy strategy's open position with a reduce-only MARKET sell, then stop
    the strategy from re-entering. Real money moves. Honors AUTO_EXIT_LIVE: in dry-run it marks the
    position closed WITHOUT placing a broker order (matching the exit engine's own gating). */
-app.post("/api/autobuy/close", requireAuth, requireActiveUser, async (req, res) => {
+app.post("/api/autobuy/close", requireAuth, requireSchemaReady, requireActiveUser, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { id } = req.body || {};
@@ -8383,7 +8439,7 @@ app.post("/api/autobuy/close", requireAuth, requireActiveUser, async (req, res) 
        entryOrderId/positionId; returns AUTHORITATIVE filled + remaining quantity.
      • A partial close reduces the tracked quantity and keeps the residual OPEN (never a false full close); an
        unconfirmed/pending/partial broker result keeps the position visible and retryable. */
-app.post("/api/real-positions/:positionId/close", requireAuth, requireActiveUser, requireFreshSession, async (req, res) => {
+app.post("/api/real-positions/:positionId/close", requireAuth, requireSchemaReady, requireActiveUser, requireFreshSession, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const positionId = String(req.params.positionId || "");
@@ -8514,7 +8570,7 @@ app.post("/api/real-positions/:positionId/close", requireAuth, requireActiveUser
 
 /* UPDATE SL/TP — change the strategy's stop-loss / take-profit and push the new levels onto its open
    managed position so the exit engine acts on them. */
-app.post("/api/autobuy/update", requireAuth, requireActiveUser, async (req, res) => {
+app.post("/api/autobuy/update", requireAuth, requireSchemaReady, requireActiveUser, async (req, res) => {
   try {
     const userId = routeUserId(req);
     const { id, sl, tp } = req.body || {};

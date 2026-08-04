@@ -107,6 +107,73 @@ test("R31-P2-08: summarizeFinalizations reports count, net correction, and still
   assert.equal(s.stillProvisional, 3, "5 provisional fills, 2 finalized ⇒ 3 still awaiting the contract note");
 });
 
+test("R33-P2-02: charges are BROKER-SCOPED — an identical orderId across two brokers never cross-allocates", () => {
+  // FYERS order "123" and Delta order "123" both exist for the same user. Each broker's charge must land ONLY on
+  // that broker's fill; without broker scoping, one broker's fee could be applied to the other broker's fill.
+  const fills = [
+    { fillId: "fy", execId: "E1", orderId: "123", broker: "fyers", real: true, fees: 1, feeFinal: false },
+    { fillId: "dl", execId: "E2", orderId: "123", broker: "delta", real: true, fees: 1, feeFinal: false },
+  ];
+  const note = [
+    { execId: "E1", orderId: "123", charges: 5, broker: "fyers" },
+    { execId: "E2", orderId: "123", charges: 9, broker: "delta" },
+  ];
+  const out = reconcileEodFees({ fills, contractNote: note, now: NOW });
+  assert.equal(out.find((x) => x.fillId === "fy").finalFees, 5, "FYERS fill gets ONLY the FYERS charge");
+  assert.equal(out.find((x) => x.fillId === "dl").finalFees, 9, "Delta fill gets ONLY the Delta charge");
+});
+
+test("R33-P2-02: order-level charges are broker-scoped too (no cross-broker order-total bleed)", () => {
+  const fills = [
+    { fillId: "fy", orderId: "999", qty: 1, broker: "fyers", real: true, fees: 0, feeFinal: false },
+    { fillId: "dl", orderId: "999", qty: 1, broker: "delta", real: true, fees: 0, feeFinal: false },
+  ];
+  const note = [
+    { orderId: "999", charges: 12, broker: "fyers" },
+    { orderId: "999", charges: 30, broker: "delta" },
+  ];
+  const out = reconcileEodFees({ fills, contractNote: note, now: NOW });
+  assert.equal(out.find((x) => x.fillId === "fy").finalFees, 12);
+  assert.equal(out.find((x) => x.fillId === "dl").finalFees, 30);
+});
+
+test("R33-P2-02: an UNTAGGED (wildcard) contract-note line still matches (backward compat)", () => {
+  const fills = [{ fillId: "x", execId: "E1", broker: "fyers", real: true, fees: 1, feeFinal: false }];
+  const out = reconcileEodFees({ fills, contractNote: [{ execId: "E1", charges: 4 }], now: NOW });   // no broker on the line
+  assert.equal(out.length, 1);
+  assert.equal(out[0].finalFees, 4);
+});
+
+test("R33-P2-01: the job counts a NEW insert as finalized, an identical replay as alreadyFinal, a changed row as a conflict", async () => {
+  // recordFeeFinal simulates the immutable-ledger adapter: first write inserts, a re-run of the same content is an
+  // idempotent replay (inserted:false, no conflict), and a DIFFERENT amount on the same key is a flagged conflict.
+  const calls = [];
+  const summary = await runEodFeeReconcile({
+    userKeys: ["u1"],
+    now: NOW,
+    listProvisionalFills: async () => [
+      { fillId: "a", execId: "EA", broker: "fyers", real: true, fees: 1, feeFinal: false },
+      { fillId: "b", execId: "EB", broker: "fyers", real: true, fees: 1, feeFinal: false },
+      { fillId: "c", execId: "EC", broker: "fyers", real: true, fees: 1, feeFinal: false },
+    ],
+    fetchContractNote: async () => [
+      { execId: "EA", charges: 2 },   // a → NEW insert
+      { execId: "EB", charges: 3 },   // b → replay (already final, identical)
+      { execId: "EC", charges: 4 },   // c → conflict (existing row has a different delta)
+    ],
+    recordFeeFinal: async (uk, fin) => {
+      calls.push(fin.fillId);
+      if (fin.fillId === "a") return { inserted: true };
+      if (fin.fillId === "b") return { inserted: false, conflict: false };
+      return { inserted: false, conflict: true };
+    },
+  });
+  assert.equal(summary.finalized, 1, "only the genuinely new write counts as finalized");
+  assert.equal(summary.alreadyFinal, 1, "an identical replay is idempotent success, not a re-finalization");
+  assert.equal(summary.conflicts, 1, "a changed correction on an existing key is flagged, not silently lost");
+  assert.equal(summary.netFeeCorrection, 1, "net correction moves ONLY by the inserted delta (2 − 1)");
+});
+
 test("R31-P2-08: runEodFeeReconcile orchestrates per-user, persists finalizations, and is fail-soft", async () => {
   const persisted = [];
   const summary = await runEodFeeReconcile({
