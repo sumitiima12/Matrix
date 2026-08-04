@@ -452,12 +452,17 @@ async function recordFyersExecutionFills(userKey, sess, orderId, { leg = "entry"
     const _itemisedFees = ["brokerage", "stt", "sebiCharges", "exchangeCharges", "gst", "stampDuty", "clearingCharges"]
       .reduce((a, k) => a + (Number(t[k]) || 0), 0);
     const fees = _itemisedFees > 0 ? _itemisedFees : (Number(t.charges ?? t.fees ?? t.tax ?? 0) || 0);
+    /* R31-P2-08: stamp fee PROVENANCE so downstream P&L can be labelled honestly. "itemised" = summed independent
+       charge components; "aggregate" = single combined charges field; "none" = broker returned no charges on the
+       tradebook. All intraday fees are PROVISIONAL until the EOD contract note is reconciled (feeFinal:false) — the
+       contract-note reconciliation job upgrades them to final. This never changes the numbers, only their labelling. */
+    const feeStatus = _itemisedFees > 0 ? "itemised" : (fees > 0 ? "aggregate" : "none");
     const sideStr = (t.side === -1 || String(t.side).toUpperCase() === "SELL" || String(t.side) === "-1") ? "SELL" : "BUY";
     const tsMs = t.orderDateTime ? (Date.parse(String(t.orderDateTime).replace(" ", "T")) || Date.now()) : (Number(t.tradeTime) || Date.now());
     try {
       const res = await db.recordFill(userKey, {
         fillId: `x_${userRefSafe(userKey)}_fyers_${execId}`, execEvent: true, execId,
-        ...(leg === "exit" ? { kind: "exit" } : {}), side: sideStr, qty: q, entry: px, price: px, fees,
+        ...(leg === "exit" ? { kind: "exit" } : {}), side: sideStr, qty: q, entry: px, price: px, fees, feeStatus, feeFinal: false,
         orderId, entryOrderId: entryOrderId != null ? String(entryOrderId) : null,
         broker: "fyers", market, real: true, serverAuthored: true, tradeType, ...(strategy ? { strategy } : {}), ts: tsMs,
       });
@@ -5725,9 +5730,12 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     const clientOverride = cleanRiskPolicy(req.body?.riskLimits);
     const effLimits = strictestRiskPolicy(serverPolicy, clientOverride);
     const userLimits = Object.keys(effLimits).length ? effLimits : null;
-    /* A reduce-only order is an EXIT — the broker's reduce_only flag guarantees it can only close/reduce, never
-       open. Flag it so the risk gate exempts it from entry-side controls (cooldown, funds, sizing, frequency);
-       blocking a close on those grounds would strand the user in a live position they asked to exit. */
+    /* A reduce-only order is an EXIT. On brokers with a native reduce_only flag (e.g. Delta) the broker enforces
+       "close/reduce only, never open"; on FYERS there is NO native reduce_only guarantee — the exit is a plain SELL
+       whose safety comes from Matrix's own exposure-clamped sizing + exit-tag recovery (R31-P4-02: don't assume the
+       broker prevents reversal). Either way we flag it so the risk gate exempts it from entry-side controls
+       (cooldown, funds, sizing, frequency); blocking a close on those grounds would strand the user in a live
+       position they asked to exit. */
     const rkReduceOnly = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
     const check = serverValidateOrder(
       { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket, reduceOnly: rkReduceOnly },
@@ -5764,6 +5772,21 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           const waitS = Math.ceil((cooldownMs - (Date.now() - fillsRk.lastEntryTs)) / 1000);
           logFinancial("risk.fills_block", { userId: uidKey, cap: "cooldownMs", sinceLastMs: Date.now() - fillsRk.lastEntryTs, cooldownMs });
           return res.status(422).json({ error: `Order blocked by risk checks: cooldown active — wait ~${waitS}s before your next entry (execution-ledger authoritative).`, reasons: ["cooldown (execution-ledger authoritative)"] });
+        }
+        /* R31-P2-05: the daily-loss circuit breaker is now enforced from the IMMUTABLE, FEE-AWARE fills ledger too,
+           not only the account/projection view — we block on the STRICTER of the two. deriveRiskFromFills.realizedLoss
+           is the net (post-brokerage/tax) realized loss today; back out today's realized P&L from current cash to get
+           the day's opening equity (same basis as riskEngine), then block a new entry once realized loss breaches the
+           cap. This makes the breaker authoritative on executed truth, so fabricated/omitted projection rows can't
+           loosen it. */
+        const maxLossPct = Number(userLimits.maxDailyLossPct) || 0;
+        if (maxLossPct > 0) {
+          const startOfDayEquity = (Number(account.wallet) || 0) - (Number(fillsRk.realizedPnl) || 0);
+          const lossCap = Math.max(0, (startOfDayEquity * maxLossPct) / 100);
+          if (lossCap > 0 && Number(fillsRk.realizedLoss) >= lossCap) {
+            logFinancial("risk.fills_block", { userId: uidKey, cap: "maxDailyLossPct", realizedLoss: fillsRk.realizedLoss, lossCap: +lossCap.toFixed(2), pct: maxLossPct });
+            return res.status(422).json({ error: `Order blocked by risk checks: today's realized loss (${fillsRk.realizedLoss.toFixed(0)}) has hit your daily-loss limit (${lossCap.toFixed(0)}, execution-ledger authoritative). Trading is paused for the session.`, reasons: ["daily loss limit (execution-ledger authoritative)"] });
+          }
         }
       }
       // Divergence alert (both directions) — the projection's real entries today vs the ledger's executed entries.
@@ -7608,10 +7631,14 @@ async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
   if (!schemaReady) return;   // R23-P2-12: never trade against an unproven schema (safety tables may be absent)
   autoBuyRunning = true;
+  // R31-P2-04: capture THIS sweep's lease fence so we can re-validate it immediately before each broker send. A
+  // worker paused past its lease expiry must not resume and place a duplicate entry after a takeover.
+  let engineFence = null;
   try {
     // S7: only the lease-OWNER replica runs the entry sweep. Others stand down this tick (fail-closed).
     const g = await db.acquireLease("engine:autobuy", INSTANCE_ID, Math.max(AUTO_BUY_MS * 2, 60_000)).catch(() => null);
     if (!g || !g.acquired) { autoBuyRunning = false; return; }
+    engineFence = g.fence;
   } catch { autoBuyRunning = false; return; }
   const live = autoBuyLiveOn();
   let checked = 0, bought = 0;
@@ -7818,6 +7845,19 @@ async function runAutoBuyEngine() {
           continue;
         }
 
+        /* R31-P2-04: LAST-INSTANT LEASE FENCE CHECK before the broker send. Everything above (claim, risk, freshness)
+           may have run while this replica held the lease, then it could have paused (GC/partition) and lost the lease
+           to a takeover. If our sweep's fence is no longer live, another replica now owns the engine — placing this
+           entry would be the duplicate-order bug. Release the pending marker and skip; the current owner will act. */
+        if (live && engineFence != null) {
+          let fenceLive = false;
+          try { fenceLive = await db.fenceValid("engine:autobuy", engineFence); } catch { fenceLive = false; }
+          if (!fenceLive) {
+            await db.updateRealStrategy(st.id, { pendingSince: null, pendingClientId: null, lastOrderStatus: "skipped", lastError: "Engine ownership changed (lease takeover) before the order was sent — skipped to avoid a duplicate; the active instance will handle it." }).catch(() => {});
+            logFinancial("autobuy.fenced_before_send", { userId: st.userId, strategyId: st.id, broker: st.broker, symbol: st.symbol, fence: engineFence });
+            continue;
+          }
+        }
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
         // price, so P&L reflects what really executed, not what we requested.
@@ -8135,12 +8175,13 @@ app.post("/api/autobuy/close", requireAuth, requireActiveUser, async (req, res) 
     const pos = await openPositionForStrategy(userId, strat);
     // No open position — nothing to sell; just stop the strategy.
     if (!pos) { await db.updateRealStrategy(id, { status: "cancelled" }); return res.json({ ok: true, closed: false, note: "no open position — strategy stopped" }); }
+    // R31-P1-01: an explicitly invoked REAL close must NEVER mutate broker-backed truth as if executed.
+    // When live exit is disabled we place no order AND change nothing (position, ledger, strategy) — the UI
+    // must not be told a live position was flattened while real money is still exposed. Simulated closes belong
+    // only to virtual books, never to a real managed position.
     const live = String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true";
     if (!live) {
-      // Dry-run: simulate the close so the UI clears, but place no real order.
-      await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "manual-close (dry-run)" });
-      await db.updateRealStrategy(id, { status: "cancelled" });
-      return res.json({ ok: true, closed: true, dryRun: true });
+      return res.status(409).json({ ok: false, closed: false, code: "LIVE_EXIT_DISABLED", error: "Live exit is disabled on this deployment, so this real position was NOT closed and nothing was changed. Enable live exit (or close it in your broker) — Matrix will never simulate a real close." });
     }
     const sess = await sessionFromCred(userId, pos.broker || strat.broker);
     if (!sess) return res.status(400).json({ error: "no stored credentials for this broker — reconnect it first" });
@@ -8250,18 +8291,26 @@ app.post("/api/real-positions/:positionId/close", requireAuth, requireActiveUser
         // authoritative, so brokerQty=0 (not null). Only a THROWN read leaves brokerQty=null (unknown exposure).
         brokerQty = held ? Math.abs(Number(held.qty ?? held.netQty ?? 0)) : 0;
       }
-    } catch { brokerQty = null; }   // couldn't read exposure → fall back to the tracked quantity
-    if (brokerQty != null && brokerQty <= 0) {
+    } catch { brokerQty = null; }   // couldn't read exposure → unknown, must fail closed (never guess from local qty)
+    // R31-P1-02: fresh broker exposure is MANDATORY for canonical close sizing. If we could not read it, we do
+    // NOT fall back to the tracked (possibly stale) quantity — a stale larger quantity could oversell a long into
+    // a short on a SELL-based exit. Keep the position untouched and return 503/reconciliation-required.
+    if (brokerQty == null) {
+      return res.status(503).json({ ok: false, closed: false, code: "EXPOSURE_UNVERIFIED", error: "Couldn't verify your live broker exposure right now, so nothing was closed and nothing was changed. Fresh broker truth is required before a real close — try again in a moment." });
+    }
+    if (brokerQty <= 0) {
       // The broker holds nothing for this symbol → already flat there. Reconcile closed WITHOUT a new order.
+      // This is broker-TRUTH-driven (not a simulated fill), so it is correct regardless of the live-exit flag.
       await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: `${reason} (broker already flat)`, closingSince: null });
       return res.json({ ok: true, closed: true, filledQty: 0, remainingQty: 0, note: "broker holds no exposure for this symbol — position reconciled closed without placing an order" });
     }
-    const closeQty = brokerQty != null ? Math.min(requestedQty, brokerQty) : requestedQty;
+    const closeQty = Math.min(requestedQty, brokerQty);   // brokerQty is verified non-null here
 
+    // R31-P1-01: a real close must place and verify a broker exit or refuse — it must NEVER mark a real position
+    // closed without a broker-confirmed fill. When live exit is disabled we change nothing and say so.
     const live = String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true";
     if (!live) {
-      await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: `${reason} (dry-run)`, closingSince: null });
-      return res.json({ ok: true, closed: true, dryRun: true, filledQty: closeQty, remainingQty: openQty - closeQty });
+      return res.status(409).json({ ok: false, closed: false, code: "LIVE_EXIT_DISABLED", error: "Live exit is disabled on this deployment, so this real position was NOT closed and nothing was changed. Enable live exit (or close it in your broker) — Matrix will never simulate a real close." });
     }
 
     // ATOMIC claim (open→closing) so a second close / the exit engine can't also submit; exitTag ⇒ crash-idempotent.
@@ -8291,16 +8340,33 @@ app.post("/api/real-positions/:positionId/close", requireAuth, requireActiveUser
       return res.status(409).json({ ok: false, closed: false, orderId: r.orderId || null, filledQty: 0, remainingQty: closeQty, error: "broker didn't confirm a full close — the position is still open and will keep retrying" });
     }
 
-    // Confirmed close of closeQty. Book the exit leg linked to entryOrderId/positionId, then update the position.
-    const filledQty = closeQty;
+    // R31-P2-01: size the close from the BROKER-REPORTED executed quantity, never the requested closeQty. A broker
+    // adapter that reports a terminal partial as "filled" (with a smaller filledQty) must reduce only what actually
+    // executed — otherwise we'd hide real residual exposure behind a false full close. Fall back to closeQty only
+    // when the adapter reports no numeric quantity at all (older adapters), clamped so we never over-reduce.
+    const reportedQty = Number(r.filledQty);
+    const filledQty = Number.isFinite(reportedQty) && reportedQty > 0 ? Math.min(reportedQty, closeQty) : closeQty;
     const remainingQty = openQty - filledQty;
+    /* R31-P2-02: the exit ledger and the managed-position residual must converge as ONE durable operation. We book
+       the immutable exit leg first, then update the position. If the position write FAILS after the ledger write, we
+       must NOT return a plain success (that would leave a ledgered exit with an open position). Instead we keep the
+       position "closing" with its exitTag — the exit engine's tag-based stale-close reconciliation (R11-P1-01) and the
+       PROJECTION_PENDING repair sweep finish it idempotently — and return 202 reconciliation-required. */
     await recordExitFill(storageKeyFor(pos.userId), { ...pos, entryOrderId: pos.entryOrderId }, { orderId: r.orderId, filledQty, avgPrice: r.avgPrice }, reason);
-    if (remainingQty <= 1e-9) {
-      await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: reason, exitOrderId: r.orderId || null, closingSince: null });
-    } else {
-      // §5: a PARTIAL close (requested < open, or broker exposure < open) reduces the tracked quantity and keeps
-      // the residual OPEN — the exposure is never hidden behind a false full close.
-      await db.updateManagedPosition(pos.id, { qty: remainingQty, status: "open", closingSince: null, exitTag: null, exitOrderId: r.orderId || null, exitReason: `${reason} (partial)` });
+    try {
+      if (remainingQty <= 1e-9) {
+        await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: reason, exitOrderId: r.orderId || null, closingSince: null });
+      } else {
+        // §5: a PARTIAL close (requested < open, or broker exposure < open) reduces the tracked quantity and keeps
+        // the residual OPEN — the exposure is never hidden behind a false full close.
+        await db.updateManagedPosition(pos.id, { qty: remainingQty, status: "open", closingSince: null, exitTag: null, exitOrderId: r.orderId || null, exitReason: `${reason} (partial)` });
+      }
+    } catch (posErr) {
+      // Ledger written, position residual NOT — park durable reconciliation; the position stays "closing" (exitTag set)
+      // so the tag-reconcile / repair sweep converges it without a second broker order. Never report a clean close.
+      logFinancial("real_close.residual_write_failed", { userId: String(userId), positionId, broker: pos.broker, orderId: r.orderId || null, err: String((posErr && posErr.message) || posErr) });
+      try { await db.saveProjectionPending({ id: `exproj_${r.orderId || positionId}`, kind: "exit", userId: storageKeyFor(pos.userId), orderId: r.orderId || null, payload: { sym: pos.brokerSym || pos.symbol, closeSide: pos.short ? "BUY" : "SELL", qty: filledQty, exitPx: Number(r.avgPrice) || 0, orderId: r.orderId || null, entryOrderId: pos.entryOrderId != null ? String(pos.entryOrderId) : null, broker: pos.broker, market: pos.market, tradeType: pos.tradeType || "Manual", managedId: pos.id } }); } catch { /* best-effort */ }
+      return res.status(202).json({ ok: false, closed: false, reconcileRequired: true, filledQty, remainingQty, orderId: r.orderId || null, error: "Your close executed at the broker but updating the position record failed — it will be reconciled automatically. No duplicate order will be sent." });
     }
     logFinancial("real_close.confirmed", { userId: String(userId), positionId, broker: pos.broker, filledQty, remainingQty, orderId: r.orderId || null });
     return res.json({ ok: true, closed: remainingQty <= 1e-9, filledQty, remainingQty, orderId: r.orderId || null });
@@ -8445,6 +8511,17 @@ if (!MATRIX_NO_LISTEN) {
      as a deliberate, temporary escape hatch (logs a loud warning instead). */
   if (prod && TRADING_ENABLED && credWeak && !/^(1|true|yes)$/i.test(String(process.env.CRED_KEY_ALLOW_WEAK || ""))) {
     throw new Error("[startup] Live trading is enabled (BROKER_TRADING_ENABLED=true) but CRED_KEY is missing/weak (need ≥16 chars). Real broker credentials require a dedicated strong encryption key. Set CRED_KEY, or set CRED_KEY_ALLOW_WEAK=1 to override temporarily. Refusing to start.");
+  }
+  /* R31-P2-03: any real-money flag (real orders, live Auto Exit, live Auto Buy) REQUIRES PostgreSQL. Flat-file
+     fallbacks can't provide the cross-process transactions + fencing that leases, signal claims, durable attempts
+     and positions depend on, so a real deployment must never boot on them. Fail closed when a real flag is on and
+     DATABASE_URL is unset. A deliberate local escape hatch (ALLOW_FILE_STORE_FOR_REAL=1) exists for dev only. */
+  const anyRealFlag = TRADING_ENABLED
+    || String(process.env.AUTO_EXIT_LIVE || "").toLowerCase() === "true"
+    || String(process.env.AUTO_BUY_LIVE || "").toLowerCase() === "true";
+  const hasPg = !!String(process.env.DATABASE_URL || "").trim();
+  if (anyRealFlag && !hasPg && !/^(1|true|yes)$/i.test(String(process.env.ALLOW_FILE_STORE_FOR_REAL || ""))) {
+    throw new Error("[startup] A real-money flag is enabled (BROKER_TRADING_ENABLED / AUTO_EXIT_LIVE / AUTO_BUY_LIVE) but DATABASE_URL is not set. Real trading requires PostgreSQL for cross-process transactions and lease/claim fencing — flat-file storage cannot guarantee no-duplicate execution. Set DATABASE_URL, or set ALLOW_FILE_STORE_FOR_REAL=1 for local dev only. Refusing to start.");
   }
   const problems = [];
   if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).length < 16) problems.push("JWT_SECRET (set a long, stable random string)");

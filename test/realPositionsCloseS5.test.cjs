@@ -165,3 +165,43 @@ test("§5 J6: broker already flat → position reconciled CLOSED with NO new ord
   const pos = (await db.getManagedPositionsForUser(SKEY)).find((p) => p.id === pid);
   assert.equal(pos.status, "closed", "position reconciled closed");
 }));
+
+// R31-P1-01 — a real close with LIVE EXIT DISABLED must refuse and mutate NOTHING (never a simulated close).
+test("§5 J7: live-exit disabled → close is REFUSED with zero state mutation (no dry-run false close)", guard(async () => {
+  fake.reset(); fake.setMode("fill");
+  const before = fake.placeCount();
+  const prevLive = process.env.AUTO_EXIT_LIVE;
+  process.env.AUTO_EXIT_LIVE = "false";                       // the endpoint reads this per-request
+  try {
+    const pid = await seedPosition(4);
+    const r = await closeReq(pid, { exitIntentId: "ex_" + pid });
+    assert.equal(r.status, 409, "refused: " + JSON.stringify(r.body));
+    assert.equal(r.body.code, "LIVE_EXIT_DISABLED", "explicit refusal code");
+    assert.equal(r.body.closed, false, "not closed");
+    assert.equal(fake.placeCount(), before, "NO broker order placed");
+    const pos = (await db.getManagedPositionsForUser(SKEY)).find((p) => p.id === pid);
+    assert.equal(pos.status, "open", "position UNCHANGED — still open");
+    assert.equal(pos.exitAt == null, true, "no exit was recorded");
+    assert.equal(Number(pos.qty), 4, "tracked qty unchanged");
+    const fills = await db.getFills(SKEY, 0, Date.now());
+    assert.equal(fills.some((f) => f.managedId === pid), false, "NO exit fill was booked");
+  } finally { process.env.AUTO_EXIT_LIVE = prevLive; }
+}));
+
+// R31-P1-02 — when fresh broker exposure can't be read, the close must FAIL CLOSED (503), place no order,
+// and never size from the stale local quantity.
+test("§5 J8: broker exposure read fails → close FAILS CLOSED (503), no order, position untouched", guard(async () => {
+  fake.reset(); fake.setMode("fill");
+  const before = fake.placeCount();
+  const pid = await seedPosition(4);
+  fake.state.failWallet = true;                               // simulate the exposure/funds read outage
+  try {
+    const r = await closeReq(pid, { exitIntentId: "ex_" + pid });
+    assert.equal(r.status, 503, "fail closed: " + JSON.stringify(r.body));
+    assert.equal(r.body.code, "EXPOSURE_UNVERIFIED", "explicit unverified-exposure code");
+    assert.equal(fake.placeCount(), before, "NO broker order placed on unverified exposure");
+    const pos = (await db.getManagedPositionsForUser(SKEY)).find((p) => p.id === pid);
+    assert.equal(pos.status, "open", "position kept OPEN for reconciliation");
+    assert.equal(Number(pos.qty), 4, "tracked qty unchanged — never sized a SELL from stale local qty");
+  } finally { fake.state.failWallet = false; }
+}));

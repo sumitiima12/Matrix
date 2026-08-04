@@ -14,9 +14,14 @@
  *     remain UNCERTIFIED (false) pending that suite.
  *   • Zerodha / others — connection + portfolio only until their fill-truth + route suites pass.
  *
+ * R31-P2-06: manualEntry/manualExit are certified ONLY together with verifiedFill. A broker whose order route can
+ * return PENDING without a verified-fill + partial + recovery journey must NOT advertise manualEntry/manualExit
+ * (that let the route accept a real op it can't prove settled). Such a broker stays connect+portfolio only until
+ * its fill-truth suite passes; the connection and portfolio are always preserved.
+ *
  * Bump CERTIFICATION_VERSION whenever a flag flips so the admin diagnostic + clients can see which matrix is live.
  */
-const CERTIFICATION_VERSION = "2026-08-03.1";
+const CERTIFICATION_VERSION = "2026-08-04.1";
 
 const ALL_CAPS = [
   "connect", "portfolio", "manualEntry", "manualExit", "verifiedFill",
@@ -40,7 +45,10 @@ const BROKER_CAPABILITIES = {
     // durableAttempts / startupRecovery / unattendedAutomation: NOT yet certified for Delta (C03 route + 2-instance
     // matrix pending). Real manual trading + native bracket protection remain available.
   }),
-  zerodha: caps({ connect: true, portfolio: true, manualEntry: true, manualExit: true }),
+  // R31-P2-06: Zerodha's real order route lacks the verified-fill + partial + durable-attempt + recovery journeys
+  // that FYERS/Delta passed, so manualEntry/manualExit stay FALSE (were overstated as true). Connection + portfolio
+  // remain fully available; only the uncertified real-order capability is withheld until its fill-truth suite passes.
+  zerodha: caps({ connect: true, portfolio: true }),
   coindcx: caps({ connect: true, portfolio: true }),
   binance: caps({ connect: true, portfolio: true }),
   angelone: caps({ connect: true, portfolio: true }),

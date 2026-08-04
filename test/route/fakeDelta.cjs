@@ -12,6 +12,7 @@ const http = require("http");
 function makeFakeDelta() {
   const state = {
     mode: "fill",            // fill | partial | reject
+    failWallet: false,       // when true, /v2/wallet/balances returns 500 (simulated exposure-read outage)
     requests: [],
     placeCount: 0,
     bracketCount: 0,
@@ -38,6 +39,8 @@ function makeFakeDelta() {
     }
     if (req.method === "GET" && path === "/v2/wallet/balances") {
       state.requests.push({ method: "GET", path });
+      // Fault injection: simulate a broker outage on the funds/exposure read so fetchBrokerAccount returns null.
+      if (state.failWallet) return send(500, { success: false, error: "simulated broker outage" });
       return send(200, { success: true, result: [{ asset_symbol: "USD", available_balance: String(state.wallet), balance: String(state.wallet) }] });
     }
     if (req.method === "GET" && path === "/v2/positions/margined") {
@@ -85,7 +88,7 @@ function makeFakeDelta() {
     placeCount() { return state.placeCount; },
     bracketCount() { return state.bracketCount; },
     orderPosts() { return state.requests.filter((r) => r.method === "POST" && r.path === "/v2/orders"); },
-    reset() { state.requests.length = 0; state.placeCount = 0; state.bracketCount = 0; state.mode = "fill"; state.positions.length = 0; state.orders.clear(); },
+    reset() { state.requests.length = 0; state.placeCount = 0; state.bracketCount = 0; state.mode = "fill"; state.failWallet = false; state.positions.length = 0; state.orders.clear(); },
   };
 }
 

@@ -94,7 +94,16 @@ async function reconcileUnresolvedAttempts(deps) {
         never a silent duplicate. A thrown-but-conclusive rejection can be finalized REJECTED by the caller.
      4. a returned result is classified via `classify(res)` → { status, patch } and finalized transactionally.
    When the flag is OFF this module isn't used at all; the legacy path runs byte-for-byte unchanged. */
-async function submitWithAttempt({ db, attempt, submit, classify, classifyError }) {
+async function submitWithAttempt({ db, attempt, submit, classify, classifyError, fenceGuard = null }) {
+  /* R31-P2-04 — LEASE FENCE BOUND TO THE SEND. A single-owner job (auto-buy / screener / exit sweep) acquires a
+     durable fenced lease before it runs, but the SUBMITTING claim below is per-attempt and, on its own, does NOT
+     know whether THIS worker still holds the lease. A worker paused past its lease expiry (GC pause / partition)
+     could resume, win the PREPARED→SUBMITTING CAS and place a DUPLICATE order after a takeover. `fenceGuard` closes
+     that hole: it returns false iff this worker's fence is no longer the live one. We check it (a) before the CAS,
+     and (b) AGAIN immediately before the broker send — so even a pause that happens BETWEEN the claim and the send
+     is caught. A stale-fence worker is refused here and never reaches the broker. */
+  const fenceOk = async () => { if (typeof fenceGuard !== "function") return true; try { return !!(await fenceGuard()); } catch { return false; } };
+  if (!(await fenceOk())) return { fenced: true, submitted: false, status: "FENCED" };
   // 1 — durable PREPARED. Throws on an id collision from a DIFFERENT request; returns the existing row on a
   //     legit same-request retry. If this throws, the broker is NEVER called.
   const row = await db.prepareOrderAttempt(attempt);
@@ -110,9 +119,13 @@ async function submitWithAttempt({ db, attempt, submit, classify, classifyError 
     const cur = await db.getOrderAttempt(attempt.id).catch(() => null);
     return { replay: true, submitted: false, status: cur ? cur.status : "UNKNOWN", attempt: cur || row };
   }
+  /* 2a — RE-CHECK the fence at the last possible instant before the send. The CAS above may have been won while the
+     lease was still live, then this worker paused and lost it to a takeover. If the fence is now stale we must NOT
+     submit; leave the attempt SUBMITTING so startup/periodic recovery reconciles it by tag (never a phantom send). */
+  if (!(await fenceOk())) return { fenced: true, submitted: false, status: "FENCED", attempt: row };
   let res;
   try {
-    res = await submit();   // reached ONLY after a durable PREPARED + a won SUBMITTING claim
+    res = await submit();   // reached ONLY after a durable PREPARED + a won SUBMITTING claim + a LIVE fence
   } catch (e) {
     /* 3 — the submit threw. Two distinct cases:
        (a) CONCLUSIVE broker rejection — the broker definitively rejected the order and nothing landed (e.g. an

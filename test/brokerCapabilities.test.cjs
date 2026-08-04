@@ -20,6 +20,9 @@ test("S1: uncertified/other brokers keep connect+portfolio, block real ops (bloc
   assert.equal(caps.brokerCap("zerodha", "connect"), true);
   assert.equal(caps.brokerCap("zerodha", "portfolio"), true);
   assert.equal(caps.brokerCap("zerodha", "verifiedFill"), false, "acceptance-only broker: fill truth not certified");
+  // R31-P2-06: Zerodha manualEntry/manualExit must NOT be advertised while fill-truth is uncertified (was overstated).
+  assert.equal(caps.brokerCap("zerodha", "manualEntry"), false, "uncertified fill-truth ⇒ no real manual entry");
+  assert.equal(caps.brokerCap("zerodha", "manualExit"), false, "uncertified fill-truth ⇒ no real manual exit");
   assert.equal(caps.brokerCap("coindcx", "manualEntry"), false);
 });
 
