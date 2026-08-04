@@ -81,19 +81,22 @@ function validateOrder(order, account) {
   const { sym, side = "BUY", qty, price, market = "IN", reduceOnly = false } = order || {};
   const { wallet = 0, portfolio = [], trades = [] } = account || {};
 
-  // --- basic sanity ---
+  // --- basic sanity (applies to EVERY order, entry or exit) ---
   if (!sym) reasons.push("No symbol on the order.");
   if (!qty || qty <= 0 || !Number.isFinite(qty)) reasons.push("Quantity must be a positive number.");
-  // Price gates BUYS only — a SELL closes a position you already own.
-  if (side === "BUY" && (!price || price <= 0 || !Number.isFinite(price))) reasons.push("No live price available for this order.");
   if (reasons.length) return { ok: false, reasons, warnings };
 
   /* REDUCE-ONLY orders can ONLY reduce/close exposure — the broker enforces reduce_only and rejects anything
      that would open or increase a position. So a reduce-only exit is risk-DECREASING by construction and must
-     NOT be blocked by any entry-side control: funds, position sizing, open-position count, daily-trade frequency,
-     daily-loss circuit breaker, short-margin, or the same-symbol entry cooldown. Blocking a close on those grounds
-     would strand a user in a live position they explicitly asked to exit. Basic sanity above still applies. */
+     NOT be blocked by ANY entry-side control: the live-price requirement (a close doesn't need an entry price),
+     funds, position sizing, open-position count, daily-trade frequency, daily-loss circuit breaker, short-margin,
+     or the same-symbol entry cooldown. Blocking a close on those grounds would strand a user in a live position
+     they explicitly asked to exit. This exemption sits BEFORE the price gate for exactly that reason. */
   if (reduceOnly) return { ok: true, reasons: [], warnings };
+
+  // Price gates opening BUYS only — a SELL closes a long you already own; a reduce-only exit is handled above.
+  if (side === "BUY" && (!price || price <= 0 || !Number.isFinite(price))) reasons.push("No live price available for this order.");
+  if (reasons.length) return { ok: false, reasons, warnings };
 
   const value = qty * price;
   const held = portfolio.find((h) => h.sym === sym);
