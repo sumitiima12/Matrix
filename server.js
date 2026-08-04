@@ -8130,12 +8130,32 @@ if (process.env.EXIT_MONITOR !== "off") {
    delayed statements). */
 const EOD_FEE_RECONCILE_LOCK_KEY = 0x45_4f_44_46 | 0;   // "EODF"
 async function fetchBrokerContractNote(userKey, broker) {
-  // Normalize each broker's EOD charge source to [{ execId?, orderId?, charges }]. Best-effort: return [] on any
-  // failure so one broker's missing statement never blocks another's. By EOD the tradebook carries FINAL charges.
+  // Normalize each broker's AUTHORITATIVE EOD charge source to [{ execId?, orderId?, charges }]. Best-effort: return []
+  // on any failure so one broker's missing statement never blocks another's, and — critically — so a fill with no
+  // authoritative source stays PROVISIONAL rather than being falsely finalized.
   const sess = await sessionFromCred(userKey, broker).catch(() => null);
   if (!sess || !sess.accessToken) return [];
   try {
     if (broker === "fyers") {
+      /* R34-P2-01 — the FYERS /tradebook is a DAY-SCOPED, live/provisional feed; it can omit statutory charges (STT,
+         exchange, SEBI, GST, stamp, clearing) or expose partial values. It is NOT the contract note, so we MUST NOT
+         stamp its numbers as final. Two honest sources instead:
+           1. An ops-configured AUTHORITATIVE statement import (`FYERS_STATEMENT_URL`) that returns the settled
+              contract-note charges as [{ execId?, orderId?, charges }]. These are treated as final.
+           2. Otherwise: return [] so the fill stays ESTIMATED/provisional and is retried when a real statement exists.
+         The legacy tradebook path is available ONLY behind an explicit opt-in (FYERS_TRADEBOOK_FEES_FINAL=1) for
+         environments that have verified their tradebook carries settled charges — off by default. */
+      const stmtUrl = process.env.FYERS_STATEMENT_URL;
+      if (stmtUrl) {
+        const sr = await withTimeout(fetch(`${stmtUrl}${stmtUrl.includes("?") ? "&" : "?"}user=${encodeURIComponent(String(sess.userId || userKey))}`, { headers: brokerAuth("fyers", sess.accessToken, sess.userId) }), 8000).catch(() => null);
+        const sd = sr && sr.ok ? await sr.json().catch(() => null) : null;
+        const lines = Array.isArray(sd) ? sd : (sd && Array.isArray(sd.charges) ? sd.charges : null);
+        if (Array.isArray(lines)) {
+          return lines.map((t) => ({ execId: String(t.execId ?? t.tradeNumber ?? t.id ?? ""), orderId: String(t.orderId ?? t.orderNumber ?? ""), charges: Number(t.charges ?? t.fees ?? 0) || 0, source: "contract-note" }));
+        }
+        return [];   // statement source configured but unreadable → stay provisional, never guess from tradebook
+      }
+      if (!/^(1|true|yes)$/i.test(String(process.env.FYERS_TRADEBOOK_FEES_FINAL || ""))) return [];   // no authoritative source → provisional
       const r = await fyFetch("https://api-t1.fyers.in/api/v3/tradebook", { headers: brokerAuth("fyers", sess.accessToken, sess.userId) });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || d.s === "error") return [];
@@ -8144,13 +8164,15 @@ async function fetchBrokerContractNote(userKey, broker) {
         const itemised = ["brokerage", "stt", "sebiCharges", "exchangeCharges", "gst", "stampDuty", "clearingCharges"]
           .reduce((a, k) => a + (Number(t[k]) || 0), 0);
         const charges = itemised > 0 ? itemised : (Number(t.charges ?? t.fees ?? t.tax ?? 0) || 0);
-        return { execId: String(t.tradeNumber ?? t.id ?? t.fillId ?? ""), orderId: String(t.orderNumber ?? t.orderId ?? t.id ?? ""), charges };
+        return { execId: String(t.tradeNumber ?? t.id ?? t.fillId ?? ""), orderId: String(t.orderNumber ?? t.orderId ?? t.id ?? ""), charges, source: "tradebook-optin" };
       });
     }
     if (broker === "delta") {
+      // Delta's /v2/fills carries the SETTLED per-fill commission (its authoritative execution cost), so it is a
+      // legitimate final source. Tagged as contract-note-equivalent.
       const fills = await withTimeout(deltaCall("GET", "/v2/fills", { userId: sess.userId }), 8000).catch(() => null);
       const rows = (fills && fills.result) || [];
-      return rows.map((f) => ({ execId: String(f.id ?? ""), orderId: String(f.order_id ?? ""), charges: Number(f.commission ?? f.fee ?? 0) || 0 }));
+      return rows.map((f) => ({ execId: String(f.id ?? ""), orderId: String(f.order_id ?? ""), charges: Number(f.commission ?? f.fee ?? 0) || 0, source: "contract-note" }));
     }
   } catch { /* fall through to [] */ }
   return [];
@@ -8179,7 +8201,12 @@ async function runEodFeeReconcileJob(reason = "scheduled") {
     const oldestProvisional = discovered.reduce((m, r) => Math.min(m, r.oldest || Infinity), Infinity);
     const summary = await feeReconcile.runEodFeeReconcile({
       userKeys, now: Date.now(), log: (ev, d) => logFinancial(ev, { reason, ...d }),
-      listProvisionalFills: (uk) => db.getFills(uk, windowStart, Date.now()),
+      // R34-P2-02/03: complete per-order execution set (paginated to exhaustion, no 5,000-row cap) and already
+      // excludes fills that carry a fee_final overlay — so allocation is complete and finalized work isn't reprocessed.
+      listProvisionalFills: (uk) => db.getProvisionalFills(uk, windowStart, Date.now()),
+      // R34-P2-02: true per-(broker,order) execution counts so the matcher refuses order-level allocation over an
+      // incomplete execution set (e.g. some executions finalized in a prior sweep).
+      getOrderExecTotals: (uk) => db.getOrderExecCounts(uk, windowStart, Date.now()),
       fetchContractNote: fetchBrokerContractNote,
       /* R32-P2-02: the fee-final event is a fee-DELTA overlay, NOT an execution. It carries no qty and is NOT an
          execEvent, so projectFills never groups it as an entry/exit leg (which would double-count fees or add a

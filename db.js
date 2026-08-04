@@ -164,6 +164,9 @@ async function initDb() {
     status TEXT NOT NULL, broker_order_id TEXT, filled_qty DOUBLE PRECISION, avg_price DOUBLE PRECISION,
     resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT, updated_at BIGINT)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_attempts_unresolved ON order_attempts (resolved, created_at)`);
+  // R33 follow-up: a JSONB slot for a durable resolution record (e.g. the MANUAL_RECONCILIATION_REQUIRED evidence).
+  // finalizeOrderAttempt previously accepted `evidence`/`manual` but silently dropped them — this column persists them.
+  await pool.query(`ALTER TABLE order_attempts ADD COLUMN IF NOT EXISTS resolution JSONB`);
   /* S3.2 PROJECTION_PENDING: a broker EXIT execution is confirmed but the ledger/projection write failed. The
      payload holds everything needed to REPAIR the projection WITHOUT re-contacting the broker (idempotent by the
      exit order id). A background sweep retries until it commits; the account stays risk-locked until then. */
@@ -564,7 +567,7 @@ async function recordFill(userId, fill) {
     );
     return { inserted: (r.rowCount || 0) > 0, fillId };
   }
-  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  const f = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
   const d = readJSON(f); const bucket = d[String(userId)] || {};
   const inserted = !(fillId in bucket);
   if (inserted) { bucket[fillId] = { ...row, ts }; d[String(userId)] = bucket; writeJSON(f, d); }
@@ -576,7 +579,7 @@ async function getFills(userId, from = 0, to = Date.now()) {
     const r = await pool.query(`SELECT data FROM fills WHERE user_id=$1 AND ts>=$2 AND ts<=$3 ORDER BY ts DESC LIMIT 5000`, [String(userId), from, to]);
     return r.rows.map((x) => x.data);
   }
-  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  const f = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
   return Object.values(readJSON(f)[String(userId)] || {}).filter((x) => (x.ts || 0) >= from && (x.ts || 0) <= to).sort((a, b) => (b.ts || 0) - (a.ts || 0));
 }
 /* R33-P2-01: read one ledger fill by its immutable fill_id (used to verify an on-conflict fee-final write carries
@@ -587,37 +590,121 @@ async function getFillById(userId, fillId) {
     const r = await pool.query(`SELECT data FROM fills WHERE user_id=$1 AND fill_id=$2 LIMIT 1`, [String(userId), String(fillId)]);
     return r.rows[0] ? r.rows[0].data : null;
   }
-  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  const f = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
   return (readJSON(f)[String(userId)] || {})[String(fillId)] || null;
 }
-/* R33-P2-03: discover the DISTINCT storage keys that have PROVISIONAL real fills in a window — the true set of users
-   whose fees still need finalizing, regardless of whether they still have an active strategy or ever ran automation
-   (manual `/api/broker/order` traders included). Strategy state must never gate accounting finality. Paginated;
-   returns [{ userKey, oldest }] where oldest is the earliest provisional ts (for an ops "oldest unfinalized" alert). */
+/* R34-P2-03 — a source execution fill is UNMATCHED (still needs finalizing) when it is a real execution with no
+   `fee_final` OVERLAY referencing it. The original execution row's own `feeFinal` is never rewritten (append-only
+   ledger), so "feeFinal != true on the source" alone rediscovers already-finalized work forever. This predicate is
+   the single source of truth for both discovery and the provisional list, so metrics reflect TRULY unmatched work. */
+function _isUnfinalizedSource(row) {
+  return row && row.real === true && row.kind !== "fee_final"
+    && String(row.feeStatus || "") !== "contract-note" && row.feeFinal !== true;
+}
+// Build the set of referenced fill ids that already carry a fee_final overlay, from a user's fills bucket (flat mode).
+function _finalizedRefIds(bucket) {
+  const s = new Set();
+  for (const row of Object.values(bucket || {})) if (row && row.kind === "fee_final" && row.refFillId != null) s.add(String(row.refFillId));
+  return s;
+}
+/* R33-P2-03 / R34-P2-03: discover the DISTINCT storage keys that have UNMATCHED provisional real fills in a window —
+   users whose fees still need finalizing, regardless of strategy state (manual traders included) AND excluding fills
+   that already have a matching fee_final overlay (so a finalized user isn't rediscovered every sweep). Paginated;
+   returns [{ userKey, oldest }] where oldest is the earliest still-unmatched provisional ts. */
 async function getUsersWithProvisionalFills(from = 0, to = Date.now(), limit = 1000, offset = 0) {
   if (USING_PG) {
     const r = await pool.query(
-      `SELECT user_id, MIN(ts) AS oldest FROM fills
-        WHERE ts>=$1 AND ts<=$2
-          AND (data->>'real')='true'
-          AND COALESCE(data->>'feeFinal','false')<>'true'
-          AND COALESCE(data->>'kind','')<>'fee_final'
-        GROUP BY user_id ORDER BY user_id LIMIT $3 OFFSET $4`,
+      `SELECT s.user_id, MIN(s.ts) AS oldest
+         FROM fills s
+        WHERE s.ts>=$1 AND s.ts<=$2
+          AND (s.data->>'real')='true'
+          AND COALESCE(s.data->>'kind','')<>'fee_final'
+          AND COALESCE(s.data->>'feeStatus','')<>'contract-note'
+          AND COALESCE(s.data->>'feeFinal','false')<>'true'
+          AND NOT EXISTS (
+            SELECT 1 FROM fills o
+             WHERE o.user_id=s.user_id AND o.broker=s.broker
+               AND (o.data->>'kind')='fee_final'
+               AND (o.data->>'refFillId')=s.fill_id )
+        GROUP BY s.user_id ORDER BY s.user_id LIMIT $3 OFFSET $4`,
       [from, to, limit, offset]
     );
     return r.rows.map((x) => ({ userKey: x.user_id, oldest: Number(x.oldest) || 0 }));
   }
-  const f = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+  const f = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
   const d = readJSON(f); const out = [];
   for (const [uid, bucket] of Object.entries(d)) {
+    const finalized = _finalizedRefIds(bucket);
     let oldest = Infinity;
     for (const row of Object.values(bucket || {})) {
-      if (row && row.real === true && row.feeFinal !== true && row.kind !== "fee_final" && (row.ts || 0) >= from && (row.ts || 0) <= to) oldest = Math.min(oldest, row.ts || 0);
+      if (_isUnfinalizedSource(row) && !finalized.has(String(row.fillId)) && (row.ts || 0) >= from && (row.ts || 0) <= to) oldest = Math.min(oldest, row.ts || 0);
     }
     if (oldest !== Infinity) out.push({ userKey: uid, oldest });
   }
   out.sort((a, b) => (a.userKey < b.userKey ? -1 : 1));
   return out.slice(offset, offset + limit);
+}
+/* R34-P2-02 / P2-03 — return ALL still-unmatched provisional real fills for a user in a window, PAGINATED TO
+   EXHAUSTION (no 5,000-row cap that could split an order's executions and misallocate its order-level charge). Excludes
+   fills that already carry a fee_final overlay, so a re-sweep doesn't reprocess finalized work. Because it returns the
+   COMPLETE execution set per order in the window, order-level allocation is safe. */
+async function getProvisionalFills(userId, from = 0, to = Date.now()) {
+  if (USING_PG) {
+    const out = []; const pageSize = 5000; let offset = 0;
+    for (;;) {
+      const r = await pool.query(
+        `SELECT s.data FROM fills s
+          WHERE s.user_id=$1 AND s.ts>=$2 AND s.ts<=$3
+            AND (s.data->>'real')='true'
+            AND COALESCE(s.data->>'kind','')<>'fee_final'
+            AND COALESCE(s.data->>'feeStatus','')<>'contract-note'
+            AND COALESCE(s.data->>'feeFinal','false')<>'true'
+            AND NOT EXISTS (
+              SELECT 1 FROM fills o
+               WHERE o.user_id=s.user_id AND o.broker=s.broker
+                 AND (o.data->>'kind')='fee_final'
+                 AND (o.data->>'refFillId')=s.fill_id )
+          ORDER BY s.ts ASC, s.fill_id ASC LIMIT $4 OFFSET $5`,
+        [String(userId), from, to, pageSize, offset]);
+      out.push(...r.rows.map((x) => x.data));
+      if (r.rows.length < pageSize) break;
+      offset += pageSize;
+    }
+    return out;
+  }
+  const f = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
+  const bucket = readJSON(f)[String(userId)] || {};
+  const finalized = _finalizedRefIds(bucket);
+  return Object.values(bucket).filter((row) => _isUnfinalizedSource(row) && !finalized.has(String(row.fillId)) && (row.ts || 0) >= from && (row.ts || 0) <= to);
+}
+/* R34-P2-02 — total EXECUTION count per (broker, orderId) in a window, counting ALL executions of the order (finalized
+   or not). The EOD matcher uses this to REFUSE order-level allocation when the visible (unfinalized) execution set is
+   smaller than the order's true size — e.g. some executions were finalized in a prior sweep — so a full order charge is
+   never divided across an incomplete subset. Key format matches feeReconcile's bkey: `<broker>+0x1F+<orderId>`. */
+async function getOrderExecCounts(userId, from = 0, to = Date.now()) {
+  const SEP = "\u001F";
+  const out = {};
+  if (USING_PG) {
+    const r = await pool.query(
+      `SELECT LOWER(COALESCE(broker,'')) AS b, (data->>'orderId') AS oid, COUNT(*)::int AS n
+         FROM fills
+        WHERE user_id=$1 AND ts>=$2 AND ts<=$3
+          AND (data->>'real')='true' AND COALESCE(data->>'kind','')<>'fee_final'
+          AND (data->>'orderId') IS NOT NULL AND (data->>'orderId')<>''
+        GROUP BY 1,2`, [String(userId), from, to]);
+    for (const row of r.rows) out[String(row.b) + SEP + String(row.oid)] = Number(row.n) || 0;
+    return out;
+  }
+  const f = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
+  const bucket = readJSON(f)[String(userId)] || {};
+  for (const row of Object.values(bucket)) {
+    if (!row || row.real !== true || row.kind === "fee_final") continue;
+    if (row.orderId == null || String(row.orderId) === "") continue;
+    if ((row.ts || 0) < from || (row.ts || 0) > to) continue;
+    const k = String(row.broker == null ? "" : row.broker).toLowerCase() + SEP + String(row.orderId);
+    out[k] = (out[k] || 0) + 1;
+  }
+  return out;
 }
 /* INC-1: pure comparator for risk-journal ↔ fills-ledger drift. Compares the VERIFIED entry legs the risk
    engine reads (server-authored real trades with a broker order id) against the entry fills in the immutable
@@ -883,7 +970,7 @@ async function reassignAndArchiveTrades(phone, fromUserId, archiveKey) {
   // R24-P2-05 (flat-file): move the previous owner's fills bucket to the archive key too, so a recycled number
   // doesn't inherit their verified executions. Deterministic/idempotent — merges into any existing archive bucket.
   try {
-    const ff = FILES.fills || (FILES.fills = path.join(__dirname, "fills.json"));
+    const ff = FILES.fills || (FILES.fills = process.env.FILLS_FILE || path.join(__dirname, "fills.json"));
     const fd = readJSON(ff);
     if (fd[String(fromUserId)]) {
       fd[String(archiveKey)] = { ...(fd[String(archiveKey)] || {}), ...fd[String(fromUserId)] };
@@ -1693,6 +1780,7 @@ function _rowFromPg(r) {
     fingerprint: r.fingerprint, payload: r.payload, symbol: r.symbol, side: r.side, qty: r.qty != null ? Number(r.qty) : null,
     product: r.product, protection: r.protection, status: r.status, brokerOrderId: r.broker_order_id,
     filledQty: r.filled_qty != null ? Number(r.filled_qty) : null, avgPrice: r.avg_price != null ? Number(r.avg_price) : null,
+    resolution: r.resolution != null ? r.resolution : null,
     resolved: r.resolved === true, createdAt: r.created_at != null ? Number(r.created_at) : null, updatedAt: r.updated_at != null ? Number(r.updated_at) : null };
 }
 
@@ -1760,13 +1848,20 @@ async function finalizeOrderAttempt(id, status, patch = {}) {
   faultHook.gate("db.attempt.finalize");
   const now = Date.now();
   const resolved = patch.resolved === true || _ATTEMPT_TERMINAL.has(String(status));
+  /* R33 follow-up: PERSIST the resolution record (manual flag + evidence) that was previously ignored. Only build a
+     non-null value when the caller supplied evidence/manual, and COALESCE on write so an ordinary finalize never wipes
+     a previously-recorded resolution. This makes the MANUAL_RECONCILIATION_REQUIRED evidence durable and auditable. */
+  const resolution = (patch.evidence !== undefined || patch.manual !== undefined || patch.resolution !== undefined)
+    ? (patch.resolution !== undefined ? patch.resolution : { manual: !!patch.manual, evidence: patch.evidence ?? null, at: now })
+    : null;
   if (USING_PG) {
     const r = await pool.query(
       `UPDATE order_attempts SET status=$2, broker_order_id=COALESCE($3,broker_order_id),
-         filled_qty=COALESCE($4,filled_qty), avg_price=COALESCE($5,avg_price), resolved=$6, updated_at=$7
+         filled_qty=COALESCE($4,filled_qty), avg_price=COALESCE($5,avg_price), resolved=$6, updated_at=$7,
+         resolution=COALESCE($8::jsonb, resolution)
        WHERE id=$1 RETURNING *`,
       [String(id), String(status), patch.brokerOrderId || null, patch.filledQty != null ? Number(patch.filledQty) : null,
-       patch.avgPrice != null ? Number(patch.avgPrice) : null, !!resolved, now]);
+       patch.avgPrice != null ? Number(patch.avgPrice) : null, !!resolved, now, resolution ? JSON.stringify(resolution) : null]);
     return _rowFromPg(r.rows[0]);
   }
   const f = _attemptFile(); const d = readJSON(f); const row = d[String(id)]; if (!row) return null;
@@ -1774,6 +1869,7 @@ async function finalizeOrderAttempt(id, status, patch = {}) {
   if (patch.brokerOrderId != null) row.brokerOrderId = patch.brokerOrderId;
   if (patch.filledQty != null) row.filledQty = Number(patch.filledQty);
   if (patch.avgPrice != null) row.avgPrice = Number(patch.avgPrice);
+  if (resolution != null) row.resolution = resolution;
   row.resolved = !!resolved; row.updatedAt = now; writeJSON(f, d); return row;
 }
 
@@ -2177,4 +2273,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
