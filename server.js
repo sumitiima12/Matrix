@@ -54,6 +54,7 @@ function ensureCapability(res, broker, capability) {
 }
 const orderRecovery = require("./orderRecovery");     // C03 durable order-attempt orchestrator (flag-gated wiring)
 const feeReconcile = require("./feeReconcile");        // R31-P2-08: EOD contract-note fee reconciliation (pure + injected)
+const feeStatement = require("./feeStatement");        // R37-P3-02/P2-02: pure contract-note envelope+date adapter (testable)
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
    routes use this — identity is taken from the token when we have it, and we fall back to the
@@ -8129,37 +8130,13 @@ if (process.env.EXIT_MONITOR !== "off") {
    deterministic fill id, so extra runs are safe. Intended to run once after market close (and once late, to catch
    delayed statements). */
 const EOD_FEE_RECONCILE_LOCK_KEY = 0x45_4f_44_46 | 0;   // "EODF"
-/* R35-P2-01/P2-02 — STRICT normalization of one authoritative-statement charge line to { execId?, orderId?, charges }.
-   Returns null (REJECTED) unless the line is well-formed. Key rules the reviewer required:
-     • identity: an ID present only as "" / "  " is ABSENT. A line is EXECUTION-level ONLY when it has a non-empty
-       execution id; otherwise it must have a non-empty order id and is ORDER-level. A blank execId no longer smuggles
-       an order-level charge into the execution map (where it would never match). Neither id ⇒ reject.
-     • charges: must be a FINITE, NON-NEGATIVE number. We NEVER default a missing/NaN/negative charge to 0 (that would
-       persist a fabricated "free execution" as authoritative). Missing or invalid ⇒ reject the line. */
-function _nzId(v) { const s = v == null ? "" : String(v).trim(); return s === "" ? null : s; }
-/* R36-P2-01 — STRICT charge parse. Accept ONLY a finite non-negative number, or a strict decimal STRING (optional
-   surrounding whitespace). Reject everything else — booleans (`true`→1, `false`→0), arrays (`[]`→0), objects, empty
-   string, whitespace-only, `NaN`, negatives — so a malformed/schema-drifted authoritative payload can NEVER coerce
-   into a fabricated fee. Returns null on rejection. */
-function _strictCharge(raw) {
-  if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : null;
-  if (typeof raw === "string" && /^\s*\d+(\.\d+)?\s*$/.test(raw)) { const n = Number(raw.trim()); return Number.isFinite(n) && n >= 0 ? n : null; }
-  return null;   // boolean, array, object, empty/whitespace, null/undefined ⇒ rejected
-}
-function _normStatementLine(t) {
-  if (!t || typeof t !== "object" || Array.isArray(t)) return null;
-  const execId = _nzId(t.execId ?? t.tradeNumber ?? t.id ?? t.fillId);
-  const orderId = _nzId(t.orderId ?? t.orderNumber);
-  const charges = _strictCharge(t.charges ?? t.fees);
-  if (charges == null) return null;   // strict type check — never coerce booleans/arrays/whitespace to 0
-  if (execId) return { execId, orderId: orderId || null, charges, source: "contract-note" };   // execution-level
-  if (orderId) return { orderId, charges, source: "contract-note" };                           // order-level
-  return null;                                                                                 // no usable identity
-}
-async function fetchBrokerContractNote(userKey, broker) {
+/* R37-P3-02 — the strict statement line/charge/envelope logic now lives in the PURE, unit-tested `feeStatement` module
+   (test/feeStatement.test.cjs). server.js keeps only HTTP/auth wiring + audit logging. */
+async function fetchBrokerContractNote(userKey, broker, opts = {}) {
   // Normalize each broker's AUTHORITATIVE EOD charge source to [{ execId?, orderId?, charges }]. Best-effort: return []
   // on any failure so one broker's missing statement never blocks another's, and — critically — so a fill with no
   // authoritative source stays PROVISIONAL rather than being falsely finalized.
+  // R37-P2-02: `opts.allowedDates` (IST reconciliation-day ISO set) + `opts.nowMs` gate the statement's tradingDate.
   const sess = await sessionFromCred(userKey, broker).catch(() => null);
   if (!sess || !sess.accessToken) return [];
   try {
@@ -8171,32 +8148,24 @@ async function fetchBrokerContractNote(userKey, broker) {
       const stmtUrl = process.env.FYERS_STATEMENT_URL;
       if (!stmtUrl) return [];
       const acctExpected = String(sess.userId || userKey);
-      const sr = await withTimeout(fetch(`${stmtUrl}${stmtUrl.includes("?") ? "&" : "?"}user=${encodeURIComponent(acctExpected)}`, { headers: brokerAuth("fyers", sess.accessToken, sess.userId) }), 8000).catch(() => null);
+      /* R37-P2-02 — pass the EXPECTED trading date to the importer so a statement fetched for the wrong day can't be
+         requested-then-silently-accepted. We send the newest allowed IST day as `tradingDate` (best-effort hint), and —
+         authoritatively — enforce the returned envelope's tradingDate against the allowed window below. */
+      const allowedDates = Array.isArray(opts.allowedDates) ? opts.allowedDates : null;
+      const expectDay = allowedDates && allowedDates.length ? allowedDates[allowedDates.length - 1] : null;
+      const nowMs = opts.nowMs != null ? opts.nowMs : Date.now();
+      const q = `user=${encodeURIComponent(acctExpected)}${expectDay ? `&tradingDate=${encodeURIComponent(expectDay)}` : ""}`;
+      const sr = await withTimeout(fetch(`${stmtUrl}${stmtUrl.includes("?") ? "&" : "?"}${q}`, { headers: brokerAuth("fyers", sess.accessToken, sess.userId) }), 8000).catch(() => null);
       const sd = sr && sr.ok ? await sr.json().catch(() => null) : null;
-      /* R36-P2-01 — MANDATORY provenance envelope. The authoritative source MUST return an OBJECT (never a bare array)
-         carrying: a schema version, the broker ACCOUNT id (must equal the requested account), a trading DATE, a
-         settlement/finality marker (settled === true), currency INR, and a `lines`/`charges` array. Any missing/
-         mismatched field rejects the WHOLE batch — a wrong-account, wrong-day, unsettled or schema-drifted response can
-         never finalize fees. A top-level array (no provenance) is rejected outright. */
-      if (!sd || typeof sd !== "object" || Array.isArray(sd)) { logFinancial("eodfee.stmt_rejected_batch", { userKey, reason: "no-envelope" }); return []; }
-      const lines = Array.isArray(sd.lines) ? sd.lines : (Array.isArray(sd.charges) ? sd.charges : null);
-      if (!Array.isArray(lines)) { logFinancial("eodfee.stmt_rejected_batch", { userKey, reason: "no-lines" }); return []; }
-      const cur = _nzId(sd.currency);
-      const acct = _nzId(sd.account ?? sd.accountId ?? sd.fyId);
-      const tdate = _nzId(sd.tradingDate ?? sd.date);
-      const settled = sd.settled === true || sd.settlement === "settled" || sd.final === true;
-      const schemaOk = _nzId(sd.schemaVersion ?? sd.version) != null;
-      const reasons = [];
-      if (!schemaOk) reasons.push("schemaVersion");
-      if (!acct) reasons.push("account-missing"); else if (String(acct) !== acctExpected) reasons.push("account-mismatch");
-      if (!tdate) reasons.push("tradingDate");
-      if (!settled) reasons.push("not-settled");
-      if (!cur) reasons.push("currency-missing"); else if (cur.toUpperCase() !== "INR") reasons.push("currency-not-INR");
-      if (reasons.length) { logFinancial("eodfee.stmt_rejected_batch", { userKey, reasons, account: acct || null, tradingDate: tdate || null }); return []; }
-      const out = []; let rejected = 0;
-      for (const t of lines) { const n = _normStatementLine(t); if (n) out.push(n); else rejected++; }
-      if (rejected) logFinancial("eodfee.stmt_line_rejected", { userKey, broker: "fyers", rejected, accepted: out.length });
-      try { const hash = crypto.createHash("sha256").update(JSON.stringify({ v: sd.schemaVersion ?? sd.version, a: acct, d: tdate, lines })).digest("hex").slice(0, 16); logFinancial("eodfee.stmt_imported", { userKey, broker: "fyers", importId: hash, account: acct, tradingDate: tdate, accepted: out.length, rejected }); } catch { /* audit best-effort */ }
+      /* R36-P2-01 + R37-P2-02 — MANDATORY provenance envelope AND trading-date match. The authoritative source MUST
+         return an OBJECT (never a bare array) carrying schema version, the broker ACCOUNT (== requested account), a
+         trading DATE (strict ISO, within the reconciliation window, not future), settled === true, currency INR, and a
+         `lines`/`charges` array. Any missing/mismatched/wrong-day field rejects the WHOLE batch. */
+      const v = feeStatement.validateStatement(sd, { account: acctExpected, allowedDates, nowMs });
+      if (!v.ok) { logFinancial("eodfee.stmt_rejected_batch", { userKey, reasons: v.reasons, account: v.account || null, tradingDate: v.tradingDate || null, allowedDates }); return []; }
+      const out = v.lines;
+      if (v.rejected) logFinancial("eodfee.stmt_line_rejected", { userKey, broker: "fyers", rejected: v.rejected, accepted: out.length });
+      try { const hash = crypto.createHash("sha256").update(JSON.stringify({ v: sd.schemaVersion ?? sd.version, a: v.account, d: v.tradingDate, lines: (sd.lines || sd.charges) })).digest("hex").slice(0, 16); logFinancial("eodfee.stmt_imported", { userKey, broker: "fyers", importId: hash, account: v.account, tradingDate: v.tradingDate, expectedDay: expectDay, accepted: out.length, rejected: v.rejected }); } catch { /* audit best-effort */ }
       return out;
     }
     if (broker === "delta") {
@@ -8205,7 +8174,7 @@ async function fetchBrokerContractNote(userKey, broker) {
       const fills = await withTimeout(deltaCall("GET", "/v2/fills", { userId: sess.userId }), 8000).catch(() => null);
       const rows = (fills && fills.result) || [];
       const out = []; let rejected = 0;
-      for (const f of rows) { const n = _normStatementLine({ execId: f.id, orderId: f.order_id, charges: (f.commission ?? f.fee) }); if (n) out.push(n); else rejected++; }
+      for (const f of rows) { const n = feeStatement.normStatementLine({ execId: f.id, orderId: f.order_id, charges: (f.commission ?? f.fee) }); if (n) out.push(n); else rejected++; }
       if (rejected) logFinancial("eodfee.stmt_line_rejected", { userKey, broker: "delta", rejected, accepted: out.length });
       return out;
     }
@@ -8242,7 +8211,9 @@ async function runEodFeeReconcileJob(reason = "scheduled") {
       // allocate order-level charges deterministically and converge (finish the remaining fills after a partial prior
       // write) instead of refusing forever.
       listReconcilableFills: (uk) => db.getReconcilableFills(uk, windowStart, Date.now()),
-      fetchContractNote: fetchBrokerContractNote,
+      // R37-P2-02: bind the allowed IST reconciliation-day window so the statement's tradingDate is validated against
+      // the day(s) being reconciled — a settled statement for the wrong day is rejected, not silently finalized.
+      fetchContractNote: (uk, broker) => fetchBrokerContractNote(uk, broker, { allowedDates: feeStatement.istDayWindow(windowStart, Date.now()), nowMs: Date.now() }),
       /* R32-P2-02: the fee-final event is a fee-DELTA overlay, NOT an execution. It carries no qty and is NOT an
          execEvent, so projectFills never groups it as an entry/exit leg (which would double-count fees or add a
          phantom zero-qty leg). It records the net feeDelta, the referenced fill, and the leg it corrects; projectFills

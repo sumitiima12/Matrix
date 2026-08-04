@@ -88,20 +88,38 @@ jobs:
       - run: npm ci
       - name: Broker sandbox order + fill verification
         env:
-          # R35 reviewer note: set the repo/environment VARIABLE `REQUIRE_BROKER_CERT=1` for a real-money release run.
-          # When certification is REQUIRED but the sandbox secrets are absent, this job FAILS with an explicit
-          # NOT CERTIFIED / NO-GO status (a green pipeline can never imply broker certification). When not required
-          # (ordinary PR/dev), it records NOT_CONFIGURED and passes so unrelated work isn't blocked.
+          # R35/R37 — certification is REQUIRED in either of two ways:
+          #   • vars.REQUIRE_BROKER_CERT=1 (explicit request, any branch), OR
+          #   • R37-P1-01: vars.REAL_MONEY_RELEASE=1 on the release branch (main/master). On the real-money release
+          #     branch, an un-certified broker path is a NO-GO by DEFAULT — NOT_CONFIGURED FAILS the job. It is no longer
+          #     merely a warning that requires someone to remember to flip an optional variable.
+          # When certification is required but the complete sandbox secrets are absent, the job FAILS (NOT CERTIFIED /
+          # NO-GO). Only on a non-release branch (or PR/dev) with no real-money flag does NOT_CONFIGURED pass, so
+          # unrelated work isn't blocked.
           REQUIRE_BROKER_CERT: ${{ vars.REQUIRE_BROKER_CERT }}
+          REAL_MONEY_RELEASE: ${{ vars.REAL_MONEY_RELEASE }}
+          IS_RELEASE_BRANCH: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && '1' || '0' }}
           FYERS_SANDBOX_APP_ID: ${{ secrets.FYERS_SANDBOX_APP_ID }}
           FYERS_SANDBOX_TOKEN: ${{ secrets.FYERS_SANDBOX_TOKEN }}
+          # R37-P2-01: place/base/symbol settings the suites need to run a REAL fill→close journey (not read-only).
+          FYERS_SANDBOX_BASE: ${{ vars.FYERS_SANDBOX_BASE }}
+          FYERS_SANDBOX_SYMBOL: ${{ vars.FYERS_SANDBOX_SYMBOL }}
+          FYERS_SANDBOX_MAX_QTY: ${{ vars.FYERS_SANDBOX_MAX_QTY }}
           DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
           DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
+          DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
+          DELTA_SANDBOX_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
+          DELTA_SANDBOX_MAX_SIZE: ${{ vars.DELTA_SANDBOX_MAX_SIZE }}
         run: |
           # R36-P1-01: `pipefail` so Node's exit code is NOT masked by tee; `-u` catches unset vars; `-e` stops on error.
           set -euo pipefail
           mkdir -p artifacts
-          REQUIRED=$(echo "${REQUIRE_BROKER_CERT:-0}" | grep -Eiq '^(1|true|yes)$' && echo 1 || echo 0)
+          # R37-P1-01: certification is REQUIRED when explicitly requested OR when this is the real-money release branch.
+          REQ_EXPLICIT=$(echo "${REQUIRE_BROKER_CERT:-0}" | grep -Eiq '^(1|true|yes)$' && echo 1 || echo 0)
+          REAL_MONEY=$(echo "${REAL_MONEY_RELEASE:-0}" | grep -Eiq '^(1|true|yes)$' && echo 1 || echo 0)
+          REQUIRED=0
+          [ "$REQ_EXPLICIT" = "1" ] && REQUIRED=1
+          [ "$IS_RELEASE_BRANCH" = "1" ] && [ "$REAL_MONEY" = "1" ] && REQUIRED=1
           # A broker is "requested" for certification only if it has its COMPLETE credential set. A partial set is treated
           # as MISSING (never a partial certification).
           FYERS_OK=0; [ -n "${FYERS_SANDBOX_APP_ID:-}" ] && [ -n "${FYERS_SANDBOX_TOKEN:-}" ] && FYERS_OK=1
@@ -117,14 +135,17 @@ jobs:
           {
             echo "commit=${GITHUB_SHA}"
             echo "files=${FILES}"
+            echo "release_branch=${IS_RELEASE_BRANCH}  real_money_release=${REAL_MONEY}  require_cert=${REQ_EXPLICIT}  required=${REQUIRED}"
             echo "fyers_creds=${FYERS_OK}  delta_creds=${DELTA_OK}"
           } | tee artifacts/broker-sandbox.txt
+          # R37-P1-01: on the release branch with real-money enabled, BOTH brokers must be certified (not just one).
+          if [ "$REQUIRED" = "1" ] && { [ "$FYERS_OK" = "0" ] || [ "$DELTA_OK" = "0" ]; }; then
+            echo "broker_sandbox=NOT_CERTIFIED (certification REQUIRED but a complete per-broker credential set is missing: fyers=${FYERS_OK} delta=${DELTA_OK})" | tee -a artifacts/broker-sandbox.txt
+            echo "::error::NO-GO — real-money release requires BOTH FYERS and Delta complete sandbox credentials"; exit 1
+          fi
           if [ "$FYERS_OK" = "0" ] && [ "$DELTA_OK" = "0" ]; then
-            if [ "$REQUIRED" = "1" ]; then
-              echo "broker_sandbox=NOT_CERTIFIED (certification REQUESTED but no complete *_SANDBOX_* credential set)" | tee -a artifacts/broker-sandbox.txt
-              echo "::error::NO-GO — broker certification requested but complete sandbox credentials are missing"; exit 1
-            fi
-            echo "broker_sandbox=NOT_CONFIGURED (set a COMPLETE broker credential set + vars.REQUIRE_BROKER_CERT=1 to certify)" | tee -a artifacts/broker-sandbox.txt
+            # REQUIRED is already handled above; reaching here means certification is NOT required for this run.
+            echo "broker_sandbox=NOT_CONFIGURED (set complete FYERS+Delta secrets and vars.REAL_MONEY_RELEASE=1 on main to certify)" | tee -a artifacts/broker-sandbox.txt
             echo "::warning::broker-sandbox credentials absent — real order paths NOT certified this run"; exit 0
           fi
           # Run the sandbox suites. `set -o pipefail` makes a Node failure fail the step. Capture TAP for the gate.

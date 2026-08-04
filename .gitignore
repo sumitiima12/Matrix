@@ -33,3 +33,8 @@ automation_flags.json
 real_strategies.json
 managed_positions.json
 _bootpg.cjs
+
+# R37-P4-01: never commit ad-hoc debug scripts
+_dbg.cjs
+zdbg.cjs
+*.dbg.cjs
