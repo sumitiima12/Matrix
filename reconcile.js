@@ -353,4 +353,24 @@ function correlateOrphanToAttempt(orphan, attempts, broker = null) {
   return { attemptId: best.id, orderTag: best.orderTag || null, broker: best.broker || broker || null, symbol: best.symbol || best.sym || orphan.sym, side: best.side || null, qty: best.qty != null ? Number(best.qty) : null, orphan };
 }
 
-module.exports = { parseDeltaTs, brokerFillTsMs, correlateOrphanToAttempt, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, verifyManagedAgainstBroker };
+/* R31-P2-07 — ATTEMPT-TIMESTAMP GATE for declaring a FYERS order ABSENT.
+   FYERS' order book / tradebook are day/window-scoped and can lag right after placement — a just-sent order can be
+   momentarily missing from EVERY read even though the broker did receive it. So "not found anywhere" is only
+   trustworthy once the attempt is OLD ENOUGH that broker-side propagation lag can't still be hiding it. This pure
+   predicate decides whether it is safe to conclude ABSENT (→ CANCELLED). It is deliberately conservative:
+     • no createdAt / unparseable            → NOT safe (unknown age ⇒ stay locked, retry a later sweep);
+     • createdAt in the future / now         → NOT safe (clock skew ⇒ treat as too-recent);
+     • age < minAgeMs (default 2 min)         → NOT safe (still inside the lag window);
+     • age ≥ minAgeMs                         → safe to declare absent (all live reads already checked by the caller).
+   The caller only reaches this after order book + tradebook + positions + holdings were ALL readable and none
+   referenced the order AND a broker order id exists — this gate adds the time dimension the review asked for. */
+function safeToDeclareAbsent(attempt, { now = Date.now(), minAgeMs = 120000 } = {}) {
+  const created = attempt && (attempt.createdAt ?? attempt.created_at);
+  const ts = Number(created);
+  if (!Number.isFinite(ts) || ts <= 0) return false;   // unknown age ⇒ never conclude absent
+  const age = now - ts;
+  if (age < 0) return false;                            // future timestamp (clock skew) ⇒ treat as too recent
+  return age >= (Number(minAgeMs) || 0);
+}
+
+module.exports = { parseDeltaTs, brokerFillTsMs, correlateOrphanToAttempt, safeToDeclareAbsent, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, verifyManagedAgainstBroker };

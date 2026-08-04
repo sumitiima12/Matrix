@@ -599,6 +599,9 @@ function requireSchemaReady(req, res, next) {
    the account is unlocked, a confirmed rejection/absence is closed, and anything the broker can't conclusively
    confirm (unreachable, still-pending, partial) KEEPS THE ACCOUNT LOCKED. Fail-closed throughout. */
 const C03_RECON_ADVISORY_KEY = 0x4331_0304 | 0;   // stable, app-unique advisory-lock id for the C03 sweep
+/* R31-P2-07: how old an accepted-but-unfound FYERS attempt must be before "absent from every read" is trusted as a
+   real cancellation rather than order-book/tradebook propagation lag. Overridable for tests/ops; default 2 minutes. */
+const FYERS_ABSENCE_MIN_AGE_MS = Number(process.env.FYERS_ABSENCE_MIN_AGE_MS) || 120000;
 async function _fyersProbeByTag(attempt) {
   // A missing/undecryptable session is UNREACHABLE (throw) → the attempt stays locked, never falsely resolved.
   const sess = await sessionFromCred(String(attempt.userId), attempt.broker || "fyers");
@@ -662,9 +665,10 @@ async function _fyersProbeByTag(attempt) {
   catch { return null; }
   if (hold.some((h) => clean(h.symbol) === clean(attempt.symbol) && Math.abs(Number(h.quantity ?? h.remainingQuantity ?? 0) || 0) > 0)) return null;
   // Order book + tradebook + positions + holdings ALL readable and none reference our order. Only call it ABSENT if
-  // the order was at least accepted (we hold a broker order id); a never-confirmed unknown stays locked (never
-  // auto-cancelled), and a bounded age gate below keeps a very-recent unknown locked in case of broker lag.
-  if (bid) return { status: "absent" };
+  // the order was at least accepted (we hold a broker order id) AND the attempt is old enough that broker-side
+  // propagation lag can't still be hiding it (R31-P2-07 attempt-timestamp gate). A never-confirmed unknown stays
+  // locked (never auto-cancelled); a very-recent unknown also stays locked and is retried on a later sweep.
+  if (bid && reconcile.safeToDeclareAbsent(attempt, { now: Date.now(), minAgeMs: FYERS_ABSENCE_MIN_AGE_MS })) return { status: "absent" };
   return null;
 }
 async function _adoptFyersFill(attempt, ob) {
@@ -7841,7 +7845,18 @@ async function runAutoBuyEngine() {
         catch { riskLockedNow = true; }   // unreadable lock ⇒ do NOT place a real order
         if (riskLockedNow) haltedEntries.add(String(st.userId));
         if ((fresh && fresh.status !== "active") || haltedEntries.has(String(st.userId)) || riskLockedNow) {
-          await db.updateRealStrategy(st.id, { pendingSince: null, pendingClientId: null, lastOrderStatus: "skipped", lastError: riskLockedNow ? "Entries are locked (risk halt) — reconcile with your broker to resume." : "Paused/cancelled before the order was sent — no entry placed." });
+          /* R31-P3-01: a post-claim safety block intentionally CONSUMES this candle (the intent stays claimed so we
+             never re-fire this exact bar and never resubmit after an ambiguous send). But surface WHY, and whether it
+             is RETRYABLE or TERMINAL for this signal, instead of an opaque "skipped": a risk-halt is RETRYABLE (the
+             signal can fire again once reconciliation clears the lock, on a later candle), whereas a pause/cancel is
+             TERMINAL for this run (the user turned the strategy off). This is honest lifecycle state for the UI/audit;
+             it deliberately does NOT retry the SAME candle after any ambiguity. */
+          const retryable = riskLockedNow && !(fresh && fresh.status !== "active");
+          const reason = riskLockedNow
+            ? "Entries are locked (risk halt) — reconcile with your broker to resume."
+            : "Paused/cancelled before the order was sent — no entry placed.";
+          await db.updateRealStrategy(st.id, { pendingSince: null, pendingClientId: null, lastOrderStatus: "skipped_safety", skipReason: reason, skipClass: retryable ? "retryable" : "terminal", lastError: reason });
+          logFinancial("autobuy.skipped_safety", { userId: st.userId, strategyId: st.id, symbol: st.symbol, retryable, cause: riskLockedNow ? "risk_lock" : "paused_cancelled" });
           continue;
         }
 
