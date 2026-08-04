@@ -118,6 +118,10 @@ jobs:
           # unrelated work isn't blocked.
           REQUIRE_BROKER_CERT: ${{ vars.REQUIRE_BROKER_CERT }}
           REAL_MONEY_RELEASE: ${{ vars.REAL_MONEY_RELEASE }}
+          # R38: which brokers this deployment certifies for real money. Default "delta,fyers". Narrow it (e.g. "delta")
+          # to certify only the broker(s) you have a real sandbox for; the others stay honestly NO-GO / uncertified and
+          # are neither required nor run. A broker not listed here can never be granted real-money GO by this gate.
+          CERT_BROKERS: ${{ vars.CERT_BROKERS }}
           IS_RELEASE_BRANCH: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && '1' || '0' }}
           FYERS_SANDBOX_APP_ID: ${{ secrets.FYERS_SANDBOX_APP_ID }}
           FYERS_SANDBOX_TOKEN: ${{ secrets.FYERS_SANDBOX_TOKEN }}
@@ -140,35 +144,49 @@ jobs:
           REQUIRED=0
           [ "$REQ_EXPLICIT" = "1" ] && REQUIRED=1
           [ "$IS_RELEASE_BRANCH" = "1" ] && [ "$REAL_MONEY" = "1" ] && REQUIRED=1
+          # R38: brokers this deployment certifies. Default both; narrow via vars.CERT_BROKERS (e.g. "delta").
+          CB=$(echo "${CERT_BROKERS:-delta,fyers}" | tr 'A-Z' 'a-z')
+          WANT_FYERS=0; echo "$CB" | grep -qw fyers && WANT_FYERS=1
+          WANT_DELTA=0; echo "$CB" | grep -qw delta && WANT_DELTA=1
+          if [ "$WANT_FYERS" = "0" ] && [ "$WANT_DELTA" = "0" ]; then
+            echo "::error::CERT_BROKERS='${CERT_BROKERS}' names no known broker (expected delta and/or fyers)"; exit 1
+          fi
           # A broker is "requested" for certification only if it has its COMPLETE credential set. A partial set is treated
           # as MISSING (never a partial certification).
           FYERS_OK=0; [ -n "${FYERS_SANDBOX_APP_ID:-}" ] && [ -n "${FYERS_SANDBOX_TOKEN:-}" ] && FYERS_OK=1
           DELTA_OK=0; [ -n "${DELTA_SANDBOX_KEY:-}" ] && [ -n "${DELTA_SANDBOX_SECRET:-}" ] && DELTA_OK=1
-          # The sandbox suite FILES must exist (a glob that resolves to nothing must never be a silent pass).
+          # Build the run list from the WANTED brokers that have complete creds (an unwanted broker's suite is never run —
+          # the suite's own guard would throw under BROKER_SANDBOX=1 without its creds, which is correct only for a broker
+          # we actually intend to certify).
           FILES=""
-          for pat in test/deltaTestnet*.cjs test/fyersSandbox*.cjs; do
-            for f in $pat; do [ -f "$f" ] && FILES="$FILES $f"; done
-          done
-          if [ -z "$FILES" ]; then
-            echo "::error::broker-sandbox suite files are missing (test/deltaTestnet*.cjs, test/fyersSandbox*.cjs)"; exit 1
-          fi
+          [ "$WANT_DELTA" = "1" ] && [ "$DELTA_OK" = "1" ] && for f in test/deltaTestnet*.cjs; do [ -f "$f" ] && FILES="$FILES $f"; done
+          [ "$WANT_FYERS" = "1" ] && [ "$FYERS_OK" = "1" ] && for f in test/fyersSandbox*.cjs; do [ -f "$f" ] && FILES="$FILES $f"; done
+          # The suite files for wanted brokers must EXIST on disk (a glob resolving to nothing must never be a silent pass).
+          for f in test/deltaTestnet*.cjs test/fyersSandbox*.cjs; do :; done
+          [ "$WANT_DELTA" = "1" ] && ! ls test/deltaTestnet*.cjs >/dev/null 2>&1 && { echo "::error::delta sandbox suite file missing"; exit 1; }
+          [ "$WANT_FYERS" = "1" ] && ! ls test/fyersSandbox*.cjs >/dev/null 2>&1 && { echo "::error::fyers sandbox suite file missing"; exit 1; }
           {
             echo "commit=${GITHUB_SHA}"
-            echo "files=${FILES}"
+            echo "cert_brokers=${CB}  want_fyers=${WANT_FYERS}  want_delta=${WANT_DELTA}"
             echo "release_branch=${IS_RELEASE_BRANCH}  real_money_release=${REAL_MONEY}  require_cert=${REQ_EXPLICIT}  required=${REQUIRED}"
             echo "fyers_creds=${FYERS_OK}  delta_creds=${DELTA_OK}"
+            echo "run_files=${FILES}"
           } | tee artifacts/broker-sandbox.txt
-          # R37-P1-01: on the release branch with real-money enabled, BOTH brokers must be certified (not just one).
-          if [ "$REQUIRED" = "1" ] && { [ "$FYERS_OK" = "0" ] || [ "$DELTA_OK" = "0" ]; }; then
-            echo "broker_sandbox=NOT_CERTIFIED (certification REQUIRED but a complete per-broker credential set is missing: fyers=${FYERS_OK} delta=${DELTA_OK})" | tee -a artifacts/broker-sandbox.txt
-            echo "::error::NO-GO — real-money release requires BOTH FYERS and Delta complete sandbox credentials"; exit 1
+          # R37-P1-01 + R38: when certification is REQUIRED, every WANTED broker must have complete creds. A broker not in
+          # CERT_BROKERS is not required and stays uncertified (NO-GO for that broker), so real money can't be granted to it.
+          MISSING=""
+          [ "$WANT_DELTA" = "1" ] && [ "$DELTA_OK" = "0" ] && MISSING="$MISSING delta"
+          [ "$WANT_FYERS" = "1" ] && [ "$FYERS_OK" = "0" ] && MISSING="$MISSING fyers"
+          if [ "$REQUIRED" = "1" ] && [ -n "$MISSING" ]; then
+            echo "broker_sandbox=NOT_CERTIFIED (certification REQUIRED but complete sandbox creds are missing for:${MISSING})" | tee -a artifacts/broker-sandbox.txt
+            echo "::error::NO-GO — real-money release requires complete sandbox credentials for every CERT_BROKERS entry (${CB}); missing:${MISSING}"; exit 1
           fi
-          if [ "$FYERS_OK" = "0" ] && [ "$DELTA_OK" = "0" ]; then
-            # REQUIRED is already handled above; reaching here means certification is NOT required for this run.
-            echo "broker_sandbox=NOT_CONFIGURED (set complete FYERS+Delta secrets and vars.REAL_MONEY_RELEASE=1 on main to certify)" | tee -a artifacts/broker-sandbox.txt
-            echo "::warning::broker-sandbox credentials absent — real order paths NOT certified this run"; exit 0
+          if [ -z "$FILES" ]; then
+            # No wanted broker has creds. REQUIRED is already handled above, so here certification is NOT required.
+            echo "broker_sandbox=NOT_CONFIGURED (set complete creds for CERT_BROKERS=${CB} + vars.REAL_MONEY_RELEASE=1 on main to certify)" | tee -a artifacts/broker-sandbox.txt
+            echo "::warning::broker-sandbox credentials absent for the wanted brokers — real order paths NOT certified this run"; exit 0
           fi
-          # Run the sandbox suites. `set -o pipefail` makes a Node failure fail the step. Capture TAP for the gate.
+          # Run ONLY the wanted+credentialed suites. `set -o pipefail` makes a Node failure fail the step.
           BROKER_SANDBOX=1 node --test $FILES 2>&1 | tee -a artifacts/broker-sandbox.tap
           PASS=$(grep -c '^ok ' artifacts/broker-sandbox.tap || true)
           FAIL=$(grep -c '^not ok ' artifacts/broker-sandbox.tap || true)
