@@ -152,6 +152,9 @@ async function initDb() {
   // The unknown-order probe may only declare a broker "never received it" (release the key) for a TAGGED order —
   // a legacy/untagged order's absent tag is NOT proof of absence, so it must never be released as absent.
   await pool.query(`ALTER TABLE order_idempotency ADD COLUMN IF NOT EXISTS tagged BOOLEAN NOT NULL DEFAULT FALSE`);
+  // R38: last-change timestamp. getIdempotencyRecord SELECTs updated_at; without this column a FRESH database (CI /
+  // new deploy) errored on every read (the maintenance/idempotency query silently failed). Expand-only, idempotent.
+  await pool.query(`ALTER TABLE order_idempotency ADD COLUMN IF NOT EXISTS updated_at BIGINT`);
   /* C03 — durable WRITE-BEFORE-SEND order-attempt ledger. A row is committed as PREPARED BEFORE any broker
      submission, so a crash/DB-outage after FYERS accepts is always recoverable: startup finds the attempt by
      its deterministic order_tag and reconciles against the broker. Statuses:
@@ -1779,8 +1782,8 @@ async function transitionRealStrategy(id, patch, expectVersion = null) {
 async function claimIdempotencyKey(userId, key, reqHash = null) {
   if (USING_PG) {
     const r = await pool.query(
-      `INSERT INTO order_idempotency (user_id, key, response, req_hash, status, created_at)
-       VALUES ($1,$2,NULL,$3,'in_flight',$4)
+      `INSERT INTO order_idempotency (user_id, key, response, req_hash, status, created_at, updated_at)
+       VALUES ($1,$2,NULL,$3,'in_flight',$4,$4)
        ON CONFLICT (user_id, key) DO NOTHING RETURNING key`, [String(userId), String(key), reqHash, Date.now()]);
     return !!r.rows[0];
   }
@@ -1797,8 +1800,8 @@ async function getIdempotencyRecord(userId, key) {
    client_order_id). Only a TAGGED order may later be resolved as "broker never received it" — an untagged
    (legacy) order's missing tag is not proof of absence. Best-effort (never blocks placement). */
 async function markIdempotencyTagged(userId, key) {
-  if (USING_PG) { await pool.query(`UPDATE order_idempotency SET tagged=TRUE WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]).catch(() => {}); return; }
-  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const row = d[`${userId}|${key}`]; if (row) { row.tagged = true; writeJSON(f, d); }
+  if (USING_PG) { await pool.query(`UPDATE order_idempotency SET tagged=TRUE, updated_at=$3 WHERE user_id=$1 AND key=$2`, [String(userId), String(key), Date.now()]).catch(() => {}); return; }
+  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const row = d[`${userId}|${key}`]; if (row) { row.tagged = true; row.updatedAt = Date.now(); writeJSON(f, d); }
 }
 
 /* ─────────────────────────── C03 durable order-attempt state machine ───────────────────────────
@@ -2081,7 +2084,7 @@ async function bumpProjectionPending(id) {
 async function reconcileStaleIdempotency({ inflightMs = 5 * 60 * 1000 } = {}) {
   const now = Date.now();
   if (USING_PG) {
-    const m = await pool.query(`UPDATE order_idempotency SET status='unknown' WHERE status='in_flight' AND created_at < $1`, [now - inflightMs]).catch(() => ({ rowCount: 0 }));
+    const m = await pool.query(`UPDATE order_idempotency SET status='unknown', updated_at=$2 WHERE status='in_flight' AND created_at < $1`, [now - inflightMs, now]).catch(() => ({ rowCount: 0 }));
     // Nothing is deleted: 'unknown' rows block until reconciled, 'succeeded' rows are kept forever to replay.
     return { markedUnknown: m.rowCount || 0, purged: 0 };
   }
@@ -2128,8 +2131,8 @@ async function countUnknownIdempotency(userId) {
    so a same-key retry may proceed; 'succeeded'/'unknown' persist the response for replay/blocking. */
 async function finalizeIdempotency(userId, key, status, response) {
   if (status === "rejected") { await releaseIdempotencyKey(userId, key); return; }
-  if (USING_PG) { await pool.query(`UPDATE order_idempotency SET response=$3, status=$4 WHERE user_id=$1 AND key=$2`, [String(userId), String(key), response, status]); return; }
-  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const cur = d[`${userId}|${key}`] || {}; d[`${userId}|${key}`] = { ...cur, response, status, createdAt: cur.createdAt || Date.now() }; writeJSON(f, d);
+  if (USING_PG) { await pool.query(`UPDATE order_idempotency SET response=$3, status=$4, updated_at=$5 WHERE user_id=$1 AND key=$2`, [String(userId), String(key), response, status, Date.now()]); return; }
+  const f = FILES.idem || (FILES.idem = path.join(__dirname, "order_idempotency.json")); const d = readJSON(f); const cur = d[`${userId}|${key}`] || {}; d[`${userId}|${key}`] = { ...cur, response, status, createdAt: cur.createdAt || Date.now(), updatedAt: Date.now() }; writeJSON(f, d);
 }
 async function releaseIdempotencyKey(userId, key) {
   if (USING_PG) { await pool.query(`DELETE FROM order_idempotency WHERE user_id=$1 AND key=$2`, [String(userId), String(key)]); return; }
