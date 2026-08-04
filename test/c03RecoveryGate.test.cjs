@@ -60,6 +60,9 @@ test("S3.1: an invalid C03_ORDER_ATTEMPTS value refuses to start (ambiguous safe
 });
 
 test("S3.1: BROKER_TRADING_ENABLED=true with C03 unset (default-on) starts fine", () => {
-  const out = requireServerWith({ BROKER_TRADING_ENABLED: "true", CRED_KEY: "route-test-cred-key-32bytes-min!!" });
+  // This test isolates the C03 gate. The server ALSO (correctly) refuses real-money startup without PostgreSQL unless
+  // ALLOW_FILE_STORE_FOR_REAL=1 (dev-only flat-file path); requireServerWith runs with DATABASE_URL="" so we set that
+  // dev flag to satisfy the DB requirement and prove specifically that a DEFAULT-ON C03 does not block startup.
+  const out = requireServerWith({ BROKER_TRADING_ENABLED: "true", ALLOW_FILE_STORE_FOR_REAL: "1", CRED_KEY: "route-test-cred-key-32bytes-min!!" });
   assert.match(out, /LOADED/, "default-on C03 satisfies the live-trading requirement");
 });

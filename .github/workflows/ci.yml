@@ -12,7 +12,7 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     # R38-P1-03: bound the whole job so a hung suite fails fast (visible) instead of running until the 6h platform cap.
-    timeout-minutes: 25
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -50,13 +50,16 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p artifacts
-          # --test-timeout=120000 → any single test exceeding 2 min is failed by the runner (not left hanging).
+          # --test-timeout=600000 → a single test wedged >10 min is failed by the runner (catches a true hang) WITHOUT
+          # killing the legitimate multi-journey real-Postgres route suites (deltaRouteH07/orderRouteC03/
+          # realPositionsCloseS5), which run several minutes each. (R38 first shipped 120000, which was too tight and
+          # killed those healthy suites mid-transaction.)
           # `timeout --kill-after` → hard backstop; on expiry Node is killed, the ephemeral PG service is torn down by
           # Actions, and the zero-skip gate below still runs against whatever TAP was captured.
           # R38-P1-03: the *.sandbox.cjs broker-certification + E2E suites are EXCLUDED here (they run in their own
           # dedicated jobs) so the main suite has NO intentional skips — a skip in this run is now a real problem.
           FILES=$(ls test/*.cjs | grep -Ev '\.sandbox\.cjs$')
-          timeout --kill-after=30s 15m node --test --test-timeout=120000 $FILES 2>&1 | tee artifacts/backend-tests.tap
+          timeout --kill-after=30s 22m node --test --test-timeout=600000 $FILES 2>&1 | tee artifacts/backend-tests.tap
       - name: Zero-skip safety gate + evidence summary
         if: always()
         run: |

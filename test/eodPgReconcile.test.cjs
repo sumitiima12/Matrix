@@ -81,6 +81,11 @@ test("R35-P2-04: crash-after-first-overlay REPLAY converges (order-level, real D
   await db.recordFill(uk, { fillId: "a", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 });
   await db.recordFill(uk, { fillId: "b", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 1 });
   await db.recordFill(uk, { fillId: "c", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 2 });
+  // Precondition: the three DISTINCT executions of order OC must all persist as separate reconcilable rows. If this
+  // fails (e.g. count 1), the convergence assert below would report a confusing "1 == 3"; assert the setup up front so
+  // a failure points at fill persistence, not the matcher.
+  const seeded = await db.getReconcilableFills(uk, 0, ts0 + 100);
+  assert.equal(seeded.filter((f) => f.orderId === "OC").length, 3, "3 distinct executions of order OC persisted as reconcilable fills");
   const note = [{ execId: null, orderId: "OC", broker: "fyers", charges: 30 }];
   /* Sweep to a FIXPOINT the way production does — reconcile → persist EACH emitted overlay one at a time (persisting
      just one per pass models a crash-after-first-overlay, the hardest replay case) → repeat. Convergence requires that
