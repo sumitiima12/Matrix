@@ -364,12 +364,18 @@ function correlateOrphanToAttempt(orphan, attempts, broker = null) {
      • age ≥ minAgeMs                         → safe to declare absent (all live reads already checked by the caller).
    The caller only reaches this after order book + tradebook + positions + holdings were ALL readable and none
    referenced the order AND a broker order id exists — this gate adds the time dimension the review asked for. */
-function safeToDeclareAbsent(attempt, { now = Date.now(), minAgeMs = 120000 } = {}) {
+function safeToDeclareAbsent(attempt, { now = Date.now(), minAgeMs = 120000, coverageStartMs = null } = {}) {
   const created = attempt && (attempt.createdAt ?? attempt.created_at);
   const ts = Number(created);
   if (!Number.isFinite(ts) || ts <= 0) return false;   // unknown age ⇒ never conclude absent
   const age = now - ts;
   if (age < 0) return false;                            // future timestamp (clock skew) ⇒ treat as too recent
+  /* R32-P2-06: the FYERS orderbook/tradebook/positions are DAY/SESSION-scoped — they can only prove absence for
+     orders inside the window they cover. `coverageStartMs` is the start of that window (the current session day).
+     A PREVIOUS-session attempt is NOT covered by today's empty books, so "not found" is inconclusive there — retain
+     UNKNOWN (return false) rather than falsely declaring a completed prior-session round trip "absent"/cancelled.
+     Only a next-session historical endpoint could prove that; until one is queried, stay locked. */
+  if (coverageStartMs != null && Number.isFinite(Number(coverageStartMs)) && ts < Number(coverageStartMs)) return false;
   return age >= (Number(minAgeMs) || 0);
 }
 

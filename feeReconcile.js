@@ -14,37 +14,60 @@
  *   { execId?, orderId?, charges }   // charges = TOTAL final cost for that execution (or the order, if per-order)
  */
 
-// Match provisional fills to contract-note charges. Prefer an EXACT execution match (execId); else fall back to the
-// per-ORDER total (summed across the order's lines). Returns one finalization per matched, not-yet-final real fill.
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;   // paise/cents
+
+// Match provisional fills to contract-note charges.
+//   • EXACT execution match (execId line) → that execution's charge, verbatim.
+//   • ORDER-LEVEL line (orderId, no execId) → the order's TOTAL is ALLOCATED ACROSS that order's executions by
+//     quantity weight (equal split if no qty), with the LAST fill absorbing the rounding remainder so the allocated
+//     fees sum EXACTLY to the order total. This is the R32-P2-01 fix: a ₹30 order over three fills is ₹10+₹10+₹10,
+//     never ₹30 on each. byOrder is built ONLY from order-level lines so per-execution lines never inflate it.
+// Returns one finalization per matched, not-yet-final real fill.
 function reconcileEodFees({ fills = [], contractNote = [], now = Date.now() } = {}) {
-  const byExec = new Map();
-  const byOrder = new Map();
+  const byExec = new Map();       // execId -> exact charge
+  const byOrderTotal = new Map(); // orderId -> total charge from ORDER-LEVEL lines only
   for (const c of (contractNote || [])) {
     const charges = Number(c && (c.charges ?? c.fees));
     if (!Number.isFinite(charges)) continue;
     if (c.execId != null) byExec.set(String(c.execId), charges);
-    if (c.orderId != null) byOrder.set(String(c.orderId), (byOrder.get(String(c.orderId)) || 0) + charges);
+    else if (c.orderId != null) byOrderTotal.set(String(c.orderId), (byOrderTotal.get(String(c.orderId)) || 0) + charges);
   }
+
+  const provisionalFills = (fills || []).filter((f) => f && f.real === true && f.feeFinal !== true);
   const out = [];
-  for (const f of (fills || [])) {
-    if (!f || f.real !== true) continue;          // only real executions bear brokerage
-    if (f.feeFinal === true) continue;            // already reconciled to the contract note
-    let finalFees = null;
-    if (f.execId != null && byExec.has(String(f.execId))) finalFees = byExec.get(String(f.execId));
-    else if (f.orderId != null && byOrder.has(String(f.orderId))) finalFees = byOrder.get(String(f.orderId));
-    if (finalFees == null || !Number.isFinite(Number(finalFees))) continue;   // no EOD line yet → stays provisional
+  const mk = (f, finalFees) => {
     const provisional = Number(f.fees) || 0;
     out.push({
-      fillId: f.fillId ?? f.id ?? null,
-      execId: f.execId ?? null,
-      orderId: f.orderId ?? null,
-      broker: f.broker ?? null,
-      provisionalFees: provisional,
-      finalFees: Number(finalFees),
-      feeDelta: +(Number(finalFees) - provisional).toFixed(6),
-      feeStatus: "contract-note",
-      feeFinal: true,
-      at: now,
+      fillId: f.fillId ?? f.id ?? null, execId: f.execId ?? null, orderId: f.orderId ?? null, broker: f.broker ?? null,
+      leg: f.kind === "exit" ? "exit" : "entry",   // R32-P2-02: which leg's fee this corrects (for the projection overlay)
+      provisionalFees: provisional, finalFees: round2(finalFees), feeDelta: +(round2(finalFees) - provisional).toFixed(6),
+      feeStatus: "contract-note", feeFinal: true, at: now,
+    });
+  };
+
+  // Pass 1 — exact per-execution matches; collect the rest (order-level fallback) grouped by orderId.
+  const orderBuckets = new Map();   // orderId -> [fills awaiting allocation]
+  for (const f of provisionalFills) {
+    if (f.execId != null && byExec.has(String(f.execId))) { mk(f, byExec.get(String(f.execId))); continue; }
+    if (f.orderId != null && byOrderTotal.has(String(f.orderId))) {
+      const oid = String(f.orderId);
+      if (!orderBuckets.has(oid)) orderBuckets.set(oid, []);
+      orderBuckets.get(oid).push(f);
+    }
+    // else: no contract-note line for this fill yet → leave provisional (retried next run).
+  }
+
+  // Pass 2 — allocate each order's total across its bucket by |qty| (equal split if no qty), remainder on the last.
+  for (const [oid, bucket] of orderBuckets) {
+    const total = round2(byOrderTotal.get(oid));
+    const weights = bucket.map((f) => Math.abs(Number(f.qty)) || 0);
+    const wsum = weights.reduce((a, b) => a + b, 0);
+    let allocated = 0;
+    bucket.forEach((f, i) => {
+      let share;
+      if (i === bucket.length - 1) share = round2(total - allocated);          // last absorbs rounding → exact sum
+      else { share = round2(wsum > 0 ? total * (weights[i] / wsum) : total / bucket.length); allocated += share; }
+      mk(f, share);
     });
   }
   return out;
@@ -66,7 +89,9 @@ function summarizeFinalizations(finalizations = [], totalProvisionalFills = 0) {
    never blocks another's; unmatched fills simply stay provisional and are retried on the next run. Returns an ops
    summary (finalized count, net fee correction, still-provisional gap = alertable, error count).
 
-   Production wiring (server.js supplies these):
+   Production wiring: server.js `runEodFeeReconcileJob()` supplies these and schedules the sweep behind the
+   EOD_FEE_RECONCILE flag (single-owner via advisory lock). It is exported as server.runEodFeeReconcileJob for ops.
+   The injected functions it passes are:
      • userKeys            — storage keys with real trading (e.g. from active real strategies + recent real fills).
      • listProvisionalFills(userKey) → db.getFills(userKey, sessionDayStart, now)
      • fetchContractNote(userKey, broker) → normalized [{ execId?, orderId?, charges }] from the broker's EOD

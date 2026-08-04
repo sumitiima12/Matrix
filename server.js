@@ -403,7 +403,24 @@ async function repairProjectionPending(reason = "periodic") {
     try { items = await db.listProjectionPending(200); } catch { return { error: "list failed" }; }
     for (const it of items) {
       const p = (it && it.payload) || null;
-      if (!p || (it.kind && it.kind !== "exit")) continue;
+      if (!p) continue;
+      /* R32-P2-05: a MANAGED_EXIT item repairs the exact managed-position RESIDUAL for a canonical close whose exit
+         fill was already ledgered but whose position-row update failed. applyReduceOnlyExit only touches the trade
+         journal, NOT the managed position — so this needs its own idempotent handler that updates the referenced
+         managed row (close it, or reduce it to the residual + reopen). Idempotent: re-applying the same close/residual
+         is a no-op if the row already reflects it. */
+      if (it.kind === "managed_exit") {
+        try {
+          const mid = p.managedId;
+          if (mid) {
+            if (p.closed) await db.updateManagedPosition(mid, { status: "closed", closedAt: p.closedAt || Date.now(), exitReason: p.exitReason || "reconciled-close", exitOrderId: p.exitOrderId || null, closingSince: null, exitTag: null });
+            else await db.updateManagedPosition(mid, { qty: p.remainingQty, status: "open", closingSince: null, exitTag: null, exitOrderId: p.exitOrderId || null, exitReason: `${p.exitReason || "reconciled-close"} (partial)` });
+          }
+          await db.deleteProjectionPending(it.id); repaired++;
+        } catch (e) { failed++; try { await db.bumpProjectionPending(it.id); } catch { /* ignore */ } }
+        continue;
+      }
+      if (it.kind && it.kind !== "exit") continue;
       try {
         const res = await applyReduceOnlyExit(String(it.userId || p.userId), {
           sym: p.sym, closeSide: p.closeSide, qty: p.qty, exitPx: p.exitPx, orderId: p.orderId,
@@ -568,7 +585,17 @@ let schemaReady = false;
       });   // throws ⇒ rejects this .then ⇒ retried by .catch; schemaReady stays FALSE (fail closed)
       if (r && r.unresolved) console.warn(`[c03] startup re-armed ${r.users.length} account(s) with ${r.unresolved} unresolved order attempt(s)`);
     }
-    schemaReady = true;   // ready ONLY after the durable re-arm (if enabled) has completed
+    /* R32-P2-04: readiness is a HARD function of the TARGET schema version. initDb throws if a migration this
+       replica owned failed (→ retry, stay 503). If ANOTHER replica owns the migration lock, our initDb returned
+       without applying — so we WAIT here until the schema actually reaches the target before serving money-moving
+       traffic; if it doesn't within the window we throw to retry rather than flip ready on an un-migrated schema. */
+    if (typeof db.schemaIsAtTarget === "function") {
+      const deadline = Date.now() + 60_000;
+      let atTarget = await db.schemaIsAtTarget().catch(() => false);
+      while (!atTarget && Date.now() < deadline) { await new Promise((r) => setTimeout(r, 1000)); atTarget = await db.schemaIsAtTarget().catch(() => false); }
+      if (!atTarget) throw new Error("schema did not reach the target migration version within the readiness window");
+    }
+    schemaReady = true;   // ready ONLY after the durable re-arm (if enabled) has completed AND schema is at target
     if (attempt) console.log(`[db] schema ready after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
     /* C04: IMMEDIATE broker-backed reconciliation sweep at startup (non-blocking — the fail-closed re-arm above
        already locked every affected account before we became ready, so an ambiguous order can't trade in the gap;
@@ -669,7 +696,12 @@ async function _fyersProbeByTag(attempt) {
   // the order was at least accepted (we hold a broker order id) AND the attempt is old enough that broker-side
   // propagation lag can't still be hiding it (R31-P2-07 attempt-timestamp gate). A never-confirmed unknown stays
   // locked (never auto-cancelled); a very-recent unknown also stays locked and is retried on a later sweep.
-  if (bid && reconcile.safeToDeclareAbsent(attempt, { now: Date.now(), minAgeMs: FYERS_ABSENCE_MIN_AGE_MS })) return { status: "absent" };
+  /* R32-P2-06: only declare ABSENT when the attempt falls inside the window the day-scoped FYERS books actually
+     cover — the current session day. A previous-session order the current books can't see stays UNKNOWN (locked),
+     never falsely cancelled. coverageStart = start of today's IST session. */
+  const IST_OFFSET_MS = 19800000;
+  const sessionStart = Math.floor((Date.now() + IST_OFFSET_MS) / 86400000) * 86400000 - IST_OFFSET_MS;
+  if (bid && reconcile.safeToDeclareAbsent(attempt, { now: Date.now(), minAgeMs: FYERS_ABSENCE_MIN_AGE_MS, coverageStartMs: sessionStart })) return { status: "absent" };
   return null;
 }
 async function _adoptFyersFill(attempt, ob) {
@@ -7791,6 +7823,25 @@ async function runAutoBuyEngine() {
             logFinancial("autobuy.risk_blocked", { userId: st.userId, broker: st.broker, symbol: st.symbol, reasons: abCheck.reasons, usedDefaults: !Object.keys(abPolicy).length });
             continue;
           }
+          /* R32-P3-06: PARITY with the manual /api/broker/order path — the automated entry must ALSO block on the
+             IMMUTABLE, FEE-AWARE realized loss from the executions ledger (deriveRiskFromFills), not only the
+             account/projection view, so a fabricated/omitted projection row can't loosen the auto-buy daily-loss
+             breaker. Fail closed on a ledger read error. */
+          if (typeof db.deriveRiskFromFills === "function") {
+            const abMaxLossPct = Number(abPolicy.maxDailyLossPct) || 25;   // platform default floor
+            const IST_OFF = 19800000;
+            const abDayStart = Math.floor((Date.now() + IST_OFF) / 86400000) * 86400000 - IST_OFF;
+            let abFillsRk;
+            try { abFillsRk = db.deriveRiskFromFills(await db.getFills(abStoreKey, abDayStart, Date.now()), { from: abDayStart, to: Date.now() }); }
+            catch { await db.updateRealStrategy(st.id, { lastError: "Couldn't read the execution ledger to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }).catch(() => {}); continue; }
+            const abStartEquity = (Number(abAccount.wallet) || 0) - (Number(abFillsRk.realizedPnl) || 0);
+            const abLossCap = Math.max(0, (abStartEquity * abMaxLossPct) / 100);
+            if (abLossCap > 0 && Number(abFillsRk.realizedLoss) >= abLossCap) {
+              await db.updateRealStrategy(st.id, { lastError: `Daily loss limit hit (execution-ledger authoritative): realized ${abFillsRk.realizedLoss.toFixed(0)} ≥ cap ${abLossCap.toFixed(0)}. New automated entries paused for the session.`, lastOrderStatus: "risk-blocked" });
+              logFinancial("autobuy.risk_blocked", { userId: st.userId, broker: st.broker, symbol: st.symbol, cap: "maxDailyLossPct", realizedLoss: abFillsRk.realizedLoss, lossCap: +abLossCap.toFixed(2), source: "fills-ledger" });
+              continue;
+            }
+          }
         }
 
         /* STAMP THE INTENT before we touch the broker (R16-P1-01). The claim is candle-idempotent and
@@ -8089,10 +8140,14 @@ async function runEodFeeReconcileJob(reason = "scheduled") {
       userKeys, now: Date.now(), log: (ev, d) => logFinancial(ev, { reason, ...d }),
       listProvisionalFills: (uk) => db.getFills(uk, dayStart, Date.now()),
       fetchContractNote: fetchBrokerContractNote,
+      /* R32-P2-02: the fee-final event is a fee-DELTA overlay, NOT an execution. It carries no qty and is NOT an
+         execEvent, so projectFills never groups it as an entry/exit leg (which would double-count fees or add a
+         phantom zero-qty leg). It records the net feeDelta, the referenced fill, and the leg it corrects; projectFills
+         applies exactly this delta once per (broker, orderId, leg). Deterministic fillId ⇒ idempotent re-runs. */
       recordFeeFinal: (uk, fin) => db.recordFill(uk, {
-        fillId: `feefinal_${fin.broker || "x"}_${fin.execId || fin.orderId}`, kind: "fee_final", execEvent: true,
-        refFillId: fin.fillId, fees: fin.finalFees, feeDelta: fin.feeDelta, feeStatus: "contract-note", feeFinal: true,
-        broker: fin.broker || null, real: true, ts: fin.at,
+        fillId: `feefinal_${fin.broker || "x"}_${fin.execId || fin.orderId}`, kind: "fee_final",
+        refFillId: fin.fillId, orderId: fin.orderId || null, leg: fin.leg || "entry",
+        feeDelta: fin.feeDelta, feeStatus: "contract-note", feeFinal: true, broker: fin.broker || null, real: true, ts: fin.at,
       }),
     });
     logFinancial("eodfee.sweep", { reason, ...summary });
@@ -8445,7 +8500,11 @@ app.post("/api/real-positions/:positionId/close", requireAuth, requireActiveUser
       // Ledger written, position residual NOT — park durable reconciliation; the position stays "closing" (exitTag set)
       // so the tag-reconcile / repair sweep converges it without a second broker order. Never report a clean close.
       logFinancial("real_close.residual_write_failed", { userId: String(userId), positionId, broker: pos.broker, orderId: r.orderId || null, err: String((posErr && posErr.message) || posErr) });
-      try { await db.saveProjectionPending({ id: `exproj_${r.orderId || positionId}`, kind: "exit", userId: storageKeyFor(pos.userId), orderId: r.orderId || null, payload: { sym: pos.brokerSym || pos.symbol, closeSide: pos.short ? "BUY" : "SELL", qty: filledQty, exitPx: Number(r.avgPrice) || 0, orderId: r.orderId || null, entryOrderId: pos.entryOrderId != null ? String(pos.entryOrderId) : null, broker: pos.broker, market: pos.market, tradeType: pos.tradeType || "Manual", managedId: pos.id } }); } catch { /* best-effort */ }
+      /* R32-P2-05: the exit fill is ALREADY in the ledger (recordExitFill above succeeded) — only the managed-position
+         row update failed. Park a MANAGED_EXIT repair carrying the exact residual to apply, so the repair worker fixes
+         the referenced position row itself (a generic "exit" item would only touch the trade journal, leaving the
+         managed row stale at its pre-close quantity). Idempotent by managedId. */
+      try { await db.saveProjectionPending({ id: `mgdexit_${pos.id}_${r.orderId || positionId}`, kind: "managed_exit", userId: storageKeyFor(pos.userId), orderId: r.orderId || null, payload: { managedId: pos.id, remainingQty, closed: remainingQty <= 1e-9, exitReason: reason, exitOrderId: r.orderId || null, closedAt: Date.now() } }); } catch { /* best-effort */ }
       return res.status(202).json({ ok: false, closed: false, reconcileRequired: true, filledQty, remainingQty, orderId: r.orderId || null, error: "Your close executed at the broker but updating the position record failed — it will be reconciled automatically. No duplicate order will be sent." });
     }
     logFinancial("real_close.confirmed", { userId: String(userId), positionId, broker: pos.broker, filledQty, remainingQty, orderId: r.orderId || null });

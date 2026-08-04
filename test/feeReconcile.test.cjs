@@ -20,12 +20,50 @@ test("R31-P2-08: finalizes a fill by EXACT execId and computes the fee delta", (
 });
 
 test("R31-P2-08: falls back to the PER-ORDER total (summed lines) when there's no execId match", () => {
-  const fills = [{ fillId: "x2", orderId: "O9", real: true, fees: 2, feeFinal: false }];
-  const note = [{ orderId: "O9", charges: 1.5 }, { orderId: "O9", charges: 2.5 }];   // two lines for the order
+  const fills = [{ fillId: "x2", orderId: "O9", qty: 1, real: true, fees: 2, feeFinal: false }];
+  const note = [{ orderId: "O9", charges: 1.5 }, { orderId: "O9", charges: 2.5 }];   // two order-level lines
   const out = reconcileEodFees({ fills, contractNote: note, now: NOW });
   assert.equal(out.length, 1);
-  assert.equal(out[0].finalFees, 4);              // 1.5 + 2.5
+  assert.equal(out[0].finalFees, 4);              // 1.5 + 2.5, one fill gets the whole order total
   assert.equal(out[0].feeDelta, 2);               // 4 − 2
+});
+
+test("R32-P2-01: an order-level charge is ALLOCATED across the order's executions, never multiplied", () => {
+  // ₹30 order charge across THREE equal-qty execution fills ⇒ ₹10 each, summing EXACTLY to ₹30 (not ₹90).
+  const fills = [
+    { fillId: "e1", orderId: "O1", qty: 1, real: true, fees: 0, feeFinal: false },
+    { fillId: "e2", orderId: "O1", qty: 1, real: true, fees: 0, feeFinal: false },
+    { fillId: "e3", orderId: "O1", qty: 1, real: true, fees: 0, feeFinal: false },
+  ];
+  const note = [{ orderId: "O1", charges: 30 }];
+  const out = reconcileEodFees({ fills, contractNote: note, now: NOW });
+  assert.equal(out.length, 3);
+  const total = out.reduce((a, x) => a + x.finalFees, 0);
+  assert.equal(+total.toFixed(2), 30, "allocated fees sum EXACTLY to the order total (no multiply)");
+  out.forEach((x) => assert.equal(x.finalFees, 10));
+});
+
+test("R32-P2-01: order-level allocation is QUANTITY-weighted with the remainder on the last fill", () => {
+  // ₹10 order over qty 1 and qty 2 ⇒ ~3.33 + 6.67 (last absorbs rounding) summing to exactly 10.
+  const fills = [
+    { fillId: "a", orderId: "OQ", qty: 1, real: true, fees: 0, feeFinal: false },
+    { fillId: "b", orderId: "OQ", qty: 2, real: true, fees: 0, feeFinal: false },
+  ];
+  const out = reconcileEodFees({ fills, contractNote: [{ orderId: "OQ", charges: 10 }], now: NOW });
+  const total = out.reduce((a, x) => a + x.finalFees, 0);
+  assert.equal(+total.toFixed(2), 10, "weighted allocation still sums exactly to the order total");
+  assert.ok(out.find((x) => x.fillId === "b").finalFees > out.find((x) => x.fillId === "a").finalFees, "the larger-qty fill bears more fee");
+});
+
+test("R32-P2-02: each finalization carries the leg it corrects (entry vs exit)", () => {
+  const fills = [
+    { fillId: "en", execId: "E1", orderId: "O1", real: true, fees: 1, feeFinal: false },                 // entry (no kind)
+    { fillId: "ex", execId: "E2", orderId: "O2", kind: "exit", real: true, fees: 1, feeFinal: false },   // exit leg
+  ];
+  const note = [{ execId: "E1", charges: 2 }, { execId: "E2", charges: 3 }];
+  const out = reconcileEodFees({ fills, contractNote: note, now: NOW });
+  assert.equal(out.find((x) => x.fillId === "en").leg, "entry");
+  assert.equal(out.find((x) => x.fillId === "ex").leg, "exit");
 });
 
 test("R31-P2-08: prefers execId over orderId when both are present", () => {

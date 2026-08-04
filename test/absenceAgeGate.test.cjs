@@ -46,3 +46,19 @@ test("R31-P2-07: monotone in age — once old enough to be absent, staying older
     assert.equal(reconcile.safeToDeclareAbsent({ createdAt: created }, { now: NOW, minAgeMs: MIN }), true);
   }
 });
+
+// R32-P2-06 — coverage window: a PREVIOUS-session attempt is not covered by today's day-scoped books, so it must
+// NOT be declared absent even though it's "old enough". Only an attempt within the coverage window can be absent.
+const SESSION_START = NOW - 3 * 3600 * 1000;   // session began 3h ago
+test("R32-P2-06: a within-session, old-enough attempt CAN be declared absent", () => {
+  const created = SESSION_START + 60 * 1000;   // 1 min into the session, and > minAge old vs NOW
+  assert.equal(reconcile.safeToDeclareAbsent({ createdAt: created }, { now: NOW, minAgeMs: MIN, coverageStartMs: SESSION_START }), true);
+});
+test("R32-P2-06: a PREVIOUS-session attempt is NEVER absent (books don't cover it → stay UNKNOWN)", () => {
+  const yesterday = SESSION_START - 24 * 3600 * 1000;   // clearly before this session's coverage window
+  assert.equal(reconcile.safeToDeclareAbsent({ createdAt: yesterday }, { now: NOW, minAgeMs: MIN, coverageStartMs: SESSION_START }), false);
+});
+test("R32-P2-06: exactly at the coverage boundary is covered; one ms before is not", () => {
+  assert.equal(reconcile.safeToDeclareAbsent({ createdAt: SESSION_START }, { now: NOW, minAgeMs: MIN, coverageStartMs: SESSION_START }), true, "at the boundary is covered");
+  assert.equal(reconcile.safeToDeclareAbsent({ createdAt: SESSION_START - 1 }, { now: NOW, minAgeMs: MIN, coverageStartMs: SESSION_START }), false, "just before the window is not");
+});

@@ -25,12 +25,14 @@ const SCHEMA_MIGRATIONS = [
     // No-op: marks the pre-migration schema as version 0 so future expand/contract steps have an ordered anchor.
     up: async () => {},
   },
-  // Example of the intended shape for a FUTURE change (commented so it never runs until real):
-  // {
-  //   version: "2026-09-01-001-fills-fee-final",
-  //   name: "expand: fills.fee_final flag for EOD contract-note reconciliation (R31-P2-08)",
-  //   up: async (query) => { await query(`ALTER TABLE fills ADD COLUMN IF NOT EXISTS fee_final BOOLEAN DEFAULT FALSE`); },
-  // },
+  {
+    // R32-P4-01: a REAL expand migration (idempotent). The EOD fee-reconciliation (R31-P2-08) and the risk-vs-ledger
+    // drift join both look up fills by (user_id, order_id); this index makes those order-scoped scans fast. EXPAND-only
+    // (adds an index, drops nothing), CREATE INDEX IF NOT EXISTS ⇒ safe to run twice and on an existing DB.
+    version: "2026-08-04-001-fills-order-index",
+    name: "expand: index fills(user_id, order_id) for order-scoped fee/drift reconciliation",
+    up: async (query) => { await query(`CREATE INDEX IF NOT EXISTS fills_user_order ON fills (user_id, order_id)`); },
+  },
 ];
 
 // The version the code EXPECTS to be live — readiness can gate real-money features on reaching it.

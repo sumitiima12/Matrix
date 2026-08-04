@@ -251,12 +251,15 @@ async function initDb() {
      Its own table so it is never clobbered by an app_state blob save. */
   await pool.query(`CREATE TABLE IF NOT EXISTS risk_policy (
     user_id TEXT PRIMARY KEY, data JSONB, updated_at BIGINT)`);
-  /* R31-P3-07: after the idempotent inline DDL above establishes the baseline shape, run the VERSIONED
-     expand/contract migrations so future schema changes are ordered + recorded (schema_migrations) and readiness
-     can be tied to a target version. Single-runner across replicas via the existing pg advisory lock. Best-effort
-     wrapper so a migration framework hiccup never blocks the working inline init that already ran. */
-  try { await runSchemaMigrations(); } catch (e) { console.error("[db] schema migrations failed:", e && e.message); }
-  console.log("[db] Postgres ready");
+  /* R31-P3-07 / R32-P2-04: after the idempotent inline DDL establishes the baseline, run the VERSIONED
+     expand/contract migrations (ordered + recorded in schema_migrations) so readiness can be tied to a target
+     version. Single-runner via the pg advisory lock. A migration failure is NOT swallowed — it PROPAGATES so
+     initDb throws and readiness stays false (a half-migrated schema must never serve real money). A non-owner
+     result (another replica holds the lock) returns without applying; the caller then WAITS for the schema to
+     reach the target (see server startup) before flipping ready. */
+  const mig = await runSchemaMigrations();
+  if (mig && mig.error) throw new Error(`schema migrations failed: ${mig.error}`);
+  console.log("[db] Postgres ready", mig && mig.skipped ? "(migrations owned by another replica — will await target)" : "");
 }
 
 /* R31-P3-07 wiring: apply the versioned migrations using THIS module's pool + a dedicated advisory lock so exactly
@@ -593,8 +596,22 @@ async function getFills(userId, from = 0, to = Date.now()) {
    managedId, executions` (executions = count of true execution events, 0 for a legacy snapshot). */
 function projectFills(fills) {
   const groups = new Map();
+  /* R32-P2-02: fee-finalization events (kind:"fee_final") are NOT executions — they carry an idempotent fee DELTA
+     that corrects the provisional fee on the referenced order-leg once the EOD contract note is reconciled. They must
+     never be grouped as an entry execution (that double-counted fees + added phantom zero-qty legs). We collect their
+     net delta per (broker, orderId, leg), deduped by the referenced fill id (latest wins), and OVERLAY it onto the
+     matching projected leg's fees below. */
+  const feeDeltas = new Map();
   for (const x of (fills || [])) {
     if (!x || x.orderId == null) continue;
+    if (x.kind === "fee_final") {
+      const key = `${x.broker || ""}|${String(x.orderId)}|${x.leg === "exit" ? "exit" : "entry"}`;
+      let m = feeDeltas.get(key); if (!m) { m = new Map(); feeDeltas.set(key, m); }
+      const ref = String(x.refFillId ?? x.fillId ?? "");
+      const ts = Number(x.ts) || 0; const prev = m.get(ref);
+      if (!prev || ts >= prev.ts) m.set(ref, { delta: Number(x.feeDelta) || 0, ts });
+      continue;
+    }
     const leg = x.kind === "exit" ? "exit" : "entry";
     const key = `${x.broker || ""}|${String(x.orderId)}|${leg}`;
     let g = groups.get(key);
@@ -634,6 +651,18 @@ function projectFills(fills) {
     } else if (g.snap) {
       const s = g.snap;
       out.push({ broker: g.broker, orderId: g.orderId, leg: g.leg, qty: s.qty, price: s.price, fees: s.fees, side: s.side, market: s.market, ts: s.ts, entryOrderId: s.entryOrderId, managedId: s.managedId, executions: 0 });
+    }
+  }
+  // R32-P2-02: OVERLAY the net EOD fee correction onto the matching projected leg — applied exactly once per
+  // (broker, orderId, leg), never re-added as a separate execution. This is what makes fee finality flow into
+  // deriveRiskFromFills' net P&L / daily-loss and all display consumers without double-counting.
+  if (feeDeltas.size) {
+    for (const p of out) {
+      const m = feeDeltas.get(`${p.broker || ""}|${p.orderId}|${p.leg}`);
+      if (!m) continue;
+      let d = 0; for (const v of m.values()) d += v.delta;
+      p.fees = +(((Number(p.fees) || 0) + d)).toFixed(6);
+      p.feeFinal = true;
     }
   }
   return out;
