@@ -94,10 +94,27 @@ async function resolveProduct() {
   return p;
 }
 async function netPositionSize(productId) {
+  // Primary: single-product position. Delta returns { result: {...} } (object) or an empty/`null` result when flat.
   const pos = await delta("GET", "/v2/positions", { query: `product_id=${productId}`, kind: "verify" });
-  const rows = pos.json && (Array.isArray(pos.json.result) ? pos.json.result : [pos.json.result]).filter(Boolean);
-  const mine = (rows || []).find((r) => r && String(r.product_id) === String(productId));
+  let rows = pos.json && (Array.isArray(pos.json.result) ? pos.json.result : [pos.json.result]).filter(Boolean);
+  let mine = (rows || []).find((r) => r && String(r.product_id) === String(productId));
+  // Fallback: the margined-positions LIST (some Delta deployments only surface an open position here).
+  if (!mine || Number(mine.size || 0) === 0) {
+    const marg = await delta("GET", "/v2/positions/margined", { kind: "verify" });
+    const list = (marg.json && (Array.isArray(marg.json.result) ? marg.json.result : [marg.json.result])) || [];
+    const m2 = list.filter(Boolean).find((r) => String(r.product_id) === String(productId));
+    if (m2 && Number(m2.size || 0) !== 0) mine = m2;
+  }
   return mine ? Number(mine.size || 0) : 0;
+}
+// R38: poll the position until it reflects the just-filled order (Delta's /v2/positions lags /v2/fills by a moment).
+async function waitForPosition(productId, want /* 'open' | 'flat' */, attempts = 12) {
+  let sz = await netPositionSize(productId);
+  for (let i = 0; i < attempts && (want === "open" ? sz === 0 : sz !== 0); i++) {
+    await sleep(500);
+    sz = await netPositionSize(productId);
+  }
+  return sz;
 }
 
 test("delta-sandbox: authenticated wallet read succeeds (connectivity + auth)", async (t) => {
@@ -151,8 +168,8 @@ test("delta-sandbox: REAL fill (broker-truth verified) → reduce-only CLOSE →
     assert.ok(filledSize > 0, "broker /v2/fills confirms a nonzero FILLED size (real execution, not just acceptance)");
     assert.ok(avgPx > 0, "broker fill carries a positive average fill price");
 
-    // Confirm the position actually opened (net long).
-    const openPos = await netPositionSize(p.id);
+    // Confirm the position actually opened (net long) — poll, since /v2/positions lags /v2/fills briefly.
+    const openPos = await waitForPosition(p.id, "open");
     assert.ok(openPos > 0, "position opened net long after the fill");
 
     // 3) REDUCE-ONLY CLOSE — opposite side, reduce_only, sized to the open position (the real auto-exit path).
@@ -160,8 +177,7 @@ test("delta-sandbox: REAL fill (broker-truth verified) → reduce-only CLOSE →
     assert.ok([200, 201].includes(close.status), "reduce-only close accepted");
 
     // 4) VERIFY FLAT — re-read the position until it nets to zero.
-    let endSize = openPos;
-    for (let attempt = 0; attempt < 8 && endSize !== 0; attempt++) { await sleep(400); endSize = await netPositionSize(p.id); }
+    const endSize = await waitForPosition(p.id, "flat");
     assert.equal(endSize, 0, "position is flat after the reduce-only close (verified from broker truth)");
 
     assert.ok(calls.placement > 0 && calls.fillVerify > 0 && calls.close > 0, "nonzero placement/fillVerify/close broker calls");
