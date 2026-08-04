@@ -53,6 +53,7 @@ function ensureCapability(res, broker, capability) {
   return false;
 }
 const orderRecovery = require("./orderRecovery");     // C03 durable order-attempt orchestrator (flag-gated wiring)
+const feeReconcile = require("./feeReconcile");        // R31-P2-08: EOD contract-note fee reconciliation (pure + injected)
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
 /* softAuth: verify the token IF present (attaching req.authUserId), but NEVER reject. Broker
    routes use this — identity is taken from the token when we have it, and we fall back to the
@@ -8040,6 +8041,70 @@ if (process.env.EXIT_MONITOR !== "off") {
   setTimeout(runProtectionWatcher, 40_000);
 }
 
+/* R31-P2-08 — EOD CONTRACT-NOTE FEE RECONCILIATION (production wiring of feeReconcile.runEodFeeReconcile).
+   Flag-gated (EOD_FEE_RECONCILE=true, default OFF) and single-owner (pg advisory lock) so exactly one replica runs.
+   Fetches each involved broker's end-of-day charges, reconciles provisional fills, and appends an immutable linked
+   `fee_final` ledger event per finalization (append-only — the execution is never rewritten). Idempotent by a
+   deterministic fill id, so extra runs are safe. Intended to run once after market close (and once late, to catch
+   delayed statements). */
+const EOD_FEE_RECONCILE_LOCK_KEY = 0x45_4f_44_46 | 0;   // "EODF"
+async function fetchBrokerContractNote(userKey, broker) {
+  // Normalize each broker's EOD charge source to [{ execId?, orderId?, charges }]. Best-effort: return [] on any
+  // failure so one broker's missing statement never blocks another's. By EOD the tradebook carries FINAL charges.
+  const sess = await sessionFromCred(userKey, broker).catch(() => null);
+  if (!sess || !sess.accessToken) return [];
+  try {
+    if (broker === "fyers") {
+      const r = await fyFetch("https://api-t1.fyers.in/api/v3/tradebook", { headers: brokerAuth("fyers", sess.accessToken, sess.userId) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.s === "error") return [];
+      const book = Array.isArray(d.tradeBook) ? d.tradeBook : (Array.isArray(d.trades) ? d.trades : []);
+      return book.map((t) => {
+        const itemised = ["brokerage", "stt", "sebiCharges", "exchangeCharges", "gst", "stampDuty", "clearingCharges"]
+          .reduce((a, k) => a + (Number(t[k]) || 0), 0);
+        const charges = itemised > 0 ? itemised : (Number(t.charges ?? t.fees ?? t.tax ?? 0) || 0);
+        return { execId: String(t.tradeNumber ?? t.id ?? t.fillId ?? ""), orderId: String(t.orderNumber ?? t.orderId ?? t.id ?? ""), charges };
+      });
+    }
+    if (broker === "delta") {
+      const fills = await withTimeout(deltaCall("GET", "/v2/fills", { userId: sess.userId }), 8000).catch(() => null);
+      const rows = (fills && fills.result) || [];
+      return rows.map((f) => ({ execId: String(f.id ?? ""), orderId: String(f.order_id ?? ""), charges: Number(f.commission ?? f.fee ?? 0) || 0 }));
+    }
+  } catch { /* fall through to [] */ }
+  return [];
+}
+async function runEodFeeReconcileJob(reason = "scheduled") {
+  if (!db.USING_PG) return { skipped: true, reason: "flat-file" };
+  let owner = false;
+  try {
+    owner = await db.tryAdvisoryLock(EOD_FEE_RECONCILE_LOCK_KEY);
+    if (!owner) return { skipped: true, reason: "not-owner" };
+    // Users with real trading today: derive from active real strategies (their storage keys).
+    const strategies = await db.getActiveRealStrategies(1000).catch(() => []);
+    const userKeys = [...new Set((strategies || []).map((s) => storageKeyFor(s.userId)).filter(Boolean))];
+    const IST_OFFSET_MS = 19800000;
+    const dayStart = Math.floor((Date.now() + IST_OFFSET_MS) / 86400000) * 86400000 - IST_OFFSET_MS;
+    const summary = await feeReconcile.runEodFeeReconcile({
+      userKeys, now: Date.now(), log: (ev, d) => logFinancial(ev, { reason, ...d }),
+      listProvisionalFills: (uk) => db.getFills(uk, dayStart, Date.now()),
+      fetchContractNote: fetchBrokerContractNote,
+      recordFeeFinal: (uk, fin) => db.recordFill(uk, {
+        fillId: `feefinal_${fin.broker || "x"}_${fin.execId || fin.orderId}`, kind: "fee_final", execEvent: true,
+        refFillId: fin.fillId, fees: fin.finalFees, feeDelta: fin.feeDelta, feeStatus: "contract-note", feeFinal: true,
+        broker: fin.broker || null, real: true, ts: fin.at,
+      }),
+    });
+    logFinancial("eodfee.sweep", { reason, ...summary });
+    return summary;
+  } catch (e) { return { error: (e && e.message) || String(e) }; }
+  finally { if (owner) await db.releaseAdvisoryLock(EOD_FEE_RECONCILE_LOCK_KEY).catch(() => {}); }
+}
+if (/^(1|true|yes)$/i.test(String(process.env.EOD_FEE_RECONCILE || "")) && !MATRIX_NO_LISTEN) {
+  const EOD_FEE_MS = Number(process.env.EOD_FEE_MS) || 30 * 60 * 1000;   // sweep every 30m; the job self-skips users with nothing to finalize
+  setInterval(() => { runEodFeeReconcileJob("periodic").catch((e) => console.error("[eodfee] error:", e && e.message)); }, EOD_FEE_MS).unref?.();
+}
+
 /* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
    the creds the engine will act with). Supported brokers only. */
 app.post("/api/autobuy/register", requireAuth, requireActiveUser, async (req, res) => {
@@ -8552,7 +8617,7 @@ if (!MATRIX_NO_LISTEN) {
    they are pure crypto helpers, safe to export. runC03Reconcile lets a test drive the exact production startup /
    periodic reconciliation sweep. None of this changes production behaviour (the app still boots + listens
    identically when MATRIX_NO_LISTEN is unset). */
-module.exports = { app, isSchemaReady: () => schemaReady, runC03Reconcile, repairProjectionPending, encryptCred, decryptCred, putBrokerSession };
+module.exports = { app, isSchemaReady: () => schemaReady, runC03Reconcile, repairProjectionPending, runEodFeeReconcileJob, encryptCred, decryptCred, putBrokerSession };
 if (!MATRIX_NO_LISTEN) {
   app.listen(PORT, () => console.log(`Matrix proxy on :${PORT}`));
 }
