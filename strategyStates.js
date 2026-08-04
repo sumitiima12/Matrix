@@ -81,4 +81,18 @@ const isTerminal = (state) => String(state || "").toUpperCase() === STRATEGY_STA
 // A state where new entries must NOT be started (but protection/recovery for an open position still run).
 const blocksNewEntries = (state) => [STRATEGY_STATES.PAUSED, STRATEGY_STATES.RECONCILIATION_REQUIRED, STRATEGY_STATES.ERROR_LOCKED, STRATEGY_STATES.STOPPED, STRATEGY_STATES.ENTRY_PENDING, STRATEGY_STATES.EXIT_PENDING, STRATEGY_STATES.POSITION_OPEN].includes(String(state || "").toUpperCase());
 
-module.exports = { STRATEGY_STATES, LEGAL_TRANSITIONS, deriveStrategyState, canTransition, isTerminal, blocksNewEntries };
+/* §8/§9 — DETERMINISTIC SIGNAL IDENTITY. A real automated entry may be created at most once per unique signal,
+   across restarts and replicas. The spec's identity is: user + strategy id + version + symbol + timeframe +
+   closed-candle timestamp + direction. This pure function builds that stable string so the durable unique claim
+   (and audit attribution) is computed the same way everywhere. Direction is normalised to L(ong)/S(hort);
+   editing a strategy bumps its version, which changes the identity so a NEW version evaluates a candle fresh and
+   never collides with (or is blocked by) the OLD version's already-consumed signal. */
+function signalIdentity({ userId, strategyId, version = 1, symbol, timeframe, candleTime, direction } = {}) {
+  const dir = (String(direction).toUpperCase() === "SELL" || direction === "short" || direction === true) ? "S" : "L";
+  return [
+    String(userId || ""), String(strategyId || ""), "v" + (Number(version) || 1),
+    String(symbol || "").toUpperCase(), String(timeframe || ""), String(candleTime || ""), dir,
+  ].join("|");
+}
+
+module.exports = { STRATEGY_STATES, LEGAL_TRANSITIONS, deriveStrategyState, canTransition, isTerminal, blocksNewEntries, signalIdentity };

@@ -2041,10 +2041,12 @@ async function saveRealStrategy(s) {
 }
 async function getActiveRealStrategies(limit = 500) {
   if (USING_PG) {
-    const r = await pool.query(`SELECT data FROM real_strategies WHERE status='active' ORDER BY updated_at ASC LIMIT $1`, [limit]);
-    return r.rows.map((x) => x.data);
+    // §8/§9: surface the row VERSION so the engine can build a version-aware signal identity (an edit bumps the
+    // version, so a new version re-evaluates a candle fresh and never collides with the old consumed signal).
+    const r = await pool.query(`SELECT data, version FROM real_strategies WHERE status='active' ORDER BY updated_at ASC LIMIT $1`, [limit]);
+    return r.rows.map((x) => ({ ...x.data, version: Number(x.version) || Number(x.data && x.data.version) || 1 }));
   }
-  return Object.values(readJSON(FILES.realStrats)).filter((s) => s.status === "active").slice(0, limit);
+  return Object.values(readJSON(FILES.realStrats)).filter((s) => s.status === "active").slice(0, limit).map((s) => ({ ...s, version: Number(s.version) || 1 }));
 }
 async function getRealStrategiesForUser(userId, limit = 200) {
   if (USING_PG) {

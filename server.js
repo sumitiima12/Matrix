@@ -33,6 +33,7 @@ const { createPinLock } = require("./pinLock");       // per-account PIN/answer 
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
 const strategyStates = require("./strategyStates");   // §8: canonical automated-strategy state vocabulary + derivation
+const signalGuards = require("./signalGuards");        // §10/§13: stale-signal + duplicate-symbol pre-entry guards
 /* R30-P1-01 — single enforcement point for the capability registry. Every REAL operation maps to a capability and
    fails CLOSED here with a structured CAPABILITY_NOT_CERTIFIED (HTTP 403) when that broker isn't certified for it.
    Connection, portfolio and all VIRTUAL paths never call this. `capabilityBlock` is the non-HTTP form for engines. */
@@ -684,11 +685,13 @@ async function _adoptFyersFill(attempt, ob) {
     tradeType: "Recovery", serverAuthored: true,
   }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
 }
+let _lastC03SweepAt = 0;   // §15: heartbeat for the reconciler — the observability board pages if it goes stale.
 async function runC03Reconcile(reason = "periodic") {
   // R30-C1: recovery MUST use the SAME gate as submission (default-on unless C03_ORDER_ATTEMPTS=0). Previously
   // this required the var to equal "1", so with the var omitted submission created attempts that recovery then
   // silently skipped — leaving accounts locked with unreconciled orders. Now they're consistent.
   if (!C03_ORDER_ATTEMPTS_ON) return { skipped: true, reason: "flag-off" };
+  _lastC03SweepAt = Date.now();
   const orderRecovery = require("./orderRecovery");
   let owner = false;
   try {
@@ -3897,6 +3900,41 @@ app.get("/api/broker/capabilities", (req, res) => res.json(brokerCaps.capabiliti
 app.get("/api/admin/broker-capabilities", (req, res) => {
   if (!requireAdmin(req, res)) return;
   res.json({ ...brokerCaps.capabilitiesView(), tradingEnabled: TRADING_ENABLED, c03Enabled: C03_ORDER_ATTEMPTS_ON });
+});
+
+/* §15 OBSERVABILITY — one server-owned snapshot of the real-money safety metrics + the alerts they should page
+   on. Read-only, admin-gated, defensive (each metric fails soft to null so a single read error never blanks the
+   whole board). Consolidates the spec's alert set: unresolved UNKNOWN orders + their age, PROJECTION_PENDING
+   backlog, unknown-idempotency growth, accounts risk-locked / entry-halted, orphan/exit reconciliation signals,
+   inactive reconciler, and C03 disabled. `alerts` lists the conditions that are currently PAGE-worthy. */
+app.get("/api/admin/observability", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const now = Date.now();
+  const m = { generatedAt: now, c03Enabled: C03_ORDER_ATTEMPTS_ON, tradingEnabled: TRADING_ENABLED };
+  // Unresolved order attempts (UNKNOWN outcomes) + oldest age — the money-critical "outcome still unknown" set.
+  try {
+    const un = await db.listUnresolvedOrderAttempts(1000);
+    const oldest = un.reduce((mn, a) => Math.min(mn, Number(a && (a.createdAt || a.created_at)) || now), now);
+    m.unresolvedAttempts = { count: un.length, oldestAgeMs: un.length ? now - oldest : 0 };
+  } catch { m.unresolvedAttempts = null; }
+  // PROJECTION_PENDING exits awaiting repair.
+  try { const pp = await db.listProjectionPending(500); m.projectionPending = { count: pp.length, maxAttempts: pp.reduce((x, p) => Math.max(x, Number(p.attempts) || 0), 0) }; } catch { m.projectionPending = null; }
+  // Idempotency ledger health (unknown outcomes that keep a key blocked; overall growth for the archive policy).
+  try { m.idempotency = await db.idempotencyStats(); } catch { m.idempotency = null; }
+  // Accounts currently gated from new real entries (durable entry-halt) + this worker's in-memory lock set.
+  try { const halted = await db.getHaltedEntryUsers(); m.gatedAccounts = { durableEntryHalted: (halted || []).length, thisWorkerLocked: haltedEntries.size }; } catch { m.gatedAccounts = { durableEntryHalted: null, thisWorkerLocked: haltedEntries.size }; }
+  // Is the C03 reconciler alive? (last successful sweep timestamp, if tracked.)
+  m.reconciler = { c03: C03_ORDER_ATTEMPTS_ON ? "enabled" : "DISABLED", lastSweepAgeMs: (typeof _lastC03SweepAt === "number" && _lastC03SweepAt > 0) ? now - _lastC03SweepAt : null };
+
+  // PAGE-worthy alerts derived from the above.
+  const alerts = [];
+  if (!C03_ORDER_ATTEMPTS_ON) alerts.push({ level: "critical", key: "c03_disabled", msg: "C03 durable order attempts are DISABLED — real orders are not crash-recoverable." });
+  if (m.unresolvedAttempts && m.unresolvedAttempts.count > 0 && m.unresolvedAttempts.oldestAgeMs > (Number(process.env.ALERT_UNKNOWN_AGE_MS) || 10 * 60 * 1000)) alerts.push({ level: "critical", key: "unknown_order_aged", msg: `${m.unresolvedAttempts.count} unresolved order(s); oldest ${Math.round(m.unresolvedAttempts.oldestAgeMs / 1000)}s old.` });
+  if (m.projectionPending && m.projectionPending.count > 0) alerts.push({ level: "high", key: "projection_pending", msg: `${m.projectionPending.count} exit projection(s) awaiting repair.` });
+  if (m.idempotency && m.idempotency.unknown > 0) alerts.push({ level: "high", key: "idempotency_unknown", msg: `${m.idempotency.unknown} idempotency key(s) in UNKNOWN state.` });
+  if (m.gatedAccounts && Number(m.gatedAccounts.durableEntryHalted) > 0) alerts.push({ level: "info", key: "accounts_gated", msg: `${m.gatedAccounts.durableEntryHalted} account(s) have new real entries paused (risk lock).` });
+  m.alerts = alerts;
+  res.json(m);
 });
 
 /* Live diagnostic for the house price feeds. Hits FYERS + Delta right now and reports what
@@ -7729,9 +7767,34 @@ async function runAutoBuyEngine() {
            UNIQUE (strategy, candle) row guarantees at-most-once even if a fast winner clears pendingSince
            before a delayed replica arrives, and it blocks an order after the user pauses/cancels. The broker
            client_order_id derives from the same candle key so a timed-out order is found by it. */
-        const candleKey = String(sig.candleTime ?? (candles[candles.length - 1] && candles[candles.length - 1].t) ?? Date.now());
+        /* §8/§9: VERSION-AWARE candle-idempotent claim + persisted match snapshot. The unique (strategy_id,
+           candle_key) row already pins user+symbol+direction via the strategy; the one spec dimension it was
+           missing is the strategy VERSION — so we prefix the candle key with it (an edit bumps the version and
+           re-evaluates the candle fresh, never reinterpreting an old consumed signal). We also compute the FULL
+           deterministic signal identity for audit/attribution and persist the exact match snapshot (signal price
+           + closed-candle time + market-data timestamp) BEFORE ordering. The broker client id stays compact. */
+        const sigVersion = Number(st.version) || 1;
+        const candleTime = String(sig.candleTime ?? (candles[candles.length - 1] && candles[candles.length - 1].t) ?? Date.now());
+        /* §10/§13: never execute a STALE signal. If the engine is far behind (restart/outage/backlog), a
+           closed-candle signal from long ago must not fire a real order on old data — skip it (the candle stays
+           un-consumed so a fresh signal can still fire later). */
+        if (live && signalGuards.staleSignal(Number(candleTime), Date.now(), st.interval)) {
+          await db.updateRealStrategy(st.id, { lastOrderStatus: "skipped", lastError: `Signal for the ${String(st.interval || "")} candle is stale (engine was behind) — no real entry placed on old data.` });
+          logFinancial("autobuy.stale_signal_skipped", { userId: st.userId, strategyId: st.id, symbol: st.symbol, candleTime, tf: st.interval });
+          continue;
+        }
+        /* §10 CONFLICT POLICY: if the account ALREADY holds an open real position in this (broker, symbol) — from
+           this or ANY other automation (Screener / Smart Auto-Buy / another strategy) — do not stack a duplicate.
+           First claim wins; a strategy can opt in to pyramiding with allowDuplicateSymbol. */
+        if (live && !st.allowDuplicateSymbol && signalGuards.duplicateOpenSymbol(await positionsFor(st.userId), st.broker, st.brokerSym)) {
+          await db.updateRealStrategy(st.id, { lastOrderStatus: "skipped", lastError: `You already hold an open ${st.symbol} position on ${st.broker} — skipping a duplicate entry (another automation owns this symbol).` });
+          logFinancial("autobuy.duplicate_symbol_skipped", { userId: st.userId, strategyId: st.id, broker: st.broker, symbol: st.symbol });
+          continue;
+        }
+        const signalId = strategyStates.signalIdentity({ userId: st.userId, strategyId: st.id, version: sigVersion, symbol: st.symbol, timeframe: st.interval, candleTime, direction: st.short ? "short" : "long" });
+        const candleKey = `v${sigVersion}_${candleTime}`;
         const pendingClientId = `mx_${st.id}_${candleKey}`;
-        const claimed = await db.claimRealStrategyForEntry(st.id, candleKey, { pendingSince: Date.now(), pendingClientId, lastOrderAt: Date.now(), userId: st.userId });
+        const claimed = await db.claimRealStrategyForEntry(st.id, candleKey, { pendingSince: Date.now(), pendingClientId, lastOrderAt: Date.now(), userId: st.userId, signalId, matchSnapshot: { price: Number(px) || null, candleTime, dataTs: Date.now() } });
         if (!claimed) continue;
         st.pendingSince = claimed.pendingSince; st.pendingClientId = pendingClientId; st.lastOrderAt = claimed.lastOrderAt;
 

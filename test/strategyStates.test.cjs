@@ -49,6 +49,23 @@ test("§8 transitions: forward progress allowed, illegal jumps rejected, termina
   assert.equal(S.canTransition(ST.ACTIVE, "BOGUS"), false);
 });
 
+test("§9 signalIdentity: deterministic, version-aware, direction-normalised", () => {
+  const base = { userId: "u1", strategyId: "st1", version: 1, symbol: "sbin", timeframe: "15m", candleTime: 1700000000000, direction: "long" };
+  // Deterministic and case-normalised on symbol.
+  assert.equal(S.signalIdentity(base), S.signalIdentity({ ...base, symbol: "SBIN" }), "symbol case doesn't change identity");
+  assert.equal(S.signalIdentity(base), "u1|st1|v1|SBIN|15m|1700000000000|L");
+  // Version is part of the identity — an edit (v2) is a DIFFERENT signal on the same candle (re-evaluates fresh).
+  assert.notEqual(S.signalIdentity(base), S.signalIdentity({ ...base, version: 2 }));
+  // Direction changes the identity; short/SELL/true all normalise to S.
+  assert.notEqual(S.signalIdentity(base), S.signalIdentity({ ...base, direction: "short" }));
+  assert.equal(S.signalIdentity({ ...base, direction: "short" }), S.signalIdentity({ ...base, direction: "SELL" }));
+  assert.equal(S.signalIdentity({ ...base, direction: true }), S.signalIdentity({ ...base, direction: "short" }));
+  // Each of user / strategy / symbol / timeframe / candle changes the identity.
+  for (const k of ["userId", "strategyId", "symbol", "timeframe", "candleTime"]) {
+    assert.notEqual(S.signalIdentity(base), S.signalIdentity({ ...base, [k]: base[k] + "_x" }), `${k} must be part of the identity`);
+  }
+});
+
 test("§8 helpers: blocksNewEntries + isTerminal reflect the safety contract", () => {
   assert.equal(S.isTerminal(ST.STOPPED), true);
   assert.equal(S.isTerminal(ST.ACTIVE), false);
