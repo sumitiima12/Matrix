@@ -19,13 +19,19 @@ async function reconcileUnresolvedAttempts(deps) {
   const {
     db, probeByTag, adoptFill, setLock, setHalt,
     acquireOwner = async () => true,   // advisory lock: returns true if THIS worker is the single owner
+    releaseOwner = async () => {},     // MUST release the single-owner lock when the sweep finishes (see below)
     faults = null, logger = () => {}, limit = 1000,
   } = deps || {};
 
   if (faults) faults.gate("c03.recover.owner");
   const owner = await acquireOwner();
   if (!owner) { logger("c03.recover.not_owner", {}); return { owner: false, skipped: true }; }
-
+  /* OWNERSHIP LIFECYCLE: acquireOwner takes a single-owner lock (a pg advisory lock in prod). It MUST be released
+     when this sweep ends — otherwise the lock lingers on whatever pooled connection took it, and the NEXT sweep
+     (often a different pooled connection) gets owner=false and SILENTLY no-ops. That would quietly wedge the
+     reconciler: unresolved UNKNOWN orders would stop being reconciled and accounts would never re-lock/settle.
+     So everything after acquisition runs in a try/finally that always releases. */
+  try {
   const attempts = await db.listUnresolvedOrderAttempts(limit);
   let resolved = 0, adopted = 0, keptLocked = 0;
   const lockUsers = new Set();   // users with an attempt we could NOT resolve → re-lock them per-user
@@ -74,6 +80,9 @@ async function reconcileUnresolvedAttempts(deps) {
   const stillUnresolved = lockUsers.size > 0;
   logger("c03.recover.done", { attempts: attempts.length, resolved, adopted, keptLocked, stillUnresolved, lockedUsers: lockUsers.size });
   return { owner: true, attempts: attempts.length, resolved, adopted, keptLocked, stillUnresolved, lockedUsers: [...lockUsers] };
+  } finally {
+    try { await releaseOwner(); } catch { /* best-effort — a leaked lock would wedge the next sweep */ }
+  }
 }
 
 /* C03 slice 2b — the WRITE-BEFORE-SEND submit orchestrator. This is the seam wired into the live FYERS branch
@@ -85,7 +94,7 @@ async function reconcileUnresolvedAttempts(deps) {
         never a silent duplicate. A thrown-but-conclusive rejection can be finalized REJECTED by the caller.
      4. a returned result is classified via `classify(res)` → { status, patch } and finalized transactionally.
    When the flag is OFF this module isn't used at all; the legacy path runs byte-for-byte unchanged. */
-async function submitWithAttempt({ db, attempt, submit, classify }) {
+async function submitWithAttempt({ db, attempt, submit, classify, classifyError }) {
   // 1 — durable PREPARED. Throws on an id collision from a DIFFERENT request; returns the existing row on a
   //     legit same-request retry. If this throws, the broker is NEVER called.
   const row = await db.prepareOrderAttempt(attempt);
@@ -105,9 +114,21 @@ async function submitWithAttempt({ db, attempt, submit, classify }) {
   try {
     res = await submit();   // reached ONLY after a durable PREPARED + a won SUBMITTING claim
   } catch (e) {
-    // 3 — ambiguous outcome: the broker MAY have received it. Mark UNKNOWN (unresolved → startup reconciles by
-    //     tag; the account is kept locked). Best-effort finalize; rethrow so the caller surfaces the failure.
-    try { await db.finalizeOrderAttempt(attempt.id, "UNKNOWN", {}); } catch { /* recovery still finds it SUBMITTING */ }
+    /* 3 — the submit threw. Two distinct cases:
+       (a) CONCLUSIVE broker rejection — the broker definitively rejected the order and nothing landed (e.g. an
+           RMS "insufficient margin" error on a synchronous endpoint). classifyError(e) returns a TERMINAL status
+           (e.g. "REJECTED") so we finalize it RESOLVED — no phantom position, and crucially NOT left UNKNOWN,
+           which would needlessly lock the account waiting to reconcile an order that never existed.
+       (b) AMBIGUOUS transport failure (timeout / lost response) — the broker MAY have received it. Mark UNKNOWN
+           (unresolved → startup reconciles by tag; the account is kept locked). Rethrow either way so the caller
+           surfaces the failure honestly. */
+    let terminal = null;
+    try { terminal = typeof classifyError === "function" ? classifyError(e) : null; } catch { terminal = null; }
+    if (terminal && terminal.status) {
+      try { await db.finalizeOrderAttempt(attempt.id, terminal.status, { resolved: true, ...(terminal.patch || {}) }); } catch { /* recovery resolves it */ }
+    } else {
+      try { await db.finalizeOrderAttempt(attempt.id, "UNKNOWN", {}); } catch { /* recovery still finds it SUBMITTING */ }
+    }
     throw e;
   }
   // 4 — conclusive result → finalize the mapped terminal/near-terminal state atomically.

@@ -14,6 +14,7 @@ function makeFakeFyers() {
     requests: [],             // every received request { method, path, body }
     placeCount: 0,            // number of ACTUAL order-placement calls that reached the broker
     fillPrice: 100,
+    markPrice: 100,           // live mark returned by GET /data/quotes (risk-gate sizing for market orders)
     nextExecutions: null,     // H04: [{qty,price}] to split the NEXT order into multiple executions (else one)
     tradeBook: [],            // H04: per-execution trade lines { orderNumber, tradeNumber, tradePrice, tradedQty, side }
   };
@@ -36,6 +37,15 @@ function makeFakeFyers() {
     const u = new URL(req.url, "http://x");
     const path = u.pathname;
     const send = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+
+    // ---- live quotes (risk-gate mark for a market order with no client price) ------------------------
+    // liveMarkForOrder → fyersHouseQuotes hits GET /data/quotes?symbols=NSE:SBIN-EQ,... . Return the
+    // configured mark so the server can size real-money risk exactly as it does in production.
+    if (req.method === "GET" && path === "/data/quotes") {
+      state.requests.push({ method: "GET", path });
+      const syms = String(u.searchParams.get("symbols") || "").split(",").filter(Boolean);
+      return send(200, { s: "ok", d: syms.map((n) => ({ n, v: { lp: state.markPrice, chp: 0 } })) });
+    }
 
     // ---- account snapshot (risk gate) ---------------------------------------------------------------
     if (req.method === "GET" && path === "/api/v3/funds") { state.requests.push({ method: "GET", path }); return send(200, { s: "ok", fund_limit: [{ title: "Available Balance", equityAmount: 1_000_000 }] }); }
@@ -106,7 +116,7 @@ function makeFakeFyers() {
     state,
     async listen() { await new Promise((r) => server.listen(0, "127.0.0.1", r)); return `http://127.0.0.1:${server.address().port}`; },
     async close() { await new Promise((r) => server.close(r)); },
-    setMode(m, opts = {}) { state.mode = m; if (opts.delayMs != null) state.delayMs = opts.delayMs; if (opts.fillPrice != null) state.fillPrice = opts.fillPrice; },
+    setMode(m, opts = {}) { state.mode = m; if (opts.delayMs != null) state.delayMs = opts.delayMs; if (opts.fillPrice != null) { state.fillPrice = opts.fillPrice; state.markPrice = opts.fillPrice; } if (opts.markPrice != null) state.markPrice = opts.markPrice; },
     // H04: split the NEXT filled order into these executions (each {qty, price}); one-shot.
     setExecutions(execs) { state.nextExecutions = execs; },
     // R30-C3: seed a tradebook execution WITHOUT any matching current order-book row — models an older executed

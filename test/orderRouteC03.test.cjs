@@ -111,6 +111,11 @@ test.before(async () => {
   process.env.CRED_KEY = "route-test-cred-key-32bytes-min!!";
   process.env.BROKER_TRADING_ENABLED = "true";
   process.env.C03_ORDER_ATTEMPTS = "1";
+  // Enable the FYERS house feed so the server's own liveMarkForOrder resolves a live mark through the
+  // FYERS_API_BASE seam (the fake serves GET /data/quotes). A market BUY carries no client price, so the
+  // risk gate needs a server-fetched mark to size the order — this exercises the real production sizing path.
+  process.env.EQUITY_HOUSE_FEED = "true";
+  process.env.FYERS_ACCESS_TOKEN = "house-feed-token";
   process.env.MATRIX_NO_LISTEN = "1";
   server = require("../server.js");
   auth = require("../auth.js");
@@ -145,6 +150,20 @@ const guard = (fn) => async (t, ...rest) => {
   }
   return fn(t, ...rest);
 };
+
+// Test ISOLATION: the shared PHONE trader is reused across independent journeys. Once orders actually journal
+// (they do now that the risk gate can price a market order via the fake's /data/quotes), each journey's entry
+// would otherwise leave a fresh SBIN trade that trips the *legitimate* 15s same-symbol entry cooldown for the
+// NEXT journey. So before each test we wipe this user's trades + ledgers + risk/entry locks, giving every
+// journey a clean slate (the cooldown itself stays enforced WITHIN a journey — that's a real control).
+async function resetSharedUser() {
+  if (!DATABASE_URL) return;
+  try { const all = await db.getTrades(SKEY, 0, Date.now()); if (all.length) await db.deleteTradesByIds(SKEY, all.map((x) => x && x.id).filter(Boolean)); } catch { /* ignore */ }
+  try { await db.purgeLedgersForUser(SKEY, {}); } catch { /* ignore */ }
+  try { await db.setRiskLock(SKEY, false); } catch { /* ignore */ }
+  try { await db.setEntryHalt(SKEY, false); } catch { /* ignore */ }
+}
+test.beforeEach(async () => { await resetSharedUser(); });
 
 test("J5: auth/PIN/credential failures reject BEFORE any broker order (zero placements)", guard(async () => {
   fake.reset();
@@ -232,8 +251,14 @@ test("J2/J7: lost-response after acceptance → UNKNOWN + locked; restart reconc
   const unresolved = await db.getOrderAttempt(attemptIdFor(key));
   assert.equal(unresolved.resolved, false, "attempt is UNKNOWN/unresolved after a lost response");
   assert.equal(fake.placeCount(), 1, "the broker received the order exactly once");
-  const lockedNow = await db.isRiskLocked(SKEY);
-  assert.equal(lockedNow, true, "account is fail-closed LOCKED while the order outcome is unknown");
+  /* The REAL, directly-observable safety contract while an order outcome is UNKNOWN (R25-H01): the account is
+     BLOCKED from placing a NEW entry (HTTP 423, citing the unresolved order) until it's reconciled — a stronger
+     guarantee than an internal lock flag (which the startup re-arm sets on boot, not synchronously mid-request).
+     A reduce-only EXIT stays allowed so the user can always flatten. */
+  const blockedEntry = await req("POST", "/api/broker/order", { token: TOKEN, headers: orderHeaders(newKey()), body: { symbol: "NSE:SBIN-EQ", side: "BUY", qty: 1, orderType: "MARKET", product: "CNC" } });
+  assert.equal(blockedEntry.status, 423, "a NEW entry is blocked while a prior order outcome is unknown: " + JSON.stringify(blockedEntry.body));
+  assert.ok(blockedEntry.body && Number(blockedEntry.body.unknownOutstanding) >= 1, "the block cites the unresolved unknown order");
+  assert.equal(fake.placeCount(), 1, "the blocked new entry placed NO broker order");
 
   // RESTART/RECOVERY: production startup + periodic worker call this exact function. The broker's book still holds
   // the filled order under our tag; reconcile must adopt it exactly once and resolve — with NO duplicate order.

@@ -1694,14 +1694,33 @@ async function getOrderAttempt(id) {
    reconciliation sweep at a time (others no-op). Flat-file/dev has a single process, so it's trivially the owner.
    tryAdvisoryLock returns true iff THIS connection acquired it; releaseAdvisoryLock frees it. Best-effort/fail-open
    on the release; fail-closed (returns false ⇒ not owner ⇒ skip) if the lock can't be acquired. */
+/* A session-level pg advisory lock lives on the CONNECTION that took it — `pg_advisory_unlock` and any re-acquire
+   MUST run on that SAME connection. Going through `pool.query` picks an arbitrary idle connection each time, so the
+   lock would be taken on connection A, "released" on connection B (a no-op — A still holds it), and the next
+   acquire from connection C would fail. That silently wedges the single-owner sweep (e.g. the C03 reconciler)
+   after its first run. So we CHECK OUT and hold a dedicated client per lock key for the lifetime of the lock, and
+   release it back to the pool only after unlocking on that same client. */
+const _advisoryClients = new Map();   // key -> checked-out pg client currently holding the lock
 async function tryAdvisoryLock(key) {
   if (!USING_PG) return true;
-  try { const r = await pool.query("SELECT pg_try_advisory_lock($1) AS ok", [Number(key) | 0]); return r.rows[0] && r.rows[0].ok === true; }
-  catch { return false; }
+  const k = Number(key) | 0;
+  if (_advisoryClients.has(k)) return true;   // already held by this process (re-entrant)
+  let client;
+  try {
+    client = await pool.connect();
+    const r = await client.query("SELECT pg_try_advisory_lock($1) AS ok", [k]);
+    if (r.rows[0] && r.rows[0].ok === true) { _advisoryClients.set(k, client); return true; }
+    client.release(); return false;
+  } catch { try { if (client) client.release(); } catch { /* ignore */ } return false; }
 }
 async function releaseAdvisoryLock(key) {
   if (!USING_PG) return;
-  try { await pool.query("SELECT pg_advisory_unlock($1)", [Number(key) | 0]); } catch { /* best-effort */ }
+  const k = Number(key) | 0;
+  const client = _advisoryClients.get(k);
+  if (!client) return;                         // not held here
+  _advisoryClients.delete(k);
+  try { await client.query("SELECT pg_advisory_unlock($1)", [k]); } catch { /* best-effort */ }
+  finally { try { client.release(); } catch { /* ignore */ } }
 }
 
 /* S7 durable fenced leases. Semantics:

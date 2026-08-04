@@ -698,6 +698,9 @@ async function runC03Reconcile(reason = "periodic") {
       setLock: (uid, v) => { try { haltedEntries.add(String(uid)); } catch { /* engine may not be up */ } return db.setRiskLock(String(uid), v); },
       setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
       acquireOwner: async () => { owner = await db.tryAdvisoryLock(C03_RECON_ADVISORY_KEY); return owner; },
+      // Always release the single-owner advisory lock when the sweep ends — a leaked lock would make the NEXT
+      // periodic sweep (a different pooled connection) see owner=false and silently no-op, wedging reconciliation.
+      releaseOwner: async () => { if (owner) { try { await db.releaseAdvisoryLock(C03_RECON_ADVISORY_KEY); } catch { /* best-effort */ } } },
       logger: (evt, o) => { try { logFinancial(evt, o); } catch { /* pre-logger */ } },
     });
     if (out && !out.skipped) logFinancial("c03.reconcile.sweep", { reason, ...out });
@@ -2155,7 +2158,7 @@ async function fyersHouseQuotes(ySyms) {
   const pairs = ySyms.map((y) => [y, yahooToFyers(y)]).filter(([, f]) => f);
   if (!pairs.length) return {};
   try {
-    const r = await pfetch(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`, {
+    const r = await pfetch(_fyRewrite(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`), {
       headers: { Authorization: `${appId}:${token}` },
       ...fyFetchOpts,
     });
@@ -5683,8 +5686,12 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     const clientOverride = cleanRiskPolicy(req.body?.riskLimits);
     const effLimits = strictestRiskPolicy(serverPolicy, clientOverride);
     const userLimits = Object.keys(effLimits).length ? effLimits : null;
+    /* A reduce-only order is an EXIT — the broker's reduce_only flag guarantees it can only close/reduce, never
+       open. Flag it so the risk gate exempts it from entry-side controls (cooldown, funds, sizing, frequency);
+       blocking a close on those grounds would strand the user in a live position they asked to exit. */
+    const rkReduceOnly = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
     const check = serverValidateOrder(
-      { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket },
+      { sym: orderSym, side: String(side).toUpperCase(), qty: nQty, price: rkPrice, market: rkMarket, reduceOnly: rkReduceOnly },
       { wallet: account.wallet, portfolio: account.portfolio, trades: riskEligibleTrades(rkTrades), ...(userLimits ? { limits: userLimits } : {}) },
     );
     if (!check.ok) {
@@ -5787,6 +5794,13 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         const out = await orderRecovery.submitWithAttempt({
           db, attempt, submit: _fyersSubmit,
           classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.id } }),
+          /* A CONCLUSIVE FYERS rejection (RMS/validation) throws with s:"error" and no order landing — this is a
+             definitive "did not fill, nothing open", so finalize the attempt REJECTED (resolved) rather than the
+             ambiguous UNKNOWN. Only the clear rejection shapes qualify; a transport/timeout error stays UNKNOWN. */
+          classifyError: (e) => {
+            const m = String((e && e.message) || e || "");
+            return /reject|insufficient|margin|rms|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null;
+          },
         });
         if (out && out.replay) {
           return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
@@ -5958,8 +5972,24 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         bracket = await placeDeltaBracket(prod, side, entryRef, slPct, tpPct, sess.userId);
       }
       const autoExitId = await registerAutoExit();
-      // R19-P1-04: server-authoritative trade row on the verified Delta fill (risk counters count it server-side).
-      const deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase(), side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}) }, { haltUserIdOnFail: sess.userId });
+      const deltaSym = String(symbol).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+      /* R19-P1-04 / C01 for Delta: on a verified fill write the authoritative record. A REDUCE-ONLY fill is an EXIT —
+         book it as a CLOSE of the referenced open position(s) (immutable exit leg + realized P&L), never a new
+         opposite-side entry row (which would leave a phantom short and corrupt risk). This mirrors the FYERS path;
+         previously the Delta branch recorded ALL fills — including closes — as new authoritative entries. */
+      let deltaJournaled = true;
+      const isDeltaReduceClose = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+      if (isDeltaReduceClose) {
+        const ex = await applyReduceOnlyExit(storageKeyFor(sess.userId), {
+          sym: deltaSym, closeSide: side, qty: filled, exitPx: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0,
+          orderId: o.id, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null,
+          broker: "delta", market: "Crypto", tradeType: String(req.body?.tradeType || "Manual"),
+          ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+        }, { haltUserIdOnFail: sess.userId });
+        if (ex && (ex.error || ex.reconcileRequired || ex.projectionPending)) deltaJournaled = false;
+      } else {
+        deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: deltaSym, side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}) }, { haltUserIdOnFail: sess.userId });
+      }
       // R25-H07: a filled Delta order whose fill couldn't be journaled is reconciliation-required, not a plain success.
       if (!deltaJournaled) {
         return res.status(202).json({ ok: false, broker, status, orderId: o.id ?? null, filledQty: filled, avgPrice: o.average_fill_price != null ? Number(o.average_fill_price) : null, reconcileRequired: true, error: "Your order filled but recording it failed — new orders are paused. Please reconcile with your broker." });

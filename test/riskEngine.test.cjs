@@ -23,6 +23,22 @@ test("a buy exceeding available funds is blocked", () => {
   assert.match(r.reasons[0], /funds/i);
 });
 
+test("REDUCE-ONLY exit is EXEMPT from entry-side gates (cooldown, funds, sizing, frequency)", () => {
+  // Same symbol traded 0s ago (would trip the cooldown), no held position, tiny wallet: an ENTRY here would be
+  // blocked on multiple grounds. A reduce-only CLOSE must still pass — the broker guarantees it only reduces.
+  const trades = [{ sym: "TCS", entryAt: Date.now(), market: "IN" }];
+  const entry = validateOrder({ sym: "TCS", side: "BUY", qty: 5, price: 3000, market: "IN" }, acct({ wallet: 10, trades, limits: { cooldownMs: 15000 } }));
+  assert.strictEqual(entry.ok, false, "a fresh ENTRY in cooldown / underfunded is blocked");
+  const exit = validateOrder({ sym: "TCS", side: "SELL", qty: 5, price: 3100, market: "IN", reduceOnly: true }, acct({ wallet: 10, trades, limits: { cooldownMs: 15000 } }));
+  assert.strictEqual(exit.ok, true, "the reduce-only CLOSE is allowed despite cooldown/funds — you can always flatten");
+  assert.strictEqual(exit.reasons.length, 0);
+});
+
+test("REDUCE-ONLY still fails basic sanity (a non-positive qty is rejected)", () => {
+  const r = validateOrder({ sym: "TCS", side: "SELL", qty: 0, price: 3100, market: "IN", reduceOnly: true }, acct());
+  assert.strictEqual(r.ok, false);
+});
+
 // Caps are OFF by default (the user opts in from Profile). These tests set an explicit limit to
 // prove the ENFORCEMENT LOGIC still works when a user turns a cap on.
 test("a position larger than the 25% cap is blocked (when the user sets a 25% cap)", () => {

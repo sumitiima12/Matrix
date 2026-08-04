@@ -103,3 +103,51 @@ test("Delta J3: a broker REJECTION creates NO position (no phantom) and reports 
   const after = (await db.getTrades(SKEY, 0, Date.now())).filter((t) => t && t.real && t.broker === "delta" && t.exitAt == null).length;
   assert.equal(after, before, "NO new position from a rejected order (no phantom)");
 }));
+
+// A fresh Delta trader isolates the exit/partial journeys from J1/J3 state.
+async function freshDelta() {
+  const phone = "9" + String(Math.floor(1e8 + Math.random() * 8e8));
+  const skey = "ph_" + phone;
+  process.env.ADMIN_USER_IDS = process.env.ADMIN_USER_IDS + "," + phone;   // make this trader Delta-tradable too
+  await db.createUser(phone, bcrypt.hashSync("1234", 8), "Delta X", null, null, null, null, true);
+  const token = auth.signToken(phone, process.env.JWT_SECRET, 24 * 3600 * 1000, 0);
+  const session = server.putBrokerSession(skey, "delta", "server-signed");
+  const oh2 = (idem, extra = {}) => ({ "X-Broker-Session": session, "X-Confirm-Live": "yes", "X-Idempotency-Key": idem, ...extra });
+  const order = (body, extra = {}) => req("POST", "/api/broker/order", { token, headers: oh2(newKey(), extra), body });
+  const open = async () => (await db.getTrades(skey, 0, Date.now())).filter((t) => t && t.real && t.broker === "delta" && t.entryAt != null && t.exitAt == null && t.exit == null && t.status !== "rejected");
+  return { skey, order, open };
+}
+
+test("Delta J-exit: a reduce-only close books an EXIT (realized P&L), NOT a phantom sell row", guard(async () => {
+  fake.reset(); fake.setMode("fill", { fillPrice: 100 });
+  const t = await freshDelta();
+  await t.order({ broker: "delta", symbol: "BTCUSD", side: "buy", qty: 4, price: 100 });            // open long 4 @100
+  let open = await t.open();
+  assert.equal(open.length, 1, "one open Delta long after the entry");
+  fake.setMode("fill", { fillPrice: 130 });
+  const r = await t.order({ broker: "delta", symbol: "BTCUSD", side: "sell", qty: 4, price: 130, reduceOnly: true }, { "X-Reduce-Only": "yes" });
+  assert.ok(r.status === 200 || r.status === 201, "close accepted: " + JSON.stringify(r.body));
+  open = await t.open();
+  assert.equal(open.length, 0, "position is CLOSED after the reduce-only sell (no leftover open long)");
+  const all = await db.getTrades(t.skey, 0, Date.now());
+  const closed = all.filter((x) => x.broker === "delta" && x.status === "closed");
+  assert.equal(closed.length, 1, "exactly one closed row (the exit), not a phantom new sell entry");
+  assert.ok(Math.abs(Number(closed[0].pnl) - 120) < 1e-6, "realized P&L = (130-100)*4 = 120: " + closed[0].pnl);
+}));
+
+test("Delta J-partial: a PARTIAL fill journals the FILLED qty only (never the requested size)", guard(async () => {
+  fake.reset(); fake.setMode("partial", { fillPrice: 100 });   // fills floor(qty/2)
+  const t = await freshDelta();
+  await t.order({ broker: "delta", symbol: "BTCUSD", side: "buy", qty: 4, price: 100 });
+  const open = await t.open();
+  assert.equal(open.length, 1, "one open Delta position from the partial fill");
+  assert.equal(Number(open[0].qty), 2, "journaled the FILLED qty (2), not the requested 4: " + open[0].qty);
+}));
+
+test("Delta J-bracket: SL/TP request attaches an exchange-side bracket on Delta", guard(async () => {
+  fake.reset(); fake.setMode("fill", { fillPrice: 100 });
+  const t = await freshDelta();
+  const before = fake.bracketCount();
+  await t.order({ broker: "delta", symbol: "BTCUSD", side: "buy", qty: 3, price: 100, slPct: 2, tpPct: 4 });
+  assert.equal(fake.bracketCount(), before + 1, "one exchange-side bracket placed on Delta for the SL/TP");
+}));
