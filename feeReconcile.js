@@ -19,8 +19,21 @@ const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;   //
 // partitioned by (broker, trading-day) so each day's fills are matched ONLY against that day's settled statement — a
 // delayed prior-day note still finalizes, and reused order/exec IDs on different days never cross-match.
 const IST_OFFSET_MS = 19800000;
-const istTradingDay = (ms) => new Date(Number(ms) + IST_OFFSET_MS).toISOString().slice(0, 10);
-const fillTradingDay = (f, fallbackMs) => istTradingDay(f && (f.ts ?? f.createdAt ?? f.created_at ?? f.at) != null ? (f.ts ?? f.createdAt ?? f.created_at ?? f.at) : fallbackMs);
+// R39-P2-02 — returns the IST YYYY-MM-DD for a FINITE ms instant, or null for missing/NaN/Infinity. NEVER throws
+// (a malformed timestamp used to make `new Date(NaN).toISOString()` throw and abort the whole user's reconciliation).
+const istTradingDay = (ms) => {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return null;
+  const d = new Date(n + IST_OFFSET_MS);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+};
+// The fill's IST trading day from its OWN execution timestamp, or null if it has none / it is invalid. We must NEVER
+// infer "today" for an undated fill: that would drop a historical or corrupt execution into today's group and match it
+// against today's statement. A null day makes the fill UNRECONCILABLE (left provisional + alerted), never mis-dated.
+const fillTradingDay = (f) => {
+  const raw = f && (f.ts ?? f.createdAt ?? f.created_at ?? f.at);
+  return raw == null ? null : istTradingDay(raw);
+};
 
 // Match provisional fills to contract-note charges.
 //   • EXACT execution match (execId line) → that execution's charge, verbatim.
@@ -176,9 +189,16 @@ async function runEodFeeReconcile({ userKeys = [], listReconcilableFills, listPr
        order/exec IDs on different days can never cross-match (the candidate set is a single day's fills). The matcher
        still receives that day's COMPLETE real set (finalized + not) so order-level allocation stays convergent. */
     const groups = new Map();   // `${broker}${day}` -> { broker, day, fills: [] }
+    let undatedProvisional = 0;
     for (const f of real) {
       const broker = String(f.broker || "");
-      const day = fillTradingDay(f, now);
+      const day = fillTradingDay(f);
+      if (day == null) {
+        // R39-P2-02 — no valid execution timestamp ⇒ UNRECONCILABLE. Never infer today; leave provisional + alert so an
+        // operator can repair the source. Counted into stillProvisional below so the backlog is never falsely empty.
+        if (f.feeFinalized !== true) { undatedProvisional++; log("eodfee.fill_undated", { userKey: uk, fillId: f.fillId || f.id || null, broker, tsRaw: (f && (f.ts ?? f.createdAt ?? f.created_at ?? f.at)) ?? null }); }
+        continue;
+      }
       const gk = broker + SEP + day;
       if (!groups.has(gk)) groups.set(gk, { broker, day, fills: [] });
       groups.get(gk).fills.push(f);
@@ -214,7 +234,7 @@ async function runEodFeeReconcile({ userKeys = [], listReconcilableFills, listPr
     }
     // R36-P3-01: stillProvisional = the day-groups' unfinalized fills MINUS durably-resolved. A failed write or conflict
     // leaves the fill counted, so the monitor never reports a false-empty backlog.
-    stillProvisional += Math.max(0, unfinalizedConsidered - resolvedThisUser);
+    stillProvisional += Math.max(0, unfinalizedConsidered - resolvedThisUser) + undatedProvisional;
   }
   const summary = { usersTouched, finalized, alreadyFinal, conflicts, netFeeCorrection: +netFeeCorrection.toFixed(6), stillProvisional, errors };
   log("eodfee.done", summary);

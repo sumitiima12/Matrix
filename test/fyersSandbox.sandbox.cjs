@@ -26,10 +26,16 @@ const assert = require("node:assert");
 const CERT = /^(1|true|yes)$/i.test(String(process.env.BROKER_SANDBOX || ""));
 const APP_ID = process.env.FYERS_SANDBOX_APP_ID || "";
 const TOKEN = process.env.FYERS_SANDBOX_TOKEN || "";
-const BASE = (process.env.FYERS_SANDBOX_BASE || "https://api-t1.fyers.in/api/v3").replace(/\/+$/, "");
+// R39-P1-05 — NO DEFAULT BASE. A cert run that can place a REAL NSE-hours order must never fall back to a trading
+// endpoint from a misnamed/absent env var. FYERS_SANDBOX_BASE is REQUIRED and must resolve to an approved UAT host
+// (checked below); with it unset the suite is not READY and skips (or fails loudly under a required cert run).
+const BASE = String(process.env.FYERS_SANDBOX_BASE || "").replace(/\/+$/, "");
 const SYMBOL = process.env.FYERS_SANDBOX_SYMBOL || "NSE:SBIN-EQ";
 const MAX_QTY = Math.max(1, Number(process.env.FYERS_SANDBOX_MAX_QTY) || 1);
-const READY = APP_ID && TOKEN;
+// R39-P1-05 — explicit ISOLATED-ACCOUNT allow-list. Placement is refused unless the authenticated FYERS account id is
+// on this list, so a generic CI credential can't place against an unintended (e.g. a real personal) account.
+const ACCOUNT_ALLOW = new Set(String(process.env.FYERS_SANDBOX_ACCOUNT_ALLOW || "").split(",").map((s) => s.trim()).filter(Boolean));
+const READY = APP_ID && TOKEN && BASE;
 // R37-P2-01: during a certification run placement is REQUIRED. FYERS_SANDBOX_PLACE can only turn it OFF for manual dev.
 const PLACE = CERT ? !/^(0|false|no)$/i.test(String(process.env.FYERS_SANDBOX_PLACE ?? "1")) : /^(1|true|yes)$/i.test(String(process.env.FYERS_SANDBOX_PLACE || ""));
 
@@ -61,9 +67,13 @@ const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 test.before(() => {
   if (!CERT) return;
-  if (!READY) throw new Error("FYERS_SANDBOX_APP_ID/TOKEN required for a BROKER_SANDBOX=1 certification run");
+  // R39-P1-05: BASE is now mandatory (no default endpoint) alongside creds.
+  if (!READY) throw new Error("FYERS_SANDBOX_APP_ID + FYERS_SANDBOX_TOKEN + FYERS_SANDBOX_BASE are all required for a BROKER_SANDBOX=1 certification run");
   // R38-P1-04: a placement certification run must target an approved UAT host — never api.fyers.in (production).
   if (PLACE && !HOST_OK) throw new Error(`refusing to place: FYERS_SANDBOX_BASE host "${BASE_HOST}" is not an approved FYERS UAT host (allow-list: ${[...APPROVED_HOSTS].join(", ")})`);
+  // R39-P1-05: placement also requires an explicit isolated-account allow-list so a generic credential can't trade an
+  // unintended account.
+  if (PLACE && ACCOUNT_ALLOW.size === 0) throw new Error("refusing to place: set FYERS_SANDBOX_ACCOUNT_ALLOW to the isolated UAT account id(s) permitted to trade");
 });
 
 function guard(t) { if (CERT && READY && (!PLACE || HOST_OK)) return true; if (CERT) throw new Error(HOST_OK || !PLACE ? "fyers sandbox creds missing" : `unapproved host ${BASE_HOST}`); t.skip("BROKER_SANDBOX not set / no FYERS sandbox creds"); return false; }
@@ -115,21 +125,28 @@ test("fyers-sandbox: REAL fill (tradebook-verified) → square-off CLOSE → fla
 
   if (!PLACE) { t.skip("placement disabled (manual dev run) — read-only checks only"); assert.ok(calls.read > 0 && calls.verify > 0); return; }
 
+  // R39-P1-05 — the authenticated account MUST be on the isolated allow-list before ANY order is placed.
+  const prof = await fy("GET", "/profile", { kind: "read" });
+  const acctId = String((prof.json && prof.json.data && (prof.json.data.fy_id || prof.json.data.id)) || (prof.json && prof.json.fy_id) || "");
+  assert.ok(ACCOUNT_ALLOW.has(acctId), `authenticated FYERS account "${acctId}" is not on FYERS_SANDBOX_ACCOUNT_ALLOW (${[...ACCOUNT_ALLOW].join(", ")})`);
+
   const qty = Math.min(MAX_QTY, 1);
   // Start flat for a clean, reduce-safe journey.
   const startQty = await netQtyFor(SYMBOL);
   assert.equal(startQty, 0, "starting flat (no residual UAT position)");
 
-  /* R38-P1-04 — the whole open lifecycle is wrapped in try/finally. Once the market order is accepted, ANY later failure
-     still runs a bounded emergency square-off in `finally` and PROVES flat; if it can't, the test fails loudly with a
-     MANUAL-INTERVENTION marker rather than exiting with a live intraday position. */
+  /* R38-P1-04 / R39-P1-04 — the whole open lifecycle is wrapped in try/finally, and cleanup is ARMED BEFORE the network
+     send. A market order the broker ACCEPTS but whose HTTP response is lost/timed-out/malformed (no id parsed) still
+     leaves possible exposure; setting `opened` only AFTER parsing the id skipped the flatten in exactly that ambiguous
+     case. Now `finally` reconciles from BROKER TRUTH (emergencySquareOff re-reads /positions) whenever a submission was
+     attempted — it flattens a real fill and is a no-op if nothing actually opened. If it can't prove flat it fails loud. */
   let opened = false, cleanupProven = true;
   try {
-    // 1) OPEN with a MARKET (type 2) INTRADAY BUY so it actually FILLS.
+    // 1) OPEN with a MARKET (type 2) INTRADAY BUY so it actually FILLS. Arm cleanup FIRST (submission attempted).
+    opened = true;   // ambiguous accept/lost-response ⇒ exposure may exist → finally MUST reconcile & square off
     const place = await fy("POST", "/orders", { kind: "placement", body: { symbol: SYMBOL, qty, type: 2, side: 1, productType: "INTRADAY", validity: "DAY", disclosedQty: 0, offlineOrder: false } });
     assert.ok(place.json && place.json.s === "ok" && place.json.id, "sandbox accepted the market order and returned an id");
     const oid = place.json.id;
-    opened = true;   // exposure may now exist → finally must square off
 
     // 2) VERIFY the fill from BROKER TRUTH (/tradebook): nonzero traded qty + positive traded price.
     let tradedQty = 0, tradePx = 0;

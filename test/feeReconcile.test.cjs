@@ -152,9 +152,9 @@ test("R33-P2-01: the job counts a NEW insert as finalized, an identical replay a
     userKeys: ["u1"],
     now: NOW,
     listProvisionalFills: async () => [
-      { fillId: "a", execId: "EA", broker: "fyers", real: true, fees: 1, feeFinal: false },
-      { fillId: "b", execId: "EB", broker: "fyers", real: true, fees: 1, feeFinal: false },
-      { fillId: "c", execId: "EC", broker: "fyers", real: true, fees: 1, feeFinal: false },
+      { fillId: "a", execId: "EA", broker: "fyers", real: true, fees: 1, feeFinal: false, ts: NOW },
+      { fillId: "b", execId: "EB", broker: "fyers", real: true, fees: 1, feeFinal: false, ts: NOW },
+      { fillId: "c", execId: "EC", broker: "fyers", real: true, fees: 1, feeFinal: false, ts: NOW },
     ],
     fetchContractNote: async () => [
       { execId: "EA", charges: 2 },   // a → NEW insert
@@ -206,9 +206,9 @@ test("R36-P3-01: stillProvisional reflects DURABLE inserts — a persistence fai
     userKeys: ["u1"],
     now: NOW,
     listReconcilableFills: async () => [
-      { fillId: "ok", execId: "E1", broker: "fyers", real: true, fees: 1, feeFinalized: false },
-      { fillId: "boom", execId: "E2", broker: "fyers", real: true, fees: 1, feeFinalized: false },
-      { fillId: "conf", execId: "E3", broker: "fyers", real: true, fees: 1, feeFinalized: false },
+      { fillId: "ok", execId: "E1", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: NOW },
+      { fillId: "boom", execId: "E2", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: NOW },
+      { fillId: "conf", execId: "E3", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: NOW },
     ],
     fetchContractNote: async () => [{ execId: "E1", charges: 2 }, { execId: "E2", charges: 3 }, { execId: "E3", charges: 4 }],
     recordFeeFinal: async (uk, fin) => {
@@ -302,9 +302,9 @@ test("R31-P2-08: runEodFeeReconcile orchestrates per-user, persists finalization
     userKeys: ["ph_1", "ph_2", "ph_3"],
     now: NOW,
     listProvisionalFills: async (uk) => {
-      if (uk === "ph_1") return [{ fillId: "a", execId: "E1", broker: "fyers", real: true, fees: 3, feeFinal: false }];
+      if (uk === "ph_1") return [{ fillId: "a", execId: "E1", broker: "fyers", real: true, fees: 3, feeFinal: false, ts: NOW }];
       if (uk === "ph_2") throw new Error("db read blip");                     // fail-soft: skip this user
-      return [{ fillId: "b", orderId: "O2", broker: "delta", real: true, fees: 1, feeFinal: false }];   // ph_3
+      return [{ fillId: "b", orderId: "O2", broker: "delta", real: true, fees: 1, feeFinal: false, ts: NOW }];   // ph_3
     },
     fetchContractNote: async (uk, broker) => {
       if (uk === "ph_1" && broker === "fyers") return [{ execId: "E1", charges: 4 }];
@@ -318,4 +318,29 @@ test("R31-P2-08: runEodFeeReconcile orchestrates per-user, persists finalization
   assert.equal(summary.usersTouched, 2, "ph_2 skipped (read failed), ph_1 + ph_3 processed");
   assert.equal(persisted.length, 2);
   assert.deepEqual(persisted.map((p) => p.fillId).sort(), ["a", "b"]);
+});
+
+test("R39-P2-02: a fill with a MISSING or INVALID timestamp is left provisional (never dated to today, never crashes)", async () => {
+  const fetchDaysReq = [];
+  const persisted = [];
+  const logged = [];
+  const summary = await runEodFeeReconcile({
+    userKeys: ["u1"],
+    now: NOW,
+    listReconcilableFills: async () => [
+      { fillId: "dated", execId: "E1", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: NOW },   // valid → finalizes
+      { fillId: "undated", execId: "E2", broker: "fyers", real: true, fees: 1, feeFinalized: false },           // no ts → provisional
+      { fillId: "bad", execId: "E3", broker: "fyers", real: true, fees: 1, feeFinalized: false, ts: "not-a-time" }, // NaN → provisional, no throw
+    ],
+    fetchContractNote: async (uk, broker, tradingDate) => { fetchDaysReq.push(tradingDate); return [{ execId: "E1", charges: 2 }, { execId: "E2", charges: 5 }, { execId: "E3", charges: 5 }]; },
+    recordFeeFinal: async (uk, fin) => { persisted.push(fin.fillId); return { inserted: true }; },
+    log: (ev, d) => logged.push([ev, d]),
+  });
+  assert.equal(summary.finalized, 1, "only the dated fill finalizes");
+  assert.deepEqual(persisted, ["dated"], "the undated/invalid fills were NEVER matched against today's statement");
+  assert.ok(summary.stillProvisional >= 2, "both undated fills remain counted in the backlog");
+  const undatedAlerts = logged.filter(([ev]) => ev === "eodfee.fill_undated").map(([, d]) => d.fillId).sort();
+  assert.deepEqual(undatedAlerts, ["bad", "undated"], "each undated/invalid fill is alerted for operator repair");
+  // The only trading day ever requested is today's — a historical/undated fill never invents a day.
+  assert.ok(fetchDaysReq.every((d) => d === istDay(NOW)), "no statement was requested for an inferred/invalid day");
 });

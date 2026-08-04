@@ -149,11 +149,15 @@ test("delta-sandbox: REAL fill (broker-truth verified) → reduce-only CLOSE →
   let opened = false, cleanupProven = true;
   try {
     // 1) OPEN with a MARKET order so it actually FILLS (not a resting limit). Testnet paper funds only.
+    // R39-P1-04 — ARM cleanup BEFORE the network send. A market order the sandbox ACCEPTS but whose HTTP response is
+    // lost/timed-out/malformed (no id parsed) still leaves possible exposure; setting `opened` only AFTER parsing the id
+    // skipped the flatten in exactly that ambiguous case. `finally` now reconciles from BROKER TRUTH (emergencyFlatten
+    // re-reads /v2/positions) whenever a submission was attempted — flattening a real fill, no-op if nothing opened.
+    opened = true;   // submission attempted ⇒ exposure may exist → finally MUST reconcile & flatten
     const open = await delta("POST", "/v2/orders", { kind: "placement", body: { product_id: p.id, size, side: "buy", order_type: "market_order" } });
     assert.ok([200, 201].includes(open.status), "market open accepted by the sandbox");
     const oid = open.json && open.json.result && open.json.result.id;
     assert.ok(oid, "sandbox returned a broker order id");
-    opened = true;   // from here on, exposure may exist → finally must flatten
 
     // 2) VERIFY the fill from BROKER TRUTH (/v2/fills): nonzero filled size + positive average price.
     let filledSize = 0, avgPx = 0;

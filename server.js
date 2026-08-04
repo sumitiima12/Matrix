@@ -8178,20 +8178,23 @@ async function fetchBrokerContractNote(userKey, broker, opts = {}) {
       const expectDay = feeStatement.parseIsoDate(opts.tradingDate) || null;
       const acctExpected = String(sess.userId || userKey);
       const PAGE = 200, MAX_PAGES = 50;
-      const rows = []; let complete = false, after = null;
-      for (let p = 0; p < MAX_PAGES; p++) {
-        const q = { userId: sess.userId, page_size: PAGE };
-        if (after) q.after = after;
-        const resp = await withTimeout(deltaCall("GET", "/v2/fills", q), 8000).catch(() => null);
-        const batch = (resp && resp.result) || [];
-        rows.push(...batch);
-        after = resp && resp.meta && (resp.meta.after || resp.meta.next);
-        if (!after || batch.length === 0 || batch.length < PAGE) { complete = true; break; }   // reached exhaustion
-      }
-      const norm = feeStatement.normalizeDeltaFills(rows, { tradingDate: expectDay, account: acctExpected, complete });
-      if (!norm.ok) { logFinancial("eodfee.delta_incomplete", { userKey, broker: "delta", reason: norm.reason, tradingDate: expectDay, pages: rows.length ? "capped" : "empty" }); return []; }
+      /* R39-P2-01 — bind the account at the ENVELOPE level before trusting fills. A signed, per-user Delta call (wallet
+         balances) proves THESE credentials authenticate THIS account (Delta rejects a bad signature). A success lets the
+         adapter accept rows that carry no per-row account field; a failure means we do NOT claim provenance and such
+         unattributed rows are refused (fees stay provisional) rather than being trusted from a possibly-misrouted page. */
+      let accountVerified = false;
+      try { const w = await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }), 8000); accountVerified = !!(w && (w.success === true || Array.isArray(w.result))); } catch { accountVerified = false; }
+      /* R39-P1-02 — paginate with a REAL signed query string. deltaCall transmits ONLY its `query` string, so passing
+         page_size/after as loose object keys silently dropped them (fetching page 1 forever / false completeness). The
+         pure paginator builds "?page_size=&after=" and decides completeness from the AUTHORITATIVE next cursor. */
+      const { rows, complete, pages } = await feeStatement.paginateDeltaFills(
+        (query) => withTimeout(deltaCall("GET", "/v2/fills", { query, userId: sess.userId }), 8000).catch(() => null),
+        { pageSize: PAGE, maxPages: MAX_PAGES }
+      );
+      const norm = feeStatement.normalizeDeltaFills(rows, { tradingDate: expectDay, account: acctExpected, complete, accountVerified });
+      if (!norm.ok) { logFinancial("eodfee.delta_incomplete", { userKey, broker: "delta", reason: norm.reason, tradingDate: expectDay, pages }); return []; }
       if (norm.rejected) logFinancial("eodfee.stmt_line_rejected", { userKey, broker: "delta", rejected: norm.rejected, accepted: norm.kept, tradingDate: expectDay });
-      logFinancial("eodfee.stmt_imported", { userKey, broker: "delta", tradingDate: expectDay, accepted: norm.kept, rejected: norm.rejected, offday: norm.offday, complete });
+      logFinancial("eodfee.stmt_imported", { userKey, broker: "delta", tradingDate: expectDay, account: acctExpected, accountVerified, unattributed: norm.unattributed, accepted: norm.kept, rejected: norm.rejected, offday: norm.offday, complete, pages });
       return norm.lines;
     }
   } catch { /* fall through to [] */ }

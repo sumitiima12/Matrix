@@ -81,10 +81,15 @@ jobs:
             echo "fail=${FAIL}"
             echo "skipped=${SKIP}"
           } | tee artifacts/backend-evidence.txt
-          # Safety suites must never skip in a release run.
+          # Safety suites must never skip in a release run (named diagnostic — kept for a precise pointer).
           if grep -Eq '(realPositionsCloseS5|leasesTwoProcess|fenceToSend|orderRouteC03|deltaRouteH07|migrations|eodPgReconcile|R35-P2-04|R35-P3-04).*# (SKIP|skip)' "$TAP"; then
             echo "::error::a safety-tagged suite was SKIPPED — release evidence is invalid"; exit 1
           fi
+          # R39-P2-03: GLOBAL zero-skip gate. The main suite is DESIGNED to have no intentional skips (sandbox suites run
+          # in their own job; PostgreSQL is required, so PG self-skips already fail via ciPgRequired). Therefore ANY skip
+          # means a money-safety test silently vanished — fail on skipped>0 regardless of name, so a NEW or RENAMED safety
+          # test can't skip past the named regex above. Release documentation requires global skipped=0.
+          if [ "${SKIP:-0}" != "0" ]; then echo "::error::global zero-skip gate: ${SKIP} skipped test(s) in the backend suite (a money-safety test may have silently skipped)"; exit 1; fi
           if [ "${FAIL:-0}" != "0" ]; then echo "::error::backend tests failed"; exit 1; fi
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
@@ -208,3 +213,51 @@ jobs:
           name: broker-sandbox-evidence-${{ github.sha }}
           path: artifacts/
           retention-days: 90
+
+  # R39-P3-01: PROTECTED real-money deployment gate. This job is the enforcement point the docs described but the
+  # workflow lacked. It runs ONLY on the release branch when vars.REAL_MONEY_RELEASE=1, `needs:` the backend + broker
+  # certification jobs (so it can't start unless both SUCCEEDED), and binds to a PROTECTED `environment:` — configure
+  # `production` in Settings → Environments with required reviewers so activation needs a human approval and can't be
+  # bypassed by a push. It then re-VERIFIES the per-SHA evidence CONTENTS (not just job success): the backend suite is
+  # green with zero skips for THIS commit, and every CERT_BROKERS broker is actually certified (pass>0, fail=0, skip=0,
+  # no NOT_CERTIFIED/NOT_CONFIGURED). Real-money activation is emitted only when all checks pass.
+  deploy:
+    needs: [backend, broker-sandbox]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.REAL_MONEY_RELEASE == '1' }}
+    environment: production   # protected: add required reviewers in repo Settings → Environments
+    steps:
+      - name: Download backend evidence (this SHA)
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-evidence-${{ github.sha }}
+          path: ev-backend
+      - name: Download broker-sandbox evidence (this SHA)
+        uses: actions/download-artifact@v4
+        with:
+          name: broker-sandbox-evidence-${{ github.sha }}
+          path: ev-broker
+      - name: Verify certified evidence before real-money activation
+        env:
+          CERT_BROKERS: ${{ vars.CERT_BROKERS }}
+        run: |
+          set -euo pipefail
+          BE=ev-backend/backend-evidence.txt
+          BS=ev-broker/broker-sandbox.txt
+          [ -f "$BE" ] || { echo "::error::missing backend evidence for ${GITHUB_SHA}"; exit 1; }
+          [ -f "$BS" ] || { echo "::error::missing broker-sandbox evidence for ${GITHUB_SHA}"; exit 1; }
+          # 1) Backend evidence must be for THIS commit, green, zero-skip.
+          grep -q "commit=${GITHUB_SHA}" "$BE" || { echo "::error::backend evidence commit mismatch (artifact is not for ${GITHUB_SHA})"; exit 1; }
+          grep -q "^fail=0" "$BE" || { echo "::error::backend evidence shows failures"; exit 1; }
+          grep -q "^skipped=0" "$BE" || { echo "::error::backend evidence shows skipped tests"; exit 1; }
+          # 2) Broker certification must have actually happened — never a NOT_CERTIFIED / NOT_CONFIGURED artifact.
+          if grep -Eq 'NOT_CERTIFIED|NOT_CONFIGURED' "$BS"; then echo "::error::broker-sandbox was not certified for a real-money release"; exit 1; fi
+          grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$BS" || { echo "::error::broker-sandbox evidence is not a clean pass>0/fail=0/skipped=0"; exit 1; }
+          # 3) Every broker named in CERT_BROKERS must be one the certification run actually WANTED and ran.
+          CB=$(echo "${CERT_BROKERS:-delta,fyers}" | tr 'A-Z' 'a-z')
+          echo "$CB" | grep -qw fyers && ! grep -q 'want_fyers=1' "$BS" && { echo "::error::fyers is in CERT_BROKERS but was not certified"; exit 1; } || true
+          echo "$CB" | grep -qw delta && ! grep -q 'want_delta=1' "$BS" && { echo "::error::delta is in CERT_BROKERS but was not certified"; exit 1; } || true
+          echo "deploy_gate=GO commit=${GITHUB_SHA} cert_brokers=${CB}"
+          echo "::notice::Real-money release evidence verified for ${GITHUB_SHA} (backend green+zero-skip; brokers ${CB} certified). Proceeding to protected deployment."
+          # (Real deployment / capability activation step goes here — kept as the single gated point.)

@@ -129,17 +129,25 @@ function brokerTradingDay(v, offsetMs = 19800000) {
  *   Returns { ok:false, reason } or { ok:true, tradingDate, lines:[{execId,orderId,charges,tradingDate}], kept, rejected }.
  */
 function normalizeDeltaFills(rows, opts = {}) {
-  const { tradingDate, account, complete } = opts;
+  const { tradingDate, account, complete, accountVerified } = opts;
   if (complete === false) return { ok: false, reason: "incomplete-pagination" };            // completeness watermark
   if (!Array.isArray(rows)) return { ok: false, reason: "no-rows" };
   const wantDay = parseIsoDate(tradingDate);
   if (tradingDate != null && !wantDay) return { ok: false, reason: "bad-trading-date" };
   const lines = [];
-  let rejected = 0, offday = 0;
+  let rejected = 0, offday = 0, unattributed = 0;
   const seen = new Set();                                                                    // de-dupe by fill id
   for (const f of rows) {
     if (!f || typeof f !== "object") { rejected++; continue; }
-    if (account != null) { const a = nzId(f.account_id ?? f.account ?? f.user_id); if (a != null && String(a) !== String(account)) { rejected++; continue; } }
+    // R39-P2-01 — ACCOUNT PROVENANCE. When an expected account is given: a row carrying a DIFFERENT account is always
+    // rejected; a row with NO account field is "unattributed" and can only be trusted when the caller independently
+    // proved the credential↔account binding at the envelope level (accountVerified === true). Without that proof we do
+    // NOT silently accept unattributed rows (a misrouted proxy/cache page for another account would be undetectable).
+    if (account != null) {
+      const a = nzId(f.account_id ?? f.account ?? f.user_id);
+      if (a != null) { if (String(a) !== String(account)) { rejected++; continue; } }
+      else { unattributed++; if (accountVerified !== true) { rejected++; continue; } }
+    }
     const day = brokerTradingDay(f.created_at ?? f.timestamp ?? f.fill_time ?? f.time);
     if (wantDay && day !== wantDay) { offday++; continue; }                                   // per-day partition
     const charges = strictCharge(f.commission ?? f.fee ?? f.charges);
@@ -153,7 +161,37 @@ function normalizeDeltaFills(rows, opts = {}) {
     if (execId != null) { line.execId = execId; line.orderId = orderId || null; } else { line.orderId = orderId; }
     lines.push(line);
   }
-  return { ok: true, tradingDate: wantDay || null, lines, kept: lines.length, rejected, offday };
+  return { ok: true, tradingDate: wantDay || null, lines, kept: lines.length, rejected, offday, unattributed, accountVerified: accountVerified === true };
 }
 
-module.exports = { strictCharge, nzId, parseIsoDate, normStatementLine, validateStatement, istDayWindow, brokerTradingDay, normalizeDeltaFills };
+/* R39-P1-02 — PURE, INJECTED Delta /v2/fills paginator. `call(query)` performs ONE signed request for the given query
+ * STRING (e.g. "?page_size=200&after=<cursor>") and returns the raw response object. Because deltaCall only transmits
+ * its `query` string, the caller MUST build the query here — passing page_size/after as loose object keys silently
+ * drops them (the R39-P1-02 bug). Completeness is decided by the AUTHORITATIVE next cursor, never by a short page:
+ *   • no next cursor OR an empty page  ⇒ complete (reached the end);
+ *   • a next cursor that does not advance (repeats the one we just sent)  ⇒ STOP, complete:false (fail closed);
+ *   • a malformed/failed response (null / non-array result)  ⇒ STOP, complete:false (fail closed);
+ *   • hitting maxPages with a cursor still present  ⇒ complete:false (fail closed).
+ * Returns { rows, complete, pages }. An incomplete result must leave fills provisional upstream, never partially final.
+ */
+async function paginateDeltaFills(call, opts = {}) {
+  const pageSize = Math.max(1, Number(opts.pageSize) || 200);
+  const maxPages = Math.max(1, Number(opts.maxPages) || 50);
+  const rows = [];
+  let complete = false, after = null, pages = 0;
+  for (let p = 0; p < maxPages; p++) {
+    const params = new URLSearchParams({ page_size: String(pageSize) });
+    if (after != null) params.set("after", String(after));
+    const resp = await call("?" + params.toString());
+    pages++;
+    if (!resp || !Array.isArray(resp.result)) break;                       // malformed/failed ⇒ fail closed
+    rows.push(...resp.result);
+    const next = resp.meta && (resp.meta.after ?? resp.meta.next ?? null);
+    if (next == null || resp.result.length === 0) { complete = true; break; }   // authoritative end
+    if (after != null && String(next) === String(after)) break;            // cursor not advancing ⇒ fail closed
+    after = next;
+  }
+  return { rows, complete, pages };
+}
+
+module.exports = { strictCharge, nzId, parseIsoDate, normStatementLine, validateStatement, istDayWindow, brokerTradingDay, normalizeDeltaFills, paginateDeltaFills };

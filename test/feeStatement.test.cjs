@@ -201,10 +201,73 @@ test("normalizeDeltaFills: rejects malformed rows + wrong account; strict commis
   assert.ok(r.rejected >= 3);
 });
 
+// ---- R39-P2-01: account provenance (unattributed rows) ----------------------------------------
+test("normalizeDeltaFills: an unattributed row (no account field) is REJECTED unless envelope-verified", () => {
+  const rows = [{ id: "x", commission: "1", created_at: "2026-08-04T05:00:00Z" }];   // no account_id/account/user_id
+  const unverified = normalizeDeltaFills(rows, { tradingDate: "2026-08-04", account: "ACC1", complete: true });
+  assert.equal(unverified.kept, 0, "not accepted without envelope proof");
+  assert.equal(unverified.unattributed, 1);
+  assert.ok(unverified.rejected >= 1, "the unattributed row is rejected");
+
+  const verified = normalizeDeltaFills(rows, { tradingDate: "2026-08-04", account: "ACC1", complete: true, accountVerified: true });
+  assert.equal(verified.kept, 1, "accepted once the caller proved the account↔credential binding");
+  assert.equal(verified.unattributed, 1);
+  assert.equal(verified.accountVerified, true);
+});
+
+// ---- R39-P1-02: pure paginator (HTTP-level cursor behavior) ------------------------------------
+const { paginateDeltaFills } = feeStatement;
+const row = (id) => ({ id, commission: "1", created_at: "2026-08-04T05:00:00Z", account_id: "ACC1" });
+
+test("paginateDeltaFills: page 2 receives the cursor, all pages included once, ends complete on absent cursor", async () => {
+  const pages = [
+    { result: [row("a"), row("b")], meta: { after: "c1" } },
+    { result: [row("c"), row("d")], meta: { after: "c2" } },
+    { result: [row("e")], meta: { after: null } },   // authoritative end
+  ];
+  const seen = []; let i = 0;
+  const call = async (query) => { seen.push(query); return pages[i++]; };
+  const r = await paginateDeltaFills(call, { pageSize: 2, maxPages: 10 });
+  assert.equal(r.complete, true);
+  assert.equal(r.rows.length, 5, "every page's rows are included exactly once");
+  assert.match(seen[0], /page_size=2/);
+  assert.ok(!/after=/.test(seen[0]), "first request carries no cursor");
+  assert.match(seen[1], /after=c1/, "second request sends the page-1 cursor");
+  assert.match(seen[2], /after=c2/, "third request sends the page-2 cursor");
+});
+
+test("paginateDeltaFills: a repeated (non-advancing) cursor FAILS CLOSED (complete:false)", async () => {
+  const call = async () => ({ result: [row("z")], meta: { after: "SAME" } });   // never advances
+  const r = await paginateDeltaFills(call, { pageSize: 2, maxPages: 10 });
+  assert.equal(r.complete, false, "a stuck cursor must not report completion");
+});
+
+test("paginateDeltaFills: a malformed/failed mid-page response FAILS CLOSED", async () => {
+  const pages = [{ result: [row("a")], meta: { after: "c1" } }, null];   // 2nd fetch failed
+  let i = 0;
+  const r = await paginateDeltaFills(async () => pages[i++], { pageSize: 2, maxPages: 10 });
+  assert.equal(r.complete, false);
+  assert.equal(r.rows.length, 1, "only the first page's rows are retained");
+});
+
+test("paginateDeltaFills: an empty page ends the loop as complete", async () => {
+  const r = await paginateDeltaFills(async () => ({ result: [], meta: { after: "c1" } }), { pageSize: 2, maxPages: 10 });
+  assert.equal(r.complete, true);
+  assert.equal(r.rows.length, 0);
+});
+
+test("paginateDeltaFills: hitting the page cap with a live cursor NEVER reports completion", async () => {
+  let n = 0;
+  const call = async () => ({ result: [row("a"), row("b")], meta: { after: "c" + (++n) } });   // always advances
+  const r = await paginateDeltaFills(call, { pageSize: 2, maxPages: 3 });
+  assert.equal(r.pages, 3, "stopped at the cap");
+  assert.equal(r.complete, false, "capped pagination is incomplete → fees stay provisional");
+});
+
 // ---- module presence sanity --------------------------------------------------------------------
 test("feeStatement module file exists at backend root and exports the pure API", () => {
   assert.ok(fs.existsSync(path.join(__dirname, "..", "feeStatement.js")));
-  for (const fn of ["strictCharge", "nzId", "parseIsoDate", "normStatementLine", "validateStatement", "istDayWindow", "brokerTradingDay", "normalizeDeltaFills"]) {
+  for (const fn of ["strictCharge", "nzId", "parseIsoDate", "normStatementLine", "validateStatement", "istDayWindow", "brokerTradingDay", "normalizeDeltaFills", "paginateDeltaFills"]) {
     assert.equal(typeof feeStatement[fn], "function", `exports ${fn}`);
   }
 });
