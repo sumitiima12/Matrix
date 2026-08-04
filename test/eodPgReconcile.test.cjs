@@ -40,9 +40,13 @@ test.before(async () => {
 });
 test.after(async () => { if (pgHandle) { try { await pgHandle.stop(); } catch { /* ignore */ } } });
 
-const skip = () => (!READY ? { skip: "no PostgreSQL (set DATABASE_URL; CI provides one)" } : false);
+/* R36-P2-02: the skip decision is made at RUNTIME inside each test (READY is only set by the async before hook, so a
+   definition-time `{ skip: skip() }` would ALWAYS skip). Locally without a DB the test self-skips; under CI the before
+   hook throws (no DB ⇒ hard fail), so READY is true and every test actually runs. */
+function guard(t) { if (READY) return true; if (IN_CI) throw new Error("PostgreSQL required in CI for this test"); t.skip("no PostgreSQL (set DATABASE_URL; CI provides one)"); return false; }
 
-test("R35-P3-04: getReconcilableFills paginates BEYOND 5,000 rows (no cap-driven order split)", { skip: skip() }, async () => {
+test("R35-P3-04: getReconcilableFills paginates BEYOND 5,000 rows (no cap-driven order split)", async (t) => {
+  if (!guard(t)) return;
   const uk = "pg_paginate_" + Date.now();
   const base = 1_700_000_000_000;
   for (let i = 0; i < 5001; i++) {
@@ -53,46 +57,54 @@ test("R35-P3-04: getReconcilableFills paginates BEYOND 5,000 rows (no cap-driven
   assert.ok(all.every((f) => f.feeFinalized === false), "none finalized yet");
 });
 
-test("R35-P3-04 / P2-03: overlay exclusion — a finalized execution is annotated feeFinalized:true", { skip: skip() }, async () => {
+test("R35-P3-04 / P2-03: overlay exclusion — a finalized execution is annotated feeFinalized:true", async (t) => {
+  if (!guard(t)) return;
   const uk = "pg_overlay_" + Date.now();
-  const t = 1_700_000_100_000;
-  await db.recordFill(uk, { fillId: "a", real: true, broker: "fyers", orderId: "OZ", qty: 1, fees: 0, ts: t });
-  await db.recordFill(uk, { fillId: "b", real: true, broker: "fyers", orderId: "OZ", qty: 1, fees: 0, ts: t + 1 });
-  await db.recordFill(uk, { fillId: "feefinal_fyers_entry_a", kind: "fee_final", real: true, broker: "fyers", refFillId: "a", feeDelta: 5, feeStatus: "contract-note", feeFinal: true, ts: t + 2 });
-  const set = await db.getReconcilableFills(uk, 0, t + 100);
+  const ts0 = 1_700_000_100_000;
+  await db.recordFill(uk, { fillId: "a", real: true, broker: "fyers", orderId: "OZ", qty: 1, fees: 0, ts: ts0 });
+  await db.recordFill(uk, { fillId: "b", real: true, broker: "fyers", orderId: "OZ", qty: 1, fees: 0, ts: ts0 + 1 });
+  await db.recordFill(uk, { fillId: "feefinal_fyers_entry_a", kind: "fee_final", real: true, broker: "fyers", refFillId: "a", feeDelta: 5, feeStatus: "contract-note", feeFinal: true, ts: ts0 + 2 });
+  const set = await db.getReconcilableFills(uk, 0, ts0 + 100);
   const byId = Object.fromEntries(set.map((f) => [f.fillId, f]));
   assert.equal(byId.a.feeFinalized, true, "a has an overlay ⇒ finalized");
   assert.equal(byId.b.feeFinalized, false, "b still needs finalizing");
   // Discovery must still see this user (b is unmatched) but NOT after b is finalized too.
-  const users1 = await db.getUsersWithProvisionalFills(0, t + 100);
+  const users1 = await db.getUsersWithProvisionalFills(0, ts0 + 100);
   assert.ok(users1.some((u) => u.userKey === uk), "user discovered while b is unmatched");
 });
 
-test("R35-P2-04: crash-after-first-overlay REPLAY converges (order-level, real DB)", { skip: skip() }, async () => {
+test("R35-P2-04: crash-after-first-overlay REPLAY converges (order-level, real DB)", async (t) => {
+  if (!guard(t)) return;
   const uk = "pg_converge_" + Date.now();
-  const t = 1_700_000_200_000;
-  // 3 executions of one order, ₹30 order-level charge.
-  for (const id of ["a", "b", "c"]) await db.recordFill(uk, { fillId: id, real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: t });
+  const ts0 = 1_700_000_200_000;
+  // 3 executions of one order (distinct timestamps, as real fills arrive), ₹30 order-level charge.
+  await db.recordFill(uk, { fillId: "a", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 });
+  await db.recordFill(uk, { fillId: "b", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 1 });
+  await db.recordFill(uk, { fillId: "c", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 2 });
   const note = [{ execId: null, orderId: "OC", broker: "fyers", charges: 30 }];
-  // Run 1 — persist overlays for ALL finals, but simulate a CRASH after only the first is written.
-  const finals1 = feeReconcile.reconcileEodFees({ fills: await db.getReconcilableFills(uk, 0, t + 100), contractNote: note, now: t });
-  assert.equal(finals1.length, 3);
-  const first = finals1.slice().sort((x, y) => String(x.fillId).localeCompare(String(y.fillId)))[0];
-  await db.recordFill(uk, { fillId: `feefinal_fyers_entry_${first.fillId}`, kind: "fee_final", real: true, broker: "fyers", refFillId: first.fillId, feeDelta: first.feeDelta, feeStatus: "contract-note", feeFinal: true, ts: t + 1 });
-  // Run 2 — replay after the crash: only the two remaining executions are emitted, and the total still sums to ₹30.
-  const finals2 = feeReconcile.reconcileEodFees({ fills: await db.getReconcilableFills(uk, 0, t + 100), contractNote: note, now: t + 2 });
-  assert.equal(finals2.length, 2, "only the two not-yet-finalized executions are emitted on replay");
-  assert.ok(!finals2.find((f) => f.fillId === first.fillId), "the already-finalized execution is not re-emitted");
-  assert.equal(+(first.finalFees + finals2.reduce((s, x) => s + x.finalFees, 0)).toFixed(2), 30, "prior + replayed shares sum to the order total");
-  for (const f of finals2) await db.recordFill(uk, { fillId: `feefinal_fyers_entry_${f.fillId}`, kind: "fee_final", real: true, broker: "fyers", refFillId: f.fillId, feeDelta: f.feeDelta, feeStatus: "contract-note", feeFinal: true, ts: t + 3 });
-  // Run 3 — fully converged: nothing left to emit, and the user drops out of discovery.
-  const finals3 = feeReconcile.reconcileEodFees({ fills: await db.getReconcilableFills(uk, 0, t + 100), contractNote: note, now: t + 4 });
-  assert.equal(finals3.length, 0, "converged ⇒ no more finalizations");
-  const users = await db.getUsersWithProvisionalFills(0, t + 100);
+  /* Sweep to a FIXPOINT the way production does — reconcile → persist EACH emitted overlay one at a time (persisting
+     just one per pass models a crash-after-first-overlay, the hardest replay case) → repeat. Convergence requires that
+     this terminates, that EXACTLY 3 distinct overlays are written (one per execution, never duplicated), and that
+     their finalized charges sum to the ₹30 order total. A non-convergent design (the old R34 refusal gate) would loop
+     forever or leave the remainder unfinalized. */
+  const overlays = new Map();   // refFillId → finalFees (dedupe proves no double-finalization)
+  let passes = 0;
+  for (;;) {
+    if (++passes > 12) { assert.fail("reconciliation did not converge within 12 passes"); }
+    const finals = feeReconcile.reconcileEodFees({ fills: await db.getReconcilableFills(uk, 0, ts0 + 100), contractNote: note, now: ts0 + passes });
+    if (finals.length === 0) break;   // fixpoint reached
+    const f = finals[0];   // persist ONE overlay per pass (models crash after the first write)
+    overlays.set(String(f.fillId), f.finalFees);
+    await db.recordFill(uk, { fillId: `feefinal_fyers_entry_${f.fillId}`, kind: "fee_final", real: true, broker: "fyers", refFillId: f.fillId, feeDelta: f.feeDelta, feeStatus: "contract-note", feeFinal: true, ts: ts0 + 50 + passes });
+  }
+  assert.equal(overlays.size, 3, "exactly one overlay per execution — converged with no duplicates");
+  assert.equal(+[...overlays.values()].reduce((s, v) => s + v, 0).toFixed(2), 30, "finalized charges sum to the order total");
+  const users = await db.getUsersWithProvisionalFills(0, ts0 + 100);
   assert.ok(!users.some((u) => u.userKey === uk), "user no longer discovered once every execution is finalized");
 });
 
-test("R35-P3-01: MANUAL_RECONCILIATION_REQUIRED evidence survives a fresh DB read (JSONB persisted)", { skip: skip() }, async () => {
+test("R35-P3-01: MANUAL_RECONCILIATION_REQUIRED evidence survives a fresh DB read (JSONB persisted)", async (t) => {
+  if (!guard(t)) return;
   const id = "pg_att_" + Date.now();
   await db.prepareOrderAttempt({ id, userId: "pg_u", orderTag: "TAGX", status: "PREPARED" });
   const evidence = { orderTag: "TAGX", brokerOrderId: "5501", createdAt: 1, checked: ["orders", "tradebook", "positions", "holdings"] };

@@ -34,6 +34,13 @@ const bkey = (broker, id) => String(broker == null ? "" : broker).toLowerCase() 
 // R35-P2-01: an id present only as "" / whitespace is ABSENT. Used for BOTH contract-note lines and fills so a blank
 // execution id never routes an order-level charge into the execution map (where it would never match).
 const nzId = (v) => { const s = v == null ? "" : String(v).trim(); return s === "" ? null : s; };
+// R36-P2-01: strict charge — only a finite non-negative number or a strict decimal string. Booleans/arrays/objects/
+// whitespace are rejected (null), so a malformed note line can never coerce into a fabricated fee inside the matcher.
+const strictCharge = (raw) => {
+  if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : null;
+  if (typeof raw === "string" && /^\s*\d+(\.\d+)?\s*$/.test(raw)) { const n = Number(raw.trim()); return Number.isFinite(n) && n >= 0 ? n : null; }
+  return null;
+};
 function reconcileEodFees({ fills = [], contractNote = [], now = Date.now() } = {}) {
   /* R35-P2-04 — CONVERGENT order-level allocation. The input `fills` is the COMPLETE execution set for the window (a
      fill already carrying a fee_final overlay is included and flagged `feeFinalized:true`). Order-level charges are
@@ -45,8 +52,8 @@ function reconcileEodFees({ fills = [], contractNote = [], now = Date.now() } = 
   const byExec = new Map();       // (broker,execId) -> exact charge   [broker "" = wildcard]
   const byOrderTotal = new Map(); // (broker,orderId) -> total charge from ORDER-LEVEL lines only
   for (const c of (contractNote || [])) {
-    const charges = Number(c && (c.charges ?? c.fees));
-    if (!Number.isFinite(charges) || charges < 0) continue;   // R35-P2-02: never accept a non-finite/negative charge
+    const charges = strictCharge(c && (c.charges ?? c.fees));
+    if (charges == null) continue;   // R36-P2-01: strict type — reject booleans/arrays/whitespace, never coerce to 0
     const brk = c.broker;
     const eId = nzId(c.execId), oId = nzId(c.orderId);
     if (eId != null) byExec.set(bkey(brk, eId), charges);
@@ -166,6 +173,11 @@ async function runEodFeeReconcile({ userKeys = [], listReconcilableFills, listPr
     }
     // Pass the COMPLETE real set so order-level allocation is deterministic + convergent; mk() emits only the missing overlays.
     const finals = reconcileEodFees({ fills: real, contractNote: note, now });
+    // R36-P3-01: track how many of THIS user's unfinalized fills became DURABLY resolved (a new insert, or a verified
+    // identical replay). stillProvisional is then unfinalized MINUS durably-resolved — NOT unfinalized minus proposed
+    // finalizations. So a persistence failure or a conflict leaves the fill counted as still-provisional, and the
+    // monitor can never report a false-empty backlog during a DB failure or collision.
+    let resolvedThisUser = 0;
     for (const fin of finals) {
       try {
         // R33-P2-01: recordFeeFinal returns { inserted, conflict }. A finalization only counts (and its delta only
@@ -173,12 +185,12 @@ async function runEodFeeReconcile({ userKeys = [], listReconcilableFills, listPr
         // idempotent replay (alreadyFinal); inserted:false with DIFFERENT content is a collision alert (conflict).
         const r = await recordFeeFinal(uk, fin);
         if (r && r.inserted === false) {
-          if (r.conflict) { conflicts++; log("eodfee.conflict", { userKey: uk, fillId: fin.fillId, broker: fin.broker }); }
-          else alreadyFinal++;
-        } else { finalized++; netFeeCorrection += Number(fin.feeDelta) || 0; }
-      } catch (e) { errors++; log("eodfee.persist_failed", { userKey: uk, fillId: fin.fillId, err: String((e && e.message) || e) }); }
+          if (r.conflict) { conflicts++; log("eodfee.conflict", { userKey: uk, fillId: fin.fillId, broker: fin.broker }); }   // UNresolved
+          else { alreadyFinal++; resolvedThisUser++; }   // verified identical overlay ⇒ durably resolved
+        } else { finalized++; resolvedThisUser++; netFeeCorrection += Number(fin.feeDelta) || 0; }   // new durable insert
+      } catch (e) { errors++; log("eodfee.persist_failed", { userKey: uk, fillId: fin.fillId, err: String((e && e.message) || e) }); }   // failed write ⇒ UNresolved
     }
-    stillProvisional += summarizeFinalizations(finals, unfinalized.length).stillProvisional;
+    stillProvisional += Math.max(0, unfinalized.length - resolvedThisUser);
   }
   const summary = { usersTouched, finalized, alreadyFinal, conflicts, netFeeCorrection: +netFeeCorrection.toFixed(6), stillProvisional, errors };
   log("eodfee.done", summary);

@@ -98,21 +98,45 @@ jobs:
           DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
           DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
         run: |
+          # R36-P1-01: `pipefail` so Node's exit code is NOT masked by tee; `-u` catches unset vars; `-e` stops on error.
+          set -euo pipefail
           mkdir -p artifacts
           REQUIRED=$(echo "${REQUIRE_BROKER_CERT:-0}" | grep -Eiq '^(1|true|yes)$' && echo 1 || echo 0)
-          if [ -z "$DELTA_SANDBOX_KEY" ] && [ -z "$FYERS_SANDBOX_TOKEN" ]; then
-            if [ "$REQUIRED" = "1" ]; then
-              echo "broker_sandbox=NOT_CERTIFIED (real-money certification REQUESTED but *_SANDBOX_* secrets are absent)" | tee artifacts/broker-sandbox.txt
-              echo "::error::NO-GO — broker certification requested but sandbox secrets are missing; real order paths NOT certified"
-              exit 1
-            fi
-            echo "broker_sandbox=NOT_CONFIGURED (set *_SANDBOX_* secrets + vars.REQUIRE_BROKER_CERT=1 to certify real order paths)" | tee artifacts/broker-sandbox.txt
-            echo "::warning::broker-sandbox secrets absent — real order paths NOT certified this run"
-            exit 0
+          # A broker is "requested" for certification only if it has its COMPLETE credential set. A partial set is treated
+          # as MISSING (never a partial certification).
+          FYERS_OK=0; [ -n "${FYERS_SANDBOX_APP_ID:-}" ] && [ -n "${FYERS_SANDBOX_TOKEN:-}" ] && FYERS_OK=1
+          DELTA_OK=0; [ -n "${DELTA_SANDBOX_KEY:-}" ] && [ -n "${DELTA_SANDBOX_SECRET:-}" ] && DELTA_OK=1
+          # The sandbox suite FILES must exist (a glob that resolves to nothing must never be a silent pass).
+          FILES=""
+          for pat in test/deltaTestnet*.cjs test/fyersSandbox*.cjs; do
+            for f in $pat; do [ -f "$f" ] && FILES="$FILES $f"; done
+          done
+          if [ -z "$FILES" ]; then
+            echo "::error::broker-sandbox suite files are missing (test/deltaTestnet*.cjs, test/fyersSandbox*.cjs)"; exit 1
           fi
-          echo "commit=${GITHUB_SHA}" | tee artifacts/broker-sandbox.txt
-          # Sandbox-tagged suites read the *_SANDBOX_* creds and exercise real testnet order + verify calls.
-          BROKER_SANDBOX=1 node --test test/deltaTestnet*.cjs test/fyersSandbox*.cjs 2>&1 | tee -a artifacts/broker-sandbox.txt
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "files=${FILES}"
+            echo "fyers_creds=${FYERS_OK}  delta_creds=${DELTA_OK}"
+          } | tee artifacts/broker-sandbox.txt
+          if [ "$FYERS_OK" = "0" ] && [ "$DELTA_OK" = "0" ]; then
+            if [ "$REQUIRED" = "1" ]; then
+              echo "broker_sandbox=NOT_CERTIFIED (certification REQUESTED but no complete *_SANDBOX_* credential set)" | tee -a artifacts/broker-sandbox.txt
+              echo "::error::NO-GO — broker certification requested but complete sandbox credentials are missing"; exit 1
+            fi
+            echo "broker_sandbox=NOT_CONFIGURED (set a COMPLETE broker credential set + vars.REQUIRE_BROKER_CERT=1 to certify)" | tee -a artifacts/broker-sandbox.txt
+            echo "::warning::broker-sandbox credentials absent — real order paths NOT certified this run"; exit 0
+          fi
+          # Run the sandbox suites. `set -o pipefail` makes a Node failure fail the step. Capture TAP for the gate.
+          BROKER_SANDBOX=1 node --test $FILES 2>&1 | tee -a artifacts/broker-sandbox.tap
+          PASS=$(grep -c '^ok ' artifacts/broker-sandbox.tap || true)
+          FAIL=$(grep -c '^not ok ' artifacts/broker-sandbox.tap || true)
+          SKIP=$(grep -Ec '# (SKIP|skip)' artifacts/broker-sandbox.tap || true)
+          echo "pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee -a artifacts/broker-sandbox.txt
+          # A real certification requires pass>0, fail=0 AND skipped=0 (no vacuous/absent execution).
+          if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
+            echo "::error::broker-sandbox certification invalid (need pass>0, fail=0, skipped=0)"; exit 1
+          fi
       - name: Upload broker-sandbox evidence (per-SHA)
         if: always()
         uses: actions/upload-artifact@v4

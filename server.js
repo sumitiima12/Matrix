@@ -8137,13 +8137,21 @@ const EOD_FEE_RECONCILE_LOCK_KEY = 0x45_4f_44_46 | 0;   // "EODF"
      • charges: must be a FINITE, NON-NEGATIVE number. We NEVER default a missing/NaN/negative charge to 0 (that would
        persist a fabricated "free execution" as authoritative). Missing or invalid ⇒ reject the line. */
 function _nzId(v) { const s = v == null ? "" : String(v).trim(); return s === "" ? null : s; }
+/* R36-P2-01 — STRICT charge parse. Accept ONLY a finite non-negative number, or a strict decimal STRING (optional
+   surrounding whitespace). Reject everything else — booleans (`true`→1, `false`→0), arrays (`[]`→0), objects, empty
+   string, whitespace-only, `NaN`, negatives — so a malformed/schema-drifted authoritative payload can NEVER coerce
+   into a fabricated fee. Returns null on rejection. */
+function _strictCharge(raw) {
+  if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : null;
+  if (typeof raw === "string" && /^\s*\d+(\.\d+)?\s*$/.test(raw)) { const n = Number(raw.trim()); return Number.isFinite(n) && n >= 0 ? n : null; }
+  return null;   // boolean, array, object, empty/whitespace, null/undefined ⇒ rejected
+}
 function _normStatementLine(t) {
-  if (!t || typeof t !== "object") return null;
+  if (!t || typeof t !== "object" || Array.isArray(t)) return null;
   const execId = _nzId(t.execId ?? t.tradeNumber ?? t.id ?? t.fillId);
   const orderId = _nzId(t.orderId ?? t.orderNumber);
-  const raw = (t.charges ?? t.fees);
-  const charges = Number(raw);
-  if (raw == null || raw === "" || !Number.isFinite(charges) || charges < 0) return null;   // never coerce to 0
+  const charges = _strictCharge(t.charges ?? t.fees);
+  if (charges == null) return null;   // strict type check — never coerce booleans/arrays/whitespace to 0
   if (execId) return { execId, orderId: orderId || null, charges, source: "contract-note" };   // execution-level
   if (orderId) return { orderId, charges, source: "contract-note" };                           // order-level
   return null;                                                                                 // no usable identity
@@ -8162,20 +8170,33 @@ async function fetchBrokerContractNote(userKey, broker) {
          (`FYERS_STATEMENT_URL`). With no statement source, return [] so fees stay ESTIMATED/provisional and retry. */
       const stmtUrl = process.env.FYERS_STATEMENT_URL;
       if (!stmtUrl) return [];
-      const sr = await withTimeout(fetch(`${stmtUrl}${stmtUrl.includes("?") ? "&" : "?"}user=${encodeURIComponent(String(sess.userId || userKey))}`, { headers: brokerAuth("fyers", sess.accessToken, sess.userId) }), 8000).catch(() => null);
+      const acctExpected = String(sess.userId || userKey);
+      const sr = await withTimeout(fetch(`${stmtUrl}${stmtUrl.includes("?") ? "&" : "?"}user=${encodeURIComponent(acctExpected)}`, { headers: brokerAuth("fyers", sess.accessToken, sess.userId) }), 8000).catch(() => null);
       const sd = sr && sr.ok ? await sr.json().catch(() => null) : null;
-      const lines = Array.isArray(sd) ? sd : (sd && Array.isArray(sd.charges) ? sd.charges : null);
-      if (!Array.isArray(lines)) return [];   // configured but unreadable ⇒ provisional, never guess from tradebook
-      /* R35-P2-02 — batch PROVENANCE validation. If the envelope declares a currency it MUST be INR (an FYERS INR
-         statement mislabelled/another account is rejected wholesale). Record an import id/hash for audit. */
-      if (sd && !Array.isArray(sd)) {
-        const cur = _nzId(sd.currency);
-        if (cur && cur.toUpperCase() !== "INR") { logFinancial("eodfee.stmt_rejected_batch", { userKey, reason: "currency", currency: cur }); return []; }
-      }
+      /* R36-P2-01 — MANDATORY provenance envelope. The authoritative source MUST return an OBJECT (never a bare array)
+         carrying: a schema version, the broker ACCOUNT id (must equal the requested account), a trading DATE, a
+         settlement/finality marker (settled === true), currency INR, and a `lines`/`charges` array. Any missing/
+         mismatched field rejects the WHOLE batch — a wrong-account, wrong-day, unsettled or schema-drifted response can
+         never finalize fees. A top-level array (no provenance) is rejected outright. */
+      if (!sd || typeof sd !== "object" || Array.isArray(sd)) { logFinancial("eodfee.stmt_rejected_batch", { userKey, reason: "no-envelope" }); return []; }
+      const lines = Array.isArray(sd.lines) ? sd.lines : (Array.isArray(sd.charges) ? sd.charges : null);
+      if (!Array.isArray(lines)) { logFinancial("eodfee.stmt_rejected_batch", { userKey, reason: "no-lines" }); return []; }
+      const cur = _nzId(sd.currency);
+      const acct = _nzId(sd.account ?? sd.accountId ?? sd.fyId);
+      const tdate = _nzId(sd.tradingDate ?? sd.date);
+      const settled = sd.settled === true || sd.settlement === "settled" || sd.final === true;
+      const schemaOk = _nzId(sd.schemaVersion ?? sd.version) != null;
+      const reasons = [];
+      if (!schemaOk) reasons.push("schemaVersion");
+      if (!acct) reasons.push("account-missing"); else if (String(acct) !== acctExpected) reasons.push("account-mismatch");
+      if (!tdate) reasons.push("tradingDate");
+      if (!settled) reasons.push("not-settled");
+      if (!cur) reasons.push("currency-missing"); else if (cur.toUpperCase() !== "INR") reasons.push("currency-not-INR");
+      if (reasons.length) { logFinancial("eodfee.stmt_rejected_batch", { userKey, reasons, account: acct || null, tradingDate: tdate || null }); return []; }
       const out = []; let rejected = 0;
       for (const t of lines) { const n = _normStatementLine(t); if (n) out.push(n); else rejected++; }
       if (rejected) logFinancial("eodfee.stmt_line_rejected", { userKey, broker: "fyers", rejected, accepted: out.length });
-      try { const hash = crypto.createHash("sha256").update(JSON.stringify(lines)).digest("hex").slice(0, 16); logFinancial("eodfee.stmt_imported", { userKey, broker: "fyers", importId: hash, accepted: out.length, rejected }); } catch { /* audit best-effort */ }
+      try { const hash = crypto.createHash("sha256").update(JSON.stringify({ v: sd.schemaVersion ?? sd.version, a: acct, d: tdate, lines })).digest("hex").slice(0, 16); logFinancial("eodfee.stmt_imported", { userKey, broker: "fyers", importId: hash, account: acct, tradingDate: tdate, accepted: out.length, rejected }); } catch { /* audit best-effort */ }
       return out;
     }
     if (broker === "delta") {

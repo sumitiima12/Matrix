@@ -174,6 +174,55 @@ test("R33-P2-01: the job counts a NEW insert as finalized, an identical replay a
   assert.equal(summary.netFeeCorrection, 1, "net correction moves ONLY by the inserted delta (2 − 1)");
 });
 
+test("R36-P2-01: malformed charge TYPES (boolean/array/object/whitespace) are rejected — never coerced to a fee", () => {
+  // The R35 code used Number(raw), so `true`→1, `false`/`[]`/whitespace→0 could all finalize a fabricated fee. Strict
+  // typing must reject them all: only finite numbers or strict decimal strings are accepted.
+  const fills = [
+    { fillId: "t", execId: "ET", broker: "fyers", real: true, fees: 9, feeFinal: false },
+    { fillId: "f", execId: "EF", broker: "fyers", real: true, fees: 9, feeFinal: false },
+    { fillId: "a", execId: "EA", broker: "fyers", real: true, fees: 9, feeFinal: false },
+    { fillId: "w", execId: "EW", broker: "fyers", real: true, fees: 9, feeFinal: false },
+    { fillId: "o", execId: "EO", broker: "fyers", real: true, fees: 9, feeFinal: false },
+    { fillId: "s", execId: "ES", broker: "fyers", real: true, fees: 9, feeFinal: false },
+  ];
+  const note = [
+    { execId: "ET", broker: "fyers", charges: true },     // boolean true → REJECTED (would have become 1)
+    { execId: "EF", broker: "fyers", charges: false },    // boolean false → REJECTED (would have become 0)
+    { execId: "EA", broker: "fyers", charges: [] },       // array → REJECTED
+    { execId: "EW", broker: "fyers", charges: "  " },     // whitespace → REJECTED
+    { execId: "EO", broker: "fyers", charges: {} },       // object → REJECTED
+    { execId: "ES", broker: "fyers", charges: "12.50" },  // strict decimal STRING → ACCEPTED
+  ];
+  const out = reconcileEodFees({ fills, contractNote: note, now: NOW });
+  assert.equal(out.length, 1, "only the strict decimal string finalizes; every malformed type is dropped");
+  assert.equal(out[0].fillId, "s");
+  assert.equal(out[0].finalFees, 12.5);
+});
+
+test("R36-P3-01: stillProvisional reflects DURABLE inserts — a persistence failure keeps the fill provisional", async () => {
+  // recordFeeFinal throws for one fill (DB failure) and reports a conflict for another. Neither is durably resolved, so
+  // both must remain counted in stillProvisional — the monitor can't report a false-empty backlog.
+  const summary = await runEodFeeReconcile({
+    userKeys: ["u1"],
+    now: NOW,
+    listReconcilableFills: async () => [
+      { fillId: "ok", execId: "E1", broker: "fyers", real: true, fees: 1, feeFinalized: false },
+      { fillId: "boom", execId: "E2", broker: "fyers", real: true, fees: 1, feeFinalized: false },
+      { fillId: "conf", execId: "E3", broker: "fyers", real: true, fees: 1, feeFinalized: false },
+    ],
+    fetchContractNote: async () => [{ execId: "E1", charges: 2 }, { execId: "E2", charges: 3 }, { execId: "E3", charges: 4 }],
+    recordFeeFinal: async (uk, fin) => {
+      if (fin.fillId === "boom") throw new Error("db write failed");
+      if (fin.fillId === "conf") return { inserted: false, conflict: true };
+      return { inserted: true };
+    },
+  });
+  assert.equal(summary.finalized, 1, "only the durably-inserted fill counts as finalized");
+  assert.equal(summary.errors, 1, "the failed write is an error");
+  assert.equal(summary.conflicts, 1, "the collision is a conflict");
+  assert.equal(summary.stillProvisional, 2, "the failed + conflicted fills remain provisional (not falsely zero)");
+});
+
 test("R31-P2-08: runEodFeeReconcile orchestrates per-user, persists finalizations, and is fail-soft", async () => {
   const persisted = [];
   const summary = await runEodFeeReconcile({
