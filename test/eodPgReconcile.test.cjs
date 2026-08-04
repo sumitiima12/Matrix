@@ -78,9 +78,12 @@ test("R35-P2-04: crash-after-first-overlay REPLAY converges (order-level, real D
   const uk = "pg_converge_" + Date.now();
   const ts0 = 1_700_000_200_000;
   // 3 executions of one order (distinct timestamps, as real fills arrive), ₹30 order-level charge.
-  await db.recordFill(uk, { fillId: "a", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 });
-  await db.recordFill(uk, { fillId: "b", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 1 });
-  await db.recordFill(uk, { fillId: "c", real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 2 });
+  // fill_id is a GLOBAL primary key, so ids must be unique across the whole suite — scope them by `uk` (an earlier
+  // test that used bare "a"/"b" would otherwise pre-occupy those keys and ON CONFLICT DO NOTHING would drop these).
+  const [FA, FB, FC] = ["a", "b", "c"].map((x) => `${uk}_${x}`);
+  await db.recordFill(uk, { fillId: FA, real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 });
+  await db.recordFill(uk, { fillId: FB, real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 1 });
+  await db.recordFill(uk, { fillId: FC, real: true, broker: "fyers", orderId: "OC", qty: 1, fees: 0, ts: ts0 + 2 });
   // Precondition: the three DISTINCT executions of order OC must all persist as separate reconcilable rows. If this
   // fails (e.g. count 1), the convergence assert below would report a confusing "1 == 3"; assert the setup up front so
   // a failure points at fill persistence, not the matcher.
