@@ -32,6 +32,7 @@ const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./ma
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
+const strategyStates = require("./strategyStates");   // §8: canonical automated-strategy state vocabulary + derivation
 /* R30-P1-01 — single enforcement point for the capability registry. Every REAL operation maps to a capability and
    fails CLOSED here with a structured CAPABILITY_NOT_CERTIFIED (HTTP 403) when that broker isn't certified for it.
    Connection, portfolio and all VIRTUAL paths never call this. `capabilityBlock` is the non-HTTP form for engines. */
@@ -8285,10 +8286,13 @@ app.get("/api/autobuy", requireAuth, async (req, res) => {
       pos = openPos.find((p) => String(p.brokerSym || "") === String(s.brokerSym || "") && (p.market || "") === (s.market || "") && Number(p.entry) > 0);
       if (pos) db.updateRealStrategy(s.id, { openPositionId: pos.id }).catch(() => {});
     }
-    if (!pos || !(pos.entry > 0)) return { ...s, inPosition: false, livePnl: 0 };
+    if (!pos || !(pos.entry > 0)) return { ...s, inPosition: false, livePnl: 0, state: strategyStates.deriveStrategyState(s, pos) };
     let px = null; try { px = await liveMarkForOrder(pos.brokerSym || s.brokerSym, s.market); } catch { px = null; }
     const livePnl = px ? +(((px - pos.entry) * (pos.qty || 0))).toFixed(2) : 0;
-    return { ...s, inPosition: true, livePnl, entryPrice: pos.entry, positionQty: pos.qty };
+    // §8: surface the FORMAL canonical state (DRAFT/ACTIVE/PAUSED/ENTRY_PENDING/POSITION_OPEN/EXIT_PENDING/
+    // RECONCILIATION_REQUIRED/STOPPED/ERROR_LOCKED) derived from the strategy + its position, so every tab/device
+    // reads one server-owned state (never says "open" when the account actually needs reconciliation).
+    return { ...s, inPosition: true, livePnl, entryPrice: pos.entry, positionQty: pos.qty, state: strategyStates.deriveStrategyState(s, pos) };
   }));
   res.json({ engineLive: autoBuyLiveOn(), last: lastAutoBuy, strategies: enriched });
 });
