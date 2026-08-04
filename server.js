@@ -5856,7 +5856,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
             qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-            entryAt: Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
+            entryAt: c.execTs || Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
             // R27-P2-02: durable strategy attribution so a real Screener/Automate fill stays on its card after reload.
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });   // H2: if the fill can't be journaled, halt AUTOMATED entries so risk isn't computed on an incomplete book
@@ -5988,7 +5988,9 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         }, { haltUserIdOnFail: sess.userId });
         if (ex && (ex.error || ex.reconcileRequired || ex.projectionPending)) deltaJournaled = false;
       } else {
-        deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: deltaSym, side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: Date.now(), market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}) }, { haltUserIdOnFail: sess.userId });
+        // M02: prefer Delta's own execution timestamp (updated_at/created_at) for the journal entry time.
+        const deltaExecTs = reconcile.brokerFillTsMs([o.updated_at, o.created_at]) || Date.now();
+        deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: deltaSym, side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: deltaExecTs, market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}) }, { haltUserIdOnFail: sess.userId });
       }
       // R25-H07: a filled Delta order whose fill couldn't be journaled is reconciliation-required, not a plain success.
       if (!deltaJournaled) {
@@ -6691,10 +6693,11 @@ async function brokerSnapshotForUnlock(userId) {
        blocks regardless (the C03 lost-order case). */
     if (cmp.orphans && cmp.orphans.length) {
       logFinancial("killswitch.resume_orphan_exposure", { userId: String(userId), broker, orphans: cmp.orphans });
-      let hasUnresolvedAttempt = false;
+      let hasUnresolvedAttempt = false, myAttempts = [];
       try {
         const uns = await db.listUnresolvedOrderAttempts(1000);
-        hasUnresolvedAttempt = (uns || []).some((a) => a && String(a.userId) === String(userId) && (!a.broker || a.broker === broker));
+        myAttempts = (uns || []).filter((a) => a && String(a.userId) === String(userId) && (!a.broker || a.broker === broker));
+        hasUnresolvedAttempt = myAttempts.length > 0;
       } catch { hasUnresolvedAttempt = true; }   // fail closed: can't check ⇒ treat as ours
       const allowHoldings = process.env.UNLOCK_ALLOW_ORPHAN_HOLDINGS === "1";
       const strict = process.env.UNLOCK_BLOCK_ORPHAN_EXPOSURE === "1";
@@ -6702,7 +6705,11 @@ async function brokerSnapshotForUnlock(userId) {
       // explicitly allowed personal holdings for this deployment.
       if ((hasUnresolvedAttempt || strict) && !allowHoldings) {
         const o = cmp.orphans[0];
-        return { ok: false, reason: `${broker} holds ${o.qty} ${o.dir} ${o.sym} that MatrixOne doesn't track — reconcile the untracked exposure before resuming`, orphanBlocked: true };
+        // M05: name the exact lost order this orphan most likely belongs to, so reconciliation is actionable.
+        const corr = reconcile.correlateOrphanToAttempt(o, myAttempts, broker);
+        if (corr) logFinancial("killswitch.orphan_correlated", { userId: String(userId), broker, orphan: o, attemptId: corr.attemptId, orderTag: corr.orderTag });
+        const attribution = corr ? ` — this matches unresolved order ${corr.orderTag || corr.attemptId}` : "";
+        return { ok: false, reason: `${broker} holds ${o.qty} ${o.dir} ${o.sym} that MatrixOne doesn't track${attribution} — reconcile the untracked exposure before resuming`, orphanBlocked: true, ...(corr ? { correlatedAttempt: { id: corr.attemptId, orderTag: corr.orderTag } } : {}) };
       }
     }
     verified += cmp.verified;
@@ -6739,7 +6746,10 @@ async function verifyFyersFill(sess, orderId, wantQty = 0) {
       const o = (Array.isArray(d.orderBook) && d.orderBook.find((x) => String(x.id) === String(orderId))) ||
                 (Array.isArray(d.orderBook) && d.orderBook[0]) || d.orderDetails || d;
       const c = reconcile.classifyFyersOrder(o);
-      if (c.filled || c.rejected) return { ...c, reason: o.message || o.orderStatusDescription || null };
+      // M02: surface the BROKER's own execution timestamp (audit-authoritative fill time) so the journal records
+      // when the broker actually filled, not merely when this server observed it. Sanity-windowed; null if unusable.
+      const execTs = reconcile.brokerFillTsMs([o.orderDateTime, o.tradeTime, o.orderNumStatus]);
+      if (c.filled || c.rejected) return { ...c, execTs, reason: o.message || o.orderStatusDescription || null };
       // still transit/pending → wait and re-poll
     } catch { /* transient — keep polling */ }
     if (attempt < 3) await new Promise((res) => setTimeout(res, 800));

@@ -27,6 +27,21 @@ function parseDeltaTs(v) {
   return Number.isFinite(t) ? t : null;
 }
 
+/* M02 — the BROKER's own execution timestamp is the audit-authoritative fill time (it drives the IST risk-day
+   boundary and the trade ledger's entry/exit time). Prefer it over the server's receipt clock, BUT only when it
+   parses AND lands in a sane window around now (default ±2 days) — a mis-parsed or wildly-skewed broker time could
+   otherwise push a fill into the wrong risk day or corrupt ordering. Tries several common broker field names in
+   priority order. Returns a finite ms timestamp, or null if nothing usable (caller falls back to Date.now()).
+   `first` accepts numbers or strings (epoch s/ms/µs or a date string) via parseDeltaTs. */
+function brokerFillTsMs(candidates, { now = Date.now(), windowMs = 2 * 24 * 3600 * 1000 } = {}) {
+  const list = Array.isArray(candidates) ? candidates : [candidates];
+  for (const c of list) {
+    const t = parseDeltaTs(c);
+    if (t != null && Number.isFinite(t) && Math.abs(t - now) <= windowMs) return t;
+  }
+  return null;
+}
+
 /* Does this page of Delta orders carry our client_order_id? */
 function hasClientOrderId(records, cid) {
   return Array.isArray(records) && records.some((o) => String((o && o.client_order_id) || "") === String(cid));
@@ -305,4 +320,37 @@ function verifyManagedAgainstBroker(positions, held) {
   return { ok: true, verified, shortfall: null, orphans };
 }
 
-module.exports = { parseDeltaTs, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, verifyManagedAgainstBroker };
+/* M05 — ORPHAN CORRELATION. An orphan is broker exposure Matrix doesn't track; when the account also has
+   unresolved order attempts, the orphan is almost certainly the fill a lost/ambiguous order left behind. This
+   pure helper picks the unresolved attempt that BEST explains a given orphan so the reconcile/unlock message can
+   name the exact order (id + tag) instead of a generic "untracked exposure". Match rules, in priority order:
+   same broker (or attempt broker unknown) → same normalized symbol → same direction (BUY⇒long, SELL⇒short;
+   an attempt with no side matches either) → quantity closest to the orphan's (attempt qty ≥ orphan preferred).
+   Returns the matched attempt (with a `match` note) or null when nothing plausibly explains it. */
+function correlateOrphanToAttempt(orphan, attempts, broker = null) {
+  if (!orphan) return null;
+  const oSym = normUnlockSym(orphan.sym);
+  const oDir = orphan.dir === "short" ? "short" : "long";
+  const oQty = Math.abs(Number(orphan.qty) || 0);
+  let best = null, bestScore = -1;
+  for (const a of (attempts || [])) {
+    if (!a) continue;
+    if (broker && a.broker && String(a.broker) !== String(broker)) continue;   // different broker ⇒ not this one
+    if (normUnlockSym(a.symbol || a.sym) !== oSym) continue;                     // symbol must match
+    const aSideRaw = String(a.side || "").toUpperCase();
+    const aDir = aSideRaw === "SELL" ? "short" : (aSideRaw === "BUY" ? "long" : null);
+    if (aDir && aDir !== oDir) continue;                                         // known-but-opposite ⇒ not this one
+    const aQty = Math.abs(Number(a.qty) || 0);
+    // Score: exact broker + exact dir + quantity proximity. Prefer an attempt qty that covers the orphan.
+    let score = 100;
+    if (broker && a.broker === broker) score += 20;
+    if (aDir === oDir) score += 20;
+    if (aQty > 0 && oQty > 0) score += Math.max(0, 20 - Math.min(20, (Math.abs(aQty - oQty) / oQty) * 20));
+    if (aQty + 1e-9 >= oQty) score += 10;                                        // covers the orphan quantity
+    if (score > bestScore) { bestScore = score; best = a; }
+  }
+  if (!best) return null;
+  return { attemptId: best.id, orderTag: best.orderTag || null, broker: best.broker || broker || null, symbol: best.symbol || best.sym || orphan.sym, side: best.side || null, qty: best.qty != null ? Number(best.qty) : null, orphan };
+}
+
+module.exports = { parseDeltaTs, brokerFillTsMs, correlateOrphanToAttempt, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, verifyManagedAgainstBroker };

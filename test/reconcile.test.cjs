@@ -6,6 +6,46 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const R = require("../reconcile");
 
+test("M02 brokerFillTsMs: prefers a sane broker execution time; rejects skew/garbage; falls back", () => {
+  const now = Date.now();
+  // Recent ms passes through unchanged.
+  assert.equal(R.brokerFillTsMs([now - 5000], { now }), now - 5000);
+  // Epoch seconds and microseconds normalize to ms.
+  assert.equal(R.brokerFillTsMs([Math.floor((now - 5000) / 1000)], { now }), Math.floor((now - 5000) / 1000) * 1000);
+  assert.equal(R.brokerFillTsMs([(now - 5000) * 1000], { now }), now - 5000);
+  // Out-of-window (a wildly wrong broker clock) is rejected so it can't push a fill into the wrong risk day.
+  assert.equal(R.brokerFillTsMs([now + 10 * 24 * 3600 * 1000], { now }), null);
+  assert.equal(R.brokerFillTsMs(["2001-01-01T00:00:00Z"], { now }), null);
+  // Garbage / empty → null (caller falls back to its own clock).
+  assert.equal(R.brokerFillTsMs(["nope", null, undefined], { now }), null);
+  assert.equal(R.brokerFillTsMs([], { now }), null);
+  // First usable candidate wins, later ones ignored.
+  assert.equal(R.brokerFillTsMs(["junk", now - 1000, now - 2000], { now }), now - 1000);
+});
+
+test("M05 correlateOrphanToAttempt: names the lost order an orphan belongs to; rejects non-matches", () => {
+  const orphan = { sym: "SBIN", dir: "long", qty: 5 };
+  const attempts = [
+    { id: "oa_1", broker: "fyers", orderTag: "MX-A", symbol: "NSE:INFY-EQ", side: "BUY", qty: 5 },   // wrong symbol
+    { id: "oa_2", broker: "fyers", orderTag: "MX-B", symbol: "NSE:SBIN-EQ", side: "SELL", qty: 5 },  // wrong direction
+    { id: "oa_3", broker: "fyers", orderTag: "MX-C", symbol: "NSE:SBIN-EQ", side: "BUY", qty: 5 },   // exact match
+  ];
+  const m = R.correlateOrphanToAttempt(orphan, attempts, "fyers");
+  assert.equal(m && m.attemptId, "oa_3", "the exact symbol+dir+qty attempt is chosen");
+  assert.equal(m.orderTag, "MX-C");
+  // Different broker orphan → the fyers attempts don't explain a delta orphan.
+  assert.equal(R.correlateOrphanToAttempt({ sym: "BTC", dir: "long", qty: 1 }, attempts, "delta"), null);
+  // No unresolved attempts → nothing to correlate.
+  assert.equal(R.correlateOrphanToAttempt(orphan, [], "fyers"), null);
+  // Prefers the closest-quantity covering attempt among same-symbol/dir candidates.
+  const many = [
+    { id: "q10", broker: "delta", orderTag: "T10", symbol: "BTCUSD", side: "buy", qty: 10 },
+    { id: "q6", broker: "delta", orderTag: "T6", symbol: "BTCUSD", side: "buy", qty: 6 },
+  ];
+  const best = R.correlateOrphanToAttempt({ sym: "BTC", dir: "long", qty: 6 }, many, "delta");
+  assert.equal(best.attemptId, "q6", "the attempt whose qty matches the orphan is preferred");
+});
+
 test("hasClientOrderId matches our stamped id, tolerates junk", () => {
   const recs = [{ client_order_id: "a" }, { client_order_id: "mx_1" }, {}];
   assert.equal(R.hasClientOrderId(recs, "mx_1"), true);
