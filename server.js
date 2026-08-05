@@ -2012,6 +2012,10 @@ const FYERS_API_BASE = String(process.env.FYERS_API_BASE || "").replace(/\/$/, "
 // Dhan base seam — prod api.dhan.co by default; overridable to the sandbox (sandbox.dhan.co) for certification, or
 // to a fake HTTP server for hermetic tests. Trailing slash stripped so `${DHAN_API_BASE}/v2/...` is always well-formed.
 const DHAN_API_BASE = String(process.env.DHAN_API_BASE || "https://api.dhan.co").replace(/\/+$/, "");
+// IND Money (INDstocks) base seam — prod api.indstocks.com by default; overridable to a fake host for hermetic tests.
+// IND Money has NO sandbox (real brokerage) and REQUIRES static-IP whitelisting for live orders, so certification is a
+// SUPERVISED real NSE order from the whitelisted runner during market hours (like FYERS), not an unattended CI job.
+const INDM_API_BASE = String(process.env.INDM_API_BASE || "https://api.indstocks.com").replace(/\/+$/, "");
 function _fyRewrite(url) {
   if (!FYERS_API_BASE) return url;
   try {
@@ -6428,16 +6432,77 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       // INDstocks REST API: POST /order for NSE/BSE equities. security_id is the numeric NSE
       // scrip id (same numbering brokers share), resolved strictly from the instrument master.
       const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
-      const body = {
+      const indmBody = {
         txn_type: String(side).toUpperCase(), exchange: "NSE", segment: "EQUITY", security_id: String(securityId),
         qty: Number(qty), order_type: "MARKET", product: product === "CNC" ? "CNC" : "INTRADAY",
         validity: "DAY", is_amo: false, algo_id: "99999",
       };
-      const r = await fetch("https://api.indstocks.com/order", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || d.status !== "success") throw new Error((d && d.message) || `IND Money order failed (${r.status})`);
-      const autoExitId = await registerAutoExit();
-      return res.json({ ok: true, broker, orderId: (d.data && d.data.order_id) || null, status: (d.data && d.data.order_status) || "PENDING", autoExitId });
+      /* Acceptance ≠ fill. Submit through the DURABLE C03 attempt (write-before-send + crash/lost-response recovery),
+         THEN verify from broker truth (poll /order-book → TRADED). Only a VERIFIED fill journals an authoritative row
+         / arms auto-exit; a rejected or still-pending entry arms nothing. Mirrors the Dhan/FYERS/Delta paths. */
+      const _indmSubmit = async () => {
+        const r = await fetch(`${INDM_API_BASE}/order`, { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(indmBody) });
+        const dd = await r.json().catch(() => ({}));
+        if (!r.ok || dd.status !== "success") throw new Error((dd && dd.message) || `IND Money order failed (${r.status})`);
+        return { orderId: (dd.data && (dd.data.order_id || dd.data.orderId)) || null, status: (dd.data && dd.data.order_status) || "PENDING" };
+      };
+      let ires;
+      if (C03_ORDER_ATTEMPTS_ON) {
+        const attempt = {
+          id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "indmoney", idemKey,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          symbol, side, qty: Number(qty), product,
+          protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
+        };
+        const out = await orderRecovery.submitWithAttempt({
+          db, attempt, submit: _indmSubmit,
+          classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.orderId != null ? String(dd.orderId) : null } }),
+          classifyError: (e) => { const m = String((e && e.message) || e || ""); return /reject|insufficient|margin|rms|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null; },
+        });
+        if (out && (out.replay || out.fenced)) {
+          return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
+        }
+        ires = out;
+      } else {
+        ires = await _indmSubmit();
+      }
+      const indmOrderId = ires && ires.orderId != null ? String(ires.orderId) : null;
+      await db.markIdempotencyTagged(idemUser, idemKey);
+      const c = await verifyIndmoneyFill(sess, indmOrderId, Number(qty));
+      const fillStatus = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "PENDING");
+      if (C03_ORDER_ATTEMPTS_ON) {
+        try {
+          const st = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "ACCEPTED");
+          await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: indmOrderId, ...(c.filled ? { filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice } : {}) });
+        } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
+      }
+      if (c.rejected) {
+        return res.status(400).json({ ok: false, status: "rejected", broker, orderId: indmOrderId, reason: c.reason || "Order not filled — likely insufficient funds/margin, or the symbol isn't tradeable right now on IND Money" });
+      }
+      let indmAutoExitId = null, indmTrackingFailed = false;
+      const indmMarket = regMarket || "IN";
+      const bareIndmSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+      if (c.filled) {
+        const isReduceClose = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+        if (isReduceClose) {
+          const ex = await applyReduceOnlyExit(storageKeyFor(sess.userId), {
+            sym: bareIndmSym, closeSide: side, qty: c.filledQty || Number(qty), exitPx: Number(c.avgPrice) || Number(price) || 0,
+            orderId: indmOrderId, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null,
+            broker: "indmoney", market: indmMarket, tradeType: String(req.body?.tradeType || "Manual"),
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (ex && (ex.error || ex.reconcileRequired || ex.projectionPending)) indmTrackingFailed = true;
+        } else {
+          const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+            sym: bareIndmSym, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
+            entryAt: Date.now(), market: indmMarket, real: true, broker: "indmoney", tradeType: String(req.body?.tradeType || "Manual"), orderId: indmOrderId, serverAuthored: true,
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (!journaled) indmTrackingFailed = true;
+          indmAutoExitId = await registerAutoExit(c.filledQty || Number(qty), Number(c.avgPrice) || undefined);
+        }
+      }
+      return res.json({ ok: true, broker, orderId: indmOrderId, status: fillStatus, autoExitId: indmAutoExitId, ...(indmTrackingFailed ? { reconcileRequired: true } : {}) });
     }
 
     res.status(400).json({ error: "unsupported broker" });
@@ -7087,6 +7152,39 @@ async function verifyDhanFill(sess, orderId, wantQty = 0) {
   return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
 }
 
+/* IND Money (INDstocks) fill verification from BROKER TRUTH. A place-order 200 is only acceptance — poll GET
+   /order-book until our order reaches a TRADED/COMPLETE terminal (capture the real traded price + qty) or a terminal
+   REJECTED/CANCELLED. Mirrors verifyDhanFill; honours INDM_API_BASE. Never fabricates a fill — an unresolved poll
+   returns pending (the C03 attempt stays ACCEPTED for startup reconciliation). */
+async function verifyIndmoneyFill(sess, orderId, wantQty = 0) {
+  if (!orderId) return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+  const auth = brokerAuth("indmoney", sess.accessToken, sess.userId);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const r = await fetch(`${INDM_API_BASE}/order-book`, { headers: auth });
+      const d = await r.json().catch(() => null);
+      const arr = Array.isArray(d) ? d
+        : (d && Array.isArray(d.data)) ? d.data
+        : (d && d.data && Array.isArray(d.data.orders)) ? d.data.orders
+        : (d && Array.isArray(d.orders)) ? d.orders : [];
+      const o = arr.find((x) => String(x.order_id ?? x.orderId ?? x.id) === String(orderId));
+      if (o) {
+        const st = String(o.order_status ?? o.status ?? "").toUpperCase();
+        if (/TRADED|COMPLETE|EXECUTED|FILLED/.test(st)) {
+          const filledQty = Number(o.filled_qty ?? o.traded_qty ?? o.filledQty ?? o.qty ?? wantQty) || wantQty;
+          const avgPrice = Number(o.average_price ?? o.avg_price ?? o.traded_price ?? o.price) || null;
+          return { filled: true, rejected: false, pending: false, filledQty, avgPrice, status: st };
+        }
+        if (/REJECT|CANCEL|FAIL/.test(st)) {
+          return { filled: false, rejected: true, pending: false, filledQty: 0, avgPrice: null, status: st, reason: o.message || o.reason || o.rejection_reason || null };
+        }
+      }
+    } catch { /* transient — keep polling */ }
+    if (attempt < 7) await new Promise((res) => setTimeout(res, 800));
+  }
+  return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+}
+
 /* R9-P1-01: signed FYERS net quantity for a symbol (positive = long, negative = short, 0 = flat), or null
    when we can't read it. FYERS equity SELLs are NOT reduce-only, so the exit path clamps to this to make a
    retry after a partial fill unable to oversell into a short. */
@@ -7224,7 +7322,7 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
   if (broker === "indmoney") {
     const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
     const body = { txn_type: "SELL", exchange: "NSE", segment: "EQUITY", security_id: String(securityId), qty: Number(qty), order_type: "MARKET", product: "INTRADAY", validity: "DAY", is_amo: false, algo_id: "99999" };
-    const r = await fetch("https://api.indstocks.com/order", { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await fetch(`${INDM_API_BASE}/order`, { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.status !== "success") throw new Error((d && d.message) || `IND Money exit failed (${r.status})`);
     return { orderId: (d.data && d.data.order_id) || null };
