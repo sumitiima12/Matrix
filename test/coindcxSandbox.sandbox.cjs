@@ -104,11 +104,18 @@ async function waitFilled(id, label) {
 
   let bought = false, coinStart = 0;
   try {
-    // 1. CONNECT
+    // 1. CONNECT — surface the RAW status/body so a failure is diagnosable (auth vs IP-whitelist vs permissions).
     log(c.y("\n[1/5] CONNECT  POST /exchange/v1/users/balances"));
-    const inr = await balanceOf("INR");
-    if (inr == null) die("Could not read balances — check the key/secret (and IP whitelist if the key is IP-restricted).");
-    coinStart = await balanceOf(COIN);
+    const bal = await call("/exchange/v1/users/balances");
+    if (!bal.ok || !Array.isArray(bal.d)) {
+      die(`Could not read balances — HTTP ${bal.status}: ${JSON.stringify(bal.d).slice(0, 300)}\n` +
+        "  • 401 / Invalid credentials  ⇒ wrong API key/secret (or the key was revoked).\n" +
+        "  • ip_not_whitelisted / 403    ⇒ whitelist THIS machine's IP on the CoinDCX key.\n" +
+        "    Run:  curl -s https://api.ipify.org ; echo    to see the IP the venue sees, and add it to the key.\n" +
+        "  • the key must have the 'Trade'/'Read' permissions enabled.");
+    }
+    const inr = Number((bal.d.find((x) => String(x.currency).toUpperCase() === "INR") || {}).balance) || 0;
+    coinStart = Number((bal.d.find((x) => String(x.currency).toUpperCase() === COIN) || {}).balance) || 0;
     log(c.g("  ✓ authenticated") + `  INR ₹${inr}  |  ${COIN} ${coinStart}`);
 
     // Auto-size the buy to just over the ₹ min-notional if COINDCX_TEST_QTY not given.
