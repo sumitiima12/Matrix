@@ -1999,6 +1999,23 @@ function makeProxyDispatcher(url) {
    its exit IP differs and would fail the FYERS whitelist. */
 const fyersDispatcher = makeProxyDispatcher(process.env.FYERS_PROXY_URL || "");
 const fyFetchOpts = fyersDispatcher ? { dispatcher: fyersDispatcher } : {};
+
+/* PER-USER, PER-BROKER outbound proxy (Indian brokers only). Each user brings their OWN static-IP
+   proxy and whitelists its exit IP on their FYERS/Dhan/IND Money key; MatrixOne must place THAT
+   user's order through THAT proxy. proxyRouting.js validates the stored URL and caches one undici
+   dispatcher per (user,broker). Crypto/US are never proxied here. See proxyRouting.test.cjs. */
+const { makeProxyRouter, normalizeProxyUrl: normProxyUrl } = require("./proxyRouting");
+const userProxyRouter = makeProxyRouter(makeProxyDispatcher);
+/* Fetch-options for a user's Indian-broker call: routes through their proxy dispatcher when set,
+   else falls back to a plain direct call (same as today). `sess.proxyUrl` is populated when the
+   session/creds are loaded. Returns {} for crypto/US so nothing changes there. */
+function userProxyOpts(sess) {
+  try {
+    if (!sess || !sess.userId || !sess.broker) return {};
+    const disp = userProxyRouter.get(sess.userId, sess.broker, sess.proxyUrl || null);
+    return disp ? { dispatcher: disp } : {};
+  } catch { return {}; }
+}
 /* Every FYERS API call MUST exit from the whitelisted IP — especially ORDER placement, which FYERS
    rejects outright otherwise ("Orders are only allowed from whitelisted IP addresses"). Route them
    all through the proxy dispatcher; when no proxy is configured this is a plain fetch. */
@@ -5229,11 +5246,16 @@ app.post("/api/broker/session", requireAuth, requireActiveUser, async (req, res)
       const accessToken = String(extra.accessToken || "").trim();
       const clientId = String(extra.clientId || "").trim();
       if (!accessToken) throw new Error("Dhan access token is required.");
-      const r = await fetch("https://api.dhan.co/v2/fundlimit", { headers: { "access-token": accessToken, "Content-Type": "application/json" } });
+      // Per-user dedicated-IP proxy (optional but needed for real orders — Indian brokers reject
+      // non-whitelisted IPs). Validate the token THROUGH the proxy so the whitelist is proven here.
+      const proxyUrl = normProxyUrl((req.body && req.body.proxyUrl) || extra.proxyUrl || "");
+      const vDisp = userProxyRouter.get(userId, "dhan", proxyUrl);
+      const r = await pfetch("https://api.dhan.co/v2/fundlimit", { headers: { "access-token": accessToken, "Content-Type": "application/json" }, ...(vDisp ? { dispatcher: vDisp } : {}) });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || d.errorType || d.status === "failed") throw new Error(d.errorMessage || d.message || `Dhan rejected the token (${r.status}).`);
       const sid = putBrokerSession(userId, broker, accessToken, null, { clientId });
-      return res.json({ sessionId: sid, user: clientId || null, broker });
+      const sess = brokerSessions.get(sid); if (sess) { sess.proxyUrl = proxyUrl; try { await persistSessionCred(sess); } catch { /* engine will re-persist on arm */ } }
+      return res.json({ sessionId: sid, user: clientId || null, broker, proxied: Boolean(proxyUrl) });
     }
 
     if (broker === "indmoney") {
@@ -5242,11 +5264,16 @@ app.post("/api/broker/session", requireAuth, requireActiveUser, async (req, res)
       const extra = req.body.extra || {};
       const accessToken = String(extra.accessToken || "").trim();
       if (!accessToken) throw new Error("INDstocks access token is required.");
-      const r = await fetch("https://api.indstocks.com/user/profile", { headers: { Authorization: accessToken } });
+      // Per-user dedicated-IP proxy (IND Money REQUIRES a whitelisted IP for live orders). Validate
+      // the token THROUGH the proxy so a wrong/unwhitelisted IP fails at connect, not at first order.
+      const proxyUrl = normProxyUrl((req.body && req.body.proxyUrl) || extra.proxyUrl || "");
+      const vDisp = userProxyRouter.get(userId, "indmoney", proxyUrl);
+      const r = await pfetch("https://api.indstocks.com/user/profile", { headers: { Authorization: accessToken }, ...(vDisp ? { dispatcher: vDisp } : {}) });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || d.status !== "success") throw new Error(d.message || d.error || `INDstocks rejected the token (${r.status}).`);
       const sid = putBrokerSession(userId, broker, accessToken);
-      return res.json({ sessionId: sid, user: (d.data && (d.data.first_name || d.data.user_id)) || null, broker });
+      const sess = brokerSessions.get(sid); if (sess) { sess.proxyUrl = proxyUrl; try { await persistSessionCred(sess); } catch { /* engine will re-persist on arm */ } }
+      return res.json({ sessionId: sid, user: (d.data && (d.data.first_name || d.data.user_id)) || null, broker, proxied: Boolean(proxyUrl) });
     }
 
     if (broker === "angelone") {
@@ -6454,7 +6481,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
          (poll /v2/orders → TRADED). Only a VERIFIED fill journals an authoritative row / arms auto-exit — a rejected
          or still-pending entry arms nothing, so the exit engine can never SELL against a holding that doesn't exist. */
       const _dhanSubmit = async () => {
-        const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(dhanBody) });
+        const r = await pfetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(dhanBody), ...userProxyOpts(sess) });
         const dd = await r.json().catch(() => ({}));
         if (!r.ok || dd.orderStatus === "REJECTED" || dd.errorType) throw new Error(dd.errorMessage || dd.omsErrorDescription || `Dhan order failed (${r.status})`);
         return { orderId: dd.orderId ?? (dd.data && (dd.data.orderId || dd.data.order_id)) ?? null, status: dd.orderStatus || "PENDING" };
@@ -6619,7 +6646,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
          THEN verify from broker truth (poll /order-book → TRADED). Only a VERIFIED fill journals an authoritative row
          / arms auto-exit; a rejected or still-pending entry arms nothing. Mirrors the Dhan/FYERS/Delta paths. */
       const _indmSubmit = async () => {
-        const r = await fetch(`${INDM_API_BASE}/order`, { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(indmBody) });
+        const r = await pfetch(`${INDM_API_BASE}/order`, { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(indmBody), ...userProxyOpts(sess) });
         const dd = await r.json().catch(() => ({}));
         if (!r.ok || dd.status !== "success") throw new Error((dd && dd.message) || `IND Money order failed (${r.status})`);
         return { orderId: (dd.data && (dd.data.order_id || dd.data.orderId)) || null, status: (dd.data && dd.data.order_status) || "PENDING" };
@@ -7164,7 +7191,7 @@ function decryptCred(blob) {
    per-user is stored. Called only when a user opts a real position into auto-exit. */
 async function persistSessionCred(sess) {
   if (!sess || !sess.userId || !sess.broker) return;
-  const payload = { accessToken: sess.accessToken || null, refreshToken: sess.refreshToken || null, extra: sess.extra || null };
+  const payload = { accessToken: sess.accessToken || null, refreshToken: sess.refreshToken || null, extra: sess.extra || null, proxyUrl: sess.proxyUrl || null };
   await db.saveBrokerCred(sess.userId, sess.broker, encryptCred(payload));
 }
 /* Rebuild a session-shaped object from stored creds, for the engine to place an exit. */
@@ -7173,7 +7200,7 @@ async function sessionFromCred(userId, broker) {
   const blob = await db.getBrokerCred(userId, broker);
   const c = decryptCred(blob);
   if (!c) return null;
-  return { userId: String(userId), broker, accessToken: c.accessToken, refreshToken: c.refreshToken, extra: c.extra || {} };
+  return { userId: String(userId), broker, accessToken: c.accessToken, refreshToken: c.refreshToken, extra: c.extra || {}, proxyUrl: c.proxyUrl || null };
 }
 
 /* R27-P1-03 / C02: BROKER-BACKED unlock gate. Matrix-store reconciliation (reconcileForUnlock) proves our OWN
@@ -7309,7 +7336,7 @@ async function verifyDhanFill(sess, orderId, wantQty = 0) {
   const auth = { ...brokerAuth("dhan", sess.accessToken, sess.userId), Accept: "application/json" };
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
-      const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { headers: auth });
+      const r = await pfetch(`${DHAN_API_BASE}/v2/orders`, { headers: auth, ...userProxyOpts(sess) });
       const d = await r.json().catch(() => null);
       const arr = Array.isArray(d) ? d : (d && Array.isArray(d.data) ? d.data : []);
       const o = arr.find((x) => String(x.orderId) === String(orderId));
@@ -7339,7 +7366,7 @@ async function verifyIndmoneyFill(sess, orderId, wantQty = 0) {
   const auth = brokerAuth("indmoney", sess.accessToken, sess.userId);
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
-      const r = await fetch(`${INDM_API_BASE}/order-book`, { headers: auth });
+      const r = await pfetch(`${INDM_API_BASE}/order-book`, { headers: auth, ...userProxyOpts(sess) });
       const d = await r.json().catch(() => null);
       const arr = Array.isArray(d) ? d
         : (d && Array.isArray(d.data)) ? d.data
@@ -7555,7 +7582,7 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
   if (broker === "dhan") {
     const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
     const body = { dhanClientId: sess.extra && sess.extra.clientId, transactionType: "SELL", exchangeSegment: "NSE_EQ", productType: "INTRADAY", orderType: "MARKET", validity: "DAY", securityId, quantity: String(Number(qty)), price: "", afterMarketOrder: false };
-    const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await pfetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body), ...userProxyOpts(sess) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.orderStatus === "REJECTED") throw new Error(d.errorMessage || d.omsErrorDescription || `Dhan exit failed (${r.status})`);
     return { orderId: d.orderId ?? null };
@@ -7578,7 +7605,7 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
   if (broker === "indmoney") {
     const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
     const body = { txn_type: "SELL", exchange: "NSE", segment: "EQUITY", security_id: String(securityId), qty: Number(qty), order_type: "MARKET", product: "INTRADAY", validity: "DAY", is_amo: false, algo_id: "99999" };
-    const r = await fetch(`${INDM_API_BASE}/order`, { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await pfetch(`${INDM_API_BASE}/order`, { method: "POST", headers: { ...brokerAuth("indmoney", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body), ...userProxyOpts(sess) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.status !== "success") throw new Error((d && d.message) || `IND Money exit failed (${r.status})`);
     return { orderId: (d.data && d.data.order_id) || null };
