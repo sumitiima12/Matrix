@@ -21,7 +21,7 @@
  *
  * Bump CERTIFICATION_VERSION whenever a flag flips so the admin diagnostic + clients can see which matrix is live.
  */
-const CERTIFICATION_VERSION = "2026-08-04.1";
+const CERTIFICATION_VERSION = "2026-08-05.1";
 
 const ALL_CAPS = [
   "connect", "portfolio", "manualEntry", "manualExit", "verifiedFill",
@@ -42,8 +42,15 @@ const BROKER_CAPABILITIES = {
   delta: caps({
     connect: true, portfolio: true, manualEntry: true, manualExit: true, verifiedFill: true,
     partialFill: true, managedProtection: true,
-    // durableAttempts / startupRecovery / unattendedAutomation: NOT yet certified for Delta (C03 route + 2-instance
-    // matrix pending). Real manual trading + native bracket protection remain available.
+    // R40 — Delta now has the DURABLE write-before-send order-attempt + STARTUP/periodic broker-truth RECOVERY that
+    // FYERS had (server.js Delta branch + _deltaProbeByTag/_adoptDeltaFill), proven in test/deltaRecovery.test.cjs
+    // (lost-response → restart → adopt-once, no resend). Those descriptive flags are true. These gate nothing on their
+    // own — they're the certification matrix shown in diagnostics.
+    durableAttempts: true, startupRecovery: true,
+    // unattendedAutomation stays FALSE until the MatrixOne-path E2E (test/brokerPipelineE2E.sandbox.cjs) passes GREEN
+    // on the static-IP self-hosted runner against Delta testnet (broker-truth flat/close, concurrent single-owner) and
+    // that per-SHA evidence is published. This is THE gate the auto-buy engine + Go-Live route check — never flip it
+    // from code alone; flip it only alongside the runner-green certification evidence.
   }),
   // R31-P2-06: Zerodha's real order route lacks the verified-fill + partial + durable-attempt + recovery journeys
   // that FYERS/Delta passed, so manualEntry/manualExit stay FALSE (were overstated as true). Connection + portfolio

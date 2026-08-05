@@ -758,6 +758,75 @@ async function _adoptFyersFill(attempt, ob) {
     tradeType: "Recovery", serverAuthored: true,
   }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
 }
+/* Delta recovery probe — resolve an ambiguous/lost Delta order from BROKER TRUTH by our client_order_id tag, mirroring
+   the FYERS probe's fail-closed philosophy: any unreadable source ⇒ throw/null (stay locked); "filled" only from real
+   fills; "absent" only when order-history + fills + positions are ALL readable, none reference our tag, we hold a broker
+   order id, and the attempt is old enough that propagation lag can't hide it. Coin-unit conversion mirrors the live
+   branch (filledCoin = filledContracts × contract_value). */
+async function _deltaProbeByTag(attempt) {
+  const uid = String(attempt.userId);
+  const tag = String(attempt.orderTag || "");
+  const bid = attempt.brokerOrderId != null ? String(attempt.brokerOrderId) : null;
+  const q = tag ? `?client_order_id=${encodeURIComponent(tag)}` : "";
+  // ORDER HISTORY (all states). Unreachable ⇒ throw ⇒ stay locked (never falsely resolved).
+  let hist;
+  try { const h = await deltaCall("GET", "/v2/orders/history", { query: q, userId: uid }); if (!h || h.success === false || !Array.isArray(h.result)) throw new Error("unreadable"); hist = h.result; }
+  catch (e) { throw new Error("delta order-history unreachable: " + ((e && e.message) || e)); }
+  const ours = hist.filter((o) => String((o && o.client_order_id) || "") === tag || (bid && String(o && o.id) === bid));
+  // FILLS by tag → filled contracts + weighted avg price. Unreachable ⇒ inconclusive (null) ⇒ stay locked.
+  let fills;
+  try { const f = await deltaCall("GET", "/v2/fills", { query: q, userId: uid }); if (!f || f.success === false || !Array.isArray(f.result)) return null; fills = f.result.filter((x) => String((x && x.client_order_id) || "") === tag || (bid && String(x && x.order_id) === bid)); }
+  catch { return null; }
+  let cv = 1;
+  try { const prods = await deltaCall("GET", "/v2/products", { signed: false }); const p = (prods.result || []).find((pp) => pp.symbol === attempt.symbol); if (p) cv = Number(p.contract_value) || 1; } catch { /* default cv=1 */ }
+  let filledC = 0, notional = 0, firstId = null;
+  for (const x of fills) { const s = Number(x.size) || 0; const px = Number(x.price) || 0; if (s > 0) { filledC += s; notional += s * px; firstId = firstId || x.order_id; } }
+  const filledCoin = filledC * cv;
+  const avgPrice = filledC > 0 ? notional / filledC : 0;
+  const wantCoin = Number(attempt.qty) || 0;
+  if (ours.length || filledCoin > 0) {
+    if (filledCoin > 0) {
+      const oid = firstId || (ours.find((o) => o.state === "closed") || ours[0] || {}).id || bid;
+      if (wantCoin > 0 && filledCoin < wantCoin - 1e-9) return { status: "partial", orderId: oid, filledQty: filledCoin, avgPrice };
+      return { status: "filled", orderId: oid, filledQty: filledCoin, avgPrice };
+    }
+    if (ours.some((o) => o.state === "open" || o.state === "pending")) return { status: "pending" };
+    if (ours.some((o) => o.state === "rejected" || o.state === "cancelled")) return { status: "rejected", orderId: ours[0].id };
+    return { status: "pending" };
+  }
+  // POSITIONS: an open position for this symbol ⇒ a fill exists we haven't attributed ⇒ inconclusive (stay locked).
+  let pos;
+  try { const pr = await deltaCall("GET", "/v2/positions/margined", { userId: uid }); if (!pr || pr.success === false || !Array.isArray(pr.result)) return null; pos = pr.result; } catch { return null; }
+  const clean = (s) => String(s || "").replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+  if (pos.some((p) => clean(p.product_symbol || p.symbol) === clean(attempt.symbol) && Math.abs(Number(p.size) || 0) > 0)) return null;
+  // History + fills + positions ALL readable, none reference our order. ABSENT only if accepted (have order id) + old enough.
+  const created = Number(attempt.createdAt ?? attempt.created_at);
+  const oldEnough = Number.isFinite(created) && created > 0 && (Date.now() - created) >= (Number(process.env.DELTA_ABSENCE_MIN_AGE_MS) || 60000);
+  if (bid && oldEnough) return { status: "absent" };
+  return null;   // recent/never-accepted unknown ⇒ stay locked, retried on a later sweep
+}
+async function _adoptDeltaFill(attempt, ob) {
+  // Adopt the recovered Delta fill into the AUTHORITATIVE store exactly once (dedupes on the broker order id). A
+  // reduce-only order recovered at startup is booked as an authoritative EXIT (close + realized P&L), like the live route.
+  const prot = (attempt && attempt.protection) || null;
+  const deltaSym = String(attempt.symbol || "").replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+  if (prot && prot.reduceOnly === true) {
+    await applyReduceOnlyExit(String(attempt.userId), {
+      sym: deltaSym, closeSide: String(attempt.side || "BUY").toUpperCase(),
+      qty: Number(ob.filledQty) || Number(attempt.qty) || 0, exitPx: Number(ob.avgPrice) || 0,
+      orderId: ob.orderId || (attempt.brokerOrderId || null), entryOrderId: prot.entryOrderId || null,
+      broker: "delta", market: "Crypto", tradeType: "Recovery",
+    }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
+    return;
+  }
+  await recordAuthoritativeFill(String(attempt.userId), {
+    sym: deltaSym, side: String(attempt.side || "BUY").toUpperCase(),
+    qty: Number(ob.filledQty) || Number(attempt.qty) || 0,
+    entry: Number(ob.avgPrice) || 0, entryAt: Date.now(),
+    market: "Crypto", real: true, broker: "delta", orderId: ob.orderId || (attempt.brokerOrderId || null),
+    tradeType: "Recovery", serverAuthored: true,
+  }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
+}
 let _lastC03SweepAt = 0;   // §15: heartbeat for the reconciler — the observability board pages if it goes stale.
 async function runC03Reconcile(reason = "periodic") {
   // R30-C1: recovery MUST use the SAME gate as submission (default-on unless C03_ORDER_ATTEMPTS=0). Previously
@@ -770,8 +839,9 @@ async function runC03Reconcile(reason = "periodic") {
   try {
     const out = await orderRecovery.reconcileUnresolvedAttempts({
       db,
-      probeByTag: _fyersProbeByTag,
-      adoptFill: _adoptFyersFill,
+      // R40 — dispatch the broker-truth probe + fill-adopter per attempt.broker (Delta now joins FYERS).
+      probeByTag: (a) => (String(a && a.broker) === "delta" ? _deltaProbeByTag(a) : _fyersProbeByTag(a)),
+      adoptFill: (a, ob) => (String(a && a.broker) === "delta" ? _adoptDeltaFill(a, ob) : _adoptFyersFill(a, ob)),
       setLock: (uid, v) => { try { haltedEntries.add(String(uid)); } catch { /* engine may not be up */ } return db.setRiskLock(String(uid), v); },
       setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
       acquireOwner: async () => { owner = await db.tryAdvisoryLock(C03_RECON_ADVISORY_KEY); return owner; },
@@ -6065,22 +6135,47 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (isBuy && sendSize < 1) {
         return res.status(400).json({ ok: false, status: "rejected", broker, reason: `Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.` });
       }
-      const d = await deltaCall("POST", "/v2/orders", {
-        userId: sess.userId,
-        body: {
-          product_id: prod.id,
-          size: sendSize,
-          side: isBuy ? "buy" : "sell",
-          order_type: "market_order",
-          // R27-P1-02: a SELL always reduces a long, and ANY explicitly reduce-only request (a close — incl. a
-          // BUY-to-cover of a short) must carry the exchange reduce_only flag so it can only shrink exposure,
-          // never open/reverse it. (Previously reduce_only was set on SELL only, so a short-cover BUY omitted it.)
-          ...((!isBuy || req.body?.reduceOnly === true) ? { reduce_only: true } : {}),
-          // R26-P1-01: stamp our durable client_order_id (the idempotency key) so the unknown-order probe can
-          // later find THIS order in Delta's order book. Without it, an executed order looks absent → duplicate.
-          client_order_id: String(idemKey).slice(0, 64),
-        },
-      });
+      const _deltaIsReduce = (!isBuy || req.body?.reduceOnly === true);
+      const _deltaBody = {
+        product_id: prod.id,
+        size: sendSize,
+        side: isBuy ? "buy" : "sell",
+        order_type: "market_order",
+        // R27-P1-02: a SELL always reduces a long, and ANY explicitly reduce-only request (a close — incl. a
+        // BUY-to-cover of a short) must carry the exchange reduce_only flag so it can only shrink exposure.
+        ...(_deltaIsReduce ? { reduce_only: true } : {}),
+        // R26-P1-01: stamp our durable client_order_id (the idempotency key) so the recovery probe can later find
+        // THIS order in Delta's order book/fills. Without it, an executed order looks absent → duplicate.
+        client_order_id: String(idemKey).slice(0, 64),
+      };
+      const _deltaSubmit = async () => deltaCall("POST", "/v2/orders", { userId: sess.userId, body: _deltaBody });
+      /* R40 (Delta automation) — DURABLE WRITE-BEFORE-SEND, same C03 machinery FYERS uses. A PREPARED order_attempt
+         is committed BEFORE the Delta call, so a crash / lost response is recoverable by client_order_id; the broker is
+         called ONLY if this request wins the PREPARED→SUBMITTING CAS; a replayed/in-flight attempt returns
+         reconcile-required instead of a second order; a thrown/ambiguous outcome is left UNKNOWN for startup
+         reconciliation (account stays locked). Flag-gated (C03_ORDER_ATTEMPTS, default on) — off ⇒ byte-identical legacy call. */
+      let d;
+      if (C03_ORDER_ATTEMPTS_ON) {
+        const attempt = {
+          id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "delta", idemKey,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          symbol, side, qty: Number(qty), product,
+          protection: _deltaIsReduce ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
+        };
+        const out = await orderRecovery.submitWithAttempt({
+          db, attempt, submit: _deltaSubmit,
+          classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.result && dd.result.id != null ? String(dd.result.id) : null } }),
+          // A CONCLUSIVE Delta rejection thrown as an error is terminal (nothing landed); an ambiguous transport
+          // failure stays UNKNOWN (recovery resolves it). A business reject returned in the body is handled below.
+          classifyError: (e) => { const m = String((e && e.message) || e || ""); return /reject|insufficient|margin|rms|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null; },
+        });
+        if (out && (out.replay || out.fenced)) {
+          return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
+        }
+        d = out;
+      } else {
+        d = await _deltaSubmit();
+      }
       // The order carries our tag → the probe may safely resolve absence/presence for it later.
       await db.markIdempotencyTagged(idemUser, idemKey);
       /* A 200 is NOT a fill. Verify execution (all sizes here are CONTRACTS). */
@@ -6089,6 +6184,16 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const unfilledC = o.unfilled_size != null ? Number(o.unfilled_size) : (o.state === "closed" ? 0 : sizeC);
       const filledC = Math.max(0, sizeC - unfilledC);
       const status = (o.state === "cancelled" || o.state === "rejected" || filledC <= 0) ? "rejected" : (filledC < sizeC ? "partial" : "filled");
+      const filledCoinNow = filledC * (cv || 1);
+      /* C03 (Delta): finalize the durable attempt with the VERIFIED outcome. FILLED/REJECTED are terminal (resolved);
+         PARTIAL keeps the account locked for the residual; a still-open acceptance stays ACCEPTED (unresolved) so
+         startup reconciliation settles it. Idempotent re-finalize over the ACCEPTED that submitWithAttempt wrote. */
+      if (C03_ORDER_ATTEMPTS_ON) {
+        try {
+          const st = status === "filled" ? "FILLED" : (status === "partial" ? "PARTIAL" : (status === "rejected" ? "REJECTED" : "ACCEPTED"));
+          await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: o.id != null ? String(o.id) : null, ...(filledCoinNow > 0 ? { filledQty: filledCoinNow, avgPrice: Number(o.average_fill_price) || null } : {}) });
+        } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
+      }
       if (status === "rejected") {
         return res.status(400).json({ ok: false, status: "rejected", broker, orderId: o.id ?? null, reason: o.cancellation_reason || o.meta_data?.reason || "Order not filled — likely insufficient balance/margin on your Delta account" });
       }

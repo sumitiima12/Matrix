@@ -1,25 +1,22 @@
-/* R38-P2-03 / R39-P1-03 — MatrixOne-PATH real-broker integration CERTIFICATION (Delta testnet).
+/* R38-P2-03 / R39-P1-03 / R40-P1-03 — MatrixOne-PATH real-broker integration CERTIFICATION (Delta testnet).
  *
- * The raw *.sandbox.cjs suites prove broker CREDENTIALS + broker SEMANTICS (a real fill and a reduce-only close). They
- * do NOT prove MatrixOne's own unattended execution pipeline. THIS suite drives an order through MatrixOne's
- * authenticated `/api/broker/order` route against a REAL Delta testnet + a REAL PostgreSQL, and proves the safety
- * invariants end to end through the app's own code (not raw broker HTTP):
- *   J1  ENTRY            a market BUY places ONE order, its fill is VERIFIED (not assumed), and journaled to the ledger.
- *   J2  PROTECTION       an SL/TP request attaches a managed exit / exchange bracket (protection registered).
- *   J3  REDUCE-ONLY CLOSE a reduce-only SELL flattens the position; the local trade projects CLOSED with realized P&L.
- *   J4  RETRY IDEMPOTENCY replaying the SAME idempotency key does NOT place a second broker order (no double-submit).
- *   J5  LOST-RESPONSE    running the C03 reconciler after a fill does NOT create a duplicate — it reconciles, not resend.
- *   J6  SINGLE-OWNER     two REAL OS processes on ONE PostgreSQL race the same signal id → exactly ONE claim commits.
- *   TEARDOWN             any position left open by a failed journey is flattened (reduce-only) and proven flat.
+ * Drives an order through MatrixOne's authenticated `/api/broker/order` route against a REAL Delta testnet + a REAL
+ * PostgreSQL, and proves the safety invariants FROM BROKER TRUTH (R40-P1-03 hardening — no more local-only assertions):
+ *   J1  ENTRY            a market BUY places ONE order, its fill is VERIFIED, and journaled to the ledger.
+ *   J2  PROTECTION       an SL/TP request attaches a managed exit / exchange bracket.
+ *   J3  REDUCE-ONLY CLOSE a reduce-only SELL flattens the position; the BROKER reports net qty 0 (queried directly).
+ *   J4  NO DOUBLE-SUBMIT replaying the SAME idempotency key does not increase the BROKER's order count for that tag.
+ *   J5  RECOVERY         after a fill, the C03 reconciler is IDEMPOTENT vs broker truth — no resend, no duplicate.
+ *                        (A genuine accepted-but-response-lost injection + restart-adopt is proven hermetically in
+ *                        test/deltaRecovery.test.cjs — a live exchange cannot be made to drop a response on command.)
+ *   J6  SINGLE-OWNER     two CONCURRENT OS processes race the same signal on ONE PostgreSQL → exactly ONE claim commits.
+ *   TEARDOWN             an out-of-band watchdog reads BROKER positions directly and reduce-only flattens to flat,
+ *                        independent of local journal state (so a fill whose journaling failed is still cleaned up).
  *
- * WHERE IT RUNS: a STATIC-IP / self-hosted runner whose egress IP is whitelisted at Delta (the CI job `broker-e2e`
- * targets `runs-on: [self-hosted, linux]`). GitHub's shared runners have rotating IPs Delta will reject.
+ * WHERE IT RUNS: a STATIC-IP / self-hosted runner whose egress IP is whitelisted at Delta (CI job `broker-e2e`).
  *
- * GATE (fail-closed, never a false green):
- *   • Runs ONLY when BROKER_E2E=1 AND DATABASE_URL is set AND a COMPLETE Delta testnet credential set + testnet BASE are
- *     present. Any of those missing under BROKER_E2E=1 THROWS in setup — a certification run can never silently pass.
- *   • Without BROKER_E2E it self-skips (ordinary PR/dev) and is EXCLUDED from the default `npm test` gate (.sandbox.cjs).
- *   • DELTA_SANDBOX_BASE must resolve to a Delta TESTNET host (no production default) or setup refuses to run.
+ * GATE (fail-closed): runs ONLY when BROKER_E2E=1 AND DATABASE_URL AND complete Delta testnet creds + a TESTNET base.
+ * Any missing under BROKER_E2E=1 THROWS in setup; without BROKER_E2E it self-skips and is excluded from `npm test`.
  */
 const test = require("node:test");
 const assert = require("node:assert");
@@ -27,7 +24,8 @@ const http = require("http");
 const path = require("path");
 const os = require("os");
 const fs = require("fs");
-const { execFileSync } = require("child_process");
+const crypto = require("crypto");
+const { execFile } = require("child_process");
 
 const E2E = /^(1|true|yes)$/i.test(String(process.env.BROKER_E2E || ""));
 const IN_CI = /^(1|true|yes)$/i.test(String(process.env.CI || ""));
@@ -35,8 +33,9 @@ const DELTA_OK = !!(process.env.DELTA_SANDBOX_KEY && process.env.DELTA_SANDBOX_S
 const DELTA_BASE = String(process.env.DELTA_SANDBOX_BASE || "").replace(/\/+$/, "");
 const SYMBOL = process.env.DELTA_SANDBOX_SYMBOL || "BTCUSD";
 const SIZE = Math.max(1, Number(process.env.DELTA_SANDBOX_MAX_SIZE) || 1);
+const DKEY = process.env.DELTA_SANDBOX_KEY || "";
+const DSECRET = process.env.DELTA_SANDBOX_SECRET || "";
 
-// A Delta TESTNET host only — never production api.delta.exchange. (testnet hostnames contain "testnet".)
 function isTestnetHost(u) { try { return /testnet/i.test(new URL(u).host); } catch { return false; } }
 
 let pgHandle = null, DATABASE_URL = null, srv = null, base = null;
@@ -72,6 +71,36 @@ function req(method, p, { token, headers = {}, body } = {}) {
   });
 }
 
+// --- DIRECT, SIGNED Delta broker-truth reads (independent of the app), mirroring server.js deltaHeaders exactly. ---
+async function deltaGet(pathName, query = "") {
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const sig = crypto.createHmac("sha256", DSECRET).update("GET" + ts + pathName + query + "").digest("hex");
+  const res = await fetch(DELTA_BASE + pathName + query, { headers: { "api-key": DKEY, timestamp: ts, signature: sig, "Content-Type": "application/json", "User-Agent": "matrix-e2e" } });
+  const j = await res.json().catch(() => ({}));
+  return Array.isArray(j.result) ? j.result : [];
+}
+async function deltaPost(pathName, body) {
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const bs = JSON.stringify(body);
+  const sig = crypto.createHmac("sha256", DSECRET).update("POST" + ts + pathName + "" + bs).digest("hex");
+  const res = await fetch(DELTA_BASE + pathName, { method: "POST", headers: { "api-key": DKEY, timestamp: ts, signature: sig, "Content-Type": "application/json", "User-Agent": "matrix-e2e" }, body: bs });
+  return res.json().catch(() => ({}));
+}
+const cleanSym = (s) => String(s || "").replace(/(USDT|USD|INR)$/i, "").toUpperCase();
+async function brokerNetContracts(symbol) {
+  const pos = await deltaGet("/v2/positions/margined");
+  return pos.filter((p) => cleanSym(p.product_symbol || p.symbol) === cleanSym(symbol)).reduce((s, p) => s + (Number(p.size) || 0), 0);
+}
+async function brokerOrderCountByTag(tag) {
+  const hist = await deltaGet("/v2/orders/history", `?client_order_id=${encodeURIComponent(String(tag).slice(0, 64))}`);
+  return hist.length;
+}
+async function brokerProductId(symbol) {
+  const prods = await deltaGet("/v2/products");
+  const p = prods.find((x) => x.symbol === symbol);
+  return p ? p.id : null;
+}
+
 const PHONE = "9" + String(Math.floor(1e8 + Math.random() * 8e8));
 const SKEY = "ph_" + PHONE;
 let TOKEN = null, SESSION = null;
@@ -80,7 +109,7 @@ const oh = (idem, extra = {}) => ({ "X-Broker-Session": SESSION, "X-Confirm-Live
 const openTrades = async () => (await db.getTrades(SKEY, 0, Date.now())).filter((t) => t && t.real && t.broker === "delta" && t.entryAt != null && t.exitAt == null && t.exit == null && t.status !== "rejected");
 
 test.before(async () => {
-  if (!E2E) return;                                   // not a certification run — every test self-skips below
+  if (!E2E) return;
   if (!DELTA_OK) throw new Error("BROKER_E2E=1 requires a COMPLETE Delta testnet credential set (DELTA_SANDBOX_KEY + DELTA_SANDBOX_SECRET)");
   if (!DELTA_BASE) throw new Error("BROKER_E2E=1 requires DELTA_SANDBOX_BASE (the Delta TESTNET base URL — no production default)");
   if (!isTestnetHost(DELTA_BASE)) throw new Error(`refusing to run: DELTA_SANDBOX_BASE host is not a Delta testnet host (${DELTA_BASE})`);
@@ -88,13 +117,14 @@ test.before(async () => {
   if (!DATABASE_URL) throw new Error("BROKER_E2E=1 requires DATABASE_URL (a real PostgreSQL for the MatrixOne pipeline)");
 
   process.env.DATABASE_URL = DATABASE_URL;
-  process.env.DELTA_API_BASE = DELTA_BASE;                       // route every Delta call to the testnet
-  process.env.DELTA_API_KEY = process.env.DELTA_SANDBOX_KEY;     // house-signed with the testnet creds
-  process.env.DELTA_API_SECRET = process.env.DELTA_SANDBOX_SECRET;
-  process.env.ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS ? process.env.ADMIN_USER_IDS + "," : "") + PHONE;   // makes the user Delta-tradable
+  process.env.DELTA_API_BASE = DELTA_BASE;
+  process.env.DELTA_API_KEY = DKEY;
+  process.env.DELTA_API_SECRET = DSECRET;
+  process.env.ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS ? process.env.ADMIN_USER_IDS + "," : "") + PHONE;
   process.env.JWT_SECRET = process.env.JWT_SECRET || "e2e-secret-000000000000000000";
   process.env.CRED_KEY = process.env.CRED_KEY || "e2e-test-cred-key-32bytes-minimum!!";
   process.env.BROKER_TRADING_ENABLED = "true";
+  process.env.C03_ORDER_ATTEMPTS = "1";
   process.env.MATRIX_NO_LISTEN = "1";
 
   server = require("../server.js"); auth = require("../auth.js"); db = require("../db.js"); bcrypt = require("bcryptjs");
@@ -110,19 +140,19 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  // TEARDOWN — flatten anything a failed journey left open, then prove flat, so the testnet account never leaks exposure.
+  // TEARDOWN WATCHDOG — read BROKER positions directly (not the local ledger) and reduce-only flatten to flat, so a
+  // fill whose journaling failed is still cleaned up. Publishes a loud marker if it can't prove flat.
   try {
-    if (base && db) {
-      for (let attempt = 0; attempt < 4; attempt++) {
-        const open = await openTrades().catch(() => []);
-        if (!open.length) break;
-        for (const t of open) {
-          await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey(), { "X-Reduce-Only": "yes" }), body: { broker: "delta", symbol: t.symbol || SYMBOL, side: "sell", qty: Math.abs(Number(t.qty) || SIZE), reduceOnly: true } }).catch(() => {});
-        }
+    if (E2E && DELTA_BASE && DKEY) {
+      const pid = await brokerProductId(SYMBOL).catch(() => null);
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const net = await brokerNetContracts(SYMBOL).catch(() => 0);
+        if (net === 0) break;
+        if (pid) { await deltaPost("/v2/orders", { product_id: pid, size: Math.abs(net), side: net > 0 ? "sell" : "buy", order_type: "market_order", reduce_only: true }).catch(() => {}); }
         await new Promise((r) => setTimeout(r, 800));
       }
-      const left = await openTrades().catch(() => []);
-      if (left.length) console.error(`::error::BROKER-E2E TEARDOWN — ${left.length} position(s) still open after emergency flatten; check the Delta testnet account`);
+      const left = await brokerNetContracts(SYMBOL).catch(() => 1);
+      if (left !== 0) console.error(`::error::BROKER-E2E TEARDOWN — Delta testnet still shows net ${left} for ${SYMBOL} after watchdog flatten; check the account`);
     }
   } finally {
     if (srv) await new Promise((r) => srv.close(r));
@@ -144,62 +174,78 @@ test("E2E-J1: market BUY through MatrixOne verifies the fill and journals ONE au
 test("E2E-J2: an SL/TP request registers managed protection on the open position", guard(async () => {
   const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey()), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: SIZE, orderType: "market", slPct: 2, tpPct: 4 } });
   assert.ok(r.status === 200 || r.status === 201, "protected entry accepted: " + JSON.stringify(r.body));
-  // Protection is registered either as a managed-exit id on the response or as SL/TP on the journaled trade.
   const open = await openTrades();
   const protectedRow = open.find((t) => (t.sl != null || t.tp != null || t.slPct != null || t.tpPct != null));
-  assert.ok(r.body.autoExitId || r.body.managedId || protectedRow, "a managed exit / bracket was registered for the SL/TP: " + JSON.stringify(r.body));
+  assert.ok(r.body.autoExitId || r.body.managedId || (r.body.bracket && !r.body.bracket.error) || protectedRow, "a managed exit / bracket was registered for the SL/TP: " + JSON.stringify(r.body));
 }));
 
-test("E2E-J3: a reduce-only CLOSE flattens the position and projects a CLOSED trade with realized P&L", guard(async () => {
+test("E2E-J3: a reduce-only CLOSE makes the BROKER flat (queried directly) with a projected CLOSED trade", guard(async () => {
   const open = await openTrades();
   assert.ok(open.length >= 1, "there is an open position to close");
   const pos = open[0];
   const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey(), { "X-Reduce-Only": "yes" }), body: { broker: "delta", symbol: pos.symbol || SYMBOL, side: "sell", qty: Math.abs(Number(pos.qty) || SIZE), reduceOnly: true } });
   assert.ok(r.status === 200 || r.status === 201, "reduce-only close accepted: " + JSON.stringify(r.body));
-  const stillOpenSame = (await openTrades()).some((t) => t.id === pos.id);
-  assert.ok(!stillOpenSame, "the closed position is no longer open (reduce-only actually flattened it)");
+  // BROKER TRUTH: re-read Delta positions until this symbol nets to zero (not merely "the local row closed").
+  let net = null;
+  for (let i = 0; i < 8; i++) { await new Promise((res) => setTimeout(res, 500)); net = await brokerNetContracts(pos.symbol || SYMBOL); if (net === 0) break; }
+  assert.equal(net, 0, "the BROKER reports the position flat after the reduce-only close (queried from Delta directly)");
   const closed = (await db.getTrades(SKEY, 0, Date.now())).filter((x) => x.broker === "delta" && x.status === "closed");
-  assert.ok(closed.length >= 1, "at least one closed row (the exit), with a realized P&L number");
-  assert.ok(Number.isFinite(Number(closed[closed.length - 1].pnl)), "closed trade carries a finite realized P&L");
+  assert.ok(closed.length >= 1 && Number.isFinite(Number(closed[closed.length - 1].pnl)), "a CLOSED trade with a finite realized P&L is projected locally");
 }));
 
-test("E2E-J4: replaying the SAME idempotency key does NOT place a second broker order", guard(async () => {
+test("E2E-J4: replaying the SAME idempotency key does not increase the BROKER's order count for that tag", guard(async () => {
   const key = newKey();
   const body = { broker: "delta", symbol: SYMBOL, side: "buy", qty: SIZE, orderType: "market" };
-  const beforeCount = (await db.getTrades(SKEY, 0, Date.now())).length;
   const r1 = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(key), body });
   assert.ok(r1.status === 200 || r1.status === 201, "first submit accepted: " + JSON.stringify(r1.body));
-  const afterFirst = (await db.getTrades(SKEY, 0, Date.now())).length;
-  const r2 = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(key), body });   // SAME key ⇒ idempotent replay
-  const afterSecond = (await db.getTrades(SKEY, 0, Date.now())).length;
-  assert.equal(afterSecond, afterFirst, "the replay created NO new trade row (no double-submit)");
-  assert.ok(afterFirst > beforeCount, "the first submit DID create exactly one new row");
+  await new Promise((res) => setTimeout(res, 800));
+  const brokerCountAfterFirst = await brokerOrderCountByTag(key);   // BROKER TRUTH: orders carrying our client_order_id
+  assert.ok(brokerCountAfterFirst >= 1, "the first submit created a broker order tagged with our key");
+  await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(key), body });   // SAME key ⇒ idempotent replay
+  await new Promise((res) => setTimeout(res, 800));
+  const brokerCountAfterReplay = await brokerOrderCountByTag(key);
+  assert.equal(brokerCountAfterReplay, brokerCountAfterFirst, "the replay placed NO additional broker order (counted at the broker, not locally)");
+  // clean up the position this test opened
+  const net = await brokerNetContracts(SYMBOL);
+  if (net !== 0) { const pid = await brokerProductId(SYMBOL); if (pid) await deltaPost("/v2/orders", { product_id: pid, size: Math.abs(net), side: net > 0 ? "sell" : "buy", order_type: "market_order", reduce_only: true }).catch(() => {}); }
 }));
 
-test("E2E-J5: the C03 reconciler after a fill reconciles — it does NOT create a duplicate order", guard(async () => {
-  const before = (await db.getTrades(SKEY, 0, Date.now())).length;
-  if (typeof server.runC03Reconcile === "function") { await server.runC03Reconcile("e2e").catch(() => {}); }
-  const after = (await db.getTrades(SKEY, 0, Date.now())).length;
-  assert.equal(after, before, "startup/periodic reconciliation is replay-safe — no duplicate trade from a re-run");
+test("E2E-J5: the C03 reconciler is IDEMPOTENT vs broker truth after a fill (no resend, no duplicate)", guard(async () => {
+  const key = newKey();
+  await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(key), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: SIZE, orderType: "market" } });
+  await new Promise((res) => setTimeout(res, 800));
+  const beforeCount = await brokerOrderCountByTag(key);
+  const beforeOpen = (await openTrades()).length;
+  if (typeof server.runC03Reconcile === "function") { await server.runC03Reconcile("e2e"); await server.runC03Reconcile("e2e-again"); }
+  await new Promise((res) => setTimeout(res, 500));
+  assert.equal(await brokerOrderCountByTag(key), beforeCount, "recovery did NOT resend the order (broker order count unchanged)");
+  assert.equal((await openTrades()).length, beforeOpen, "recovery adopted no duplicate local position");
+  // (The full accepted-but-response-lost → restart → adopt-from-truth path is proven in test/deltaRecovery.test.cjs.)
+  const net = await brokerNetContracts(SYMBOL);
+  if (net !== 0) { const pid = await brokerProductId(SYMBOL); if (pid) await deltaPost("/v2/orders", { product_id: pid, size: Math.abs(net), side: net > 0 ? "sell" : "buy", order_type: "market_order", reduce_only: true }).catch(() => {}); }
 }));
 
-test("E2E-J6: two REAL processes on ONE PostgreSQL race the same signal — exactly ONE claim commits (single owner)", guard(async () => {
+test("E2E-J6: two CONCURRENT processes on ONE PostgreSQL race the same signal — exactly ONE claim commits", guard(async () => {
   const signalId = "e2e:sig:" + Date.now();
-  const child = (owner) => {
+  const startAt = Date.now() + 1200;   // a wall-clock BARRIER: both children busy-wait to this instant, then claim together
+  const runChild = (owner) => new Promise((resolve, reject) => {
     const script = `
       process.env.DATABASE_URL = ${JSON.stringify(DATABASE_URL)};
       const db = require(${JSON.stringify(DBPATH)});
       (async () => {
+        while (Date.now() < ${startAt}) { /* spin to the barrier so both claims fire concurrently */ }
         const claimed = await db.claimSignal(${JSON.stringify(signalId)}, ${JSON.stringify(SKEY)}, "signal");
         process.stdout.write("RESULT:" + JSON.stringify({ owner: ${JSON.stringify(owner)}, claim: !!claimed }) + "\\n");
         process.exit(0);
       })().catch((e) => { process.stderr.write("ERR:" + (e && e.message) + "\\n"); process.exit(7); });`;
-    const out = execFileSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"] });
-    const line = out.split("\n").find((l) => l.startsWith("RESULT:"));
-    if (!line) throw new Error("child produced no RESULT: " + out);
-    return JSON.parse(line.slice("RESULT:".length));
-  };
-  const a = child("procA"), b = child("procB");
+    execFile(process.execPath, ["-e", script], { timeout: 30000 }, (err, stdout) => {
+      if (err && !stdout) return reject(err);
+      const line = String(stdout).split("\n").find((l) => l.startsWith("RESULT:"));
+      if (!line) return reject(new Error("child produced no RESULT: " + stdout));
+      resolve(JSON.parse(line.slice("RESULT:".length)));
+    });
+  });
+  const [a, b] = await Promise.all([runChild("procA"), runChild("procB")]);   // launched together; both hit the barrier
   const claims = [a, b].filter((r) => r.claim);
-  assert.equal(claims.length, 1, `exactly one process may CLAIM the signal, got ${claims.length}: ${JSON.stringify([a, b])}`);
+  assert.equal(claims.length, 1, `exactly one CONCURRENT process may CLAIM the signal, got ${claims.length}: ${JSON.stringify([a, b])}`);
 }));

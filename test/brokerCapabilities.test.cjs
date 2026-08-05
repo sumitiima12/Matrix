@@ -7,12 +7,15 @@ test("S1: FYERS is fully certified (passed the route/recovery/exit/protection su
   for (const c of caps.ALL_CAPS) assert.equal(caps.brokerCap("fyers", c), true, `fyers.${c} should be certified`);
 });
 
-test("S1: Delta keeps manual real trading but durable/recovery/unattended are NOT yet certified", () => {
+test("S1: Delta has manual real trading + durable/recovery (R40, proven in deltaRecovery.test.cjs); unattended still uncertified", () => {
   assert.equal(caps.brokerCap("delta", "manualEntry"), true, "manual real trading stays available");
   assert.equal(caps.brokerCap("delta", "verifiedFill"), true);
-  assert.equal(caps.brokerCap("delta", "durableAttempts"), false, "C03 not certified for Delta yet");
-  assert.equal(caps.brokerCap("delta", "startupRecovery"), false);
-  assert.equal(caps.brokerCap("delta", "unattendedAutomation"), false, "unattended real automation uncertified");
+  // R40: Delta now has the durable write-before-send + startup/periodic broker-truth recovery (proven hermetically in
+  // test/deltaRecovery.test.cjs: lost-response → restart → adopt-once, no resend). These are descriptive (gate nothing).
+  assert.equal(caps.brokerCap("delta", "durableAttempts"), true, "C03 durable attempts now implemented + tested for Delta");
+  assert.equal(caps.brokerCap("delta", "startupRecovery"), true, "startup/periodic broker-truth recovery now implemented for Delta");
+  // THE real gate stays FALSE until the MatrixOne-path E2E passes green on the static-IP runner (broker-e2e).
+  assert.equal(caps.brokerCap("delta", "unattendedAutomation"), false, "unattended real automation stays uncertified until the runner E2E is green");
   assert.equal(caps.brokerCap("delta", "connect"), true, "connection always available");
 });
 

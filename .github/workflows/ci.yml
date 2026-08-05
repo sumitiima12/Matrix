@@ -332,7 +332,10 @@ jobs:
   # green with zero skips for THIS commit, and every CERT_BROKERS broker is actually certified (pass>0, fail=0, skip=0,
   # no NOT_CERTIFIED/NOT_CONFIGURED). Real-money activation is emitted only when all checks pass.
   deploy:
-    needs: [backend, broker-sandbox]
+    # R40-P2-02: depend on ALL certification jobs so deploy can't start before their per-SHA evidence exists (no race).
+    # When their flags are off the jobs are skipped and deploy is skipped too — an unattended real-money release requires
+    # them ON (enforced below), so for a real release they always run and gate this job.
+    needs: [backend, broker-sandbox, broker-sandbox-delta, broker-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.REAL_MONEY_RELEASE == '1' }}
@@ -367,6 +370,9 @@ jobs:
           RUN_BROKER_E2E: ${{ vars.RUN_BROKER_E2E }}
         run: |
           set -euo pipefail
+          # R40-P1-05: an UNATTENDED real-money release (this job runs only when REAL_MONEY_RELEASE=1) must NEVER pass
+          # without the MatrixOne-path E2E. Require RUN_BROKER_E2E=1 unconditionally — no optional-flag bypass.
+          [ "${RUN_BROKER_E2E:-0}" = "1" ] || { echo "::error::unattended real-money release requires RUN_BROKER_E2E=1 (the MatrixOne-path app E2E must run and be verified)"; exit 1; }
           BE=ev-backend/backend-evidence.txt
           [ -f "$BE" ] || { echo "::error::missing backend evidence for ${GITHUB_SHA}"; exit 1; }
           # 1) Backend evidence must be for THIS commit, green, zero-skip.
