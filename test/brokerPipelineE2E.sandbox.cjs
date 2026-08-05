@@ -191,12 +191,16 @@ test("E2E-J2: an SL/TP request registers managed protection on the open position
 test("E2E-J3: a reduce-only CLOSE makes the BROKER flat (queried directly) with a projected CLOSED trade", guard(async () => {
   const open = await openTrades();
   assert.ok(open.length >= 1, "there is an open position to close");
-  const pos = open[0];
-  const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey(), { "X-Reduce-Only": "yes" }), body: { broker: "delta", symbol: pos.symbol || SYMBOL, side: "sell", qty: Math.abs(Number(pos.qty) || QTY), reduceOnly: true } });
-  assert.ok(r.status === 200 || r.status === 201, "reduce-only close accepted: " + JSON.stringify(r.body));
+  const sym = open[0].symbol || SYMBOL;
+  // J1 opened a position and J2 opened a SECOND (protected) one on the same product, so the venue nets >1 contract.
+  // Flatten EVERY open journal position reduce-only so the broker truly nets to zero (not just the first row's qty).
+  for (const pos of open) {
+    const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey(), { "X-Reduce-Only": "yes" }), body: { broker: "delta", symbol: pos.symbol || SYMBOL, side: "sell", qty: Math.abs(Number(pos.qty) || QTY), reduceOnly: true } });
+    assert.ok(r.status === 200 || r.status === 201, "reduce-only close accepted: " + JSON.stringify(r.body));
+  }
   // BROKER TRUTH: re-read Delta positions until this symbol nets to zero (not merely "the local row closed").
   let net = null;
-  for (let i = 0; i < 8; i++) { await new Promise((res) => setTimeout(res, 500)); net = await brokerNetContracts(pos.symbol || SYMBOL); if (net === 0) break; }
+  for (let i = 0; i < 8; i++) { await new Promise((res) => setTimeout(res, 500)); net = await brokerNetContracts(sym); if (net === 0) break; }
   assert.equal(net, 0, "the BROKER reports the position flat after the reduce-only close (queried from Delta directly)");
   const closed = (await db.getTrades(SKEY, 0, Date.now())).filter((x) => x.broker === "delta" && x.status === "closed");
   assert.ok(closed.length >= 1 && Number.isFinite(Number(closed[closed.length - 1].pnl)), "a CLOSED trade with a finite realized P&L is projected locally");
