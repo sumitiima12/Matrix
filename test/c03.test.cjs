@@ -11,8 +11,13 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+// Capture the REAL Postgres URL up front, BEFORE the before-hook below deletes it for the flat-file tests. The PG
+// cross-restart test's skip decision (and its own DB connection) must use this captured value — reading the live env
+// there would see the deleted variable and silently skip the money-safety test (which the zero-skip CI gate rejects).
+const REAL_DATABASE_URL = process.env.DATABASE_URL || null;
+
 const faultHook = require("../faultHook");
-const { freshRequire, requirePgOrSkip } = require("./harness/restart.cjs");
+const { freshRequire } = require("./harness/restart.cjs");
 
 let dir, db;
 test.before(() => {
@@ -91,8 +96,9 @@ test("C03: a fault at db.attempt.finalize leaves the attempt UNRESOLVED (recover
 
 /* ── PostgreSQL cross-restart DURABILITY (the real point of C03): a PREPARED attempt survives a process
    restart and is rediscovered by its orderTag. Skips without DATABASE_URL; ciPgRequired makes that skip fail CI. */
-test("C03/PG: a PREPARED attempt survives a simulated restart and is found by orderTag", { skip: requirePgOrSkip() }, async () => {
+test("C03/PG: a PREPARED attempt survives a simulated restart and is found by orderTag", { skip: REAL_DATABASE_URL ? false : "DATABASE_URL not set — restart-recovery tests need a real Postgres" }, async () => {
   delete process.env.ORDER_ATTEMPTS_FILE;
+  process.env.DATABASE_URL = REAL_DATABASE_URL;   // restore the URL the before-hook cleared, so db.js talks to real PG
   let boot = freshRequire(["../../db.js"]);   // "first boot"
   await boot.db.initDb();
   const id = `PGATT_${Date.now()}`;
