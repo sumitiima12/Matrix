@@ -9,9 +9,10 @@
  * Certification status (this program):
  *   • FYERS — passed the literal /api/broker/order route suite, C03 write-before-send + startup/periodic recovery,
  *     C01 canonical exit accounting, H04 execution events + fees, and R30 multi-source absence. Fully certified.
- *   • Delta — existing verified-fill + native bracket + reduce-only real trading, but NOT yet run through the C03
- *     durable-attempt route suite or the 2-instance multi-broker matrix ⇒ durable/startup-recovery/unattended
- *     remain UNCERTIFIED (false) pending that suite.
+ *   • Delta — FULLY CERTIFIED (2026-08-05): verified-fill + native bracket + reduce-only real trading, PLUS the C03
+ *     durable write-before-send + startup/periodic recovery and the MatrixOne-path E2E, all proven GREEN on the
+ *     static-IP self-hosted runner against Delta testnet (real fill → protection → reduce-only close → broker-flat,
+ *     single-owner claim, idempotent recovery). durable/startup-recovery/unattended are all true.
  *   • Zerodha / others — connection + portfolio only until their fill-truth + route suites pass.
  *
  * R31-P2-06: manualEntry/manualExit are certified ONLY together with verifiedFill. A broker whose order route can
@@ -21,7 +22,7 @@
  *
  * Bump CERTIFICATION_VERSION whenever a flag flips so the admin diagnostic + clients can see which matrix is live.
  */
-const CERTIFICATION_VERSION = "2026-08-05.1";
+const CERTIFICATION_VERSION = "2026-08-05.2";
 
 const ALL_CAPS = [
   "connect", "portfolio", "manualEntry", "manualExit", "verifiedFill",
@@ -47,10 +48,14 @@ const BROKER_CAPABILITIES = {
     // (lost-response → restart → adopt-once, no resend). Those descriptive flags are true. These gate nothing on their
     // own — they're the certification matrix shown in diagnostics.
     durableAttempts: true, startupRecovery: true,
-    // unattendedAutomation stays FALSE until the MatrixOne-path E2E (test/brokerPipelineE2E.sandbox.cjs) passes GREEN
-    // on the static-IP self-hosted runner against Delta testnet (broker-truth flat/close, concurrent single-owner) and
-    // that per-SHA evidence is published. This is THE gate the auto-buy engine + Go-Live route check — never flip it
-    // from code alone; flip it only alongside the runner-green certification evidence.
+    // R40 CERTIFIED (2026-08-05, evidence commit chain ending 49d502e): the Delta testnet order+fill certification
+    // (test/deltaTestnet.sandbox.cjs) AND the MatrixOne-path E2E (test/brokerPipelineE2E.sandbox.cjs) BOTH passed GREEN
+    // on the static-IP self-hosted runner against Delta testnet — a real fill (broker-truth verified) → managed
+    // protection → reduce-only close → broker-flat, single-owner signal claim, and idempotent C03 recovery — with
+    // per-SHA evidence published (broker-sandbox-delta-evidence + broker-e2e artifacts). This is THE gate the auto-buy
+    // engine + Go-Live route check consult, so it is now TRUE. (Actual production release stays separately gated by
+    // vars.REAL_MONEY_RELEASE=1 on the release branch + the protected deploy job's evidence verification.)
+    unattendedAutomation: true,
   }),
   // R31-P2-06: Zerodha's real order route lacks the verified-fill + partial + durable-attempt + recovery journeys
   // that FYERS/Delta passed, so manualEntry/manualExit stay FALSE (were overstated as true). Connection + portfolio

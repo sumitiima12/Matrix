@@ -7,15 +7,17 @@ test("S1: FYERS is fully certified (passed the route/recovery/exit/protection su
   for (const c of caps.ALL_CAPS) assert.equal(caps.brokerCap("fyers", c), true, `fyers.${c} should be certified`);
 });
 
-test("S1: Delta has manual real trading + durable/recovery (R40, proven in deltaRecovery.test.cjs); unattended still uncertified", () => {
-  assert.equal(caps.brokerCap("delta", "manualEntry"), true, "manual real trading stays available");
+test("S1: Delta is FULLY CERTIFIED (R40) — manual real trading + durable/recovery + unattended automation (runner-green)", () => {
+  assert.equal(caps.brokerCap("delta", "manualEntry"), true, "manual real trading available");
   assert.equal(caps.brokerCap("delta", "verifiedFill"), true);
-  // R40: Delta now has the durable write-before-send + startup/periodic broker-truth recovery (proven hermetically in
-  // test/deltaRecovery.test.cjs: lost-response → restart → adopt-once, no resend). These are descriptive (gate nothing).
-  assert.equal(caps.brokerCap("delta", "durableAttempts"), true, "C03 durable attempts now implemented + tested for Delta");
-  assert.equal(caps.brokerCap("delta", "startupRecovery"), true, "startup/periodic broker-truth recovery now implemented for Delta");
-  // THE real gate stays FALSE until the MatrixOne-path E2E passes green on the static-IP runner (broker-e2e).
-  assert.equal(caps.brokerCap("delta", "unattendedAutomation"), false, "unattended real automation stays uncertified until the runner E2E is green");
+  // R40: Delta has the durable write-before-send + startup/periodic broker-truth recovery (proven hermetically in
+  // test/deltaRecovery.test.cjs: lost-response → restart → adopt-once, no resend).
+  assert.equal(caps.brokerCap("delta", "durableAttempts"), true, "C03 durable attempts implemented + tested for Delta");
+  assert.equal(caps.brokerCap("delta", "startupRecovery"), true, "startup/periodic broker-truth recovery implemented for Delta");
+  // THE gate the auto-buy engine consults: TRUE now that the Delta testnet order+fill cert (deltaTestnet.sandbox.cjs)
+  // AND the MatrixOne-path E2E (brokerPipelineE2E.sandbox.cjs) both passed GREEN on the static-IP self-hosted runner
+  // (broker-sandbox-delta + broker-e2e), with per-SHA evidence published.
+  assert.equal(caps.brokerCap("delta", "unattendedAutomation"), true, "unattended real automation certified on the runner-green evidence");
   assert.equal(caps.brokerCap("delta", "connect"), true, "connection always available");
 });
 
