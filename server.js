@@ -2009,6 +2009,9 @@ const fyFetchOpts = fyersDispatcher ? { dispatcher: fyersDispatcher } : {};
    data/trading host is redirected (that's all the order/account/verify/probe paths use); the auth hosts are
    left alone. */
 const FYERS_API_BASE = String(process.env.FYERS_API_BASE || "").replace(/\/$/, "");
+// Dhan base seam — prod api.dhan.co by default; overridable to the sandbox (sandbox.dhan.co) for certification, or
+// to a fake HTTP server for hermetic tests. Trailing slash stripped so `${DHAN_API_BASE}/v2/...` is always well-formed.
+const DHAN_API_BASE = String(process.env.DHAN_API_BASE || "https://api.dhan.co").replace(/\/+$/, "");
 function _fyRewrite(url) {
   if (!FYERS_API_BASE) return url;
   try {
@@ -6323,7 +6326,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         orderType: "MARKET", validity: "DAY", securityId, quantity: String(Number(qty)),
         price: "", disclosedQuantity: "", afterMarketOrder: false,
       };
-      const r = await fetch("https://api.dhan.co/v2/orders", { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || d.orderStatus === "REJECTED" || d.errorType) throw new Error(d.errorMessage || d.omsErrorDescription || `Dhan order failed (${r.status})`);
       const autoExitId = await registerAutoExit();
@@ -7106,7 +7109,7 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
   if (broker === "dhan") {
     const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
     const body = { dhanClientId: sess.extra && sess.extra.clientId, transactionType: "SELL", exchangeSegment: "NSE_EQ", productType: "INTRADAY", orderType: "MARKET", validity: "DAY", securityId, quantity: String(Number(qty)), price: "", afterMarketOrder: false };
-    const r = await fetch("https://api.dhan.co/v2/orders", { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.orderStatus === "REJECTED") throw new Error(d.errorMessage || d.omsErrorDescription || `Dhan exit failed (${r.status})`);
     return { orderId: d.orderId ?? null };
