@@ -206,7 +206,7 @@ jobs:
           BROKER_SANDBOX=1 node --test $FILES 2>&1 | tee -a artifacts/broker-sandbox.tap
           PASS=$(grep -c '^ok ' artifacts/broker-sandbox.tap || true)
           FAIL=$(grep -c '^not ok ' artifacts/broker-sandbox.tap || true)
-          SKIP=$(grep -Ec '# (SKIP|skip)' artifacts/broker-sandbox.tap || true)
+          SKIP=$(grep -Ec '^(ok|not ok) .*# (SKIP|skip)\b' artifacts/broker-sandbox.tap || true)
           echo "pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee -a artifacts/broker-sandbox.txt
           # A real certification requires pass>0, fail=0 AND skipped=0 (no vacuous/absent execution).
           if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
@@ -252,7 +252,7 @@ jobs:
           BROKER_SANDBOX=1 node --test test/deltaTestnet*.cjs 2>&1 | tee artifacts/broker-sandbox-delta.tap
           PASS=$(grep -c '^ok ' artifacts/broker-sandbox-delta.tap || true)
           FAIL=$(grep -c '^not ok ' artifacts/broker-sandbox-delta.tap || true)
-          SKIP=$(grep -Ec '# (SKIP|skip)' artifacts/broker-sandbox-delta.tap || true)
+          SKIP=$(grep -Ec '^(ok|not ok) .*# (SKIP|skip)\b' artifacts/broker-sandbox-delta.tap || true)
           echo "commit=${GITHUB_SHA} want_delta=1 pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee artifacts/broker-sandbox-delta.txt
           if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
             echo "broker_delta=NOT_CERTIFIED" | tee -a artifacts/broker-sandbox-delta.txt
@@ -313,7 +313,7 @@ jobs:
           node --test --test-force-exit test/brokerPipelineE2E.sandbox.cjs 2>&1 | tee artifacts/broker-e2e.tap
           PASS=$(grep -c '^ok ' artifacts/broker-e2e.tap || true)
           FAIL=$(grep -c '^not ok ' artifacts/broker-e2e.tap || true)
-          SKIP=$(grep -Ec '# (SKIP|skip)' artifacts/broker-e2e.tap || true)
+          SKIP=$(grep -Ec '^(ok|not ok) .*# (SKIP|skip)\b' artifacts/broker-e2e.tap || true)
           echo "commit=${GITHUB_SHA} pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee artifacts/broker-e2e.txt
           # A real certification: pass>0, fail=0, skipped=0 (no vacuous run).
           if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
