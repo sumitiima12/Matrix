@@ -6320,17 +6320,79 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
 
     if (broker === "dhan") {
       const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
-      const body = {
+      const dhanBody = {
         dhanClientId: sess.extra && sess.extra.clientId, transactionType: String(side).toUpperCase(),
         exchangeSegment: "NSE_EQ", productType: product === "CNC" ? "CNC" : "INTRADAY",
         orderType: "MARKET", validity: "DAY", securityId, quantity: String(Number(qty)),
         price: "", disclosedQuantity: "", afterMarketOrder: false,
       };
-      const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || d.orderStatus === "REJECTED" || d.errorType) throw new Error(d.errorMessage || d.omsErrorDescription || `Dhan order failed (${r.status})`);
-      const autoExitId = await registerAutoExit();
-      return res.json({ ok: true, broker, orderId: d.orderId ?? null, status: d.orderStatus || "PENDING", autoExitId });
+      /* A 200 from Dhan is ACCEPTANCE, not a fill. Submit through the DURABLE C03 attempt (write-before-send +
+         crash/lost-response recovery, the same machinery FYERS/Delta use), THEN verify the fill from broker truth
+         (poll /v2/orders → TRADED). Only a VERIFIED fill journals an authoritative row / arms auto-exit — a rejected
+         or still-pending entry arms nothing, so the exit engine can never SELL against a holding that doesn't exist. */
+      const _dhanSubmit = async () => {
+        const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { method: "POST", headers: { ...brokerAuth("dhan", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(dhanBody) });
+        const dd = await r.json().catch(() => ({}));
+        if (!r.ok || dd.orderStatus === "REJECTED" || dd.errorType) throw new Error(dd.errorMessage || dd.omsErrorDescription || `Dhan order failed (${r.status})`);
+        return { orderId: dd.orderId ?? (dd.data && (dd.data.orderId || dd.data.order_id)) ?? null, status: dd.orderStatus || "PENDING" };
+      };
+      let dres;
+      if (C03_ORDER_ATTEMPTS_ON) {
+        const attempt = {
+          id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "dhan", idemKey,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          symbol, side, qty: Number(qty), product,
+          protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
+        };
+        const out = await orderRecovery.submitWithAttempt({
+          db, attempt, submit: _dhanSubmit,
+          classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.orderId != null ? String(dd.orderId) : null } }),
+          classifyError: (e) => { const m = String((e && e.message) || e || ""); return /reject|insufficient|margin|rms|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null; },
+        });
+        if (out && (out.replay || out.fenced)) {
+          return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
+        }
+        dres = out;
+      } else {
+        dres = await _dhanSubmit();
+      }
+      const dhanOrderId = dres && dres.orderId != null ? String(dres.orderId) : null;
+      await db.markIdempotencyTagged(idemUser, idemKey);
+      const c = await verifyDhanFill(sess, dhanOrderId, Number(qty));
+      const fillStatus = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "PENDING");
+      if (C03_ORDER_ATTEMPTS_ON) {
+        try {
+          const st = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "ACCEPTED");
+          await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: dhanOrderId, ...(c.filled ? { filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice } : {}) });
+        } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
+      }
+      if (c.rejected) {
+        return res.status(400).json({ ok: false, status: "rejected", broker, orderId: dhanOrderId, reason: c.reason || "Order not filled — likely insufficient funds/margin, or the symbol isn't tradeable right now on Dhan" });
+      }
+      let dhanAutoExitId = null, dhanTrackingFailed = false;
+      const dhanMarket = regMarket || "IN";
+      const bareDhanSym = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
+      if (c.filled) {
+        const isReduceClose = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+        if (isReduceClose) {
+          const ex = await applyReduceOnlyExit(storageKeyFor(sess.userId), {
+            sym: bareDhanSym, closeSide: side, qty: c.filledQty || Number(qty), exitPx: Number(c.avgPrice) || Number(price) || 0,
+            orderId: dhanOrderId, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null,
+            broker: "dhan", market: dhanMarket, tradeType: String(req.body?.tradeType || "Manual"),
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (ex && (ex.error || ex.reconcileRequired || ex.projectionPending)) dhanTrackingFailed = true;
+        } else {
+          const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+            sym: bareDhanSym, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
+            entryAt: Date.now(), market: dhanMarket, real: true, broker: "dhan", tradeType: String(req.body?.tradeType || "Manual"), orderId: dhanOrderId, serverAuthored: true,
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (!journaled) dhanTrackingFailed = true;
+          dhanAutoExitId = await registerAutoExit(c.filledQty || Number(qty), Number(c.avgPrice) || undefined);
+        }
+      }
+      return res.json({ ok: true, broker, orderId: dhanOrderId, status: fillStatus, autoExitId: dhanAutoExitId, ...(dhanTrackingFailed ? { reconcileRequired: true } : {}) });
     }
 
     if (broker === "angelone") {
@@ -6991,6 +7053,36 @@ async function verifyFyersFill(sess, orderId, wantQty = 0) {
       // still transit/pending → wait and re-poll
     } catch { /* transient — keep polling */ }
     if (attempt < 3) await new Promise((res) => setTimeout(res, 800));
+  }
+  return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+}
+
+/* Dhan fill verification from BROKER TRUTH. A 200 on POST /v2/orders is only ACCEPTANCE — poll GET /v2/orders until
+   our order reaches TRADED (capturing the real traded price + qty) or a terminal REJECTED/CANCELLED. Mirrors
+   verifyFyersFill; honours DHAN_API_BASE so the sandbox / hermetic-test base is used. Never fabricates a fill:
+   an unresolved poll returns pending (the C03 attempt stays ACCEPTED for startup reconciliation). */
+async function verifyDhanFill(sess, orderId, wantQty = 0) {
+  if (!orderId) return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+  const auth = { ...brokerAuth("dhan", sess.accessToken, sess.userId), Accept: "application/json" };
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const r = await fetch(`${DHAN_API_BASE}/v2/orders`, { headers: auth });
+      const d = await r.json().catch(() => null);
+      const arr = Array.isArray(d) ? d : (d && Array.isArray(d.data) ? d.data : []);
+      const o = arr.find((x) => String(x.orderId) === String(orderId));
+      if (o) {
+        const st = String(o.orderStatus || o.status || "").toUpperCase();
+        if (/TRADED|FILLED|EXECUTED|COMPLETE/.test(st)) {
+          const filledQty = Number(o.filledQty ?? o.tradedQty ?? o.quantity ?? wantQty) || wantQty;
+          const avgPrice = Number(o.averageTradedPrice ?? o.avgPrice ?? o.tradedPrice ?? o.price) || null;
+          return { filled: true, rejected: false, pending: false, filledQty, avgPrice, status: st };
+        }
+        if (/REJECTED|CANCELLED|CANCELED|FAILED/.test(st)) {
+          return { filled: false, rejected: true, pending: false, filledQty: 0, avgPrice: null, status: st, reason: o.omsErrorDescription || o.errorMessage || null };
+        }
+      }
+    } catch { /* transient — keep polling */ }
+    if (attempt < 7) await new Promise((res) => setTimeout(res, 800));
   }
   return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
 }
