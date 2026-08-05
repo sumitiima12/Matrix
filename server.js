@@ -6247,18 +6247,77 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const { apiKey, apiSecret } = sess.extra || {};
       const base = String(symbol).replace(/(INR|USDT)$/i, "").toUpperCase();
       const market = `${base}INR`;
-      const body = {
+      const coinBody = {
         side: String(side).toLowerCase() === "buy" ? "buy" : "sell",
         order_type: orderType === "LIMIT" ? "limit_order" : "market_order",
         market,
         total_quantity: Number(qty),
         ...(orderType === "LIMIT" && price ? { price_per_unit: Number(price) } : {}),
       };
-      const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", body);
-      if (!r.ok || d.message || d.code) throw new Error(d.message || `CoinDCX order failed (${r.status}).`);
-      const o = (d.orders && d.orders[0]) || d;
-      const autoExitId = await registerAutoExit();
-      return res.json({ ok: true, broker, orderId: o.id || o.order_id || null, status: o.status || "PENDING", autoExitId });
+      /* Acceptance ≠ fill. Submit through the DURABLE C03 attempt (write-before-send + crash/lost-response recovery),
+         THEN verify from broker truth (poll /orders/status → filled). Only a VERIFIED fill journals an authoritative
+         row / arms auto-exit; a rejected or still-pending order arms nothing. Mirrors the Dhan/Delta/FYERS paths. */
+      const _coinSubmit = async () => {
+        const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", coinBody);
+        if (!r.ok || d.message || d.code) throw new Error(d.message || `CoinDCX order failed (${r.status}).`);
+        const o = (d.orders && d.orders[0]) || d;
+        return { orderId: o.id || o.order_id || null, status: o.status || "PENDING" };
+      };
+      let cres;
+      if (C03_ORDER_ATTEMPTS_ON) {
+        const attempt = {
+          id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "coindcx", idemKey,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          symbol, side, qty: Number(qty), product,
+          protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
+        };
+        const out = await orderRecovery.submitWithAttempt({
+          db, attempt, submit: _coinSubmit,
+          classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.orderId != null ? String(dd.orderId) : null } }),
+          classifyError: (e) => { const m = String((e && e.message) || e || ""); return /reject|insufficient|balance|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null; },
+        });
+        if (out && (out.replay || out.fenced)) {
+          return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
+        }
+        cres = out;
+      } else {
+        cres = await _coinSubmit();
+      }
+      const coinOrderId = cres && cres.orderId != null ? String(cres.orderId) : null;
+      await db.markIdempotencyTagged(idemUser, idemKey);
+      const c = await verifyCoindcxFill(apiKey, apiSecret, coinOrderId, Number(qty));
+      const fillStatus = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "PENDING");
+      if (C03_ORDER_ATTEMPTS_ON) {
+        try {
+          const st = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "ACCEPTED");
+          await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: coinOrderId, ...(c.filled ? { filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice } : {}) });
+        } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
+      }
+      if (c.rejected) {
+        return res.status(400).json({ ok: false, status: "rejected", broker, orderId: coinOrderId, reason: c.reason || "Order not filled — likely insufficient balance on your CoinDCX account" });
+      }
+      let coinAutoExitId = null, coinTrackingFailed = false;
+      if (c.filled) {
+        const isReduceClose = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+        if (isReduceClose) {
+          const ex = await applyReduceOnlyExit(storageKeyFor(sess.userId), {
+            sym: base, closeSide: side, qty: c.filledQty || Number(qty), exitPx: Number(c.avgPrice) || Number(price) || 0,
+            orderId: coinOrderId, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null,
+            broker: "coindcx", market: "Crypto", tradeType: String(req.body?.tradeType || "Manual"),
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (ex && (ex.error || ex.reconcileRequired || ex.projectionPending)) coinTrackingFailed = true;
+        } else {
+          const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+            sym: base, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
+            entryAt: Date.now(), market: "Crypto", real: true, broker: "coindcx", tradeType: String(req.body?.tradeType || "Manual"), orderId: coinOrderId, serverAuthored: true,
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (!journaled) coinTrackingFailed = true;
+          coinAutoExitId = await registerAutoExit(c.filledQty || Number(qty), Number(c.avgPrice) || undefined);
+        }
+      }
+      return res.json({ ok: true, broker, orderId: coinOrderId, status: fillStatus, autoExitId: coinAutoExitId, ...(coinTrackingFailed ? { reconcileRequired: true } : {}) });
     }
 
     if (broker === "schwab") {
@@ -7178,6 +7237,31 @@ async function verifyIndmoneyFill(sess, orderId, wantQty = 0) {
         if (/REJECT|CANCEL|FAIL/.test(st)) {
           return { filled: false, rejected: true, pending: false, filledQty: 0, avgPrice: null, status: st, reason: o.message || o.reason || o.rejection_reason || null };
         }
+      }
+    } catch { /* transient — keep polling */ }
+    if (attempt < 7) await new Promise((res) => setTimeout(res, 800));
+  }
+  return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+}
+
+/* CoinDCX fill verification from BROKER TRUTH. The /orders/create response is acceptance — poll POST
+   /exchange/v1/orders/status (signed) until the order reaches "filled" (capture avg price + filled qty) or a terminal
+   rejected/cancelled. Mirrors verifyDhanFill. A partially_filled/open order keeps polling; an unresolved poll returns
+   pending (never fabricates a fill — the C03 attempt stays ACCEPTED for startup reconciliation). */
+async function verifyCoindcxFill(apiKey, apiSecret, orderId, wantQty = 0) {
+  if (!orderId) return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const { d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/status", { id: String(orderId) });
+      const o = (d && Array.isArray(d.orders) && d.orders[0]) || (d && d.order) || d || {};
+      const st = String(o.status || "").toLowerCase();
+      if (st === "filled" || st === "closed" || st === "executed") {
+        const filledQty = Number(o.filled_quantity ?? o.total_quantity ?? o.quantity ?? wantQty) || wantQty;
+        const avgPrice = Number(o.avg_price ?? o.average_price ?? o.price_per_unit ?? o.price) || null;
+        return { filled: true, rejected: false, pending: false, filledQty, avgPrice, status: st };
+      }
+      if (st === "rejected" || st === "cancelled" || st === "canceled" || st === "partially_cancelled") {
+        return { filled: false, rejected: true, pending: false, filledQty: 0, avgPrice: null, status: st, reason: o.status_message || o.message || null };
       }
     } catch { /* transient — keep polling */ }
     if (attempt < 7) await new Promise((res) => setTimeout(res, 800));
