@@ -5944,20 +5944,80 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
   try {
     if (broker === "zerodha") {
       const [exchange, tradingsymbol] = String(symbol).split(":");
-      const body = new URLSearchParams({
+      const kiteBody = new URLSearchParams({
         exchange, tradingsymbol,
         transaction_type: side, quantity: String(qty),
         order_type: orderType, product,
         validity: "DAY",
         ...(orderType === "LIMIT" && price ? { price: String(price) } : {}),
       });
-      const r = await fetch("https://api.kite.trade/orders/regular", {
-        method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/x-www-form-urlencoded" }, body,
-      });
-      const d = await r.json();
-      if (!r.ok || d.status === "error") throw new Error(d.message || `kite ${r.status}`);
-      const autoExitId = await registerAutoExit();
-      return res.json({ orderId: d.data.order_id, status: "PENDING", broker, autoExitId });
+      /* Acceptance ≠ fill. Durable C03 attempt (write-before-send + recovery) then VERIFY from broker truth
+         (poll GET /orders/{id} → COMPLETE). Only a verified fill journals / arms auto-exit. Mirrors Dhan/Delta/FYERS. */
+      const _kiteSubmit = async () => {
+        const r = await fetch("https://api.kite.trade/orders/regular", {
+          method: "POST", headers: { ...brokerAuth("zerodha", token, sess.userId), "Content-Type": "application/x-www-form-urlencoded" }, body: kiteBody,
+        });
+        const dd = await r.json().catch(() => ({}));
+        if (!r.ok || dd.status === "error") throw new Error(dd.message || `kite ${r.status}`);
+        return { orderId: (dd.data && dd.data.order_id) || null, status: "PENDING" };
+      };
+      let kres;
+      if (C03_ORDER_ATTEMPTS_ON) {
+        const attempt = {
+          id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "zerodha", idemKey,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          symbol, side, qty: Number(qty), product,
+          protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
+        };
+        const out = await orderRecovery.submitWithAttempt({
+          db, attempt, submit: _kiteSubmit,
+          classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.orderId != null ? String(dd.orderId) : null } }),
+          classifyError: (e) => { const m = String((e && e.message) || e || ""); return /reject|insufficient|margin|rms|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null; },
+        });
+        if (out && (out.replay || out.fenced)) {
+          return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
+        }
+        kres = out;
+      } else {
+        kres = await _kiteSubmit();
+      }
+      const kiteOrderId = kres && kres.orderId != null ? String(kres.orderId) : null;
+      await db.markIdempotencyTagged(idemUser, idemKey);
+      const c = await verifyZerodhaFill(sess, kiteOrderId, Number(qty));
+      const fillStatus = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "PENDING");
+      if (C03_ORDER_ATTEMPTS_ON) {
+        try {
+          const st = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "ACCEPTED");
+          await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: kiteOrderId, ...(c.filled ? { filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice } : {}) });
+        } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
+      }
+      if (c.rejected) {
+        return res.status(400).json({ ok: false, status: "rejected", broker, orderId: kiteOrderId, reason: c.reason || "Order not filled — likely insufficient funds/margin, or the symbol isn't tradeable right now on Zerodha" });
+      }
+      let kiteAutoExitId = null, kiteTrackingFailed = false;
+      const kiteMarket = regMarket || "IN";
+      const bareKiteSym = String(tradingsymbol || symbol).replace(/-EQ$/, "");
+      if (c.filled) {
+        const isReduceClose = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+        if (isReduceClose) {
+          const ex = await applyReduceOnlyExit(storageKeyFor(sess.userId), {
+            sym: bareKiteSym, closeSide: side, qty: c.filledQty || Number(qty), exitPx: Number(c.avgPrice) || Number(price) || 0,
+            orderId: kiteOrderId, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null,
+            broker: "zerodha", market: kiteMarket, tradeType: String(req.body?.tradeType || "Manual"),
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (ex && (ex.error || ex.reconcileRequired || ex.projectionPending)) kiteTrackingFailed = true;
+        } else {
+          const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+            sym: bareKiteSym, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
+            entryAt: Date.now(), market: kiteMarket, real: true, broker: "zerodha", tradeType: String(req.body?.tradeType || "Manual"), orderId: kiteOrderId, serverAuthored: true,
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (!journaled) kiteTrackingFailed = true;
+          kiteAutoExitId = await registerAutoExit(c.filledQty || Number(qty), Number(c.avgPrice) || undefined);
+        }
+      }
+      return res.json({ ok: true, broker, orderId: kiteOrderId, status: fillStatus, autoExitId: kiteAutoExitId, ...(kiteTrackingFailed ? { reconcileRequired: true } : {}) });
     }
 
     if (broker === "fyers") {
@@ -6476,15 +6536,74 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
 
     if (broker === "groww") {
       const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
-      const body = {
+      const growwBody = {
         trading_symbol: bare, quantity: Number(qty), validity: "DAY", exchange: "NSE", segment: "CASH",
         product: product === "CNC" ? "CNC" : "MIS", order_type: "MARKET", transaction_type: String(side).toUpperCase(),
       };
-      const r = await fetch("https://api.groww.in/v1/order/create", { method: "POST", headers: { ...brokerAuth("groww", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || d.status === "FAILURE" || d.error) throw new Error((d.error && (d.error.message || d.error)) || d.message || `Groww order failed (${r.status})`);
-      const autoExitId = await registerAutoExit();
-      return res.json({ ok: true, broker, orderId: (d.payload && d.payload.groww_order_id) || d.groww_order_id || null, status: "PENDING", autoExitId });
+      /* Acceptance ≠ fill. Durable C03 attempt (write-before-send + recovery) then VERIFY from broker truth
+         (poll /v1/order/detail → EXECUTED). Only a verified fill journals / arms auto-exit. Mirrors Dhan/Delta/FYERS. */
+      const _growwSubmit = async () => {
+        const r = await fetch("https://api.groww.in/v1/order/create", { method: "POST", headers: { ...brokerAuth("groww", token, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify(growwBody) });
+        const dd = await r.json().catch(() => ({}));
+        if (!r.ok || dd.status === "FAILURE" || dd.error) throw new Error((dd.error && (dd.error.message || dd.error)) || dd.message || `Groww order failed (${r.status})`);
+        return { orderId: (dd.payload && dd.payload.groww_order_id) || dd.groww_order_id || null, status: (dd.payload && dd.payload.order_status) || "PENDING" };
+      };
+      let gres;
+      if (C03_ORDER_ATTEMPTS_ON) {
+        const attempt = {
+          id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "groww", idemKey,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          symbol, side, qty: Number(qty), product,
+          protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
+        };
+        const out = await orderRecovery.submitWithAttempt({
+          db, attempt, submit: _growwSubmit,
+          classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.orderId != null ? String(dd.orderId) : null } }),
+          classifyError: (e) => { const m = String((e && e.message) || e || ""); return /reject|insufficient|margin|rms|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null; },
+        });
+        if (out && (out.replay || out.fenced)) {
+          return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
+        }
+        gres = out;
+      } else {
+        gres = await _growwSubmit();
+      }
+      const growwOrderId = gres && gres.orderId != null ? String(gres.orderId) : null;
+      await db.markIdempotencyTagged(idemUser, idemKey);
+      const c = await verifyGrowwFill(sess, growwOrderId, Number(qty));
+      const fillStatus = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "PENDING");
+      if (C03_ORDER_ATTEMPTS_ON) {
+        try {
+          const st = c.filled ? "FILLED" : (c.rejected ? "REJECTED" : "ACCEPTED");
+          await db.finalizeOrderAttempt(`oa_${idemUser}_${idemKey}`, st, { brokerOrderId: growwOrderId, ...(c.filled ? { filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice } : {}) });
+        } catch { /* leave ACCEPTED/unresolved → recovery resolves it */ }
+      }
+      if (c.rejected) {
+        return res.status(400).json({ ok: false, status: "rejected", broker, orderId: growwOrderId, reason: c.reason || "Order not filled — likely insufficient funds/margin, or the symbol isn't tradeable right now on Groww" });
+      }
+      let growwAutoExitId = null, growwTrackingFailed = false;
+      const growwMarket = regMarket || "IN";
+      if (c.filled) {
+        const isReduceClose = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+        if (isReduceClose) {
+          const ex = await applyReduceOnlyExit(storageKeyFor(sess.userId), {
+            sym: bare, closeSide: side, qty: c.filledQty || Number(qty), exitPx: Number(c.avgPrice) || Number(price) || 0,
+            orderId: growwOrderId, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null,
+            broker: "groww", market: growwMarket, tradeType: String(req.body?.tradeType || "Manual"),
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (ex && (ex.error || ex.reconcileRequired || ex.projectionPending)) growwTrackingFailed = true;
+        } else {
+          const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
+            sym: bare, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
+            entryAt: Date.now(), market: growwMarket, real: true, broker: "groww", tradeType: String(req.body?.tradeType || "Manual"), orderId: growwOrderId, serverAuthored: true,
+            ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
+          }, { haltUserIdOnFail: sess.userId });
+          if (!journaled) growwTrackingFailed = true;
+          growwAutoExitId = await registerAutoExit(c.filledQty || Number(qty), Number(c.avgPrice) || undefined);
+        }
+      }
+      return res.json({ ok: true, broker, orderId: growwOrderId, status: fillStatus, autoExitId: growwAutoExitId, ...(growwTrackingFailed ? { reconcileRequired: true } : {}) });
     }
 
     if (broker === "indmoney") {
@@ -7262,6 +7381,59 @@ async function verifyCoindcxFill(apiKey, apiSecret, orderId, wantQty = 0) {
       }
       if (st === "rejected" || st === "cancelled" || st === "canceled" || st === "partially_cancelled") {
         return { filled: false, rejected: true, pending: false, filledQty: 0, avgPrice: null, status: st, reason: o.status_message || o.message || null };
+      }
+    } catch { /* transient — keep polling */ }
+    if (attempt < 7) await new Promise((res) => setTimeout(res, 800));
+  }
+  return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+}
+
+/* Groww fill verification from BROKER TRUTH. A place-order 200 is acceptance — poll GET
+   /v1/order/detail/{id}?segment=CASH until order_status is EXECUTED/COMPLETE (capture average_fill_price +
+   filled_quantity) or a terminal REJECTED/CANCELLED. Mirrors verifyDhanFill; never fabricates a fill. */
+async function verifyGrowwFill(sess, orderId, wantQty = 0) {
+  if (!orderId) return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+  const auth = { ...brokerAuth("groww", sess.accessToken, sess.userId), Accept: "application/json", "X-API-VERSION": "1.0" };
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const r = await fetch(`https://api.groww.in/v1/order/detail/${encodeURIComponent(orderId)}?segment=CASH`, { headers: auth });
+      const d = await r.json().catch(() => null);
+      const o = (d && d.payload) || (d && d.data) || d || {};
+      const st = String(o.order_status ?? o.status ?? "").toUpperCase();
+      if (/EXECUTED|COMPLETE|TRADED|FILLED/.test(st)) {
+        const filledQty = Number(o.filled_quantity ?? o.quantity ?? wantQty) || wantQty;
+        const avgPrice = Number(o.average_fill_price ?? o.avg_price ?? o.price) || null;
+        return { filled: true, rejected: false, pending: false, filledQty, avgPrice, status: st };
+      }
+      if (/REJECT|CANCEL|FAIL/.test(st)) {
+        return { filled: false, rejected: true, pending: false, filledQty: 0, avgPrice: null, status: st, reason: o.remark || o.message || null };
+      }
+    } catch { /* transient — keep polling */ }
+    if (attempt < 7) await new Promise((res) => setTimeout(res, 800));
+  }
+  return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+}
+
+/* Zerodha (Kite) fill verification from BROKER TRUTH. Order placement returns an order_id only — poll GET
+   /orders/{order_id} (Kite returns the order's status-history array; the LAST entry is current) until COMPLETE
+   (capture average_price + filled_quantity) or a terminal REJECTED/CANCELLED. Mirrors verifyDhanFill. */
+async function verifyZerodhaFill(sess, orderId, wantQty = 0) {
+  if (!orderId) return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
+  const auth = brokerAuth("zerodha", sess.accessToken, sess.userId);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const r = await fetch(`https://api.kite.trade/orders/${encodeURIComponent(orderId)}`, { headers: auth });
+      const d = await r.json().catch(() => null);
+      const arr = (d && Array.isArray(d.data)) ? d.data : [];
+      const o = arr.length ? arr[arr.length - 1] : ((d && d.data) || {});
+      const st = String(o.status ?? "").toUpperCase();
+      if (st === "COMPLETE") {
+        const filledQty = Number(o.filled_quantity ?? o.quantity ?? wantQty) || wantQty;
+        const avgPrice = Number(o.average_price ?? o.price) || null;
+        return { filled: true, rejected: false, pending: false, filledQty, avgPrice, status: st };
+      }
+      if (st === "REJECTED" || st === "CANCELLED") {
+        return { filled: false, rejected: true, pending: false, filledQty: 0, avgPrice: null, status: st, reason: o.status_message || null };
       }
     } catch { /* transient — keep polling */ }
     if (attempt < 7) await new Promise((res) => setTimeout(res, 800));
