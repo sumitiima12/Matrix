@@ -142,6 +142,9 @@ jobs:
           FYERS_SANDBOX_BASE: ${{ vars.FYERS_SANDBOX_BASE }}
           FYERS_SANDBOX_SYMBOL: ${{ vars.FYERS_SANDBOX_SYMBOL }}
           FYERS_SANDBOX_MAX_QTY: ${{ vars.FYERS_SANDBOX_MAX_QTY }}
+          # R39-P1-05: the isolated-account allow-list — the FYERS suite REFUSES to place unless the authenticated
+          # account id is on this list, so a generic credential can never trade an unintended (e.g. personal) account.
+          FYERS_SANDBOX_ACCOUNT_ALLOW: ${{ vars.FYERS_SANDBOX_ACCOUNT_ALLOW }}
           DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
           DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
           DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
