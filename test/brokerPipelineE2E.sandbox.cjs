@@ -103,7 +103,7 @@ async function brokerProductId(symbol) {
 
 const PHONE = "9" + String(Math.floor(1e8 + Math.random() * 8e8));
 const SKEY = "ph_" + PHONE;
-let TOKEN = null, SESSION = null;
+let TOKEN = null, SESSION = null, QTY = null;
 const newKey = () => "e2e_" + Math.random().toString(36).slice(2, 12);
 const oh = (idem, extra = {}) => ({ "X-Broker-Session": SESSION, "X-Confirm-Live": "yes", "X-Idempotency-Key": idem, ...extra });
 const openTrades = async () => (await db.getTrades(SKEY, 0, Date.now())).filter((t) => t && t.real && t.broker === "delta" && t.entryAt != null && t.exitAt == null && t.exit == null && t.status !== "rejected");
@@ -137,6 +137,15 @@ test.before(async () => {
   await db.createUser(PHONE, bcrypt.hashSync("1234", 8), "E2E Trader", null, null, null, null, true);
   TOKEN = auth.signToken(PHONE, process.env.JWT_SECRET, 24 * 3600 * 1000, 0);
   SESSION = server.putBrokerSession(SKEY, "delta", "server-signed");
+
+  // The MatrixOne /api/broker/order path sizes CRYPTO in COIN units (its risk notional = qty × price), whereas
+  // DELTA_SANDBOX_MAX_SIZE is a CONTRACT count. Convert: qty(coin) = contract_value × SIZE(contracts) so the app
+  // places EXACTLY SIZE contracts at the venue's minimum, with a real (small) notional that fits the testnet wallet —
+  // instead of reading "1" as one whole coin (~$64k for BTC). Resolved from broker truth (/v2/products.contract_value).
+  const prods = await deltaGet("/v2/products").catch(() => []);
+  const prod = prods.find((x) => x.symbol === SYMBOL);
+  const cv = prod && Number(prod.contract_value) > 0 ? Number(prod.contract_value) : 1;
+  QTY = cv * SIZE;
 });
 
 test.after(async () => {
@@ -164,7 +173,7 @@ const guard = (fn) => async (t) => { if (!E2E) { t.skip("BROKER_E2E not enabled"
 
 test("E2E-J1: market BUY through MatrixOne verifies the fill and journals ONE authoritative real position", guard(async () => {
   const before = (await openTrades()).length;
-  const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey()), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: SIZE, orderType: "market" } });
+  const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey()), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: QTY, orderType: "market" } });
   assert.ok(r.status === 200 || r.status === 201, "order accepted after a VERIFIED fill: " + JSON.stringify(r.body));
   const open = await openTrades();
   assert.equal(open.length, before + 1, "exactly one new authoritative real Delta position journaled from broker truth");
@@ -172,7 +181,7 @@ test("E2E-J1: market BUY through MatrixOne verifies the fill and journals ONE au
 }));
 
 test("E2E-J2: an SL/TP request registers managed protection on the open position", guard(async () => {
-  const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey()), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: SIZE, orderType: "market", slPct: 2, tpPct: 4 } });
+  const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey()), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: QTY, orderType: "market", slPct: 2, tpPct: 4 } });
   assert.ok(r.status === 200 || r.status === 201, "protected entry accepted: " + JSON.stringify(r.body));
   const open = await openTrades();
   const protectedRow = open.find((t) => (t.sl != null || t.tp != null || t.slPct != null || t.tpPct != null));
@@ -183,7 +192,7 @@ test("E2E-J3: a reduce-only CLOSE makes the BROKER flat (queried directly) with 
   const open = await openTrades();
   assert.ok(open.length >= 1, "there is an open position to close");
   const pos = open[0];
-  const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey(), { "X-Reduce-Only": "yes" }), body: { broker: "delta", symbol: pos.symbol || SYMBOL, side: "sell", qty: Math.abs(Number(pos.qty) || SIZE), reduceOnly: true } });
+  const r = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(newKey(), { "X-Reduce-Only": "yes" }), body: { broker: "delta", symbol: pos.symbol || SYMBOL, side: "sell", qty: Math.abs(Number(pos.qty) || QTY), reduceOnly: true } });
   assert.ok(r.status === 200 || r.status === 201, "reduce-only close accepted: " + JSON.stringify(r.body));
   // BROKER TRUTH: re-read Delta positions until this symbol nets to zero (not merely "the local row closed").
   let net = null;
@@ -195,7 +204,7 @@ test("E2E-J3: a reduce-only CLOSE makes the BROKER flat (queried directly) with 
 
 test("E2E-J4: replaying the SAME idempotency key does not increase the BROKER's order count for that tag", guard(async () => {
   const key = newKey();
-  const body = { broker: "delta", symbol: SYMBOL, side: "buy", qty: SIZE, orderType: "market" };
+  const body = { broker: "delta", symbol: SYMBOL, side: "buy", qty: QTY, orderType: "market" };
   const r1 = await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(key), body });
   assert.ok(r1.status === 200 || r1.status === 201, "first submit accepted: " + JSON.stringify(r1.body));
   await new Promise((res) => setTimeout(res, 800));
@@ -212,7 +221,7 @@ test("E2E-J4: replaying the SAME idempotency key does not increase the BROKER's 
 
 test("E2E-J5: the C03 reconciler is IDEMPOTENT vs broker truth after a fill (no resend, no duplicate)", guard(async () => {
   const key = newKey();
-  await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(key), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: SIZE, orderType: "market" } });
+  await req("POST", "/api/broker/order", { token: TOKEN, headers: oh(key), body: { broker: "delta", symbol: SYMBOL, side: "buy", qty: QTY, orderType: "market" } });
   await new Promise((res) => setTimeout(res, 800));
   const beforeCount = await brokerOrderCountByTag(key);
   const beforeOpen = (await openTrades()).length;
