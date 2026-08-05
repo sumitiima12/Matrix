@@ -71,7 +71,10 @@ jobs:
           TAP=artifacts/backend-tests.tap
           PASS=$(grep -c '^ok ' "$TAP" || true)
           FAIL=$(grep -c '^not ok ' "$TAP" || true)
-          SKIP=$(grep -Ec '# (SKIP|skip)' "$TAP" || true)
+          # Count ONLY real TAP skip directives on test-result lines (e.g. `ok 8 - name # SKIP reason`). The previous
+          # `grep -Ec '# (SKIP|skip)'` also matched node:test's own summary line `# skipped N` (because `# skip` is a
+          # substring of `# skipped`), so a clean run with zero real skips still reported skipped=1 and failed the gate.
+          SKIP=$(grep -Ec '^(ok|not ok) .*# (SKIP|skip)\b' "$TAP" || true)
           {
             echo "commit=${GITHUB_SHA}"
             echo "ref=${GITHUB_REF}"
