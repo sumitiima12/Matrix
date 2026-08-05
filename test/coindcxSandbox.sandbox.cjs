@@ -70,6 +70,16 @@ async function tickerPrice(market) {
   } catch { return 0; }
 }
 
+// CoinDCX per-market rules (precision, min qty/notional) — the venue REJECTS a wrong-precision qty (e.g. DOGE = integers).
+async function marketDetails(market) {
+  try {
+    const r = await fetch("https://api.coindcx.com/exchange/v1/markets_details");
+    const arr = await r.json().catch(() => []);
+    return Array.isArray(arr) ? arr.find((m) => String(m.market).toUpperCase() === market) : null;
+  } catch { return null; }
+}
+const roundUpTo = (x, p) => { const f = Math.pow(10, Math.max(0, p | 0)); return Math.ceil(x * f) / f; };
+
 async function placeMarket(side, quantity) {
   const { ok, status, d } = await call("/exchange/v1/orders/create", {
     side, order_type: "market_order", market: MARKET, total_quantity: Number(quantity),
@@ -118,14 +128,21 @@ async function waitFilled(id, label) {
     coinStart = Number((bal.d.find((x) => String(x.currency).toUpperCase() === COIN) || {}).balance) || 0;
     log(c.g("  ✓ authenticated") + `  INR ₹${inr}  |  ${COIN} ${coinStart}`);
 
-    // Auto-size the buy to just over the ₹ min-notional if COINDCX_TEST_QTY not given.
-    if (!QTY) {
-      const px = await tickerPrice(MARKET);
-      if (!px) die(`Could not read ${MARKET} price to auto-size the order — set COINDCX_TEST_QTY explicitly.`);
-      QTY = Math.ceil((MIN_INR / px) * 1000) / 1000;   // round up to 3 dp
-      log(c.y(`  auto-sized: buying ${QTY} ${COIN} (≈ ₹${(QTY * px).toFixed(2)} at ₹${px})`));
-    }
-    if (inr < QTY * (await tickerPrice(MARKET) || 0)) log(c.y("  ⚠ INR balance may be too low for this order — the venue will reject if so."));
+    // Size to the market's REAL precision + minimums (CoinDCX rejects wrong-precision qty; DOGE needs whole numbers).
+    const md = await marketDetails(MARKET);
+    const px = await tickerPrice(MARKET);
+    if (!px) die(`Could not read ${MARKET} price to size the order — set COINDCX_TEST_QTY explicitly.`);
+    const tp = md && md.target_currency_precision != null ? Number(md.target_currency_precision) : 3;
+    const minQ = md ? Number(md.min_quantity) || 0 : 0;
+    const minN = md ? Number(md.min_notional) || 0 : 0;
+    QTY = QTY ? roundUpTo(QTY, tp) : roundUpTo(MIN_INR / px, tp);
+    if (QTY < minQ) QTY = roundUpTo(minQ, tp);
+    const stepUp = tp > 0 ? Math.pow(10, -tp) : 1;
+    let guard = 0;
+    while (QTY * px < Math.max(minN, MIN_INR) - 1e-9 && guard++ < 10000) QTY = roundUpTo(QTY + stepUp, tp);
+    const estINR = QTY * px;
+    log(c.y(`  sized: buying ${QTY} ${COIN} (≈ ₹${estINR.toFixed(2)} at ₹${px}; precision ${tp}, min_qty ${minQ}, min_notional ₹${minN})`));
+    if (inr < estINR) die(`Insufficient INR — need ≈ ₹${estINR.toFixed(2)} but the account holds ₹${inr}. Add a little INR and re-run.`);
 
     // 2. BUY
     log(c.y("\n[2/5] BUY  POST /exchange/v1/orders/create (market)"));
