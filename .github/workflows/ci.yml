@@ -454,16 +454,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Independent flatten + prove-flat (bounded)
+      - name: Independent flatten + prove-flat (DEDICATED credentials, bounded, strict)
         env:
-          # R42-P1-06: the watchdog PREFERS dedicated credentials (DELTA_WATCHDOG_KEY/SECRET) for true independence, but
-          # STRICT is intentionally OFF here (per operator choice) so it FALLS BACK to the sandbox creds when no dedicated
-          # key is set — it still authenticates and proves-flat; it just shares fate with the test's credential. Set
-          # DELTA_WATCHDOG_KEY/SECRET (a second testnet key) and flip WATCHDOG_STRICT to '1' later for full independence.
+          # R42-P1-06: STRICT — the watchdog uses DEDICATED credentials (a SECOND Delta testnet key) with NO sandbox-cred
+          # fallback, and FAILS if they're absent. This gives true independence: a compromised/throttled TEST key can't
+          # also disable the cleanup backstop. (Requires secrets.DELTA_WATCHDOG_KEY / DELTA_WATCHDOG_SECRET to be set.)
+          WATCHDOG_STRICT: '1'
           DELTA_WATCHDOG_KEY: ${{ secrets.DELTA_WATCHDOG_KEY }}
           DELTA_WATCHDOG_SECRET: ${{ secrets.DELTA_WATCHDOG_SECRET }}
-          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
-          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
           DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
           WATCHDOG_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
         run: |
