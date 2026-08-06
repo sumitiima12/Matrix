@@ -35,6 +35,13 @@ const TOKEN = process.env.DHAN_ACCESS_TOKEN || "";
 const CLIENT_ID = process.env.DHAN_CLIENT_ID || "";
 const SYMBOL = (process.env.DHAN_TEST_SYMBOL || "RELIANCE").trim();
 const QTY = Math.max(1, Number(process.env.DHAN_TEST_QTY || 1) | 0);
+/* Order type for the cert. Dhan's SANDBOX has no live market data, so a MARKET order has no LTP to fill
+   against — it's CONFIRMED but sits PENDING with filledQty 0 forever. A LIMIT order priced at the sandbox's
+   static fill price (₹100) DOES match and reach TRADED. Default to LIMIT@100 here so the fill pipeline can be
+   proven; production still uses MARKET (which fills against the real market). The verify-fill / position /
+   flatten machinery this exercises is identical for both order types. Override with DHAN_TEST_ORDER_TYPE=MARKET. */
+const ORDER_TYPE = String(process.env.DHAN_TEST_ORDER_TYPE || "LIMIT").trim().toUpperCase() === "MARKET" ? "MARKET" : "LIMIT";
+const LIMIT_PRICE = Number(process.env.DHAN_TEST_PRICE || 100);
 
 const c = { g: (s) => `\x1b[32m${s}\x1b[0m`, r: (s) => `\x1b[31m${s}\x1b[0m`, y: (s) => `\x1b[33m${s}\x1b[0m`, b: (s) => `\x1b[1m${s}\x1b[0m` };
 const log = (...a) => console.log(...a);
@@ -83,17 +90,24 @@ async function resolveSecurityId(sym) {
 }
 
 function orderBody(side, securityId, qty = QTY) {
-  // Identical shape to server.js POST /api/order dhan branch.
+  // Same shape as server.js POST /api/order dhan branch. orderType/price come from ORDER_TYPE (LIMIT@100 for the
+  // sandbox so it can match; MARKET with empty price for production parity). Everything else is identical.
+  // priceOverride (5th arg via closure below) forces a LIMIT at that price; otherwise use the ORDER_TYPE default.
+  const px = orderBody._px;
+  const oType = px != null ? "LIMIT" : ORDER_TYPE;
   return {
     dhanClientId: CLIENT_ID, transactionType: String(side).toUpperCase(),
     exchangeSegment: "NSE_EQ", productType: "INTRADAY",
-    orderType: "MARKET", validity: "DAY", securityId, quantity: String(Math.max(1, Math.abs(Number(qty) || QTY))),
-    price: "", disclosedQuantity: "", afterMarketOrder: false,
+    orderType: oType, validity: "DAY", securityId, quantity: String(Math.max(1, Math.abs(Number(qty) || QTY))),
+    price: oType === "LIMIT" ? String(px != null ? px : LIMIT_PRICE) : "", disclosedQuantity: "", afterMarketOrder: false,
   };
 }
 
-async function placeOrder(side, securityId, qty = QTY) {
-  const r = await api("POST", "/v2/orders", orderBody(side, securityId, qty));
+async function placeOrder(side, securityId, qty = QTY, priceOverride = null) {
+  orderBody._px = priceOverride;                       // threaded into orderBody() for this call
+  const body = orderBody(side, securityId, qty);
+  orderBody._px = null;
+  const r = await api("POST", "/v2/orders", body);
   const d = r.json || {};
   if (!r.ok || d.orderStatus === "REJECTED" || d.errorType) {
     throw new Error(d.errorMessage || d.omsErrorDescription || `Dhan ${side} failed (${r.status}) ${r.text || ""}`.trim());
@@ -101,10 +115,67 @@ async function placeOrder(side, securityId, qty = QTY) {
   return { orderId: d.orderId ?? (d.data && (d.data.orderId || d.data.order_id)) ?? null, status: d.orderStatus || "PENDING" };
 }
 
+// Poll an order (order list + tradebook) up to `waitS` seconds. Returns { filled, order, rejected, rejectMsg }.
+async function awaitOutcome(orderId, waitS) {
+  let lastOrder = null, dumped = false;
+  for (let i = 0; i < waitS; i++) {
+    await sleep(1000);
+    const o = await findOrder(orderId);
+    lastOrder = o || lastOrder;
+    if (o) {
+      log(`  … order ${o.orderStatus}`);
+      if (/TRADED|FILLED|EXECUTED/i.test(o.orderStatus)) return { filled: true, order: o };
+      if (/REJECTED|CANCELLED/i.test(o.orderStatus)) return { filled: false, rejected: true, rejectMsg: o.omsErrorDescription || o.omsErrorCode || "", order: o };
+      if (!dumped && /PENDING|TRANSIT|PART/i.test(o.orderStatus)) { dumped = true; log(c.y("    raw order → ") + JSON.stringify(o)); }
+    }
+    const trs = await tradesForOrder(orderId).catch(() => []);
+    if (trs.length) return { filled: true, order: { orderStatus: "TRADED", averageTradedPrice: trs[0].tradedPrice ?? trs[0].price, _viaTrades: true } };
+  }
+  return { filled: false, order: lastOrder };
+}
+
+// Parse "... Circuit Limits of 1334.90 to 1631.50" from an RMS rejection → { lo, hi }.
+function parseCircuit(msg) {
+  const m = /Circuit\s*Limits?\s*of\s*([\d.]+)\s*to\s*([\d.]+)/i.exec(String(msg || ""));
+  return m ? { lo: Number(m[1]), hi: Number(m[2]) } : null;
+}
+
+/* Place a LIMIT order that will actually FILL in the sandbox. The sandbox enforces the symbol's circuit band, so
+   a marketable limit must sit INSIDE it: a BUY at the UPPER circuit (crosses up → fills), a SELL at the LOWER
+   circuit (crosses down → fills). We discover the band from a first attempt's RMS rejection, then re-place at the
+   right edge. Returns the filled order. `waitS` is the per-attempt fill wait. */
+async function placeFillingLimit(side, securityId, qty, waitS) {
+  const isBuy = String(side).toUpperCase() === "BUY";
+  // Attempt 1 at the configured price (default ₹100 — deliberately out-of-band, so it also serves as band discovery).
+  let o = await placeOrder(side, securityId, qty, LIMIT_PRICE);
+  log(`  order ${o.orderId} status ${o.status}`);
+  let out = await awaitOutcome(o.orderId, waitS);
+  if (out.filled) return out.order;
+  const band = out.rejected ? parseCircuit(out.rejectMsg) : null;
+  if (!band) throw new Error(`${side} did not fill and no circuit band to retry from (${out.rejectMsg || "still pending"})`);
+  const px = isBuy ? band.hi : band.lo;               // marketable edge for the side
+  log(c.y(`  ↻ circuit band ${band.lo}–${band.hi}; re-placing ${side} LIMIT @₹${px} (marketable)`));
+  o = await placeOrder(side, securityId, qty, px);
+  log(`  order ${o.orderId} status ${o.status}`);
+  out = await awaitOutcome(o.orderId, waitS);
+  if (out.filled) return out.order;
+  if (out.rejected) throw new Error(`${side} re-placed at ₹${px} but REJECTED: ${out.rejectMsg}`);
+  throw new Error(`${side} re-placed at ₹${px} but did not reach TRADED within ${waitS}s`);
+}
+
 async function findOrder(orderId) {
   const r = await api("GET", "/v2/orders");
   const arr = Array.isArray(r.json) ? r.json : (r.json && r.json.data) || [];
   return arr.find((o) => String(o.orderId) === String(orderId)) || null;
+}
+
+// Tradebook fill-truth: GET /v2/trades/{orderId} returns the executed trade(s) for an order. In the sandbox an
+// order can show TRADED here (executed at the static ₹100) even while the order list still lags on status.
+async function tradesForOrder(orderId) {
+  let r = await api("GET", `/v2/trades/${encodeURIComponent(orderId)}`);
+  let arr = Array.isArray(r.json) ? r.json : (r.json && r.json.data) || [];
+  if (!arr.length) { r = await api("GET", "/v2/trades"); arr = Array.isArray(r.json) ? r.json : (r.json && r.json.data) || []; arr = arr.filter((t) => String(t.orderId) === String(orderId)); }
+  return arr;
 }
 
 async function positionNetQty(securityId) {
@@ -116,14 +187,14 @@ async function positionNetQty(securityId) {
 
 (async function main() {
   log(c.b("\n═══ Dhan SANDBOX certification ═══"));
-  log("base:", BASE, "| symbol:", SYMBOL, "| qty:", QTY);
+  log("base:", BASE, "| symbol:", SYMBOL, "| qty:", QTY, "| orderType:", ORDER_TYPE + (ORDER_TYPE === "LIMIT" ? ` @₹${LIMIT_PRICE}` : ""));
 
   if (!TOKEN || !CLIENT_ID) die("Set DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID in the environment before running.");
   if (!/(^|\.)sandbox\.dhan\.co$/i.test(new URL(BASE).hostname) && process.env.DHAN_ALLOW_PROD !== "1") {
     die(`Refusing to run against a non-sandbox host (${new URL(BASE).hostname}). This script places live orders; keep DHAN_API_BASE on sandbox.dhan.co (or set DHAN_ALLOW_PROD=1 only if you truly mean production).`);
   }
 
-  let securityId = null, boughtQty = 0, flattened = false, submitted = false;
+  let securityId = null, boughtQty = 0, flattened = false, submitted = false, net0 = 0;
 
   try {
     // 1. CONNECT — prove the token is valid. Prefer /v2/fundlimit (shows balance), but Dhan's SANDBOX
@@ -151,44 +222,38 @@ async function positionNetQty(securityId) {
     securityId = await resolveSecurityId(SYMBOL);
     log(c.g("  ✓ ") + `${SYMBOL} → securityId ${securityId}`);
 
-    // 3. BUY — R39-P1-04: ARM cleanup BEFORE the send. If Dhan ACCEPTS the order but the HTTP response is lost/malformed
-    // (placeOrder throws), we must still flatten. `submitted` fires before the request; the catch reconciles from broker
-    // truth (net position) rather than assuming nothing happened.
-    log(c.y("\n[3/7] BUY  POST /v2/orders (MARKET INTRADAY)"));
+    // 3+4. BUY THAT FILLS — R39-P1-04: `submitted` fires before the send so the catch reconciles from broker truth
+    // even if a response is lost. placeFillingLimit places a marketable LIMIT: it discovers the sandbox's circuit
+    // band from the first RMS rejection, then re-places at the band edge (BUY → upper circuit) so the sandbox
+    // actually executes it, and polls order-status + tradebook for the fill.
+    log(c.y("\n[3/7] BUY  marketable LIMIT (auto-priced inside the circuit band)"));
+    // Baseline net BEFORE the buy — the cert asserts the CHANGE (buy adds ≥QTY), so a leftover sandbox position
+    // from an earlier run (before the daily reset) can't skew the check, and we flatten back to THIS baseline.
+    net0 = await positionNetQty(securityId).catch(() => 0);
+    if (net0 !== 0) log(c.y(`  (starting net position for ${SYMBOL} is ${net0} — will assert the delta and restore it)`));
     submitted = true;
-    const buy = await placeOrder("BUY", securityId);
+    const FILL_WAIT = Math.max(12, Number(process.env.DHAN_FILL_WAIT_S || 20) | 0);
+    const buyFill = await placeFillingLimit("BUY", securityId, QTY, FILL_WAIT);
     boughtQty = QTY;
-    log(c.g("  ✓ order accepted") + `  orderId ${buy.orderId}  status ${buy.status}`);
+    log(c.g("\n[4/7] VERIFY FILL  ✓ filled") + `  avg price ₹${buyFill.averageTradedPrice ?? buyFill.price ?? "?"}${buyFill._viaTrades ? " [via tradebook]" : ""}`);
 
-    // 4. VERIFY FILL
-    log(c.y("\n[4/7] VERIFY FILL  poll GET /v2/orders"));
-    let filled = null;
-    for (let i = 0; i < 12; i++) {
-      await sleep(1000);
-      const o = await findOrder(buy.orderId);
-      if (o) { log(`  … ${o.orderStatus}`); if (/TRADED|FILLED|EXECUTED/i.test(o.orderStatus)) { filled = o; break; } if (/REJECTED|CANCELLED/i.test(o.orderStatus)) throw new Error(`order ${o.orderStatus}: ${o.omsErrorDescription || ""}`); }
-    }
-    if (!filled) throw new Error("buy order did not reach TRADED within 12s");
-    log(c.g("  ✓ filled") + `  avg price ₹${filled.averageTradedPrice ?? filled.price ?? "?"} (sandbox fills at ₹100)`);
-
-    // 5. POSITION
+    // 5. POSITION — assert the CHANGE, not the absolute (net went up by ≥ QTY vs the pre-buy baseline).
     log(c.y("\n[5/7] POSITION  GET /v2/positions"));
     const net = await positionNetQty(securityId);
-    if (net < QTY) throw new Error(`expected a long position of ${QTY}, saw netQty ${net}`);
-    log(c.g("  ✓ long position present") + `  netQty ${net}`);
+    if (net - net0 < QTY) throw new Error(`expected net to increase by ${QTY} after the buy, but it went ${net0} → ${net}`);
+    log(c.g("  ✓ long position present") + `  netQty ${net} (was ${net0}, +${net - net0})`);
 
-    // 6. FLATTEN
-    log(c.y("\n[6/7] FLATTEN  POST /v2/orders (SELL, reduce)"));
-    const sell = await placeOrder("SELL", securityId);
+    // 6. FLATTEN — marketable LIMIT SELL (band edge → lower circuit) that reduces the position and fills.
+    log(c.y("\n[6/7] FLATTEN  marketable LIMIT SELL (reduce)"));
+    await placeFillingLimit("SELL", securityId, QTY, FILL_WAIT);
     flattened = true;
-    log(c.g("  ✓ sell accepted") + `  orderId ${sell.orderId}`);
-    for (let i = 0; i < 12; i++) { await sleep(1000); const o = await findOrder(sell.orderId); if (o && /TRADED|FILLED|EXECUTED/i.test(o.orderStatus)) break; if (o && /REJECTED|CANCELLED/i.test(o.orderStatus)) throw new Error(`sell ${o.orderStatus}`); }
+    log(c.g("  ✓ sell filled"));
 
-    // 7. VERIFY FLAT
+    // 7. VERIFY FLAT — back to the pre-buy baseline (our buy undone), not necessarily absolute zero.
     log(c.y("\n[7/7] VERIFY FLAT  GET /v2/positions"));
     const after = await positionNetQty(securityId);
-    if (after !== 0) log(c.y(`  ⚠ netQty is ${after} (sandbox may settle async) — check the DevPortal if it doesn't clear`));
-    else log(c.g("  ✓ flat") + "  netQty 0");
+    if (after !== net0) log(c.y(`  ⚠ netQty is ${after} (expected baseline ${net0}; sandbox may settle async) — check the DevPortal if it doesn't clear`));
+    else log(c.g("  ✓ restored to baseline") + `  netQty ${after}`);
 
     log(c.g("\n══════════════════════════════════════"));
     log(c.g("  PASS — Dhan sandbox order path works end-to-end"));
@@ -201,10 +266,11 @@ async function positionNetQty(securityId) {
     // back to the intended qty so we never leave a possibly-open sandbox position.
     if (submitted && !flattened && securityId) {
       let flatQty = QTY;
-      try { const net = await positionNetQty(securityId); if (Number(net) > 0) flatQty = Math.abs(Number(net)); } catch { /* positions unreadable ⇒ use intended qty */ }
+      try { const net = await positionNetQty(securityId); if (Number(net) > net0) flatQty = Math.abs(Number(net) - net0) || QTY; } catch { /* positions unreadable ⇒ use intended qty */ }
       log(c.y(`  emergency flatten: selling ${flatQty} to close any exposure…`));
-      try { await placeOrder("SELL", securityId, flatQty); log(c.y("  emergency sell submitted — verify flat in the DevPortal")); }
-      catch (e2) { log(c.r("  emergency flatten ALSO failed: " + (e2 && e2.message))); }
+      // Best-effort marketable sell (auto-priced inside the circuit band) so it actually reduces, not just accepted.
+      try { await placeFillingLimit("SELL", securityId, flatQty, 8); log(c.y("  emergency sell filled — verify flat in the DevPortal")); }
+      catch (e2) { log(c.r("  emergency flatten did not confirm: " + (e2 && e2.message) + " — check the DevPortal")); }
     }
     process.exit(1);
   }

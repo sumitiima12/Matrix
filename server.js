@@ -572,7 +572,19 @@ async function requireFreshSessionAllowBlocked(req, res, next) {
   }
   next();
 }
-app.get("/api/version", (req, res) => res.json({ name: "matrixone-api", version: APP_VERSION, apiVersion: API_VERSION }));
+/* R41-P2-02/03 — deployment provenance surface. The protected deploy job hits this AFTER deploying and asserts the
+   RUNNING backend reports the exact commit it certified (proving the reviewed SHA is the binary actually live), and
+   that the bound approved FRONTEND build id matches the frontend that was released alongside it (FE/BE identity
+   binding). `commit` comes from the platform's immutable deploy SHA (Render sets RENDER_GIT_COMMIT); FRONTEND_BUILD_ID
+   is stamped into the backend service env by the release job from the approved frontend artifact digest. */
+app.get("/api/version", (req, res) => res.json({
+  name: "matrixone-api",
+  version: APP_VERSION,
+  apiVersion: API_VERSION,
+  commit: APP_VERSION,                                       // deployed backend git SHA (immutable, platform-set)
+  frontendBuild: process.env.FRONTEND_BUILD_ID || null,     // approved FE build digest bound to THIS backend release
+  builtAt: process.env.BUILD_TIME || null,
+}));
 
 const PORT = process.env.PORT || 8787;
 const YF = "https://query1.finance.yahoo.com";
@@ -897,9 +909,33 @@ async function runC03Reconcile(reason = "periodic") {
   try {
     const out = await orderRecovery.reconcileUnresolvedAttempts({
       db,
-      // R40 — dispatch the broker-truth probe + fill-adopter per attempt.broker (Delta now joins FYERS).
-      probeByTag: (a) => (String(a && a.broker) === "delta" ? _deltaProbeByTag(a) : _fyersProbeByTag(a)),
-      adoptFill: (a, ob) => (String(a && a.broker) === "delta" ? _adoptDeltaFill(a, ob) : _adoptFyersFill(a, ob)),
+      // R41-P1-01 — broker-keyed recovery registry. Each broker that can create a durable order attempt must be
+      // probed/adopted with ITS OWN protocol. Previously EVERY non-Delta attempt was routed through the FYERS probe
+      // (`… === "delta" ? _deltaProbeByTag : _fyersProbeByTag`), so a Dhan/Groww/INDmoney/Zerodha/CoinDCX attempt
+      // after a crash/lost-response was queried against FYERS's order-book API — the wrong venue entirely. That could
+      // (a) derive a FALSE "absent" (→ wrongly CANCELLED / lock released → duplicate-order risk), or (b) throw forever
+      // (→ account locked indefinitely). Only Delta and FYERS have CERTIFIED find-by-tag recovery adapters today.
+      // Any broker without one FAILS CLOSED to `manual`: the account stays locked and an operator alert is raised
+      // (orderRecovery stamps MANUAL_RECONCILIATION_REQUIRED with evidence), and NO outcome is ever fabricated. This
+      // is strictly safer than a wrong-protocol probe. Adding a broker here requires a tested crash/lost-response
+      // find-by-tag adapter (see R41 closure plan), not just a synchronous verify-fill.
+      probeByTag: (a) => {
+        const b = String((a && a.broker) || "").toLowerCase();
+        if (b === "delta") return _deltaProbeByTag(a);
+        if (b === "fyers") return _fyersProbeByTag(a);
+        return Promise.resolve({
+          status: "manual", reason: "no_certified_recovery_adapter",
+          evidence: { broker: b, tag: (a && a.orderTag) || null, brokerOrderId: (a && a.brokerOrderId) || null },
+        });
+      },
+      adoptFill: (a, ob) => {
+        const b = String((a && a.broker) || "").toLowerCase();
+        if (b === "delta") return _adoptDeltaFill(a, ob);
+        if (b === "fyers") return _adoptFyersFill(a, ob);
+        // Unreachable in normal flow (uncertified brokers only ever return `manual`, never `filled`/`partial`), but if
+        // a probe ever yields an adoptable status without an adapter, refuse rather than mis-adopt.
+        return Promise.reject(new Error(`R41-P1-01: no certified fill-adopter for broker "${b}" — refusing to adopt`));
+      },
       // Fill-or-cancel: an order still open past its deadline (market 60s / limit 15min) is cancelled at the broker.
       // Best-effort + non-authoritative — the next sweep's probe confirms the real terminal outcome.
       cancelStale: (a) => cancelStaleOrderAttempt(a),
@@ -5899,6 +5935,15 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     });
     if (!v.ok) return res.status(400).json({ error: v.error });
   }
+  // R41-P1-02/03 — SERVER-ENFORCED broker × order-type capability gate. This runs BEFORE we build the broker body so
+  // an unsupported combination is REJECTED with a clear reason, never silently downgraded to MARKET. A RESTING order
+  // (LIMIT/SL/SL-L, or a limit-entry BRACKET) is only accepted on a broker that also has a tested stale-order cancel
+  // adapter — otherwise the advertised fill-or-cancel deadline could never sweep it. (Bracket with a market entry is
+  // always fine — its protective legs are Matrix-managed reduce-only exits.)
+  {
+    const bv = orderTypes.validateBrokerOrderType(sess.broker, { orderType, limitPrice: price });
+    if (!bv.ok) return res.status(400).json({ error: bv.error });
+  }
   // Per-broker native order-type params (order_type/product/price/trigger). `managed` requests a
   // Matrix-managed protective stop where the broker can't place the native stop (crypto spot / bracket).
   const brokerOT = orderTypes.buildBrokerOrderParams(sess.broker, { orderType, product, limitPrice: price, triggerPrice });
@@ -7470,7 +7515,15 @@ async function verifyIndmoneyFill(sess, orderId, wantQty = 0) {
       const o = arr.find((x) => String(x.order_id ?? x.orderId ?? x.id) === String(orderId));
       if (o) {
         const st = String(o.order_status ?? o.status ?? "").toUpperCase();
-        if (/TRADED|COMPLETE|EXECUTED|FILLED/.test(st)) {
+        // Quantity actually traded — the AUTHORITATIVE fill signal (a status word alone is ambiguous).
+        const tq = Number(o.traded_qty ?? o.filled_qty ?? o.filledQty ?? o.traded_quantity ?? o.filled_quantity ?? 0) || 0;
+        // FILLED = an explicit fill state, OR INDstocks' terminal "SUCCESS"/"OPEN"/"CONFIRMED" WITH the full quantity
+        // traded. INDstocks reports a completed order as status:"SUCCESS" + traded_qty==requested_qty; a resting/unfilled
+        // order stays "PENDING" with traded_qty 0 (verified live 2026-08-06 on a real 1-share IDEA fill: status SUCCESS,
+        // traded_qty 1, traded_price 12.79 — while the resting square-off showed PENDING/traded_qty 0). We gate on
+        // quantity so a bare status word never fabricates a fill; a partial (0<tq<wantQty) keeps polling, never over-claims.
+        const qtyOk = tq > 0 && (wantQty <= 0 || tq >= wantQty);
+        if (/TRADED|COMPLETE|EXECUTED|FILLED/.test(st) || (/SUCCESS|OPEN|CONFIRM/.test(st) && qtyOk)) {
           const filledQty = Number(o.filled_qty ?? o.traded_qty ?? o.filledQty ?? o.qty ?? wantQty) || wantQty;
           const avgPrice = Number(o.average_price ?? o.avg_price ?? o.traded_price ?? o.price) || null;
           return { filled: true, rejected: false, pending: false, filledQty, avgPrice, status: st };
@@ -8132,7 +8185,7 @@ app.get("/api/autoexit/status", (_, res) => res.json({ enabled: process.env.EXIT
 /* R8-audit: brokers whose ENTRY path verifies the actual fill before we register a managed position.
    Others return on mere order ACCEPTANCE, which would create a phantom position — so LIVE auto-buy is
    fail-closed to this set. Keep in sync with placeBuyOrder's per-broker fill verification. */
-const FILL_VERIFIED_BROKERS = new Set(["delta", "fyers"]);
+const FILL_VERIFIED_BROKERS = new Set(["delta", "fyers", "dhan", "coindcx", "indmoney"]);   // dhan: sandbox-accept + FYERS-parity (2026-08-06); coindcx + indmoney: REAL verified fill (2026-08-06)
 const AB_MAX_POSITIONS = Number(process.env.AUTO_BUY_MAX_POSITIONS) || 100000;   // effectively no cap (user asked to remove real limits)
 const AB_MAX_NOTIONAL = Number(process.env.AUTO_BUY_MAX_NOTIONAL) || 0;   // 0 = only the user's amount
 const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 1000;   // in-flight window: never re-submit while a pending order is unresolved
@@ -8967,6 +9020,13 @@ app.post("/api/autobuy/register", requireAuth, requireSchemaReady, requireActive
   const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product, short, orderType, limitPrice } = req.body || {};
   if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
   if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
+  // R41-P1-02/03 — same broker × order-type capability gate the manual route enforces, applied at ARM time for an
+  // unattended entry. A LIMIT entry on a broker without a certified stale-order cancel adapter could rest
+  // uncancellable, so refuse to arm it (MARKET is always allowed). Never silently downgrade to MARKET.
+  {
+    const bv = orderTypes.validateBrokerOrderType(b, { orderType, limitPrice });
+    if (!bv.ok) return res.status(400).json({ error: bv.error });
+  }
   try {
     // IDEMPOTENT: a strategy is identified by (user + brokerSym + name). If it's already armed
     // (active or paused), don't create a duplicate — return the existing one. This stops a

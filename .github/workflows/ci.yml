@@ -330,6 +330,97 @@ jobs:
           path: artifacts/
           retention-days: 90
 
+  # R41-P1-04: REAL lost-response → process death → restart → adopt-once journey on the STATIC-IP self-hosted runner.
+  # Proves the crash-recovery path the in-process E2E cannot: a child places a real testnet order + hard-dies before
+  # finalize; this job (same PG) reconciles from broker truth and asserts exactly-one order/fill/adoption. Same gate as
+  # the E2E (RUN_BROKER_E2E=1 + Delta testnet secrets).
+  restart-adoption:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 20
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: matrix
+          POSTGRES_PASSWORD: matrix
+          POSTGRES_DB: matrix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Restart-adoption crash-recovery journey (self-hosted, whitelisted IP)
+        env:
+          BROKER_SANDBOX: '1'
+          DATABASE_URL: postgres://matrix:matrix@localhost:5432/matrix_test
+          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
+          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
+          DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
+          DELTA_SANDBOX_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [ -z "${DELTA_SANDBOX_KEY:-}" ] || [ -z "${DELTA_SANDBOX_SECRET:-}" ] || [ -z "${DELTA_SANDBOX_BASE:-}" ]; then
+            echo "::error::restart-adoption enabled but Delta testnet secrets/base are missing"; exit 1
+          fi
+          node --test --test-force-exit test/restartAdoption.sandbox.cjs 2>&1 | tee artifacts/restart-adoption.tap
+          PASS=$(grep -c '^ok ' artifacts/restart-adoption.tap || true)
+          FAIL=$(grep -c '^not ok ' artifacts/restart-adoption.tap || true)
+          SKIP=$(grep -Ec '^(ok|not ok) .*# (SKIP|skip)\b' artifacts/restart-adoption.tap || true)
+          echo "commit=${GITHUB_SHA} pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee artifacts/restart-adoption.txt
+          if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
+            echo "::error::restart-adoption invalid (need pass>0, fail=0, skipped=0)"; exit 1
+          fi
+      - name: Upload restart-adoption evidence (per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restart-adoption-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90
+
+  # R41-P1-06: INDEPENDENT emergency-flatten watchdog. Runs AFTER the order-placing jobs with `if: always()` — so even
+  # if a job crashed/was cancelled mid-order, this separate process (its own creds + bounded expiry) reads broker truth,
+  # flattens the allow-listed testnet account, proves flat, and PAGES (fails) if it can't. This is the backstop for the
+  # exact failure class being certified; it is NOT itself a certification.
+  watchdog-flatten:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    needs: [broker-e2e, restart-adoption]
+    if: ${{ always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Independent flatten + prove-flat (own credentials, bounded)
+        env:
+          # Prefer INDEPENDENT watchdog creds so a compromised/hung test can't disable the backstop; falls back to sandbox creds.
+          DELTA_WATCHDOG_KEY: ${{ secrets.DELTA_WATCHDOG_KEY }}
+          DELTA_WATCHDOG_SECRET: ${{ secrets.DELTA_WATCHDOG_SECRET }}
+          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
+          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
+          DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
+          WATCHDOG_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          WATCHDOG_EVIDENCE=artifacts/watchdog-flatten.txt node test/watchdogFlatten.sandbox.cjs
+      - name: Upload watchdog evidence (per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchdog-flatten-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90
+
   # R39-P3-01: PROTECTED real-money deployment gate. This job is the enforcement point the docs described but the
   # workflow lacked. It runs ONLY on the release branch when vars.REAL_MONEY_RELEASE=1, `needs:` the backend + broker
   # certification jobs (so it can't start unless both SUCCEEDED), and binds to a PROTECTED `environment:` — configure
@@ -341,7 +432,7 @@ jobs:
     # R40-P2-02: depend on ALL certification jobs so deploy can't start before their per-SHA evidence exists (no race).
     # When their flags are off the jobs are skipped and deploy is skipped too — an unattended real-money release requires
     # them ON (enforced below), so for a real release they always run and gate this job.
-    needs: [backend, broker-sandbox, broker-sandbox-delta, broker-e2e]
+    needs: [backend, broker-sandbox, broker-sandbox-delta, broker-e2e, restart-adoption]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.REAL_MONEY_RELEASE == '1' }}
@@ -369,11 +460,18 @@ jobs:
         with:
           name: broker-e2e-evidence-${{ github.sha }}
           path: ev-e2e
+      - name: Download restart-adoption evidence (this SHA)
+        if: ${{ vars.RUN_BROKER_E2E == '1' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: restart-adoption-evidence-${{ github.sha }}
+          path: ev-restart
       - name: Verify certified evidence before real-money activation
         env:
           CERT_BROKERS: ${{ vars.CERT_BROKERS }}
           CERT_DELTA: ${{ vars.CERT_DELTA }}
           RUN_BROKER_E2E: ${{ vars.RUN_BROKER_E2E }}
+          APPROVED_FRONTEND_BUILD: ${{ vars.APPROVED_FRONTEND_BUILD }}
         run: |
           set -euo pipefail
           # R40-P1-05: an UNATTENDED real-money release (this job runs only when REAL_MONEY_RELEASE=1) must NEVER pass
@@ -409,7 +507,40 @@ jobs:
             [ -f "$EE" ] || { echo "::error::missing MatrixOne-path E2E evidence for ${GITHUB_SHA}"; exit 1; }
             grep -q "commit=${GITHUB_SHA}" "$EE" || { echo "::error::E2E evidence commit mismatch"; exit 1; }
             grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$EE" || { echo "::error::MatrixOne-path E2E is not a clean pass>0/fail=0/skipped=0"; exit 1; }
+            # R41-P1-04: the REAL lost-response → restart → adopt-once journey must also be green for THIS SHA.
+            RA=ev-restart/restart-adoption.txt
+            [ -f "$RA" ] || { echo "::error::missing restart-adoption evidence for ${GITHUB_SHA}"; exit 1; }
+            grep -q "commit=${GITHUB_SHA}" "$RA" || { echo "::error::restart-adoption evidence commit mismatch"; exit 1; }
+            grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$RA" || { echo "::error::restart-adoption is not a clean pass>0/fail=0/skipped=0"; exit 1; }
           fi
-          echo "deploy_gate=GO commit=${GITHUB_SHA} cert_brokers=${CB} cert_delta=${CERT_DELTA:-0} e2e=${RUN_BROKER_E2E:-0}"
-          echo "::notice::Real-money release evidence verified for ${GITHUB_SHA}. Proceeding to protected deployment."
-          # (Real deployment / capability activation step goes here — kept as the single gated point.)
+          # 5) R41-P2-03 — FE/BE RELEASE BINDING. A real-money backend release must be bound to an APPROVED frontend
+          #    build so an incompatible FE/BE pair can't be activated. The approved FE build digest is promoted from the
+          #    frontend repo's release (vars.APPROVED_FRONTEND_BUILD); it is stamped into the deployed backend env as
+          #    FRONTEND_BUILD_ID and re-verified post-deploy against /api/version.frontendBuild.
+          [ -n "${APPROVED_FRONTEND_BUILD:-}" ] || { echo "::error::real-money release requires vars.APPROVED_FRONTEND_BUILD (approved frontend build digest) to bind FE/BE identity"; exit 1; }
+          echo "deploy_gate=GO commit=${GITHUB_SHA} cert_brokers=${CB} cert_delta=${CERT_DELTA:-0} e2e=${RUN_BROKER_E2E:-0} frontend_build=${APPROVED_FRONTEND_BUILD}"
+          echo "::notice::Real-money release evidence verified for ${GITHUB_SHA} (frontend ${APPROVED_FRONTEND_BUILD}). Proceeding to protected deployment."
+          # (Real deployment / capability activation step goes here — kept as the single gated point. It MUST deploy the
+          #  attested backend digest with FRONTEND_BUILD_ID=${APPROVED_FRONTEND_BUILD} in the service env, then the
+          #  post-deploy provenance step below proves the running binary + bound frontend match this evidence.)
+      - name: Post-deploy provenance — prove production runs the certified SHA + bound frontend (R41-P2-02/03)
+        env:
+          PROD_HEALTHCHECK_URL: ${{ vars.PROD_HEALTHCHECK_URL }}
+          APPROVED_FRONTEND_BUILD: ${{ vars.APPROVED_FRONTEND_BUILD }}
+        run: |
+          set -euo pipefail
+          # Evidence-verified is NOT deployment-proven. After the protected deploy, the RUNNING backend must report the
+          # exact commit we certified AND the bound approved frontend build. Without this, the gate only proves the
+          # verifier ran, not that the reviewed SHA is live. A real-money release MUST configure vars.PROD_HEALTHCHECK_URL.
+          [ -n "${PROD_HEALTHCHECK_URL:-}" ] || { echo "::error::real-money release requires vars.PROD_HEALTHCHECK_URL to prove the running production version"; exit 1; }
+          COMMIT=""; BODY=""
+          for i in $(seq 1 30); do
+            BODY=$(curl -fsS "${PROD_HEALTHCHECK_URL%/}/api/version" || true)
+            COMMIT=$(printf '%s' "$BODY" | sed -n 's/.*"commit":"\([^"]*\)".*/\1/p')
+            [ "$COMMIT" = "${GITHUB_SHA}" ] && break
+            echo "waiting for production to report ${GITHUB_SHA} (saw '${COMMIT:-none}')…"; sleep 10
+          done
+          [ "$COMMIT" = "${GITHUB_SHA}" ] || { echo "::error::production /api/version commit '${COMMIT:-none}' != certified ${GITHUB_SHA} — the reviewed SHA is NOT the running binary"; exit 1; }
+          FE=$(printf '%s' "$BODY" | sed -n 's/.*"frontendBuild":"\([^"]*\)".*/\1/p')
+          [ "$FE" = "${APPROVED_FRONTEND_BUILD}" ] || { echo "::error::production frontendBuild '${FE:-none}' != approved '${APPROVED_FRONTEND_BUILD}' — FE/BE identity mismatch"; exit 1; }
+          echo "::notice::Post-deploy provenance verified — production runs ${GITHUB_SHA} with bound frontend ${FE}."

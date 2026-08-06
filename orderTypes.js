@@ -106,6 +106,71 @@ function validateOrderIntent(intent = {}) {
 /* Whether a BRACKET is being requested — the route turns this into "place entry + arm managed SL/TP/trailing". */
 function isBracket(orderType) { return normalizeOrderType(orderType) === "BRACKET"; }
 
+/* ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   R41-P1-02 / R41-P1-03 — SERVER-ENFORCED broker × order-type capability matrix.
+
+   A broker's order route previously advertised Limit/SL/SL-L/Bracket "across all 6 brokers", but (a) several brokers
+   have no tested stale-order CANCEL adapter, so a resting order that never fills couldn't be swept by the fill-or-cancel
+   deadline, and (b) unsupported combos silently fell back to MARKET. Both are real-money hazards. This matrix is the
+   single source of truth the route enforces: an unsupported (broker, order-type) combination is REJECTED (never a
+   MARKET fallback), and a RESTING/trigger order is only offered on a broker that can also cancel a stale one.
+   ───────────────────────────────────────────────────────────────────────────────────────────────────────────── */
+
+// Brokers with a TESTED unattended cancel adapter (must stay in sync with server.js cancelBrokerOrder).
+const CANCEL_CAPABLE_BROKERS = ["delta", "fyers", "dhan", "indmoney"];
+
+// Native (broker-API-level) order-type support, from each buildBrokerOrderParams branch. A broker absent here can
+// place MARKET only. This is what the broker's API accepts — cancel capability is layered on separately below.
+const NATIVE_ORDER_TYPES = {
+  delta:    ["MARKET", "LIMIT", "SL", "SL-L"],
+  fyers:    ["MARKET", "LIMIT", "SL", "SL-L"],
+  dhan:     ["MARKET", "LIMIT", "SL", "SL-L"],
+  indmoney: ["MARKET", "LIMIT", "SL", "SL-L"],
+  zerodha:  ["MARKET", "LIMIT", "SL", "SL-L"],
+  groww:    ["MARKET", "LIMIT", "SL", "SL-L"],
+  coindcx:  ["MARKET", "LIMIT"],
+};
+
+// Order types that REST at the broker waiting on a price/trigger (so they need a cancel adapter to be swept if stale).
+const RESTING_TYPES = new Set(["LIMIT", "SL", "SL-L"]);
+
+function isCancelCapable(broker) { return CANCEL_CAPABLE_BROKERS.includes(String(broker || "").toLowerCase()); }
+
+/* The canonical order types a broker may ACTUALLY place for real money: its native support, with resting/trigger
+   types withheld unless it also has a cancel adapter. BRACKET is always available (its protective legs are
+   Matrix-managed, reduce-only + fill-verified on every broker); its ENTRY leg is constrained separately below. */
+function supportedOrderTypes(broker) {
+  const b = String(broker || "").toLowerCase();
+  const native = NATIVE_ORDER_TYPES[b] || ["MARKET"];
+  const canCancel = isCancelCapable(b);
+  const out = native.filter((t) => !RESTING_TYPES.has(t) || canCancel);
+  if (!out.includes("MARKET")) out.unshift("MARKET");
+  out.push("BRACKET");
+  return out;
+}
+
+/* SERVER-SIDE ENFORCEMENT: may `broker` place this intent's order type? Unsupported ⇒ { ok:false } (the route returns
+   400 — NEVER a MARKET fallback). A BRACKET with a LIMIT entry on a non-cancellable broker is rejected (the entry
+   could rest uncancellable); a market-entry bracket is always fine. */
+function validateBrokerOrderType(broker, intent = {}) {
+  const b = String(broker || "").toLowerCase();
+  const ot = normalizeOrderType(intent.orderType);
+  const canCancel = isCancelCapable(b);
+  if (ot === "BRACKET") {
+    if (bracketEntryType(intent) === "LIMIT" && !canCancel) {
+      return { ok: false, error: `${b} can't place a limit-entry bracket order (no certified stale-order cancellation). Use a market entry.` };
+    }
+    return { ok: true };
+  }
+  const supported = supportedOrderTypes(b);
+  if (supported.includes(ot)) return { ok: true };
+  const native = NATIVE_ORDER_TYPES[b] || ["MARKET"];
+  if (RESTING_TYPES.has(ot) && native.includes(ot) && !canCancel) {
+    return { ok: false, error: `${b} does not yet support ${ot} orders (no certified stale-order cancellation). Use a Market order.` };
+  }
+  return { ok: false, error: `${b} does not support ${ot} orders. Supported here: ${supported.join(", ")}.` };
+}
+
 /* Per-broker native order-type field mapping. Given the canonical intent, returns the fields to MERGE into
    that broker's order body so a Limit / Stop-Loss / Stop-Limit is placed natively (not silently downgraded
    to Market). BRACKET resolves to its underlying entry type (market/limit) — the protective legs are armed
@@ -229,4 +294,6 @@ module.exports = {
   ORDER_TYPES, PRODUCTS,
   normalizeOrderType, normalizeProduct, deadlineType, bracketEntryType,
   validateOrderIntent, isBracket, buildBrokerOrderParams,
+  // R41-P1-02/03 — capability matrix + server-side enforcement.
+  CANCEL_CAPABLE_BROKERS, NATIVE_ORDER_TYPES, isCancelCapable, supportedOrderTypes, validateBrokerOrderType,
 };

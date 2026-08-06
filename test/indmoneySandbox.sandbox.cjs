@@ -81,18 +81,45 @@ async function orderStatus(orderId) {
   const r = await api("GET", "/order-book");
   const d = r.json;
   const arr = Array.isArray(d) ? d : (d && Array.isArray(d.data)) ? d.data : (d && d.data && Array.isArray(d.data.orders)) ? d.data.orders : (d && Array.isArray(d.orders)) ? d.orders : [];
-  const o = arr.find((x) => String(x.order_id ?? x.orderId ?? x.id) === String(orderId));
-  return o ? String(o.order_status ?? o.status ?? "").toUpperCase() : "";
+  const o = arr.find((x) => String(x.order_id ?? x.orderId ?? x.id) === String(orderId)) || null;
+  return { st: o ? String(o.order_status ?? o.status ?? "").toUpperCase() : "", o };
 }
-async function waitFilled(orderId, label) {
+// Pull the human reason a broker gives for a rejected/failed order out of whatever field it used.
+function orderReason(o) {
+  if (!o) return "";
+  for (const k of ["rejection_reason", "reject_reason", "status_message", "error_message", "error", "message", "remarks", "reason"]) {
+    if (o[k]) return String(o[k]);
+  }
+  return "";
+}
+// The traded/filled quantity from whatever field INDstocks uses — the AUTHORITATIVE fill signal (a status string
+// alone can be ambiguous). Returns a number (0 if none/unreadable).
+function tradedQty(o) {
+  if (!o) return 0;
+  for (const k of ["traded_qty", "traded_quantity", "filled_quantity", "filled_qty", "quantity_traded", "executed_qty", "exec_qty"]) {
+    if (o[k] != null && o[k] !== "") return Number(o[k]) || 0;
+  }
+  return 0;
+}
+async function waitFilled(orderId, label, wantQty = QTY) {
+  let last = null, dumped = false;
   for (let i = 0; i < 15; i++) {
     await sleep(1000);
-    const st = await orderStatus(orderId);
-    if (st) log(`  … ${st}`);
+    const { st, o } = await orderStatus(orderId);
+    last = o || last;
+    if (o && !dumped) { dumped = true; log(c.y("    full order-book row → ") + JSON.stringify(o)); }   // one-time schema dump
+    const tq = tradedQty(o);
+    if (st) log(`  … ${st}${tq ? ` (traded ${tq})` : ""}`);
+    // FILLED = an explicit fill state, OR a broker-"SUCCESS"/"OPEN"/"COMPLETE" with the full quantity traded.
     if (/TRADED|COMPLETE|EXECUTED|FILLED/.test(st)) return st;
-    if (/REJECT|CANCEL|FAIL/.test(st)) throw new Error(`${label} ${st}`);
+    if (/SUCCESS|OPEN|CONFIRM/.test(st) && tq >= wantQty && wantQty > 0) { log(c.g(`  ✓ ${st} with full traded qty ${tq}`)); return st; }
+    if (/REJECT|CANCEL|FAIL/.test(st)) {
+      const why = orderReason(o);
+      if (o) log(c.y("    raw order → ") + JSON.stringify(o));
+      throw new Error(`${label} ${st}${why ? ": " + why : " (no reason field in the order-book row — see raw above)"}`);
+    }
   }
-  throw new Error(`${label} did not reach TRADED within 15s`);
+  throw new Error(`${label} did not reach a filled state within 15s${last ? " — last row: " + JSON.stringify(last) : ""}`);
 }
 
 (async function main() {
@@ -104,9 +131,22 @@ async function waitFilled(orderId, label) {
   let securityId = null, bought = false, flattened = false;
   try {
     log(c.y("\n[1/6] CONNECT  GET /portfolio/holdings"));
-    const h = await api("GET", "/portfolio/holdings");
-    if (h.status === 401 || h.status === 403) die(`token rejected (${h.status}) — check the token and that THIS host's IP is whitelisted with IND Money.`);
-    log(c.g("  ✓ token accepted") + `  (holdings ${h.status})`);
+    let h = await api("GET", "/portfolio/holdings");
+    // A 401 on one endpoint can be a missing scope rather than a bad token — probe /funds too before failing, and
+    // print INDstocks' RAW reason so we can tell "invalid/expired token" from "IP not whitelisted" from "no API access".
+    if (h.status === 401 || h.status === 403) {
+      log(c.y(`  ⚠ /portfolio/holdings → ${h.status}: ${(h.text || "").slice(0, 300)}`));
+      const f = await api("GET", "/funds");
+      log(c.y(`  ⚠ /funds → ${f.status}: ${(f.text || "").slice(0, 300)}`));
+      if ((f.status === 401 || f.status === 403)) {
+        die(`token rejected on both endpoints (holdings ${h.status}, funds ${f.status}). The raw messages above tell you which:\n` +
+          "  • 'invalid'/'unauthorized'/'expired' token  ⇒ regenerate the INDstocks access token (they're short-lived).\n" +
+          "  • 'ip'/'whitelist'/'forbidden'              ⇒ add THIS host's public IP (curl ifconfig.me) to the INDstocks API whitelist.\n" +
+          "  • 'not subscribed'/'no access'/'plan'        ⇒ API/trading access isn't enabled on the INDstocks account yet.");
+      }
+      if (f.ok) { h = f; log(c.y("  (holdings needs a scope your token lacks, but /funds authenticated — continuing)")); }
+    }
+    log(c.g("  ✓ token accepted") + `  (${h.status})`);
 
     log(c.y("\n[2/6] RESOLVE  security id for " + SYMBOL));
     securityId = await resolveSecurityId(SYMBOL);

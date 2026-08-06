@@ -56,17 +56,42 @@ async function place(side) {
 async function orderState(orderId) {
   const r = await api("GET", `/v1/order/detail/${encodeURIComponent(orderId)}?segment=CASH`);
   const o = (r.json && r.json.payload) || (r.json && r.json.data) || r.json || {};
-  return String(o.order_status ?? o.status ?? "").toUpperCase();
+  return { st: String(o.order_status ?? o.status ?? "").toUpperCase(), o };
 }
-async function waitFilled(orderId, label) {
+// Quantity actually traded — the AUTHORITATIVE fill signal (a status word alone can be ambiguous, cf. IND Money "SUCCESS").
+function tradedQty(o) {
+  if (!o) return 0;
+  for (const k of ["filled_quantity", "filled_qty", "traded_qty", "traded_quantity", "quantity_traded", "executed_qty"]) {
+    if (o[k] != null && o[k] !== "") return Number(o[k]) || 0;
+  }
+  return 0;
+}
+function orderReason(o) {
+  if (!o) return "";
+  for (const k of ["remark", "remarks", "rejection_reason", "status_message", "error_message", "message", "reason"]) {
+    if (o[k]) return String(o[k]);
+  }
+  return "";
+}
+async function waitFilled(orderId, label, wantQty = QTY) {
+  let last = null, dumped = false;
   for (let i = 0; i < 15; i++) {
     await sleep(1000);
-    const st = await orderState(orderId);
-    if (st) log(`  … ${st}`);
+    const { st, o } = await orderState(orderId);
+    last = o || last;
+    if (o && !dumped) { dumped = true; log(c.y("    full order-detail row → ") + JSON.stringify(o)); }   // one-time schema dump
+    const tq = tradedQty(o);
+    if (st) log(`  … ${st}${tq ? ` (traded ${tq})` : ""}`);
     if (/EXECUTED|COMPLETE|TRADED|FILLED/.test(st)) return st;
-    if (/REJECT|CANCEL|FAIL/.test(st)) throw new Error(`${label} ${st}`);
+    // Fallback: any terminal-looking status WITH the full quantity traded is a real fill (quantity is the truth signal).
+    if (/SUCCESS|DELIVERY|CONFIRM/.test(st) && tq >= wantQty && wantQty > 0) { log(c.g(`  ✓ ${st} with full traded qty ${tq}`)); return st; }
+    if (/REJECT|CANCEL|FAIL/.test(st)) {
+      const why = orderReason(o);
+      if (o) log(c.y("    raw order → ") + JSON.stringify(o));
+      throw new Error(`${label} ${st}${why ? ": " + why : " (no reason field — see raw above)"}`);
+    }
   }
-  throw new Error(`${label} did not reach EXECUTED within 15s`);
+  throw new Error(`${label} did not reach a filled state within 15s${last ? " — last row: " + JSON.stringify(last) : ""}`);
 }
 
 (async function main() {

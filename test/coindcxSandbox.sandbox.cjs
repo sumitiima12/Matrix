@@ -32,7 +32,10 @@ const KEY = process.env.COINDCX_API_KEY || "";
 const SECRET = process.env.COINDCX_API_SECRET || "";
 const MARKET = (process.env.COINDCX_TEST_MARKET || "DOGEINR").trim().toUpperCase();
 const COIN = MARKET.replace(/INR$/i, "");
-const MIN_INR = Math.max(120, Number(process.env.COINDCX_MIN_INR || 160) || 160);
+// Target order value in ₹ when auto-sizing. CoinDCX enforces a REAL ~₹100 minimum order value that its
+// markets_details min_notional does NOT report (it returned ₹0), so default to ₹110 to clear it. Kept small so
+// the cert costs a few rupees. Override with COINDCX_MIN_INR if your venue min differs.
+const MIN_INR = Math.max(1, Number(process.env.COINDCX_MIN_INR || 110) || 110);
 let QTY = Number(process.env.COINDCX_TEST_QTY || 0) || 0;
 
 const c = { g: (s) => `\x1b[32m${s}\x1b[0m`, r: (s) => `\x1b[31m${s}\x1b[0m`, y: (s) => `\x1b[33m${s}\x1b[0m`, b: (s) => `\x1b[1m${s}\x1b[0m` };
@@ -80,11 +83,25 @@ async function marketDetails(market) {
 }
 const roundUpTo = (x, p) => { const f = Math.pow(10, Math.max(0, p | 0)); return Math.ceil(x * f) / f; };
 
-async function placeMarket(side, quantity) {
+async function placeMarket(side, quantity, _retry = false) {
+  let q = Number(quantity);
   const { ok, status, d } = await call("/exchange/v1/orders/create", {
-    side, order_type: "market_order", market: MARKET, total_quantity: Number(quantity),
+    side, order_type: "market_order", market: MARKET, total_quantity: q,
   });
-  if (!ok || d.message || d.code) throw new Error(d.message || `CoinDCX ${side} failed (${status})`);
+  if (!ok || d.message || d.code) {
+    const msg = d.message || `CoinDCX ${side} failed (${status})`;
+    // Self-correct: CoinDCX says "<COIN> precision should be N for <qty>". Re-round the quantity to N decimals
+    // (BUY rounds UP to keep the notional above the min; SELL rounds DOWN so we never oversell) and retry once.
+    const m = /precision should be (\d+)/i.exec(msg);
+    if (m && !_retry) {
+      const p = Number(m[1]); const f = Math.pow(10, p);
+      q = side === "buy" ? Math.ceil(q * f) / f : Math.floor(q * f) / f;
+      log(c.y(`  ↻ re-rounding ${side} qty to precision ${p} → ${q}`));
+      if (!(q > 0)) throw new Error(`${side} qty rounds to 0 at precision ${p}`);
+      return placeMarket(side, q, true);
+    }
+    throw new Error(msg);
+  }
   const o = (d.orders && d.orders[0]) || d;
   return { id: o.id || o.order_id || null, status: o.status || "PENDING" };
 }
@@ -132,7 +149,9 @@ async function waitFilled(id, label) {
     const md = await marketDetails(MARKET);
     const px = await tickerPrice(MARKET);
     if (!px) die(`Could not read ${MARKET} price to size the order — set COINDCX_TEST_QTY explicitly.`);
-    const tp = md && md.target_currency_precision != null ? Number(md.target_currency_precision) : 3;
+    // total_quantity is in the BASE currency (the coin), so its decimals = base_currency_precision. Using
+    // target_currency_precision (the INR PRICE precision) made DOGE qty fractional (12.921) → CoinDCX rejected it.
+    const tp = md && md.base_currency_precision != null ? Number(md.base_currency_precision) : 0;
     const minQ = md ? Number(md.min_quantity) || 0 : 0;
     const minN = md ? Number(md.min_notional) || 0 : 0;
     QTY = QTY ? roundUpTo(QTY, tp) : roundUpTo(MIN_INR / px, tp);
@@ -160,8 +179,9 @@ async function waitFilled(id, label) {
     await sleep(1500);
     const coinNow = await balanceOf(COIN);
     let sellQty = Math.max(0, coinNow - coinStart);
-    // round down to avoid selling more than we hold; CoinDCX truncates to the market's precision anyway.
-    sellQty = Math.floor(sellQty * 1000) / 1000;
+    // round DOWN to the market's base precision so we never try to sell more than we hold (placeMarket also
+    // self-corrects the precision on a reject).
+    { const sf = Math.pow(10, Math.max(0, tp)); sellQty = Math.floor(sellQty * sf) / sf; }
     if (sellQty <= 0) { log(c.y("  ⚠ no positive balance delta to sell (fees/precision) — nothing to flatten")); }
     else {
       const sell = await placeMarket("sell", sellQty);

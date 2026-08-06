@@ -116,3 +116,49 @@ test("BRACKET resolves to underlying entry type (limit if limitPrice set) + mana
   const lim = OT.buildBrokerOrderParams("zerodha", { orderType: "BRACKET", target: 5, limitPrice: 100 });
   assert.equal(lim.fields.order_type, "LIMIT"); assert.equal(lim.fields.price, "100"); assert.equal(lim.managed, true);
 });
+
+// ── R41-P1-02/03 — server-enforced broker × order-type capability matrix ────────────────────────────
+test("supportedOrderTypes: cancel-capable brokers offer resting types; others are MARKET+BRACKET only", () => {
+  // Delta/FYERS/Dhan/INDmoney have a tested cancel adapter → full resting-order support.
+  for (const b of ["delta", "fyers", "dhan", "indmoney"]) {
+    const s = OT.supportedOrderTypes(b);
+    for (const t of ["MARKET", "LIMIT", "SL", "SL-L", "BRACKET"]) assert.ok(s.includes(t), `${b} should support ${t}`);
+  }
+  // Groww/Zerodha have native LIMIT/SL mapping but NO cancel adapter → resting types withheld.
+  for (const b of ["groww", "zerodha"]) {
+    const s = OT.supportedOrderTypes(b);
+    assert.deepEqual(s.sort(), ["BRACKET", "MARKET"].sort(), `${b} must be MARKET+BRACKET only`);
+    for (const t of ["LIMIT", "SL", "SL-L"]) assert.ok(!s.includes(t), `${b} must NOT offer ${t}`);
+  }
+  // CoinDCX: native market/limit only, no cancel adapter → LIMIT withheld too.
+  assert.deepEqual(OT.supportedOrderTypes("coindcx").sort(), ["BRACKET", "MARKET"].sort());
+  // Unknown broker → MARKET + BRACKET only, never a fabricated resting type.
+  assert.deepEqual(OT.supportedOrderTypes("schwab").sort(), ["BRACKET", "MARKET"].sort());
+});
+
+test("validateBrokerOrderType: unsupported combo rejects (never a MARKET fallback)", () => {
+  // MARKET is always OK.
+  for (const b of ["delta", "groww", "zerodha", "coindcx", "schwab"]) {
+    assert.ok(OT.validateBrokerOrderType(b, { orderType: "MARKET" }).ok, `${b} MARKET ok`);
+  }
+  // Resting types on a non-cancel broker are REJECTED with a reason (not downgraded).
+  for (const t of ["LIMIT", "SL", "SL-L"]) {
+    const r = OT.validateBrokerOrderType("groww", { orderType: t, limitPrice: 100 });
+    assert.equal(r.ok, false, `groww ${t} must reject`);
+    assert.match(r.error, /groww/);
+  }
+  // Same types on a cancel-capable broker are accepted.
+  for (const t of ["LIMIT", "SL", "SL-L"]) {
+    assert.ok(OT.validateBrokerOrderType("dhan", { orderType: t, limitPrice: 100 }).ok, `dhan ${t} ok`);
+  }
+});
+
+test("validateBrokerOrderType: bracket entry — market always ok; limit entry needs cancel capability", () => {
+  // Market-entry bracket (no limitPrice) is fine on every broker (protection is Matrix-managed reduce-only).
+  for (const b of ["groww", "zerodha", "coindcx", "delta"]) {
+    assert.ok(OT.validateBrokerOrderType(b, { orderType: "BRACKET" }).ok, `${b} market-entry bracket ok`);
+  }
+  // Limit-entry bracket needs a cancel adapter.
+  assert.equal(OT.validateBrokerOrderType("groww", { orderType: "BRACKET", limitPrice: 100 }).ok, false);
+  assert.ok(OT.validateBrokerOrderType("delta", { orderType: "BRACKET", limitPrice: 100 }).ok);
+});
