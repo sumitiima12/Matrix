@@ -123,6 +123,12 @@ if (!["", "0", "1"].includes(_c03raw)) {
   throw new Error(`[startup] C03_ORDER_ATTEMPTS must be unset, "1" or "0" — got ${JSON.stringify(_c03raw)}. Refusing to start with an ambiguous safety flag.`);
 }
 const C03_ORDER_ATTEMPTS_ON = _c03raw !== "0";
+/* R43-P1-01: CoinDCX AUTOMATIC find-by-tag crash recovery. The adapter (_coindcxProbeByTag) is built and safe, but
+   the capability registry must not advertise unattended crash recovery for CoinDCX until a LIVE cold-restart cert
+   proves the tag lookup end-to-end on a real account. Default OFF: until certified, CoinDCX still fails closed to
+   MANUAL_RECONCILIATION_REQUIRED (never a wrong-protocol probe), exactly as before. Flip COINDCX_RECOVERY=1 once the
+   cert evidence exists. */
+const COINDCX_RECOVERY_ON = String(process.env.COINDCX_RECOVERY || "").trim() === "1";
 /* S3.1: real trading MUST NOT run on the legacy (non-durable) order path. If live trading is enabled while C03 is
    explicitly disabled, FAIL startup rather than silently placing real orders without write-before-send + recovery.
    (Read the env directly — TRADING_ENABLED is defined later in the file.) */
@@ -845,6 +851,77 @@ async function _adoptDeltaFill(attempt, ob) {
     tradeType: "Recovery", serverAuthored: true,
   }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
 }
+/* R43-P1-01 — CoinDCX recovery probe. Resolve an ambiguous/lost CoinDCX order from BROKER TRUTH by OUR client_order_id
+   tag. CoinDCX's POST /exchange/v1/orders/status accepts `client_order_id` (docs: "id or client_order_id one of the
+   parameter is required"), and /orders/create echoes it — so even a fully lost create response is recoverable by the
+   tag we chose before sending. Fail-closed like Delta/FYERS: any unreadable/ambiguous response ⇒ null/throw (stay
+   locked); "filled" only from a real terminal fill; "absent" only when the account is readable, the tag returns NO
+   order, AND the attempt is old enough that propagation lag can't hide it. CoinDCX spot qty is already in coin units. */
+async function _coindcxProbeByTag(attempt) {
+  const uid = String(attempt.userId);
+  const tag = String(attempt.orderTag || "");
+  const bid = attempt.brokerOrderId != null ? String(attempt.brokerOrderId) : null;
+  if (!tag && !bid) return null;   // nothing to look up ⇒ inconclusive ⇒ stay locked
+  const sess = await sessionFromCred(uid, "coindcx");
+  const apiKey = sess && sess.extra && sess.extra.apiKey;
+  const apiSecret = sess && sess.extra && sess.extra.apiSecret;
+  if (!apiKey || !apiSecret) throw new Error("coindcx creds unavailable — cannot probe (stay locked)");
+  // Look up by our client_order_id first (recoverable without the broker id); fall back to the broker id if we have it.
+  const lookup = tag ? { client_order_id: tag } : { id: bid };
+  let d, httpOk;
+  try { const res = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/status", lookup); d = res.d; httpOk = res.r && res.r.ok; }
+  catch (e) { throw new Error("coindcx order-status unreachable: " + ((e && e.message) || e)); }   // transport down ⇒ stay locked
+  const o = (d && Array.isArray(d.orders) && d.orders[0]) || (d && d.order) || (d && d.status ? d : null);
+  const st = o ? String(o.status || "").toLowerCase() : "";
+  const oid = (o && (o.id || o.order_id)) || bid;
+  const want = Number(attempt.qty) || 0;
+  if (o && st) {
+    if (st === "filled" || st === "closed" || st === "executed") {
+      const filledQty = Number(o.filled_quantity ?? o.total_quantity ?? o.quantity ?? want) || want;
+      const avgPrice = Number(o.avg_price ?? o.average_price ?? o.price_per_unit ?? o.price) || 0;
+      if (want > 0 && filledQty > 0 && filledQty < want - 1e-9) return { status: "partial", orderId: oid, filledQty, avgPrice };
+      return { status: "filled", orderId: oid, filledQty, avgPrice };
+    }
+    if (st === "partially_filled") {
+      const filledQty = Number(o.filled_quantity ?? 0) || 0;
+      if (filledQty > 0) { const avgPrice = Number(o.avg_price ?? o.average_price ?? o.price_per_unit ?? o.price) || 0; return { status: "partial", orderId: oid, filledQty, avgPrice }; }
+      return { status: "pending" };
+    }
+    if (st === "rejected" || st === "cancelled" || st === "canceled" || st === "partially_cancelled") return { status: "rejected", orderId: oid };
+    return { status: "pending" };   // open / init / untriggered ⇒ not conclusive ⇒ stay locked, retry next sweep
+  }
+  // Clean, readable response but the tag matched NO order. Declare ABSENT (never placed) only when old enough that a
+  // lost/lagged create can't still be settling; otherwise inconclusive (stay locked). httpOk guards against treating a
+  // transient/5xx body as authoritative absence.
+  if (httpOk) {
+    const created = Number(attempt.createdAt ?? attempt.created_at);
+    const oldEnough = Number.isFinite(created) && created > 0 && (Date.now() - created) >= (Number(process.env.COINDCX_ABSENCE_MIN_AGE_MS) || 60000);
+    if (oldEnough) return { status: "absent" };
+  }
+  return null;   // recent/ambiguous unknown ⇒ stay locked
+}
+async function _adoptCoindcxFill(attempt, ob) {
+  // Adopt the recovered CoinDCX fill into the AUTHORITATIVE store exactly once (dedupes on the broker order id). A
+  // reduce-only order recovered at startup is booked as an authoritative EXIT, mirroring the Delta adopter.
+  const prot = (attempt && attempt.protection) || null;
+  const coinSym = String(attempt.symbol || "").replace(/(INR|USDT|USD)$/i, "").toUpperCase();
+  if (prot && prot.reduceOnly === true) {
+    await applyReduceOnlyExit(String(attempt.userId), {
+      sym: coinSym, closeSide: String(attempt.side || "BUY").toUpperCase(),
+      qty: Number(ob.filledQty) || Number(attempt.qty) || 0, exitPx: Number(ob.avgPrice) || 0,
+      orderId: ob.orderId || (attempt.brokerOrderId || null), entryOrderId: prot.entryOrderId || null,
+      broker: "coindcx", market: "Crypto", tradeType: "Recovery",
+    }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
+    return;
+  }
+  await recordAuthoritativeFill(String(attempt.userId), {
+    sym: coinSym, side: String(attempt.side || "BUY").toUpperCase(),
+    qty: Number(ob.filledQty) || Number(attempt.qty) || 0,
+    entry: Number(ob.avgPrice) || 0, entryAt: Date.now(),
+    market: "Crypto", real: true, broker: "coindcx", orderId: ob.orderId || (attempt.brokerOrderId || null),
+    tradeType: "Recovery", serverAuthored: true,
+  }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
+}
 let _lastC03SweepAt = 0;   // §15: heartbeat for the reconciler — the observability board pages if it goes stale.
 /* Fill-or-cancel: ask the broker to CANCEL a specific still-open order. Best-effort + NON-authoritative — we never
    assume the cancel worked; the reconcile sweep's next broker-truth probe decides the real outcome (filled→adopt,
@@ -923,6 +1000,12 @@ async function runC03Reconcile(reason = "periodic") {
         const b = String((a && a.broker) || "").toLowerCase();
         if (b === "delta") return _deltaProbeByTag(a);
         if (b === "fyers") return _fyersProbeByTag(a);
+        // R43-P1-01: CoinDCX has a real find-by-tag adapter — its /orders/status accepts our client_order_id, so a
+        // lost-response order is recoverable by tag (see _coindcxProbeByTag). Gated behind a live cold-restart cert
+        // before the capability registry advertises AUTOMATIC crash recovery for it.
+        if (b === "coindcx" && COINDCX_RECOVERY_ON) return _coindcxProbeByTag(a);
+        // IND Money (INDstocks) has NO client reference on /order and echoes none in /order-book, so find-by-tag is
+        // impossible with their API — it stays MANUAL. Any other broker without a certified adapter also fails closed.
         return Promise.resolve({
           status: "manual", reason: "no_certified_recovery_adapter",
           evidence: { broker: b, tag: (a && a.orderTag) || null, brokerOrderId: (a && a.brokerOrderId) || null },
@@ -932,6 +1015,7 @@ async function runC03Reconcile(reason = "periodic") {
         const b = String((a && a.broker) || "").toLowerCase();
         if (b === "delta") return _adoptDeltaFill(a, ob);
         if (b === "fyers") return _adoptFyersFill(a, ob);
+        if (b === "coindcx") return _adoptCoindcxFill(a, ob);   // R43-P1-01
         // Unreachable in normal flow (uncertified brokers only ever return `manual`, never `filled`/`partial`), but if
         // a probe ever yields an adoptable status without an adapter, refuse rather than mis-adopt.
         return Promise.reject(new Error(`R41-P1-01: no certified fill-adopter for broker "${b}" — refusing to adopt`));
@@ -6474,6 +6558,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         side: String(side).toLowerCase() === "buy" ? "buy" : "sell",
         market,
         total_quantity: Number(qty),
+        // R43-P1-01: stamp OUR durable idempotency key as CoinDCX's client_order_id. CoinDCX echoes it and
+        // /exchange/v1/orders/status accepts `client_order_id` as a lookup key — so a crash/lost-response order is
+        // recoverable by tag alone (no broker order id needed), exactly like the Delta client_order_id path.
+        client_order_id: String(idemKey).slice(0, 64),
         // Native order_type (market_order|limit_order) + price_per_unit; a stop/bracket on spot is Matrix-managed.
         ...brokerOT.fields,
       };

@@ -24,13 +24,23 @@
  */
 const CERTIFICATION_VERSION = "2026-08-07.1";
 
-/* R41-P1-01 RECOVERY POSTURE (recorded for audit): Dhan, CoinDCX and IND Money are certified for real trading on a
-   REAL synchronous verified fill, and they keep unattendedAutomation=true. They do NOT yet have a per-broker CERTIFIED
-   crash/lost-response find-by-tag RECOVERY adapter (only Delta + FYERS do). By explicit product decision (2026-08-06)
-   they stay unattended-enabled, backed by the fail-closed recovery in server.js runC03Reconcile: a broker without a
-   certified recovery adapter is NEVER probed via the wrong protocol — its unresolved attempt is stamped
-   MANUAL_RECONCILIATION_REQUIRED (account stays locked + operator alerted), never fabricating a fill or a false
-   absence. The residual gap vs Delta/FYERS is that crash recovery for these brokers is MANUAL, not automatic. */
+/* R41-P1-01 / R43-P1-01 RECOVERY POSTURE (recorded for audit): Dhan, CoinDCX and IND Money are certified for real
+   trading on a REAL synchronous verified fill. Automatic crash/lost-response find-by-tag RECOVERY differs by broker,
+   and the difference is now a BROKER-API fact, not just an unbuilt-adapter gap:
+     • Delta + FYERS  — certified automatic find-by-tag recovery (client_order_id / orderTag echoed + queryable).
+     • CoinDCX        — CAN support it: /orders/create echoes our client_order_id and /orders/status accepts it as a
+                        lookup key. Adapter BUILT (server.js _coindcxProbeByTag), but gated behind COINDCX_RECOVERY=1
+                        pending a LIVE cold-restart cert; until then it still fails closed to MANUAL.
+     • IND Money      — CANNOT support it: the INDstocks /order API accepts NO client reference and /order-book echoes
+                        none (only their own order id + exch_order_id). There is no primitive to find "our" order by a
+                        tag we control after a lost response, so automatic find-by-tag is IMPOSSIBLE with their API.
+                        IND Money crash recovery is permanently MANUAL until INDstocks adds a client reference.
+     • Dhan           — supports correlationId; adapter not yet built (kept MANUAL like the others for now).
+   All brokers without a WIRED+certified adapter fail closed in server.js runC03Reconcile: the unresolved attempt is
+   stamped MANUAL_RECONCILIATION_REQUIRED (account stays locked + operator alerted), never probed via the wrong
+   protocol, never fabricating a fill or a false absence. NOTE (R43-P1-01, open): because IND Money can never have
+   automatic recovery, unattendedAutomation=true for IND Money is a standing accepted-risk decision, not a temporary
+   gap — flipping it to false is the only way to fully satisfy the reviewer for that broker. */
 
 const ALL_CAPS = [
   "connect", "portfolio", "manualEntry", "manualExit", "verifiedFill",
