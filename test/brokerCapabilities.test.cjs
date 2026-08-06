@@ -22,13 +22,44 @@ test("S1: Delta is FULLY CERTIFIED (R40) — manual real trading + durable/recov
 });
 
 test("S1: uncertified/other brokers keep connect+portfolio, block real ops (block the OP, not the broker)", () => {
-  assert.equal(caps.brokerCap("zerodha", "connect"), true);
-  assert.equal(caps.brokerCap("zerodha", "portfolio"), true);
-  assert.equal(caps.brokerCap("zerodha", "verifiedFill"), false, "acceptance-only broker: fill truth not certified");
-  // R31-P2-06: Zerodha manualEntry/manualExit must NOT be advertised while fill-truth is uncertified (was overstated).
-  assert.equal(caps.brokerCap("zerodha", "manualEntry"), false, "uncertified fill-truth ⇒ no real manual entry");
-  assert.equal(caps.brokerCap("zerodha", "manualExit"), false, "uncertified fill-truth ⇒ no real manual exit");
-  assert.equal(caps.brokerCap("coindcx", "manualEntry"), false);
+  // Zerodha + Groww: order route exists but fill-truth is NOT certified → no real manual entry/exit (block the OP).
+  for (const b of ["zerodha", "groww"]) {
+    assert.equal(caps.brokerCap(b, "connect"), true, `${b} connect available`);
+    assert.equal(caps.brokerCap(b, "portfolio"), true, `${b} portfolio available`);
+    assert.equal(caps.brokerCap(b, "verifiedFill"), false, `${b}: fill truth not certified`);
+    assert.equal(caps.brokerCap(b, "manualEntry"), false, `${b}: uncertified fill-truth ⇒ no real manual entry`);
+    assert.equal(caps.brokerCap(b, "manualExit"), false, `${b}: uncertified fill-truth ⇒ no real manual exit`);
+    assert.equal(caps.brokerCap(b, "unattendedAutomation"), false, `${b}: not unattended-certified`);
+  }
+  // Genuinely uncertified crypto/other brokers stay connect+portfolio only (fail closed on every real op).
+  for (const b of ["binance", "angelone", "coinswitch", "schwab"]) {
+    assert.equal(caps.brokerCap(b, "verifiedFill"), false, `${b}: fill truth not certified`);
+    assert.equal(caps.brokerCap(b, "manualEntry"), false, `${b}: no real manual entry`);
+    assert.equal(caps.brokerCap(b, "unattendedAutomation"), false, `${b}: not unattended`);
+  }
+});
+
+// R42-P1-01/02: the EXACT approved matrix for the brokers certified on a REAL fill but WITHOUT an automatic
+// crash-recovery adapter. verifiedFill + manual entry/exit are TRUE (real fills proven); startupRecovery is FALSE
+// (recovery is manual — fail-closed to MANUAL_RECONCILIATION_REQUIRED, never automatic). This makes the registry's
+// claims match the implementation exactly, rather than asserting a stale "uncertified" state.
+test("S1: CoinDCX + IND Money — real verified fill, manual real trading, but startupRecovery is honestly FALSE", () => {
+  for (const b of ["coindcx", "indmoney"]) {
+    assert.equal(caps.brokerCap(b, "verifiedFill"), true, `${b}: REAL verified fill proven`);
+    assert.equal(caps.brokerCap(b, "manualEntry"), true, `${b}: manual real entry certified on a real fill`);
+    assert.equal(caps.brokerCap(b, "manualExit"), true, `${b}: manual real exit certified`);
+    assert.equal(caps.brokerCap(b, "durableAttempts"), true, `${b}: write-before-send attempt is durably recorded`);
+    assert.equal(caps.brokerCap(b, "startupRecovery"), false, `${b}: NO automatic crash recovery — manual reconciliation`);
+  }
+});
+
+// R42-P1-03: Dhan is certified on sandbox-accept + FYERS code parity (per explicit product decision), NOT on a real
+// TRADED fill, and it too has NO automatic crash-recovery adapter. Its real-money flags are on by that decision; its
+// startupRecovery is honestly FALSE.
+test("S1: Dhan — parity-certified real flags on (product decision); startupRecovery honestly FALSE", () => {
+  assert.equal(caps.brokerCap("dhan", "manualEntry"), true, "dhan real entry enabled by parity decision");
+  assert.equal(caps.brokerCap("dhan", "verifiedFill"), true, "dhan verifiedFill on by parity decision");
+  assert.equal(caps.brokerCap("dhan", "startupRecovery"), false, "dhan has NO automatic crash recovery — manual");
 });
 
 test("S1: unknown broker / capability fails closed (false)", () => {

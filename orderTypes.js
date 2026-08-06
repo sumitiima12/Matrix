@@ -119,6 +119,13 @@ function isBracket(orderType) { return normalizeOrderType(orderType) === "BRACKE
 // Brokers with a TESTED unattended cancel adapter (must stay in sync with server.js cancelBrokerOrder).
 const CANCEL_CAPABLE_BROKERS = ["delta", "fyers", "dhan", "indmoney"];
 
+// R42-P1-04: brokers that can actually ARM managed/native BRACKET protection (must stay in sync with the server's
+// FILL_VERIFIED_BROKERS + registerAutoExit). BRACKET must NOT be offered on any other broker — otherwise the entry
+// fills but the protective legs never arm (registerAutoExit returns autoExitId:null), leaving a silently unprotected
+// live position. Offered ⇒ the entry fill AND the reduce-only managed exit are both certified for that broker.
+const BRACKET_CAPABLE_BROKERS = ["delta", "fyers", "dhan", "coindcx", "indmoney"];
+function isBracketCapable(broker) { return BRACKET_CAPABLE_BROKERS.includes(String(broker || "").toLowerCase()); }
+
 // Native (broker-API-level) order-type support, from each buildBrokerOrderParams branch. A broker absent here can
 // place MARKET only. This is what the broker's API accepts — cancel capability is layered on separately below.
 const NATIVE_ORDER_TYPES = {
@@ -145,7 +152,9 @@ function supportedOrderTypes(broker) {
   const canCancel = isCancelCapable(b);
   const out = native.filter((t) => !RESTING_TYPES.has(t) || canCancel);
   if (!out.includes("MARKET")) out.unshift("MARKET");
-  out.push("BRACKET");
+  // R42-P1-04: only offer BRACKET where managed protection can actually arm — otherwise the entry fills but the
+  // protective legs never register, leaving a silently unprotected live position.
+  if (isBracketCapable(b)) out.push("BRACKET");
   return out;
 }
 
@@ -157,6 +166,11 @@ function validateBrokerOrderType(broker, intent = {}) {
   const ot = normalizeOrderType(intent.orderType);
   const canCancel = isCancelCapable(b);
   if (ot === "BRACKET") {
+    // R42-P1-04: refuse BRACKET on any broker that can't arm managed protection — never accept an entry whose
+    // protective legs won't register (that would fill the entry and leave the position silently unprotected).
+    if (!isBracketCapable(b)) {
+      return { ok: false, error: `${b} does not support Bracket orders (managed protection is not certified for this broker). Use a Market or Limit order.` };
+    }
     if (bracketEntryType(intent) === "LIMIT" && !canCancel) {
       return { ok: false, error: `${b} can't place a limit-entry bracket order (no certified stale-order cancellation). Use a market entry.` };
     }
@@ -294,6 +308,7 @@ module.exports = {
   ORDER_TYPES, PRODUCTS,
   normalizeOrderType, normalizeProduct, deadlineType, bracketEntryType,
   validateOrderIntent, isBracket, buildBrokerOrderParams,
-  // R41-P1-02/03 — capability matrix + server-side enforcement.
-  CANCEL_CAPABLE_BROKERS, NATIVE_ORDER_TYPES, isCancelCapable, supportedOrderTypes, validateBrokerOrderType,
+  // R41-P1-02/03 + R42-P1-04 — capability matrix + server-side enforcement.
+  CANCEL_CAPABLE_BROKERS, BRACKET_CAPABLE_BROKERS, NATIVE_ORDER_TYPES,
+  isCancelCapable, isBracketCapable, supportedOrderTypes, validateBrokerOrderType,
 };

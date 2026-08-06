@@ -63,10 +63,6 @@ async function ordersByTag(tag) {
   }
   return out;
 }
-async function fillsByTag(tag) {
-  const r = await delta("GET", "/v2/fills");
-  return ((r.json && r.json.result) || []).filter((f) => String(f.client_order_id || "") === tag);
-}
 async function netSize(productId) {
   const pos = await delta("GET", "/v2/positions", { query: `product_id=${productId}` });
   const rows = pos.json && (Array.isArray(pos.json.result) ? pos.json.result : [pos.json.result]).filter(Boolean);
@@ -128,7 +124,9 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
 
   try {
     // 1) Spawn the child that write-before-sends, places the real order, and hard-dies before finalizing.
-    const child = fork(__filename, [], { env: { ...process.env, WORKER_ROLE: "child", RA_TAG: tag, RA_ATTEMPT_ID: attemptId, RA_USER: userId, RA_PRODUCT_ID: String(productId) }, stdio: "inherit" });
+    //    execArgv: [] is REQUIRED — otherwise the child inherits the parent's `--test` and its test runner can exit 0
+    //    before our IIFE reaches process.exit(137), making the exit-code assertion flaky.
+    const child = fork(__filename, [], { env: { ...process.env, WORKER_ROLE: "child", RA_TAG: tag, RA_ATTEMPT_ID: attemptId, RA_USER: userId, RA_PRODUCT_ID: String(productId) }, stdio: "inherit", execArgv: [] });
     const code = await new Promise((res) => child.on("exit", res));
     assert.equal(code, 137, "child hard-died after broker acceptance (simulated lost response)");
 
@@ -136,16 +134,31 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
     const unresolved = await db.listUnresolvedOrderAttempts(500);
     assert.ok(unresolved.some((a) => a.id === attemptId), "durable attempt survived the crash as UNRESOLVED");
 
-    // 3) Restart-equivalent reconciliation from BROKER TRUTH, adopting by tag exactly once.
+    // 3) Wait for the tagged order to actually settle to filled at the broker (bounded), reading the ORDER object —
+    //    which carries the client_order_id we set on placement — rather than assuming /v2/fills echoes the tag.
+    const orderFill = async () => {
+      const os = await ordersByTag(tag);
+      const o = os[0];
+      if (!o) return { present: false };
+      const total = Number(o.size || 0);
+      const unfilled = Number(o.unfilled_size ?? o.unfilledSize ?? 0);
+      const filled = total - unfilled;
+      const state = String(o.state || "").toLowerCase();
+      const done = filled > 0 && (unfilled === 0 || state === "closed");
+      return { present: true, count: os.length, filled, done, avg: Number(o.average_fill_price ?? o.avg_fill_price) || null, id: o.id };
+    };
+    let settled = { present: false };
+    for (let i = 0; i < 15; i++) { settled = await orderFill(); if (settled.done) break; await sleep(1000); }
+    assert.ok(settled.done, "the tagged testnet order settled to filled");
+
+    // 4) Restart-equivalent reconciliation from BROKER TRUTH, adopting by tag exactly once.
     let adopted = 0;
-    await sleep(1500);   // let the testnet fill settle
     const out = await orderRecovery.reconcileUnresolvedAttempts({
       db,
       probeByTag: async (a) => {
         if (a.id !== attemptId) return null;   // only our attempt
-        const fills = await fillsByTag(tag);
-        const qty = fills.reduce((s, f) => s + Math.abs(Number(f.size || 0)), 0);
-        if (qty > 0) return { status: "filled", orderId: (fills[0] && fills[0].order_id) || tag, filledQty: qty, avgPrice: Number(fills[0] && fills[0].price) || null };
+        const f = await orderFill();
+        if (f.done) return { status: "filled", orderId: f.id || tag, filledQty: f.filled, avgPrice: f.avg };
         return { status: "pending" };
       },
       adoptFill: async () => { adopted++; },
@@ -154,13 +167,12 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
     });
     assert.ok(out && !out.skipped, "reconcile ran as owner");
 
-    // 4) EXACTLY-ONCE invariants.
+    // 5) EXACTLY-ONCE invariants.
     const orders = await ordersByTag(tag);
     assert.equal(orders.length, 1, `exactly ONE broker order carries the tag (no resend) — saw ${orders.length}`);
     assert.equal(adopted, 1, "the fill was adopted exactly once");
     const after = await db.getOrderAttempt(attemptId);
     assert.equal(after && after.status, "FILLED", "durable attempt resolved to FILLED once");
-    assert.equal(after && (after.resolved === true || after.resolved === undefined ? true : after.resolved), true, "attempt is resolved");
   } finally {
     // 5) Teardown: reduce-only flatten + prove flat.
     const flat = await flatten(productId).catch(() => false);

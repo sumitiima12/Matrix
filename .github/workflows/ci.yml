@@ -400,13 +400,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Independent flatten + prove-flat (own credentials, bounded)
+      - name: Independent flatten + prove-flat (DEDICATED credentials, bounded, strict)
         env:
-          # Prefer INDEPENDENT watchdog creds so a compromised/hung test can't disable the backstop; falls back to sandbox creds.
+          # R42-P1-06: STRICT — the watchdog must use DEDICATED credentials (no sandbox-cred fallback) and FAIL if they're
+          # absent, so a release can never pass with a cleanup step that never authenticated.
+          WATCHDOG_STRICT: '1'
           DELTA_WATCHDOG_KEY: ${{ secrets.DELTA_WATCHDOG_KEY }}
           DELTA_WATCHDOG_SECRET: ${{ secrets.DELTA_WATCHDOG_SECRET }}
-          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
-          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
           DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
           WATCHDOG_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
         run: |
@@ -432,7 +432,7 @@ jobs:
     # R40-P2-02: depend on ALL certification jobs so deploy can't start before their per-SHA evidence exists (no race).
     # When their flags are off the jobs are skipped and deploy is skipped too — an unattended real-money release requires
     # them ON (enforced below), so for a real release they always run and gate this job.
-    needs: [backend, broker-sandbox, broker-sandbox-delta, broker-e2e, restart-adoption]
+    needs: [backend, broker-sandbox, broker-sandbox-delta, broker-e2e, restart-adoption, watchdog-flatten]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.REAL_MONEY_RELEASE == '1' }}
@@ -466,6 +466,12 @@ jobs:
         with:
           name: restart-adoption-evidence-${{ github.sha }}
           path: ev-restart
+      - name: Download watchdog evidence (this SHA)
+        if: ${{ vars.RUN_BROKER_E2E == '1' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: watchdog-flatten-evidence-${{ github.sha }}
+          path: ev-watchdog
       - name: Verify certified evidence before real-money activation
         env:
           CERT_BROKERS: ${{ vars.CERT_BROKERS }}
@@ -512,6 +518,12 @@ jobs:
             [ -f "$RA" ] || { echo "::error::missing restart-adoption evidence for ${GITHUB_SHA}"; exit 1; }
             grep -q "commit=${GITHUB_SHA}" "$RA" || { echo "::error::restart-adoption evidence commit mismatch"; exit 1; }
             grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$RA" || { echo "::error::restart-adoption is not a clean pass>0/fail=0/skipped=0"; exit 1; }
+            # R42-P1-06: the INDEPENDENT watchdog must have authenticated (dedicated creds) and PROVED the account flat —
+            # a SKIP/REFUSE/FAIL/PAGE (or a missing artifact) blocks the release. Cleanup that never ran is not a net.
+            WD=ev-watchdog/watchdog-flatten.txt
+            [ -f "$WD" ] || { echo "::error::missing watchdog evidence for ${GITHUB_SHA}"; exit 1; }
+            grep -Eq 'result=(FLAT|FLATTENED)' "$WD" || { echo "::error::watchdog did not PROVE the testnet account flat (need result=FLAT|FLATTENED); saw: $(cat "$WD")"; exit 1; }
+            if grep -Eq 'result=(SKIP|REFUSE|FAIL|PAGE|ERROR)' "$WD"; then echo "::error::watchdog evidence shows a non-clean result: $(cat "$WD")"; exit 1; fi
           fi
           # 5) R41-P2-03 — FE/BE RELEASE BINDING. A real-money backend release must be bound to an APPROVED frontend
           #    build so an incompatible FE/BE pair can't be activated. The approved FE build digest is promoted from the

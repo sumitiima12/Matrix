@@ -22,7 +22,7 @@
  *
  * Bump CERTIFICATION_VERSION whenever a flag flips so the admin diagnostic + clients can see which matrix is live.
  */
-const CERTIFICATION_VERSION = "2026-08-06.2";
+const CERTIFICATION_VERSION = "2026-08-07.1";
 
 /* R41-P1-01 RECOVERY POSTURE (recorded for audit): Dhan, CoinDCX and IND Money are certified for real trading on a
    REAL synchronous verified fill, and they keep unattendedAutomation=true. They do NOT yet have a per-broker CERTIFIED
@@ -76,7 +76,9 @@ const BROKER_CAPABILITIES = {
   // executed fill, so no residual-risk caveat. Production real-money still gated by AUTO_BUY_LIVE + REAL_MONEY_RELEASE.
   coindcx: caps({
     connect: true, portfolio: true, manualEntry: true, manualExit: true, verifiedFill: true,
-    partialFill: true, durableAttempts: true, startupRecovery: true, managedProtection: true,
+    // R42-P1-02: startupRecovery FALSE — no automatic crash-recovery adapter (fails closed to manual). verifiedFill
+    // stays true (proven on a REAL DOGEINR fill); durableAttempts stays true (write-before-send is recorded).
+    partialFill: true, durableAttempts: true, startupRecovery: false, managedProtection: true,
     unattendedAutomation: true,
   }),
   binance: caps({ connect: true, portfolio: true }),
@@ -91,7 +93,10 @@ const BROKER_CAPABILITIES = {
   // TRADED response. Production real-money still gated by AUTO_BUY_LIVE + REAL_MONEY_RELEASE.
   dhan: caps({
     connect: true, portfolio: true, manualEntry: true, manualExit: true, verifiedFill: true,
-    partialFill: true, durableAttempts: true, startupRecovery: true, managedProtection: true,
+    // R42-P1-02: startupRecovery is FALSE — Dhan has NO certified automatic find-by-tag crash-recovery adapter; an
+    // unresolved attempt fails closed to MANUAL_RECONCILIATION_REQUIRED (runC03Reconcile), which is manual, not
+    // automatic. durableAttempts stays true (we DO durably record the attempt write-before-send).
+    partialFill: true, durableAttempts: true, startupRecovery: false, managedProtection: true,
     unattendedAutomation: true,
   }),
   groww: caps({ connect: true, portfolio: true }),
@@ -105,7 +110,9 @@ const BROKER_CAPABILITIES = {
   // caveat. Production real-money still gated by AUTO_BUY_LIVE + REAL_MONEY_RELEASE.
   indmoney: caps({
     connect: true, portfolio: true, manualEntry: true, manualExit: true, verifiedFill: true,
-    partialFill: true, durableAttempts: true, startupRecovery: true, managedProtection: true,
+    // R42-P1-02: startupRecovery FALSE — no automatic crash-recovery adapter (fails closed to manual). verifiedFill
+    // stays true (proven on a REAL IDEA fill); durableAttempts stays true (write-before-send is recorded).
+    partialFill: true, durableAttempts: true, startupRecovery: false, managedProtection: true,
     unattendedAutomation: true,
   }),
   coinswitch: caps({ connect: true, portfolio: true }),

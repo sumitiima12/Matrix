@@ -31,8 +31,14 @@ const fs = require("fs");
 const path = require("path");
 
 const BASE = String(process.env.DELTA_SANDBOX_BASE || "https://cdn-ind.testnet.deltaex.org").replace(/\/+$/, "");
-const KEY = process.env.DELTA_WATCHDOG_KEY || process.env.DELTA_SANDBOX_KEY || "";
-const SECRET = process.env.DELTA_WATCHDOG_SECRET || process.env.DELTA_SANDBOX_SECRET || "";
+// R42-P1-06: in STRICT mode (set by the release CI) the watchdog MUST use DEDICATED credentials and MUST fail (not
+// silently SKIP) if they're absent — a cleanup that never authenticated is not a safety net. Only outside strict mode
+// may it fall back to the sandbox creds (local/dev convenience).
+const STRICT = process.env.WATCHDOG_STRICT === "1";
+const DEDICATED_KEY = process.env.DELTA_WATCHDOG_KEY || "";
+const DEDICATED_SECRET = process.env.DELTA_WATCHDOG_SECRET || "";
+const KEY = DEDICATED_KEY || (STRICT ? "" : process.env.DELTA_SANDBOX_KEY || "");
+const SECRET = DEDICATED_SECRET || (STRICT ? "" : process.env.DELTA_SANDBOX_SECRET || "");
 const SYMBOL = String(process.env.WATCHDOG_SYMBOL || process.env.DELTA_SANDBOX_SYMBOL || "BTCUSD").trim().toUpperCase();
 const ALLOW = new Set(
   String(process.env.WATCHDOG_ALLOW_SYMBOLS || SYMBOL).split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
@@ -91,6 +97,10 @@ function writeEvidence(obj) {
 
 (async function main() {
   // Fail-safe guards BEFORE any order can be placed.
+  if (STRICT && (!DEDICATED_KEY || !DEDICATED_SECRET)) {
+    writeEvidence({ result: "FAIL", reason: "strict_mode_requires_dedicated_watchdog_credentials" });
+    log("STRICT: DELTA_WATCHDOG_KEY/SECRET are required (no sandbox-cred fallback) — failing"); process.exit(6);
+  }
   if (!KEY || !SECRET) { writeEvidence({ result: "SKIP", reason: "no_credentials" }); log("no creds — nothing to guard; exiting 0"); process.exit(0); }
   if (!(APPROVED_HOSTS.has(BASE_HOST) && /testnet/i.test(BASE_HOST))) {
     writeEvidence({ result: "REFUSE", reason: "non_testnet_host", host: BASE_HOST });
