@@ -53,6 +53,7 @@ function ensureCapability(res, broker, capability) {
   return false;
 }
 const orderRecovery = require("./orderRecovery");     // C03 durable order-attempt orchestrator (flag-gated wiring)
+const orderDeadline = require("./orderDeadline");      // fill-or-cancel policy: market 60s / limit 15min (pure, tested)
 const feeReconcile = require("./feeReconcile");        // R31-P2-08: EOD contract-note fee reconciliation (pure + injected)
 const feeStatement = require("./feeStatement");        // R37-P3-02/P2-02: pure contract-note envelope+date adapter (testable)
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
@@ -832,6 +833,58 @@ async function _adoptDeltaFill(attempt, ob) {
   }, { haltUserIdOnFail: stripPh(String(attempt.userId)) });
 }
 let _lastC03SweepAt = 0;   // §15: heartbeat for the reconciler — the observability board pages if it goes stale.
+/* Fill-or-cancel: ask the broker to CANCEL a specific still-open order. Best-effort + NON-authoritative — we never
+   assume the cancel worked; the reconcile sweep's next broker-truth probe decides the real outcome (filled→adopt,
+   absent→CANCELLED). Routed through the user's per-broker proxy for the Indian brokers. Returns true if a cancel
+   request was actually sent. */
+async function cancelBrokerOrder(sess, broker, orderId) {
+  if (!sess || !orderId) return false;
+  const b = String(broker || "").toLowerCase();
+  try {
+    if (b === "delta") {
+      // Delta cancel needs the product_id too — look it up from the live order, then DELETE. If we can't resolve it
+      // we DON'T guess (a wrong product_id could touch another order); the next probe still governs truth.
+      let productId = null;
+      try {
+        const live = await deltaCall("GET", "/v2/orders", { query: `?ids=${encodeURIComponent(orderId)}`, userId: sess.userId });
+        const o = (live && Array.isArray(live.result) ? live.result : []).find((x) => String(x.id) === String(orderId));
+        productId = o && (o.product_id ?? o.product?.id) != null ? Number(o.product_id ?? o.product.id) : null;
+      } catch { /* fall through — no cancel without product_id */ }
+      if (productId == null) return false;
+      await deltaCall("DELETE", "/v2/orders", { userId: sess.userId, body: { id: Number(orderId), product_id: productId } });
+      return true;
+    }
+    if (b === "fyers") {
+      const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders", { method: "DELETE", headers: { ...brokerAuth("fyers", sess.accessToken, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify({ id: String(orderId) }) });
+      return r.ok;
+    }
+    if (b === "dhan") {
+      const r = await pfetch(`${DHAN_API_BASE}/v2/orders/${encodeURIComponent(orderId)}`, { method: "DELETE", headers: { ...brokerAuth("dhan", sess.accessToken, sess.userId), "Content-Type": "application/json" }, ...userProxyOpts(sess) });
+      return r.ok;
+    }
+    if (b === "indmoney") {
+      const r = await pfetch(`${INDM_API_BASE}/order/cancel`, { method: "POST", headers: { ...brokerAuth("indmoney", sess.accessToken, sess.userId), "Content-Type": "application/json" }, body: JSON.stringify({ order_id: String(orderId) }), ...userProxyOpts(sess) });
+      return r.ok;
+    }
+  } catch (e) { console.error("[fill-or-cancel] cancel failed:", b, orderId, e && e.message); return false; }
+  return false;   // brokers without an unattended-cancel path (crypto/others) — leave to the probe
+}
+
+/* Decide + issue the fill-or-cancel for one unresolved order attempt. Only cancels once the order is past its
+   deadline (MARKET 60s / LIMIT 15min from placement = order_attempts.created_at). Order type is read from the
+   attempt payload; unknown ⇒ MARKET (shorter deadline, fails safe). */
+async function cancelStaleOrderAttempt(a) {
+  try {
+    const orderType = (a && a.payload && a.payload.orderType) || "market";
+    if (!orderDeadline.shouldCancelStale({ orderType, placedAtMs: a && a.createdAt })) return { cancelled: false };
+    if (!a || !a.brokerOrderId) return { cancelled: false };   // no broker id to target
+    const sess = await sessionFromCred(a.userId, a.broker);
+    if (!sess) return { cancelled: false };
+    const ok = await cancelBrokerOrder(sess, a.broker, a.brokerOrderId);
+    return { cancelled: ok, orderType };
+  } catch { return { cancelled: false }; }
+}
+
 async function runC03Reconcile(reason = "periodic") {
   // R30-C1: recovery MUST use the SAME gate as submission (default-on unless C03_ORDER_ATTEMPTS=0). Previously
   // this required the var to equal "1", so with the var omitted submission created attempts that recovery then
@@ -846,6 +899,9 @@ async function runC03Reconcile(reason = "periodic") {
       // R40 — dispatch the broker-truth probe + fill-adopter per attempt.broker (Delta now joins FYERS).
       probeByTag: (a) => (String(a && a.broker) === "delta" ? _deltaProbeByTag(a) : _fyersProbeByTag(a)),
       adoptFill: (a, ob) => (String(a && a.broker) === "delta" ? _adoptDeltaFill(a, ob) : _adoptFyersFill(a, ob)),
+      // Fill-or-cancel: an order still open past its deadline (market 60s / limit 15min) is cancelled at the broker.
+      // Best-effort + non-authoritative — the next sweep's probe confirms the real terminal outcome.
+      cancelStale: (a) => cancelStaleOrderAttempt(a),
       setLock: (uid, v) => { try { haltedEntries.add(String(uid)); } catch { /* engine may not be up */ } return db.setRiskLock(String(uid), v); },
       setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
       acquireOwner: async () => { owner = await db.tryAdvisoryLock(C03_RECON_ADVISORY_KEY); return owner; },
@@ -5996,7 +6052,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "zerodha", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6256,7 +6312,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "delta", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
           symbol, side, qty: Number(qty), product,
           protection: _deltaIsReduce ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6358,7 +6414,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "coindcx", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6494,7 +6550,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "dhan", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6583,7 +6639,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "groww", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6659,7 +6715,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "indmoney", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash,
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };

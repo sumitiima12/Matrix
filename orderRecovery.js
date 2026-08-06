@@ -70,7 +70,16 @@ async function reconcileUnresolvedAttempts(deps) {
       keptLocked++; if (a.userId) lockUsers.add(a.userId);
       logger("c03.recover.manual_required", { id: a.id, tag: a.orderTag, reason: ob.reason || null, evidence: ob.evidence || null });
     } else {
-      // pending / unknown → not conclusive → stay locked, retry a later sweep.
+      // pending / unknown → not conclusive → stay locked, retry a later sweep. FILL-OR-CANCEL: if the order is
+      // still open past its deadline (market 60s / limit 15min), ask the broker to cancel it. Best-effort and
+      // NON-authoritative — we don't finalize here; the NEXT sweep's probe adopts a fill or closes it CANCELLED,
+      // so a racing fill can never be lost and a failed cancel just retries.
+      if (typeof deps.cancelStale === "function") {
+        try {
+          const c = await deps.cancelStale(a);
+          if (c && c.cancelled) logger("c03.recover.deadline_cancel", { id: a.id, tag: a.orderTag, orderType: c.orderType || null });
+        } catch { /* best-effort — order stays locked, retried next sweep */ }
+      }
       keptLocked++; if (a.userId) lockUsers.add(a.userId);
       logger("c03.recover.pending", { id: a.id, tag: a.orderTag, status: ob.status });
     }
