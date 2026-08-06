@@ -125,9 +125,14 @@ function brokerCap(broker, capability) {
   return !!(b && b[capability] === true);
 }
 
-/* Public view for the capabilities endpoint + admin diagnostic. */
+/* Public view for the capabilities endpoint + admin diagnostic. Includes the per-broker canonical ORDER TYPES the
+   server will actually accept (R42-P2-04), so the UI can render only certified choices instead of offering a type the
+   backend then rejects. Server-owned — the UI must not hard-code this. */
 function capabilitiesView() {
-  return { version: CERTIFICATION_VERSION, capabilities: BROKER_CAPABILITIES, keys: ALL_CAPS };
+  const orderTypes = require("./orderTypes");
+  const orderTypesByBroker = {};
+  for (const b of Object.keys(BROKER_CAPABILITIES)) orderTypesByBroker[b] = orderTypes.supportedOrderTypes(b);
+  return { version: CERTIFICATION_VERSION, capabilities: BROKER_CAPABILITIES, keys: ALL_CAPS, orderTypes: orderTypesByBroker };
 }
 
 module.exports = { BROKER_CAPABILITIES, CERTIFICATION_VERSION, ALL_CAPS, brokerCap, capabilitiesView };
