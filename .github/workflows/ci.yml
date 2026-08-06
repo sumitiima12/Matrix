@@ -386,6 +386,60 @@ jobs:
           path: artifacts/
           retention-days: 90
 
+  # R42-P1-07: TWO real workers race ONE signal to the broker on the STATIC-IP self-hosted runner — proving exactly-one
+  # broker send + one fill + fenced ownership/takeover (no resend), using the production lease/claimSignal/submitWithAttempt.
+  two-worker:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 20
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: matrix
+          POSTGRES_PASSWORD: matrix
+          POSTGRES_DB: matrix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Two-worker exactly-once + fenced failover (self-hosted, whitelisted IP)
+        env:
+          BROKER_SANDBOX: '1'
+          DATABASE_URL: postgres://matrix:matrix@localhost:5432/matrix_test
+          DELTA_SANDBOX_KEY: ${{ secrets.DELTA_SANDBOX_KEY }}
+          DELTA_SANDBOX_SECRET: ${{ secrets.DELTA_SANDBOX_SECRET }}
+          DELTA_SANDBOX_BASE: ${{ vars.DELTA_SANDBOX_BASE }}
+          DELTA_SANDBOX_SYMBOL: ${{ vars.DELTA_SANDBOX_SYMBOL }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [ -z "${DELTA_SANDBOX_KEY:-}" ] || [ -z "${DELTA_SANDBOX_SECRET:-}" ] || [ -z "${DELTA_SANDBOX_BASE:-}" ]; then
+            echo "::error::two-worker enabled but Delta testnet secrets/base are missing"; exit 1
+          fi
+          node --test --test-force-exit test/twoWorkerExactlyOnce.sandbox.cjs 2>&1 | tee artifacts/two-worker.tap
+          PASS=$(grep -c '^ok ' artifacts/two-worker.tap || true)
+          FAIL=$(grep -c '^not ok ' artifacts/two-worker.tap || true)
+          SKIP=$(grep -Ec '^(ok|not ok) .*# (SKIP|skip)\b' artifacts/two-worker.tap || true)
+          echo "commit=${GITHUB_SHA} pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee artifacts/two-worker.txt
+          if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
+            echo "::error::two-worker invalid (need pass>0, fail=0, skipped=0)"; exit 1
+          fi
+      - name: Upload two-worker evidence (per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-worker-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90
+
   # R41-P1-06: INDEPENDENT emergency-flatten watchdog. Runs AFTER the order-placing jobs with `if: always()` — so even
   # if a job crashed/was cancelled mid-order, this separate process (its own creds + bounded expiry) reads broker truth,
   # flattens the allow-listed testnet account, proves flat, and PAGES (fails) if it can't. This is the backstop for the
@@ -393,7 +447,7 @@ jobs:
   watchdog-flatten:
     runs-on: [self-hosted, linux]
     timeout-minutes: 5
-    needs: [broker-e2e, restart-adoption]
+    needs: [broker-e2e, restart-adoption, two-worker]
     if: ${{ always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
     steps:
       - uses: actions/checkout@v4
@@ -432,7 +486,7 @@ jobs:
     # R40-P2-02: depend on ALL certification jobs so deploy can't start before their per-SHA evidence exists (no race).
     # When their flags are off the jobs are skipped and deploy is skipped too — an unattended real-money release requires
     # them ON (enforced below), so for a real release they always run and gate this job.
-    needs: [backend, broker-sandbox, broker-sandbox-delta, broker-e2e, restart-adoption, watchdog-flatten]
+    needs: [backend, broker-sandbox, broker-sandbox-delta, broker-e2e, restart-adoption, two-worker, watchdog-flatten]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.REAL_MONEY_RELEASE == '1' }}
@@ -466,6 +520,12 @@ jobs:
         with:
           name: restart-adoption-evidence-${{ github.sha }}
           path: ev-restart
+      - name: Download two-worker evidence (this SHA)
+        if: ${{ vars.RUN_BROKER_E2E == '1' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: two-worker-evidence-${{ github.sha }}
+          path: ev-twoworker
       - name: Download watchdog evidence (this SHA)
         if: ${{ vars.RUN_BROKER_E2E == '1' }}
         uses: actions/download-artifact@v4
@@ -518,6 +578,11 @@ jobs:
             [ -f "$RA" ] || { echo "::error::missing restart-adoption evidence for ${GITHUB_SHA}"; exit 1; }
             grep -q "commit=${GITHUB_SHA}" "$RA" || { echo "::error::restart-adoption evidence commit mismatch"; exit 1; }
             grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$RA" || { echo "::error::restart-adoption is not a clean pass>0/fail=0/skipped=0"; exit 1; }
+            # R42-P1-07: the two-worker exactly-once + fenced-failover journey must also be green for THIS SHA.
+            TW=ev-twoworker/two-worker.txt
+            [ -f "$TW" ] || { echo "::error::missing two-worker evidence for ${GITHUB_SHA}"; exit 1; }
+            grep -q "commit=${GITHUB_SHA}" "$TW" || { echo "::error::two-worker evidence commit mismatch"; exit 1; }
+            grep -Eq 'pass=[1-9][0-9]* fail=0 skipped=0' "$TW" || { echo "::error::two-worker is not a clean pass>0/fail=0/skipped=0"; exit 1; }
             # R42-P1-06: the INDEPENDENT watchdog must have authenticated (dedicated creds) and PROVED the account flat —
             # a SKIP/REFUSE/FAIL/PAGE (or a missing artifact) blocks the release. Cleanup that never ran is not a net.
             WD=ev-watchdog/watchdog-flatten.txt

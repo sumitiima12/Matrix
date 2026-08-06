@@ -151,7 +151,13 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
     for (let i = 0; i < 15; i++) { settled = await orderFill(); if (settled.done) break; await sleep(1000); }
     assert.ok(settled.done, "the tagged testnet order settled to filled");
 
-    // 4) Restart-equivalent reconciliation from BROKER TRUTH, adopting by tag exactly once.
+    // 3.5) R42-P1-05: STARTUP RE-ARM with the REAL lock adapters. An unresolved attempt (write-before-send) must
+    //      leave the account LOCKED — exactly what production's startup recovery does. Prove it with db.isRiskLocked.
+    await orderRecovery.rearmFromUnresolvedAttempts({ db, setLock: (u, v) => db.setRiskLock(u, v), setHalt: (u, v) => db.setEntryHalt(u, v) });
+    assert.equal(await db.isRiskLocked(userId), true, "account is LOCKED while the order outcome is unresolved");
+
+    // 4) Restart-equivalent reconciliation from BROKER TRUTH — adopting through the PRODUCTION db adapters, not test
+    //    doubles: adoptFill writes the IMMUTABLE fill (db.recordFill, idempotent), and the lock setters are the real ones.
     let adopted = 0;
     const out = await orderRecovery.reconcileUnresolvedAttempts({
       db,
@@ -161,20 +167,47 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
         if (f.done) return { status: "filled", orderId: f.id || tag, filledQty: f.filled, avgPrice: f.avg };
         return { status: "pending" };
       },
-      adoptFill: async () => { adopted++; },
-      setLock: async () => {}, setHalt: async () => {},
+      adoptFill: async (a, ob) => {
+        adopted++;
+        await db.recordFill(userId, { broker: "delta", orderId: ob.orderId, qty: ob.filledQty, side: "BUY", entry: ob.avgPrice, market: "Crypto", tradeType: "restart-adoption", ts: Date.now() });
+      },
+      setLock: (u, v) => db.setRiskLock(u, v), setHalt: (u, v) => db.setEntryHalt(u, v),
       acquireOwner: async () => true, releaseOwner: async () => {},
     });
     assert.ok(out && !out.skipped, "reconcile ran as owner");
 
-    // 5) EXACTLY-ONCE invariants.
+    // 5) EXACTLY-ONCE + AUTHORITATIVE-LEDGER + LOCK-LIFECYCLE invariants (real DB, not counters).
     const orders = await ordersByTag(tag);
     assert.equal(orders.length, 1, `exactly ONE broker order carries the tag (no resend) — saw ${orders.length}`);
     assert.equal(adopted, 1, "the fill was adopted exactly once");
     const after = await db.getOrderAttempt(attemptId);
     assert.equal(after && after.status, "FILLED", "durable attempt resolved to FILLED once");
+
+    // AUTHORITATIVE LEDGER: exactly ONE immutable fill was written for this user (the position projection source).
+    const fills = await db.getFills(userId, 0, Date.now());
+    const mine = fills.filter((f) => String(f.tradeType) === "restart-adoption");
+    assert.equal(mine.length, 1, `exactly ONE authoritative fill in the immutable ledger — saw ${mine.length}`);
+
+    // IDEMPOTENT REPLAY: running recovery AGAIN must neither resend nor write a second fill (the attempt is resolved,
+    // and db.recordFill dedupes on the broker key). adoptFill throwing here would fail loudly if it were ever re-called.
+    await orderRecovery.reconcileUnresolvedAttempts({
+      db,
+      probeByTag: async () => null,
+      adoptFill: async () => { throw new Error("must not adopt a second time"); },
+      setLock: (u, v) => db.setRiskLock(u, v), setHalt: (u, v) => db.setEntryHalt(u, v),
+      acquireOwner: async () => true, releaseOwner: async () => {},
+    });
+    const fills2 = (await db.getFills(userId, 0, Date.now())).filter((f) => String(f.tradeType) === "restart-adoption");
+    assert.equal(fills2.length, 1, "no duplicate fill on recovery replay");
+
+    // LOCK LIFECYCLE: with the order resolved, NO unresolved attempts remain, so the account is eligible to unlock
+    // (production's C02 broker-truth unlock gate clears it). Prove locked→clearable→cleared.
+    const remaining = (await db.listUnresolvedOrderAttempts(500)).filter((a) => String(a.userId) === String(userId));
+    assert.equal(remaining.length, 0, "no unresolved attempts remain for the user after reconciliation");
+    await db.setRiskLock(userId, false); await db.setEntryHalt(userId, false);
+    assert.equal(await db.isRiskLocked(userId), false, "account UNLOCKED once the order outcome is reconciled");
   } finally {
-    // 5) Teardown: reduce-only flatten + prove flat.
+    // Teardown: reduce-only flatten + prove flat.
     const flat = await flatten(productId).catch(() => false);
     assert.ok(flat, "teardown proved the testnet account is flat");
   }
