@@ -49,27 +49,21 @@ async function resolveProduct() {
   if (!p || !p.id) throw new Error(`product ${SYMBOL} not resolvable`);
   return p;
 }
-async function ordersByTag(tag) {
-  const out = [];
-  for (const state of ["open", "closed"]) {
-    const r = await delta("GET", "/v2/orders", { query: `states=${state}` });
-    for (const o of (r.json && r.json.result) || []) if (String(o.client_order_id || "") === tag) out.push(o);
-  }
-  return out;
-}
-async function orderFill(tag) {
-  const os = await ordersByTag(tag); const o = os[0];
-  if (!o) return { present: false, done: false };
-  const total = Number(o.size || 0), unfilled = Number(o.unfilled_size ?? 0);
-  const filled = total - unfilled, state = String(o.state || "").toLowerCase();
-  return { done: filled > 0 && (unfilled === 0 || state === "closed"), filled, avg: Number(o.average_fill_price ?? o.avg_fill_price) || null, id: o.id };
-}
-async function netSize(productId) {
+// Delta drops a filled MARKET order out of /v2/orders immediately, so the fill-truth is the POSITION (same signal the
+// passing Delta cert uses). Net size doubles as the exactly-once proof: two workers sending would make it 2.
+async function positionOf(productId) {
   const pos = await delta("GET", "/v2/positions", { query: `product_id=${productId}` });
-  const rows = pos.json && (Array.isArray(pos.json.result) ? pos.json.result : [pos.json.result]).filter(Boolean);
-  const mine = (rows || []).find((r) => r && String(r.product_id) === String(productId));
-  return mine ? Number(mine.size || 0) : 0;
+  let rows = pos.json && (Array.isArray(pos.json.result) ? pos.json.result : [pos.json.result]).filter(Boolean);
+  let mine = (rows || []).find((r) => r && String(r.product_id) === String(productId));
+  if (!mine || Number(mine.size || 0) === 0) {
+    const marg = await delta("GET", "/v2/positions/margined");
+    const list = (marg.json && (Array.isArray(marg.json.result) ? marg.json.result : [marg.json.result])) || [];
+    const m2 = list.filter(Boolean).find((r) => r && String(r.product_id) === String(productId));
+    if (m2 && Number(m2.size || 0) !== 0) mine = m2;
+  }
+  return { size: mine ? Number(mine.size || 0) : 0, avg: mine ? (Number(mine.entry_price ?? mine.avg_price) || null) : null };
 }
+async function netSize(productId) { return (await positionOf(productId)).size; }
 async function flatten(productId) {
   for (let i = 0; i < 8; i++) {
     const sz = await netSize(productId).catch(() => null);
@@ -99,12 +93,12 @@ if (process.env.WORKER_ROLE === "worker") {
         db,
         attempt: { id: attemptId, userId, broker: "delta", orderTag: tag, payload: { symbol: SYMBOL, side: "BUY", qty: 1 } },
         submit: async () => { await delta("POST", "/v2/orders", { body: { product_id: productId, size: 1, side: "buy", order_type: "market_order", client_order_id: tag } }); return { ok: true }; },
-        classify: () => ({ status: "FILLED", patch: {} }),
+        // R43-P1-03: broker ACCEPTANCE is NOT fill truth. Placement leaves the durable attempt SUBMITTED (unresolved) —
+        // never FILLED. Only the production reconciler (reconcileUnresolvedAttempts, run by the parent below) may
+        // transition it to FILLED, and only after reading the Delta POSITION. The worker never self-declares a fill.
+        classify: () => ({ status: "SUBMITTED", patch: {} }),
         fenceGuard: () => db.fenceValid(lease, myFence),   // refuse to send if this worker's fence is no longer live
       });
-      let f = { done: false };
-      for (let i = 0; i < 12; i++) { f = await orderFill(tag); if (f.done) break; await sleep(1000); }
-      if (f.done) await db.recordFill(userId, { broker: "delta", orderId: f.id || tag, qty: f.filled, side: "BUY", entry: f.avg, market: "Crypto", tradeType: "two-worker", ts: Date.now() });
       process.stdout.write(`WORKER ${wid} PLACED ${tag}\n`);
       process.exit(0);
     } catch (e) { process.stderr.write(`WORKER ${wid} ERR ${(e && e.message) || e}\n`); process.exit(1); }
@@ -117,6 +111,7 @@ function guard(t) { if (CERT && READY && HOST_OK) return true; if (CERT) throw n
 test("R42-P1-07: two workers race one signal → exactly one order/fill; owner death → fenced takeover, no resend", async (t) => {
   if (!guard(t)) return;
   const db = require("../db");
+  const orderRecovery = require("../orderRecovery");
   await db.initDb();
   const r = crypto.randomBytes(6).toString("hex");
   const tag = "tw_" + r, attemptId = "oa_" + r, userId = "tw_user_" + r, signalId = "sig_" + r, lease = "autobuy:" + userId;
@@ -128,20 +123,44 @@ test("R42-P1-07: two workers race one signal → exactly one order/fill; owner d
   });
 
   try {
+    // 0) Start FLAT so net position size is a clean exactly-once signal.
+    await flatten(productId);
+    assert.equal(await netSize(productId), 0, "account starts flat for this product");
+
     // 1) Two workers concurrently, one shared PG + one signal.
     const [w1, w2] = [mkWorker("W1"), mkWorker("W2")];
     const codes = await Promise.all([w1, w2].map((c) => new Promise((res) => c.on("exit", res))));
     assert.ok(codes.every((x) => x === 0), `both workers exited cleanly — codes ${codes}`);
-    await sleep(1500);
+    // let the fill settle into the position (Delta drops a filled market order out of /v2/orders, so the POSITION is
+    // the truth — and net size is the exactly-once proof: two sends would make it 2).
+    let sz = 0;
+    for (let i = 0; i < 20; i++) { sz = await netSize(productId); if (sz >= 1) break; await sleep(1000); }
 
     // 2) EXACTLY-ONCE across the two workers.
-    const orders = await ordersByTag(tag);
-    assert.equal(orders.length, 1, `exactly ONE broker order across two workers (no double-send) — saw ${orders.length}`);
+    assert.equal(sz, 1, `exactly ONE lot at the broker across two workers (no double-send) — net size ${sz}`);
+
+    // Before reconciliation the durable attempt is SUBMITTED, NOT filled — broker acceptance is not fill truth.
+    const preRecon = await db.getOrderAttempt(attemptId);
+    assert.equal(preRecon && preRecon.status, "SUBMITTED", "attempt is SUBMITTED (unresolved) after placement — never self-declared FILLED");
+
+    /* R43-P1-03: FILL TRUTH comes ONLY from the production reconciler reading the Delta POSITION. Run
+       reconcileUnresolvedAttempts — the exact code path production uses on startup / periodically — with a
+       position-truth probe. It adopts the ONE fill into the immutable ledger and transitions the attempt
+       SUBMITTED→FILLED. The workers never wrote a fill or a terminal status themselves. */
+    const rec = await orderRecovery.reconcileUnresolvedAttempts({
+      db,
+      probeByTag: async (a) => { const p = await positionOf(productId); return p.size >= 1 ? { status: "filled", filledQty: p.size, avgPrice: p.avg, orderId: a.orderTag } : { status: "pending" }; },
+      adoptFill: async (a, ob) => { await db.recordFill(userId, { broker: "delta", orderId: a.orderTag, qty: ob.filledQty, side: "BUY", entry: ob.avgPrice, market: "Crypto", tradeType: "two-worker", ts: Date.now() }); },
+      setLock: (u, v) => db.setRiskLock(u, v),
+      setHalt: (u, v) => db.setEntryHalt(u, v),
+    });
+    assert.equal(rec.adopted, 1, `the production reconciler adopted exactly ONE broker-truth fill — saw ${rec.adopted}`);
+
     const fills = (await db.getFills(userId, 0, Date.now())).filter((f) => String(f.tradeType) === "two-worker");
     assert.equal(fills.length, 1, `exactly ONE authoritative fill — saw ${fills.length}`);
     assert.equal(await db.claimSignal(signalId, userId), false, "signal is already claimed (no re-claim possible)");
     const after = await db.getOrderAttempt(attemptId);
-    assert.equal(after && after.status, "FILLED", "the single durable attempt is FILLED");
+    assert.equal(after && after.status, "FILLED", "the single durable attempt is FILLED — set by the reconciler from broker truth, not placement");
 
     // 3) FAILOVER: both owners have exited without releasing the lease ("died"). After it expires a takeover worker
     //    acquires it (fence increments) but must NOT resend — the signal is already claimed.
@@ -151,7 +170,7 @@ test("R42-P1-07: two workers race one signal → exactly one order/fill; owner d
     assert.equal(tcode, 0, "takeover worker exited cleanly");
     const lz = await db.getLease(lease);
     assert.ok(lz && lz.fence >= 2, `takeover incremented the fence (new owner) — fence ${lz && lz.fence}`);
-    assert.equal((await ordersByTag(tag)).length, 1, "still exactly ONE broker order after failover — no resend");
+    assert.equal(await netSize(productId), 1, "broker position is still exactly ONE lot after failover — no resend");
     assert.equal((await db.getFills(userId, 0, Date.now())).filter((f) => String(f.tradeType) === "two-worker").length, 1, "still exactly ONE fill after failover");
   } finally {
     const flat = await flatten(productId).catch(() => false);

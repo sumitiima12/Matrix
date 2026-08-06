@@ -54,21 +54,21 @@ async function resolveProduct() {
   if (!p || !p.id) throw new Error(`product ${SYMBOL} not resolvable`);
   return p;
 }
-async function ordersByTag(tag) {
-  // All orders (open + closed/history) carrying our client_order_id — the "no duplicate send" evidence.
-  const out = [];
-  for (const state of ["open", "closed"]) {
-    const r = await delta("GET", "/v2/orders", { query: `states=${state}` });
-    for (const o of (r.json && r.json.result) || []) if (String(o.client_order_id || "") === tag) out.push(o);
-  }
-  return out;
-}
-async function netSize(productId) {
+// Delta drops a filled MARKET order out of /v2/orders immediately, so the fill-truth is the POSITION (same signal the
+// passing Delta cert uses): net size + entry price. Net size is also the exactly-once proof — a duplicate send makes it 2.
+async function positionOf(productId) {
   const pos = await delta("GET", "/v2/positions", { query: `product_id=${productId}` });
-  const rows = pos.json && (Array.isArray(pos.json.result) ? pos.json.result : [pos.json.result]).filter(Boolean);
-  const mine = (rows || []).find((r) => r && String(r.product_id) === String(productId));
-  return mine ? Number(mine.size || 0) : 0;
+  let rows = pos.json && (Array.isArray(pos.json.result) ? pos.json.result : [pos.json.result]).filter(Boolean);
+  let mine = (rows || []).find((r) => r && String(r.product_id) === String(productId));
+  if (!mine || Number(mine.size || 0) === 0) {
+    const marg = await delta("GET", "/v2/positions/margined");
+    const list = (marg.json && (Array.isArray(marg.json.result) ? marg.json.result : [marg.json.result])) || [];
+    const m2 = list.filter(Boolean).find((r) => r && String(r.product_id) === String(productId));
+    if (m2 && Number(m2.size || 0) !== 0) mine = m2;
+  }
+  return { size: mine ? Number(mine.size || 0) : 0, avg: mine ? (Number(mine.entry_price ?? mine.avg_price) || null) : null };
 }
+async function netSize(productId) { return (await positionOf(productId)).size; }
 async function flatten(productId) {
   for (let i = 0; i < 8; i++) {
     const sz = await netSize(productId).catch(() => null);
@@ -123,6 +123,11 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
   let productId = product.id;
 
   try {
+    // 0) Start FLAT so the position is a clean truth signal (the account is shared with other jobs — they're serialized
+    //    in CI, but flatten anyway for a clean baseline).
+    await flatten(productId);
+    assert.equal(await netSize(productId), 0, "account starts flat for this product");
+
     // 1) Spawn the child that write-before-sends, places the real order, and hard-dies before finalizing.
     //    execArgv: [] is REQUIRED — otherwise the child inherits the parent's `--test` and its test runner can exit 0
     //    before our IIFE reaches process.exit(137), making the exit-code assertion flaky.
@@ -134,22 +139,14 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
     const unresolved = await db.listUnresolvedOrderAttempts(500);
     assert.ok(unresolved.some((a) => a.id === attemptId), "durable attempt survived the crash as UNRESOLVED");
 
-    // 3) Wait for the tagged order to actually settle to filled at the broker (bounded), reading the ORDER object —
-    //    which carries the client_order_id we set on placement — rather than assuming /v2/fills echoes the tag.
-    const orderFill = async () => {
-      const os = await ordersByTag(tag);
-      const o = os[0];
-      if (!o) return { present: false };
-      const total = Number(o.size || 0);
-      const unfilled = Number(o.unfilled_size ?? o.unfilledSize ?? 0);
-      const filled = total - unfilled;
-      const state = String(o.state || "").toLowerCase();
-      const done = filled > 0 && (unfilled === 0 || state === "closed");
-      return { present: true, count: os.length, filled, done, avg: Number(o.average_fill_price ?? o.avg_fill_price) || null, id: o.id };
-    };
-    let settled = { present: false };
-    for (let i = 0; i < 15; i++) { settled = await orderFill(); if (settled.done) break; await sleep(1000); }
-    assert.ok(settled.done, "the tagged testnet order settled to filled");
+    // 3) Wait for the fill to settle — read the POSITION, not /v2/orders (Delta drops a filled market order out of the
+    //    open-orders endpoint immediately; the position is the fill-truth the passing Delta cert uses). Net size is also
+    //    the exactly-once proof: a duplicate send would make it 2.
+    const orderFill = async () => { const p = await positionOf(productId); return { done: p.size >= 1, filled: p.size, avg: p.avg, id: tag }; };
+    let settled = { done: false };
+    for (let i = 0; i < 20; i++) { settled = await orderFill(); if (settled.done) break; await sleep(1000); }
+    assert.ok(settled.done, "the testnet order settled to filled (net position size ≥ 1)");
+    assert.equal(settled.filled, 1, `exactly ONE lot filled (no resend) — net position size ${settled.filled}`);
 
     // 3.5) R42-P1-05: STARTUP RE-ARM with the REAL lock adapters. An unresolved attempt (write-before-send) must
     //      leave the account LOCKED — exactly what production's startup recovery does. Prove it with db.isRiskLocked.
@@ -176,9 +173,9 @@ test("R41-P1-04: real lost-response → child death → restart reconcile adopts
     });
     assert.ok(out && !out.skipped, "reconcile ran as owner");
 
-    // 5) EXACTLY-ONCE + AUTHORITATIVE-LEDGER + LOCK-LIFECYCLE invariants (real DB, not counters).
-    const orders = await ordersByTag(tag);
-    assert.equal(orders.length, 1, `exactly ONE broker order carries the tag (no resend) — saw ${orders.length}`);
+    // 5) EXACTLY-ONCE + AUTHORITATIVE-LEDGER + LOCK-LIFECYCLE invariants (real DB, not counters). The broker position
+    //    is still exactly ONE lot — reconciliation adopted the fill, it did NOT resend (that would make it 2).
+    assert.equal(await netSize(productId), 1, "broker position is still exactly ONE lot after reconcile (no resend)");
     assert.equal(adopted, 1, "the fill was adopted exactly once");
     const after = await db.getOrderAttempt(attemptId);
     assert.equal(after && after.status, "FILLED", "durable attempt resolved to FILLED once");
