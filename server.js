@@ -54,6 +54,7 @@ function ensureCapability(res, broker, capability) {
 }
 const orderRecovery = require("./orderRecovery");     // C03 durable order-attempt orchestrator (flag-gated wiring)
 const orderDeadline = require("./orderDeadline");      // fill-or-cancel policy: market 60s / limit 15min (pure, tested)
+const orderTypes = require("./orderTypes");            // canonical order-type/product normalization + per-broker native params (pure, tested)
 const feeReconcile = require("./feeReconcile");        // R31-P2-08: EOD contract-note fee reconciliation (pure + injected)
 const feeStatement = require("./feeStatement");        // R37-P3-02/P2-02: pure contract-note envelope+date adapter (testable)
 const mcx = require("./mcxContract");                 // MCX near-month futures resolution
@@ -5784,6 +5785,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
     b: sess.broker, s: req.body?.symbol, d: req.body?.side, q: req.body?.qty,
     t: req.body?.orderType || "MARKET", p: req.body?.product || "CNC",
     px: req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price,
+    // Stop / stop-limit trigger + bracket protective legs — different order types under one key are DIFFERENT orders.
+    trg: req.body?.triggerPrice != null ? Number(req.body.triggerPrice) : (req.body?.stopPrice != null ? Number(req.body.stopPrice) : null),
+    tgt: req.body?.target != null ? Number(req.body.target) : null,
+    stp: req.body?.stopLoss != null ? Number(req.body.stopLoss) : null,
     // Protection settings that change what actually gets placed — must match the fields the handler reads
     // below (slPct/tpPct/tslPct/autoExit/strategy), or a same-key retry with different protection replays
     // the old order silently. `strategy` is the full exit-config object, so hash its canonical JSON.
@@ -5875,24 +5880,50 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
      Several adapters map "anything not exactly BUY" to SELL, so a malformed/case-mismatched side ("buy",
      "BYY", "") could become a real SELL. Reject unless side ∈ {BUY,SELL}, type ∈ supported set, product valid. */
   const side = String(req.body?.side || "").trim().toUpperCase();
-  const orderType = String(req.body?.orderType || "MARKET").trim().toUpperCase();
-  const product = String(req.body?.product || "CNC").trim().toUpperCase();
+  // Canonical order type (MARKET|LIMIT|SL|SL-L|BRACKET) + product (INTRADAY|NRML|CNC), normalized fail-safe.
+  const orderType = orderTypes.normalizeOrderType(req.body?.orderType);
+  const product = orderTypes.normalizeProduct(req.body?.product);
   const symbol = req.body?.symbol;
   const qty = req.body?.qty;
   if (!["BUY", "SELL"].includes(side)) return res.status(400).json({ error: "side must be exactly BUY or SELL." });
-  if (!["MARKET", "LIMIT"].includes(orderType)) return res.status(400).json({ error: "orderType must be MARKET or LIMIT." });
-  if (!["CNC", "MIS", "INTRADAY", "NRML", "MARGIN"].includes(product)) return res.status(400).json({ error: "Unsupported product type for this order." });
   // A LIMIT order needs a price; the client may send it as `limitPrice` or `price`.
   const price = req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price;
+  // Stop / stop-limit trigger price (the price at which the order arms).
+  const triggerPrice = req.body?.triggerPrice != null ? Number(req.body.triggerPrice) : (req.body?.stopPrice != null ? Number(req.body.stopPrice) : 0);
+  /* Validate the full order intent: LIMIT needs a limit price; SL needs a trigger; SL-L needs both with a
+     sane side relationship; BRACKET needs at least one protective leg. Fail closed on a malformed order. */
+  {
+    const v = orderTypes.validateOrderIntent({
+      orderType, product, side, limitPrice: price, triggerPrice,
+      target: req.body?.target, stopLoss: req.body?.stopLoss, tslPct: req.body?.tslPct,
+    });
+    if (!v.ok) return res.status(400).json({ error: v.error });
+  }
+  // Per-broker native order-type params (order_type/product/price/trigger). `managed` requests a
+  // Matrix-managed protective stop where the broker can't place the native stop (crypto spot / bracket).
+  const brokerOT = orderTypes.buildBrokerOrderParams(sess.broker, { orderType, product, limitPrice: price, triggerPrice });
+  if (brokerOT.unsupported) {
+    return res.status(400).json({ error: `${orderType === "SL-L" ? "Stop-Limit" : "Stop-Loss"} entry orders aren't supported on ${sess.broker} — use Market, Limit, or a Bracket order (which manages the stop for you).` });
+  }
+  // For the fill-or-cancel deadline: LIMIT/SL-L wait (15min), MARKET/SL/BRACKET-entry are prompt (60s).
+  const orderDeadlineType = orderTypes.deadlineType(orderType);
   // Optional native stop-loss / take-profit (percentages) to attach as an exchange-side
   // bracket, so exits fire even with the app closed. entryPrice anchors the SL/TP maths.
-  const slPct = Number(req.body?.slPct) || 0;
-  const tpPct = Number(req.body?.tpPct) || 0;
+  // A BRACKET order carries its protective legs as target/stopLoss (percentages) → arm managed SL/TP.
+  const isBracketOrder = orderTypes.isBracket(orderType);
+  let slPct = Number(req.body?.slPct) || 0;
+  let tpPct = Number(req.body?.tpPct) || 0;
+  let tslPct = Number(req.body?.tslPct) || 0;
+  if (isBracketOrder) {
+    tpPct = Number(req.body?.target) || tpPct;
+    slPct = Number(req.body?.stopLoss) || slPct;
+    tslPct = Number(req.body?.tslPct) || tslPct;
+  }
   // Server-side signal-based auto-exit opt-in: register this position so the engine watches
   // its strategy exit (price + indicator) and closes it reduce-only, even with the app shut.
-  const wantAutoExit = req.body?.autoExit === true;
+  // A BRACKET (or a broker that needs a Matrix-managed stop) forces auto-exit arming.
+  const wantAutoExit = req.body?.autoExit === true || isBracketOrder || (brokerOT.managed && (slPct > 0 || tpPct > 0 || tslPct > 0));
   const exitCfg = req.body?.strategy || null;      // { defs, exit } from the strategy builder
-  const tslPct = Number(req.body?.tslPct) || 0;
   const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
   async function registerAutoExit(qtyOverride, entryOverride) {
     if (!wantAutoExit) return null;   // register for BOTH longs and shorts (exit math is direction-aware)
@@ -6034,9 +6065,9 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const kiteBody = new URLSearchParams({
         exchange, tradingsymbol,
         transaction_type: side, quantity: String(qty),
-        order_type: orderType, product,
         validity: "DAY",
-        ...(orderType === "LIMIT" && price ? { price: String(price) } : {}),
+        // Native order_type (MARKET|LIMIT|SL|SL-M) + product (CNC|MIS|NRML) + price/trigger_price from the module.
+        ...brokerOT.fields,
       });
       /* Acceptance ≠ fill. Durable C03 attempt (write-before-send + recovery) then VERIFY from broker truth
          (poll GET /orders/{id} → COMPLETE). Only a verified fill journals / arms auto-exit. Mirrors Dhan/Delta/FYERS. */
@@ -6052,7 +6083,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "zerodha", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6116,14 +6147,13 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
           body: JSON.stringify({
             symbol, qty: Number(qty),
-            type: orderType === "LIMIT" ? 1 : 2,           // 1 = limit, 2 = market
             side: side === "BUY" ? 1 : -1,
-            productType: product === "CNC" ? "CNC" : "INTRADAY",
-            limitPrice: orderType === "LIMIT" ? Number(price) : 0,
-            stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false,
+            validity: "DAY", disclosedQty: 0, offlineOrder: false,
             // R26-P1-01: stamp our durable order tag (derived from the idempotency key) so the unknown-order probe
             // can later find THIS order in the FYERS book. Without it, an executed order looks absent → duplicate.
             orderTag: reconcile.fyersOrderTag(idemKey),
+            // Native type (1=limit,2=market,3=SL,4=SL-L) + productType + limitPrice + stopPrice(trigger) from the module.
+            ...brokerOT.fields,
           }),
         });
         const dd = await r.json();
@@ -6139,7 +6169,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "fyers", idemKey,
-          orderTag: reconcile.fyersOrderTag(idemKey), fingerprint: idemHash,
+          orderTag: reconcile.fyersOrderTag(idemKey), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
           // C01: capture reduce-only + the entry order id so a fill RECOVERED at startup is adopted as an EXIT
           // (kind:"exit"), not a new opposite-side position.
           symbol, side, qty: Number(qty), product,
@@ -6294,7 +6324,8 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         product_id: prod.id,
         size: sendSize,
         side: isBuy ? "buy" : "sell",
-        order_type: "market_order",
+        // Native order_type (market/limit) + native stop fields (stop_order_type/stop_price) + limit_price from the module.
+        ...brokerOT.fields,
         // R27-P1-02: a SELL always reduces a long, and ANY explicitly reduce-only request (a close — incl. a
         // BUY-to-cover of a short) must carry the exchange reduce_only flag so it can only shrink exposure.
         ...(_deltaIsReduce ? { reduce_only: true } : {}),
@@ -6312,7 +6343,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "delta", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
           symbol, side, qty: Number(qty), product,
           protection: _deltaIsReduce ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6396,10 +6427,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const market = `${base}INR`;
       const coinBody = {
         side: String(side).toLowerCase() === "buy" ? "buy" : "sell",
-        order_type: orderType === "LIMIT" ? "limit_order" : "market_order",
         market,
         total_quantity: Number(qty),
-        ...(orderType === "LIMIT" && price ? { price_per_unit: Number(price) } : {}),
+        // Native order_type (market_order|limit_order) + price_per_unit; a stop/bracket on spot is Matrix-managed.
+        ...brokerOT.fields,
       };
       /* Acceptance ≠ fill. Submit through the DURABLE C03 attempt (write-before-send + crash/lost-response recovery),
          THEN verify from broker truth (poll /orders/status → filled). Only a VERIFIED fill journals an authoritative
@@ -6414,7 +6445,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "coindcx", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6532,9 +6563,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
       const dhanBody = {
         dhanClientId: sess.extra && sess.extra.clientId, transactionType: String(side).toUpperCase(),
-        exchangeSegment: "NSE_EQ", productType: product === "CNC" ? "CNC" : "INTRADAY",
-        orderType: "MARKET", validity: "DAY", securityId, quantity: String(Number(qty)),
-        price: "", disclosedQuantity: "", afterMarketOrder: false,
+        exchangeSegment: "NSE_EQ", validity: "DAY", securityId, quantity: String(Number(qty)),
+        disclosedQuantity: "", afterMarketOrder: false,
+        // Native orderType (MARKET|LIMIT|STOP_LOSS|STOP_LOSS_MARKET) + productType + price + triggerPrice from the module.
+        ...brokerOT.fields,
       };
       /* A 200 from Dhan is ACCEPTANCE, not a fill. Submit through the DURABLE C03 attempt (write-before-send +
          crash/lost-response recovery, the same machinery FYERS/Delta use), THEN verify the fill from broker truth
@@ -6550,7 +6582,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "dhan", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6625,7 +6657,9 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const bare = String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, "");
       const growwBody = {
         trading_symbol: bare, quantity: Number(qty), validity: "DAY", exchange: "NSE", segment: "CASH",
-        product: product === "CNC" ? "CNC" : "MIS", order_type: "MARKET", transaction_type: String(side).toUpperCase(),
+        transaction_type: String(side).toUpperCase(),
+        // Native order_type (MARKET|LIMIT|SL|SL_M) + product (CNC|MIS|NRML) + price + trigger_price from the module.
+        ...brokerOT.fields,
       };
       /* Acceptance ≠ fill. Durable C03 attempt (write-before-send + recovery) then VERIFY from broker truth
          (poll /v1/order/detail → EXECUTED). Only a verified fill journals / arms auto-exit. Mirrors Dhan/Delta/FYERS. */
@@ -6639,7 +6673,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "groww", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -6699,8 +6733,9 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const securityId = await dhanSecurityId(String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""));
       const indmBody = {
         txn_type: String(side).toUpperCase(), exchange: "NSE", segment: "EQUITY", security_id: String(securityId),
-        qty: Number(qty), order_type: "MARKET", product: product === "CNC" ? "CNC" : "INTRADAY",
-        validity: "DAY", is_amo: false, algo_id: "99999",
+        qty: Number(qty), validity: "DAY", is_amo: false, algo_id: "99999",
+        // Native order_type (MARKET|LIMIT|SL|SL_M) + product (CNC|INTRADAY) + price + trigger_price from the module.
+        ...brokerOT.fields,
       };
       /* Acceptance ≠ fill. Submit through the DURABLE C03 attempt (write-before-send + crash/lost-response recovery),
          THEN verify from broker truth (poll /order-book → TRADED). Only a VERIFIED fill journals an authoritative row
@@ -6715,7 +6750,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "indmoney", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType },
+          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
           symbol, side, qty: Number(qty), product,
           protection: (req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes") ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -8104,9 +8139,18 @@ const AB_RECONCILE_MS = Number(process.env.AUTO_BUY_RECONCILE_MS) || 5 * 60 * 10
 
 /* A real order to OPEN a position. `short` opens a SELL (Delta perpetual only) instead of a buy;
    spot brokers can't short, so they always buy. Same per-broker plumbing as the manual order route. */
-async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null, short = false, clientOrderId = null) {
+async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, tpPct = null, short = false, clientOrderId = null, entryOrderType = "MARKET", entryLimitPrice = 0) {
   const broker = sess.broker, token = sess.accessToken;
   const prod = mapProduct(broker, product);
+  /* Entry order type for the automated engines. A strategy fires at signal time, so the sensible entry types are
+     MARKET (default) and LIMIT (rest at a price). SL/SL-L/BRACKET collapse to their MARKET/LIMIT entry — the
+     protective stop/target/trailing is handled by the managed exit the engine registers after the fill. When the
+     effective entry is MARKET (the overwhelming common case) `entryLimitFields` is null and every branch below is
+     byte-identical to before; only a real LIMIT changes the order-type field. */
+  const _engEntryType = (["LIMIT", "SL-L"].includes(orderTypes.normalizeOrderType(entryOrderType)) && Number(entryLimitPrice) > 0) ? "LIMIT" : "MARKET";
+  const entryLimitFields = _engEntryType === "LIMIT" ? orderTypes.buildBrokerOrderParams(broker, { orderType: "LIMIT", product, limitPrice: Number(entryLimitPrice) }).fields : null;
+  // Engines keep their own product mapping (mapProduct) — take only the order-type/price fields from the module.
+  if (entryLimitFields) { delete entryLimitFields.product; delete entryLimitFields.productType; }
   // R8-audit F-1 (defense in depth): only Delta's entry path handles a short (opens a SELL). Every other
   // branch hardcodes a BUY, so a short here would open the OPPOSITE direction — refuse instead.
   if (short && broker !== "delta") throw new Error(`invalid: short (SELL) entry not supported on ${broker} — would open a long`);
@@ -8123,7 +8167,7 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     const entrySide = short ? "sell" : "buy";
     // R3-#1: stamp our own client_order_id so a timed-out order can be found in Delta's order book
     // later (the durable dedupe key). Delta echoes it back on both live and historical orders.
-    const orderBody = { product_id: dprod.id, size: contracts, side: entrySide, order_type: "market_order" };
+    const orderBody = { product_id: dprod.id, size: contracts, side: entrySide, order_type: "market_order", ...(entryLimitFields || {}) };
     if (clientOrderId) orderBody.client_order_id = String(clientOrderId).slice(0, 64);
     const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: orderBody });
     // HTTP 200 is NOT a fill — verify, and throw the real reason on a reject/no-fill.
@@ -8149,13 +8193,13 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
   if (broker === "coindcx") {
     const { apiKey, apiSecret } = sess.extra || {};
     const base = String(symbol).replace(/(INR|USDT)$/i, "").toUpperCase();
-    const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", { side: "buy", order_type: "market_order", market: `${base}INR`, total_quantity: Number(qty) });
+    const { r, d } = await coindcxCall(apiKey, apiSecret, "/exchange/v1/orders/create", { side: "buy", order_type: "market_order", market: `${base}INR`, total_quantity: Number(qty), ...(entryLimitFields || {}) });
     if (!r.ok || d.message || d.code) throw new Error(d.message || `CoinDCX buy failed (${r.status})`);
     const o = (d.orders && d.orders[0]) || d; return { orderId: o.id || o.order_id || null };
   }
   if (broker === "zerodha") {
     const [exchange, tradingsymbol] = String(symbol).split(":");
-    const body = new URLSearchParams({ exchange, tradingsymbol, transaction_type: "BUY", quantity: String(qty), order_type: "MARKET", product: prod, validity: "DAY" });
+    const body = new URLSearchParams({ exchange, tradingsymbol, transaction_type: "BUY", quantity: String(qty), order_type: "MARKET", product: prod, validity: "DAY", ...(entryLimitFields || {}) });
     const r = await fetch("https://api.kite.trade/orders/regular", { method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/x-www-form-urlencoded" }, body });
     const d = await r.json(); if (!r.ok || d.status === "error") throw new Error(d.message || `kite buy ${r.status}`);
     return { orderId: d.data.order_id };
@@ -8166,7 +8210,7 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     const orderTag = clientOrderId ? reconcile.fyersOrderTag(clientOrderId) : null;
     const r = await fyFetch("https://api-t1.fyers.in/api/v3/orders/sync", {
       method: "POST", headers: { ...brokerAuth(broker, token, sess.userId), "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: 1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false, ...(orderTag ? { orderTag } : {}) }),
+      body: JSON.stringify({ symbol, qty: Number(qty), type: 2, side: 1, productType: prod, limitPrice: 0, stopPrice: 0, validity: "DAY", disclosedQty: 0, offlineOrder: false, ...(orderTag ? { orderTag } : {}), ...(entryLimitFields || {}) }),
     });
     const d = await r.json(); if (!r.ok || d.s === "error") throw new Error(d.message || `fyers buy ${r.status}`);
     // Acceptance ≠ execution. Confirm the fill before we register a managed position at the entry — a
@@ -8600,7 +8644,7 @@ async function runAutoBuyEngine() {
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
         // price, so P&L reflects what really executed, not what we requested.
-        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null, !!st.short, pendingClientId);
+        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null, !!st.short, pendingClientId, st.orderType || "MARKET", st.limitPrice || 0);
         const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
         const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : px;
         const pos = await registerManagedPosition({
@@ -8920,7 +8964,7 @@ app.post("/api/autobuy/register", requireAuth, requireSchemaReady, requireActive
   // not a separate hard-coded broker list. Uncertified ⇒ structured CAPABILITY_NOT_CERTIFIED (the broker stays fully
   // usable for connection, portfolio and manual real trading).
   if (!ensureCapability(res, b, "unattendedAutomation")) return undefined;
-  const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product, short } = req.body || {};
+  const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product, short, orderType, limitPrice } = req.body || {};
   if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
   if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
   try {
@@ -8939,6 +8983,8 @@ app.post("/api/autobuy/register", requireAuth, requireSchemaReady, requireActive
       product: product || "CNC",              // "Intraday" (MIS/INTRADAY) or "Delivery/NRML" (CNC)
       short: !!short,                         // SHORT strategy → open a SELL, mirror the exit
       sl: sl || null, tp: tp || null, tsl: tsl || null,
+      // Entry order type for the engine (MARKET default, or LIMIT at limitPrice). Normalized fail-safe.
+      orderType: orderTypes.normalizeOrderType(orderType) === "LIMIT" ? "LIMIT" : "MARKET", limitPrice: Number(limitPrice) || 0,
       yahoo: yahoo || (market === "Crypto" ? `${String(brokerSym).replace(/(USDT|USD|INR)$/i, "")}-USD` : `${String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "")}.NS`),
       status: "active", createdAt: Date.now(), openPositionId: null,
     };
