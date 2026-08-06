@@ -3,6 +3,7 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:   # allow manually running CI for the current branch/SHA from the Actions tab ("Run workflow")
 # R38-P1-03: cancel superseded revisions so old runs don't pile up for hours and get cancelled at ~6h. One in-flight run
 # per ref; a new push cancels the previous one.
 concurrency:
