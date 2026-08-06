@@ -151,6 +151,10 @@ app.use(cors({
   // cross-origin live-order request is rejected at preflight before /api/broker/order ever runs.
   allowedHeaders: ["Content-Type", "Authorization", "X-Broker-Session", "X-User-Id", "X-Confirm-Live", "X-Admin-Key", "X-Idempotency-Key"],
   exposedHeaders: ["Location"],   // Schwab returns the order id in the Location header
+  // Cache the CORS preflight for 24h so the browser stops re-sending an OPTIONS before EVERY request.
+  // Without this, each authed call (custom headers ⇒ non-simple ⇒ preflighted) costs 2 round-trips; this
+  // roughly halves total request count with no behaviour change. (Chrome caps at ~2h regardless.)
+  maxAge: 86400,
 }));
 
 app.use(compression());     // gzip JSON responses — big win on the indicators/quotes payloads
