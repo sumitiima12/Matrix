@@ -230,11 +230,10 @@ jobs:
   broker-sandbox-delta:
     runs-on: [self-hosted, linux]
     timeout-minutes: 15
-    # R43: serialize ALL self-hosted Delta jobs onto ONE shared testnet account so they can't contaminate each other's
-    # positions (a concurrent job's open lot would fail another's flat-check). One at a time; queue, never cancel.
-    concurrency:
-      group: delta-testnet-account-${{ github.ref }}
-      cancel-in-progress: false
+    # R43: the single self-hosted runner already runs these Delta jobs ONE AT A TIME, and every Delta job starts flat +
+    # flattens in a try/finally teardown, so they can't contaminate each other's testnet position. (An earlier job-level
+    # `concurrency` group was removed: sharing one group across sibling jobs makes GitHub CANCEL queued siblings, which
+    # wedged the run in "queued". Serialization comes from the single runner + per-job start-flat, not concurrency.)
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.CERT_DELTA == '1' }}
     steps:
       - uses: actions/checkout@v4
@@ -284,9 +283,6 @@ jobs:
   broker-e2e:
     runs-on: [self-hosted, linux]
     timeout-minutes: 20
-    concurrency:   # R43: shared with the other Delta jobs — serialize on the one testnet account.
-      group: delta-testnet-account-${{ github.ref }}
-      cancel-in-progress: false
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
     services:
       postgres:
@@ -346,9 +342,6 @@ jobs:
   restart-adoption:
     runs-on: [self-hosted, linux]
     timeout-minutes: 20
-    concurrency:   # R43: shared with the other Delta jobs — serialize on the one testnet account.
-      group: delta-testnet-account-${{ github.ref }}
-      cancel-in-progress: false
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
     services:
       postgres:
@@ -403,9 +396,6 @@ jobs:
   two-worker:
     runs-on: [self-hosted, linux]
     timeout-minutes: 20
-    concurrency:   # R43: shared with the other Delta jobs — serialize on the one testnet account.
-      group: delta-testnet-account-${{ github.ref }}
-      cancel-in-progress: false
     if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.RUN_BROKER_E2E == '1' }}
     services:
       postgres:
