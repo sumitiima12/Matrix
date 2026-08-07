@@ -129,6 +129,34 @@ const C03_ORDER_ATTEMPTS_ON = _c03raw !== "0";
    MANUAL_RECONCILIATION_REQUIRED (never a wrong-protocol probe), exactly as before. Flip COINDCX_RECOVERY=1 once the
    cert evidence exists. */
 const COINDCX_RECOVERY_ON = String(process.env.COINDCX_RECOVERY || "").trim() === "1";
+/* Web Push (browser/PWA notifications). Enabled only when a VAPID keypair is configured (base64url raw keys —
+   generate with: node -e "console.log(require('./pushSender').generateVapidKeys())"). Without keys the whole
+   feature is inert: /api/push/config reports disabled and nothing is ever sent. */
+const pushSender = require("./pushSender");
+const VAPID_PUBLIC_KEY = String(process.env.VAPID_PUBLIC_KEY || "").trim();
+const VAPID_PRIVATE_KEY = String(process.env.VAPID_PRIVATE_KEY || "").trim();
+const VAPID_SUBJECT = String(process.env.VAPID_SUBJECT || "mailto:admin@matrixone.app").trim();
+const PUSH_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+/* Fan a notification out to every device a user has subscribed, respecting their per-category prefs.
+   `category` ∈ trades|broker|alerts|other. prefs shape: { all, trades, broker, alerts, other }; missing/empty
+   prefs default to receiving everything (the user explicitly opted in by subscribing). Best-effort, never throws.
+   A 404/410 from the push service means the subscription is dead → prune it. */
+async function notifyPush(userId, { category = "other", title, body, url } = {}) {
+  if (!PUSH_ENABLED || !title) return;
+  let subs = [];
+  try { subs = await db.getPushSubscriptions(String(userId)); } catch { return; }
+  for (const sub of subs) {
+    const p = sub.prefs || {};
+    const wantsAll = p.all === true || (p.all == null && p.trades == null && p.broker == null && p.alerts == null && p.other == null);
+    const allowed = wantsAll || p[category] === true;
+    if (p.none === true) continue;                 // explicit opt-out overrides everything
+    if (!allowed) continue;
+    try {
+      const r = await pushSender.sendPush(sub, { title, body: body || "", url: url || "/" }, { vapid: { publicKey: VAPID_PUBLIC_KEY, privateKey: VAPID_PRIVATE_KEY }, subject: VAPID_SUBJECT });
+      if (r.statusCode === 404 || r.statusCode === 410) { try { await db.deletePushSubscription(sub.endpoint); } catch { /* ignore */ } }
+    } catch { /* one bad device shouldn't stop the rest */ }
+  }
+}
 /* S3.1: real trading MUST NOT run on the legacy (non-durable) order path. If live trading is enabled while C03 is
    explicitly disabled, FAIL startup rather than silently placing real orders without write-before-send + recovery.
    (Read the env directly — TRADING_ENABLED is defined later in the file.) */
@@ -188,6 +216,15 @@ function logFinancial(event, fields) {
    user learns the terminal outcome even though it happened server-side). Best-effort; never throws. */
 async function addUserNotice(userId, notice) {
   try { await db.addNotice(String(userId), { ...notice, at: Date.now() }); } catch { /* non-fatal */ }
+  // Mirror the durable notice to a push notification (best-effort). Category comes from the notice kind so the
+  // user's per-category prefs apply: order/fill events → trades; broker/connection → broker; everything else → alerts.
+  try {
+    const k = String(notice && (notice.kind || notice.type) || "").toLowerCase();
+    const category = /fill|order|trade|exit|entry|protect/.test(k) ? "trades" : /broker|connect|token|auth/.test(k) ? "broker" : "alerts";
+    const title = notice && (notice.title || notice.heading) || "MatrixOne";
+    const body = notice && (notice.message || notice.reason || notice.body || notice.text) || "";
+    await notifyPush(String(userId), { category, title, body, url: notice && notice.url || "/" });
+  } catch { /* non-fatal */ }
 }
 /* R19 fix: persist an authoritative trade row for a VERIFIED real fill — and DO NOT silently swallow a
    write failure. If the row can't be stored, future risk/position maths would run on an incomplete journal
@@ -879,12 +916,20 @@ async function _coindcxProbeByTag(attempt) {
     if (st === "filled" || st === "closed" || st === "executed") {
       const filledQty = Number(o.filled_quantity ?? o.total_quantity ?? o.quantity ?? want) || want;
       const avgPrice = Number(o.avg_price ?? o.average_price ?? o.price_per_unit ?? o.price) || 0;
+      // R44: NEVER adopt a fill with a non-positive price — a $0 avg price would corrupt entry/P&L and the risk
+      // ledger. If the broker says filled but gives no usable price, treat it as MANUAL (stay locked, alert an
+      // operator) rather than booking a phantom-priced position.
+      if (!(avgPrice > 0)) return { status: "manual", reason: "coindcx_fill_missing_price", evidence: { broker: "coindcx", tag, orderId: oid, filledQty } };
       if (want > 0 && filledQty > 0 && filledQty < want - 1e-9) return { status: "partial", orderId: oid, filledQty, avgPrice };
       return { status: "filled", orderId: oid, filledQty, avgPrice };
     }
     if (st === "partially_filled") {
       const filledQty = Number(o.filled_quantity ?? 0) || 0;
-      if (filledQty > 0) { const avgPrice = Number(o.avg_price ?? o.average_price ?? o.price_per_unit ?? o.price) || 0; return { status: "partial", orderId: oid, filledQty, avgPrice }; }
+      if (filledQty > 0) {
+        const avgPrice = Number(o.avg_price ?? o.average_price ?? o.price_per_unit ?? o.price) || 0;
+        if (!(avgPrice > 0)) return { status: "manual", reason: "coindcx_fill_missing_price", evidence: { broker: "coindcx", tag, orderId: oid, filledQty } };   // R44: no $0-price adoption
+        return { status: "partial", orderId: oid, filledQty, avgPrice };
+      }
       return { status: "pending" };
     }
     if (st === "rejected" || st === "cancelled" || st === "canceled" || st === "partially_cancelled") return { status: "rejected", orderId: oid };
@@ -901,6 +946,9 @@ async function _coindcxProbeByTag(attempt) {
   return null;   // recent/ambiguous unknown ⇒ stay locked
 }
 async function _adoptCoindcxFill(attempt, ob) {
+  // R44: hard refuse to book a fill without a positive price — a $0 entry corrupts P&L + the risk ledger. The probe
+  // already downgrades priceless fills to "manual", but guard here too so no code path can ever adopt a 0-price fill.
+  if (!(Number(ob && ob.avgPrice) > 0)) throw new Error("R44: refusing to adopt CoinDCX fill with non-positive price");
   // Adopt the recovered CoinDCX fill into the AUTHORITATIVE store exactly once (dedupes on the broker order id). A
   // reduce-only order recovered at startup is booked as an authoritative EXIT, mirroring the Delta adopter.
   const prot = (attempt && attempt.protection) || null;
@@ -1208,6 +1256,41 @@ app.get("/api/notices", requireAuth, async (req, res) => {
 app.post("/api/notices/read", requireAuth, async (req, res) => {
   try { await db.markNoticesRead(storageKeyFor(req.authUserId)); res.json({ ok: true }); }
   catch (e) { serverError(res, e); }
+});
+
+/* -------------------------- Web Push notifications ------------------------- */
+/* Public config: whether push is available + the VAPID public key the browser needs to subscribe. No auth so
+   the client can decide whether to show the "Enable notifications" affordance before login. */
+app.get("/api/push/config", (req, res) => {
+  res.json({ enabled: PUSH_ENABLED, publicKey: PUSH_ENABLED ? VAPID_PUBLIC_KEY : null });
+});
+/* Register (or refresh) this browser's push subscription + the user's category prefs. */
+app.post("/api/push/subscribe", requireAuth, async (req, res) => {
+  try {
+    if (!PUSH_ENABLED) return res.status(503).json({ error: "Push notifications are not configured." });
+    const { subscription, prefs } = req.body || {};
+    if (!subscription || !subscription.endpoint || !subscription.keys) return res.status(400).json({ error: "Invalid subscription." });
+    await db.savePushSubscription(storageKeyFor(req.authUserId), subscription, prefs || {});
+    res.json({ ok: true });
+  } catch (e) { serverError(res, e); }
+});
+/* Remove one device's subscription (user turned notifications off on this device). */
+app.post("/api/push/unsubscribe", requireAuth, async (req, res) => {
+  try { await db.deletePushSubscription((req.body || {}).endpoint); res.json({ ok: true }); }
+  catch (e) { serverError(res, e); }
+});
+/* Update the per-category preferences across all of this user's devices. */
+app.post("/api/push/prefs", requireAuth, async (req, res) => {
+  try { await db.updatePushPrefs(storageKeyFor(req.authUserId), (req.body || {}).prefs || {}); res.json({ ok: true }); }
+  catch (e) { serverError(res, e); }
+});
+/* Send a test notification to the caller's own devices, so they can confirm delivery works. */
+app.post("/api/push/test", requireAuth, async (req, res) => {
+  try {
+    if (!PUSH_ENABLED) return res.status(503).json({ error: "Push notifications are not configured." });
+    await notifyPush(storageKeyFor(req.authUserId), { category: "alerts", title: "MatrixOne", body: "Notifications are on — you're all set.", url: "/" });
+    res.json({ ok: true });
+  } catch (e) { serverError(res, e); }
 });
 
 /* ----------------------- users (phone + PIN) & state ---------------------- */
