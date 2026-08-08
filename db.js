@@ -12,6 +12,7 @@ const fs = require("fs");
 const path = require("path");
 const faultHook = require("./faultHook");   // C03: no-op fault seam (only tests arm boundaries)
 const crypto = require("crypto");
+const objectStore = require("./objectStore");   // STOR-3→object-storage: env-gated S3/R2 for screenshots (default: DB side table)
 
 const USING_PG = !!process.env.DATABASE_URL;
 // R20-P1-03: short, stable per-user reference used to NAMESPACE trade ids so one user's row can never share
@@ -130,6 +131,8 @@ async function initDb() {
      wrapped to never block readiness. */
   await pool.query(`CREATE TABLE IF NOT EXISTS idea_screenshots (
     idea_id TEXT PRIMARY KEY, data TEXT, bytes INT, content_type TEXT, created_at BIGINT)`).catch(() => {});
+  // object_key: when object storage (S3/R2) is enabled, the blob lives in the bucket and the row keeps only its key.
+  await pool.query(`ALTER TABLE idea_screenshots ADD COLUMN IF NOT EXISTS object_key TEXT`).catch(() => {});
   try {
     await pool.query(`INSERT INTO idea_screenshots (idea_id, data, bytes, created_at)
       SELECT id, screenshot, octet_length(screenshot), created_at FROM ideas
@@ -1442,11 +1445,29 @@ async function postIdea(rec) {
       [row.id, row.owner, row.owner_name, row.symbol, row.direction, row.note, row.target, row.stop, row.created_at, JSON.stringify(row.tags), row.status]
     );
     if (row.screenshot) {
-      await pool.query(
-        `INSERT INTO idea_screenshots (idea_id, data, bytes, created_at) VALUES ($1,$2,$3,$4)
-         ON CONFLICT (idea_id) DO UPDATE SET data=EXCLUDED.data, bytes=EXCLUDED.bytes`,
-        [row.id, row.screenshot, Buffer.byteLength(String(row.screenshot)), row.created_at]
-      );
+      if (objectStore.s3Enabled()) {
+        // Object-storage mode: blob → bucket, row keeps only the key (plan: "PostgreSQL stores URL/key + metadata only").
+        try {
+          const put = await objectStore.putScreenshot(row.id, row.screenshot);
+          await pool.query(
+            `INSERT INTO idea_screenshots (idea_id, object_key, bytes, content_type, created_at) VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT (idea_id) DO UPDATE SET object_key=EXCLUDED.object_key, bytes=EXCLUDED.bytes, content_type=EXCLUDED.content_type, data=NULL`,
+            [row.id, put.key, put.bytes, put.contentType, row.created_at]
+          );
+        } catch (e) { try { console.warn("[db] object-store put failed, falling back to DB blob:", e && e.message); } catch { /* ignore */ }
+          await pool.query(
+            `INSERT INTO idea_screenshots (idea_id, data, bytes, created_at) VALUES ($1,$2,$3,$4)
+             ON CONFLICT (idea_id) DO UPDATE SET data=EXCLUDED.data, bytes=EXCLUDED.bytes, object_key=NULL`,
+            [row.id, row.screenshot, Buffer.byteLength(String(row.screenshot)), row.created_at]
+          );
+        }
+      } else {
+        await pool.query(
+          `INSERT INTO idea_screenshots (idea_id, data, bytes, created_at) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (idea_id) DO UPDATE SET data=EXCLUDED.data, bytes=EXCLUDED.bytes`,
+          [row.id, row.screenshot, Buffer.byteLength(String(row.screenshot)), row.created_at]
+        );
+      }
     }
     return row;
   }
@@ -1464,7 +1485,10 @@ async function reviewIdea(id, status) {
 async function deleteIdea(id, owner) {
   if (USING_PG) {
     const r = await pool.query(`DELETE FROM ideas WHERE id=$1 AND ($2 = '' OR owner=$2) RETURNING id`, [id, owner || ""]);
-    if (r.rowCount) { await pool.query(`DELETE FROM idea_screenshots WHERE idea_id=$1`, [String(id)]).catch(() => {}); }
+    if (r.rowCount) {
+      await pool.query(`DELETE FROM idea_screenshots WHERE idea_id=$1`, [String(id)]).catch(() => {});
+      if (objectStore.s3Enabled()) { try { await objectStore.deleteScreenshot(id); } catch { /* best-effort */ } }
+    }
     return;
   }
   const all = readJSON(FILES.ideas);
@@ -1486,9 +1510,12 @@ async function listIdeas() {
 /* Fetch ONE idea's screenshot on demand (data-URL string or null). Keeps the heavy blob out of the list. */
 async function getIdeaScreenshot(id) {
   if (USING_PG) {
-    // STOR-3: side table is the primary store; fall back to any legacy inline blob not yet migrated.
-    const s = await pool.query(`SELECT data FROM idea_screenshots WHERE idea_id=$1`, [String(id)]);
-    if (s.rows[0] && s.rows[0].data) return s.rows[0].data;
+    // STOR-3: side table is the primary store. Order: object-storage key → inline side-table blob → legacy ideas blob.
+    const s = await pool.query(`SELECT data, object_key FROM idea_screenshots WHERE idea_id=$1`, [String(id)]);
+    if (s.rows[0]) {
+      if (s.rows[0].object_key) { const blob = await objectStore.getScreenshot(id); if (blob) return blob; }
+      if (s.rows[0].data) return s.rows[0].data;
+    }
     const r = await pool.query(`SELECT screenshot FROM ideas WHERE id=$1`, [String(id)]);
     return r.rows[0] ? (r.rows[0].screenshot || null) : null;
   }
