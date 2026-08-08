@@ -135,7 +135,7 @@ const COINDCX_RECOVERY_ON = String(process.env.COINDCX_RECOVERY || "").trim() ==
 const pushSender = require("./pushSender");
 const VAPID_PUBLIC_KEY = String(process.env.VAPID_PUBLIC_KEY || "").trim();
 const VAPID_PRIVATE_KEY = String(process.env.VAPID_PRIVATE_KEY || "").trim();
-const VAPID_SUBJECT = String(process.env.VAPID_SUBJECT || "mailto:admin@matrixone.app").trim();
+const VAPID_SUBJECT = String(process.env.VAPID_SUBJECT || "mailto:sumit.iima12@gmail.com").trim();
 const PUSH_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
 /* Fan a notification out to every device a user has subscribed, respecting their per-category prefs.
    `category` ∈ trades|broker|alerts|other. prefs shape: { all, trades, broker, alerts, other }; missing/empty

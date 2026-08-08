@@ -51,7 +51,7 @@ function buildVapidHeaders(endpoint, keys, subject) {
   const claims = {
     aud: originOf(endpoint),
     exp: Math.floor(Date.now() / 1000) + 12 * 60 * 60,
-    sub: subject || "mailto:admin@matrixone.app",
+    sub: subject || "mailto:sumit.iima12@gmail.com",
   };
   const signingInput = b64u.encode(JSON.stringify(header)) + "." + b64u.encode(JSON.stringify(claims));
   const key = vapidPrivateKeyObject(keys.publicKey, keys.privateKey);
