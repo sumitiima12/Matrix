@@ -1250,7 +1250,7 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
    stored server-side and loaded on every order — a tampered/old client can't drop them by omitting the
    body. Only clean positive numbers are kept. `merge` returns the STRICTER of two policies per field so a
    per-order client override can only tighten, never loosen. */
-const { cleanRiskPolicy, strictestRiskPolicy } = require("./riskPolicy");   // pure + unit-tested
+const { cleanRiskPolicy, strictestRiskPolicy, effectiveRiskPolicy } = require("./riskPolicy");   // pure + unit-tested (RISK-1: effective = strictest of platform/user/strategy)
 app.get("/api/risk-policy", requireAuth, async (req, res) => {
   try { const p = await db.getRiskPolicy(storageKeyFor(req.authUserId)); res.json({ ok: true, policy: p || {} }); }
   catch (e) { serverError(res, e); }
@@ -9179,7 +9179,12 @@ async function runAutoBuyEngine() {
         let abPolicyRaw, abTrades;
         try { abPolicyRaw = await db.getRiskPolicy(abStoreKey); abTrades = await db.getTrades(abStoreKey, 0, Date.now()); }
         catch { await db.updateRealStrategy(st.id, { lastError: "Couldn't read risk limits / trade history to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }).catch(() => {}); continue; }
-        const abPolicy = cleanRiskPolicy(abPolicyRaw);
+        /* RISK-1 — the EFFECTIVE policy for THIS automated entry is the STRICTEST of the account policy and the
+           STRATEGY-LEVEL tier (st.riskLimits, set when the strategy was armed). A per-strategy cap can only ever
+           tighten the account cap, never loosen it (effectiveRiskPolicy is strictest-wins per field). Both are
+           cleaned, so junk can't inject a bogus limit. The platform DEFAULT_LIMITS floor still applies inside
+           serverValidateOrder when a field is absent. */
+        const abPolicy = effectiveRiskPolicy(cleanRiskPolicy(abPolicyRaw), cleanRiskPolicy(st.riskLimits));
         {
           const abAccount = await fetchBrokerAccount(sess).catch(() => null);
           if (!abAccount) { await db.updateRealStrategy(st.id, { lastError: "Couldn't verify account with broker to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }); continue; }
@@ -9665,7 +9670,7 @@ app.post("/api/autobuy/register", requireAuth, requireSchemaReady, requireActive
   // not a separate hard-coded broker list. Uncertified ⇒ structured CAPABILITY_NOT_CERTIFIED (the broker stays fully
   // usable for connection, portfolio and manual real trading).
   if (!ensureCapability(res, b, "unattendedAutomation")) return undefined;
-  const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product, short, orderType, limitPrice } = req.body || {};
+  const { name, symbol, brokerSym, market, cfg, notional, interval, sl, tp, tsl, yahoo, product, short, orderType, limitPrice, riskLimits } = req.body || {};
   if (!brokerSym || !cfg || !(Number(notional) > 0)) return res.status(400).json({ error: "brokerSym, cfg and a positive amount are required" });
   if (!Array.isArray(cfg.entry) || !cfg.entry.length) return res.status(400).json({ error: "strategy has no entry rule" });
   // R41-P1-02/03 — same broker × order-type capability gate the manual route enforces, applied at ARM time for an
@@ -9694,6 +9699,10 @@ app.post("/api/autobuy/register", requireAuth, requireSchemaReady, requireActive
       // Entry order type for the engine (MARKET default, or LIMIT at limitPrice). Normalized fail-safe.
       orderType: orderTypes.normalizeOrderType(orderType) === "LIMIT" ? "LIMIT" : "MARKET", limitPrice: Number(limitPrice) || 0,
       yahoo: yahoo || (market === "Crypto" ? `${String(brokerSym).replace(/(USDT|USD|INR)$/i, "")}-USD` : `${String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "")}.NS`),
+      // RISK-1: optional STRATEGY-LEVEL risk tier — cleaned so only valid positive caps are stored. At entry
+      // time it's combined with the account policy via effectiveRiskPolicy (strictest wins), so this can only
+      // tighten the account limits for THIS strategy, never loosen them.
+      riskLimits: cleanRiskPolicy(riskLimits),
       status: "active", createdAt: Date.now(), openPositionId: null,
     };
     await db.saveRealStrategy(st);
