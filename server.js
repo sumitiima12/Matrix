@@ -30,6 +30,7 @@ const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
 const { resolveAdminRole, roleSatisfies } = require("./adminRoles");   // RBAC: owner > admin > support > readonly
 const { reconstructUserState } = require("./drReconstruct");   // OPS-2: rebuild open positions + risk from the immutable ledger
+const { alertSeverity, alertCategory } = require("./alertSeverity");   // ALERT-1: triage severity + category for notices/push
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -143,10 +144,12 @@ const PUSH_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
    `category` ∈ trades|broker|alerts|other. prefs shape: { all, trades, broker, alerts, other }; missing/empty
    prefs default to receiving everything (the user explicitly opted in by subscribing). Best-effort, never throws.
    A 404/410 from the push service means the subscription is dead → prune it. */
-async function notifyPush(userId, { category = "other", title, body, url } = {}) {
+async function notifyPush(userId, { category = "other", severity = "info", title, body, url } = {}) {
   if (!PUSH_ENABLED || !title) return;
   let subs = [];
   try { subs = await db.getPushSubscriptions(String(userId)); } catch { return; }
+  // ALERT-1: an "urgent" alert rides with high urgency so the push service doesn't hold/coalesce it.
+  const urgency = severity === "urgent" ? "high" : "normal";
   for (const sub of subs) {
     const p = sub.prefs || {};
     const wantsAll = p.all === true || (p.all == null && p.trades == null && p.broker == null && p.alerts == null && p.other == null);
@@ -154,7 +157,7 @@ async function notifyPush(userId, { category = "other", title, body, url } = {})
     if (p.none === true) continue;                 // explicit opt-out overrides everything
     if (!allowed) continue;
     try {
-      const r = await pushSender.sendPush(sub, { title, body: body || "", url: url || "/" }, { vapid: { publicKey: VAPID_PUBLIC_KEY, privateKey: VAPID_PRIVATE_KEY }, subject: VAPID_SUBJECT });
+      const r = await pushSender.sendPush(sub, { title, body: body || "", url: url || "/", severity }, { vapid: { publicKey: VAPID_PUBLIC_KEY, privateKey: VAPID_PRIVATE_KEY }, subject: VAPID_SUBJECT, urgency });
       if (r.statusCode === 404 || r.statusCode === 410) { try { await db.deletePushSubscription(sub.endpoint); } catch { /* ignore */ } }
     } catch { /* one bad device shouldn't stop the rest */ }
   }
@@ -217,15 +220,18 @@ function logFinancial(event, fields) {
 /* R17-P2-03: write a durable user-facing notice (used by background jobs like delayed-fill protection so the
    user learns the terminal outcome even though it happened server-side). Best-effort; never throws. */
 async function addUserNotice(userId, notice) {
-  try { await db.addNotice(String(userId), { ...notice, at: Date.now() }); } catch { /* non-fatal */ }
-  // Mirror the durable notice to a push notification (best-effort). Category comes from the notice kind so the
-  // user's per-category prefs apply: order/fill events → trades; broker/connection → broker; everything else → alerts.
+  // ALERT-1: stamp a triage SEVERITY (urgent | action | info) and CATEGORY onto every notice so the UI and push
+  // can distinguish an urgent financial alert from a routine confirmation. An explicit notice.severity overrides.
+  const kind = notice && (notice.kind || notice.type);
+  const severity = alertSeverity(kind, notice && notice.severity);
+  const category = alertCategory(kind, notice && notice.category);
+  try { await db.addNotice(String(userId), { ...notice, severity, category, at: Date.now() }); } catch { /* non-fatal */ }
+  // Mirror the durable notice to a push notification (best-effort), carrying the same severity + category so the
+  // user's per-category prefs apply and the device can render an urgent alert distinctly.
   try {
-    const k = String(notice && (notice.kind || notice.type) || "").toLowerCase();
-    const category = /fill|order|trade|exit|entry|protect/.test(k) ? "trades" : /broker|connect|token|auth/.test(k) ? "broker" : "alerts";
     const title = notice && (notice.title || notice.heading) || "MatrixOne";
     const body = notice && (notice.message || notice.reason || notice.body || notice.text) || "";
-    await notifyPush(String(userId), { category, title, body, url: notice && notice.url || "/" });
+    await notifyPush(String(userId), { category, severity, title, body, url: notice && notice.url || "/" });
   } catch { /* non-fatal */ }
 }
 /* R19 fix: persist an authoritative trade row for a VERIFIED real fill — and DO NOT silently swallow a
