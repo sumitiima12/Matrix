@@ -142,7 +142,38 @@ function capabilitiesView() {
   const orderTypes = require("./orderTypes");
   const orderTypesByBroker = {};
   for (const b of Object.keys(BROKER_CAPABILITIES)) orderTypesByBroker[b] = orderTypes.supportedOrderTypes(b);
-  return { version: CERTIFICATION_VERSION, capabilities: BROKER_CAPABILITIES, keys: ALL_CAPS, orderTypes: orderTypesByBroker };
+  return {
+    version: CERTIFICATION_VERSION,
+    matrixDigest: matrixDigest(),          // REC-4: content fingerprint of the flags (comment-independent)
+    commit: deployCommit(),                // the git SHA this matrix shipped in (from the deploy env), or null
+    capabilities: BROKER_CAPABILITIES, keys: ALL_CAPS, orderTypes: orderTypesByBroker,
+  };
 }
 
-module.exports = { BROKER_CAPABILITIES, CERTIFICATION_VERSION, ALL_CAPS, brokerCap, capabilitiesView };
+/* REC-4 — FORMALIZE THE MATRIX PER SHA. CERTIFICATION_VERSION is bumped BY HAND, so a flag can silently drift
+   without it moving. matrixDigest() is a DETERMINISTIC content hash over the actual flag values (keys sorted,
+   comments and formatting irrelevant): if any capability flips, the digest changes — even if someone forgot to
+   bump the version. Bound to the deploy's git commit, it answers exactly "which capability matrix is live right
+   now, and does it match what was certified for this SHA?". Pure: same flags in ⇒ same digest out, every time. */
+const crypto = require("crypto");
+function canonicalMatrix() {
+  // Sort brokers, and within each broker sort capabilities, into a stable canonical form independent of source order.
+  const brokers = Object.keys(BROKER_CAPABILITIES).sort();
+  const out = {};
+  for (const b of brokers) {
+    const caps0 = BROKER_CAPABILITIES[b] || {};
+    out[b] = {};
+    for (const k of ALL_CAPS.slice().sort()) out[b][k] = caps0[k] === true;   // coerce to strict booleans
+  }
+  return out;
+}
+function matrixDigest() {
+  return crypto.createHash("sha256").update(JSON.stringify(canonicalMatrix())).digest("hex").slice(0, 16);
+}
+/* The git commit this process is running — read from whatever the platform injects (Render sets RENDER_GIT_COMMIT);
+   never computed here so the module stays pure. null when unknown (e.g. local/dev). */
+function deployCommit() {
+  return process.env.RENDER_GIT_COMMIT || process.env.GIT_SHA || process.env.SOURCE_VERSION || null;
+}
+
+module.exports = { BROKER_CAPABILITIES, CERTIFICATION_VERSION, ALL_CAPS, brokerCap, capabilitiesView, canonicalMatrix, matrixDigest, deployCommit };
