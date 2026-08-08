@@ -31,6 +31,7 @@ const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth")
 const { resolveAdminRole, roleSatisfies } = require("./adminRoles");   // RBAC: owner > admin > support > readonly
 const { reconstructUserState } = require("./drReconstruct");   // OPS-2: rebuild open positions + risk from the immutable ledger
 const { alertSeverity, alertCategory } = require("./alertSeverity");   // ALERT-1: triage severity + category for notices/push
+const { costMetrics } = require("./driftMetrics");   // FIN-2: cost / slippage / drift metrics from the fills ledger
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -2017,6 +2018,21 @@ app.get("/api/admin/ops/overview", async (req, res) => {
       pendingProtection: (pending || []).map((x) => ({ userId: x.userId, broker: x.broker, orderId: x.orderId, symbol: x.symbol, attempts: x.attempts, since: x.created_at })),
       realStrategies: (realStrats || []).map((s) => ({ userId: s.userId, name: s.name, symbol: s.symbol, broker: s.broker, market: s.market })),
     });
+  } catch (e) { serverError(res, e); }
+});
+/* FIN-2 — cost / slippage / drift metrics for a user, derived from the immutable fills ledger. support+ read.
+   Shows net-vs-gross realised P&L, the fee drag, per-broker breakdown, and slippage where a reference price was
+   captured (honest "unavailable" otherwise). `days` bounds the window (default 30). */
+app.get("/api/admin/ops/cost-metrics", async (req, res) => {
+  if (!requireAdmin(req, res, "support")) return;
+  try {
+    const phone = cleanPhone(req.query.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    const userId = storageKeyFor(phone);
+    const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
+    const from = Date.now() - days * 86400000;
+    const fills = await db.getFills(userId, from).catch(() => []);
+    res.json({ ok: true, phone, days, ...costMetrics(fills, { from }) });
   } catch (e) { serverError(res, e); }
 });
 /* Pause a user's automated entries (halt). support+ — a defensive action, safe to grant broadly. Audited. */
