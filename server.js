@@ -1363,6 +1363,33 @@ const publicDataLimiter = rateLimit({
   message: { error: "Too many requests — please slow down." },
 });
 
+/* SEC-2 — PER-USER rate limit on money-moving routes. The other limiters are per-IP, which a single
+   authenticated account behind one IP can still hammer (or which shared-NAT users trip for each other).
+   This keys the budget on the VERIFIED token subject so each user gets their own quota — 90 writes/min is
+   far above any legitimate manual or engine cadence but stops a runaway loop or abusive script. GETs are
+   skipped (reads have their own caches/limits); only state-changing verbs count. Falls back to IP for
+   unauthenticated callers so it still limits pre-login abuse. */
+const perUserWriteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 90,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS",
+  keyGenerator: (req) => {
+    try {
+      const h = req.get("Authorization") || "";
+      const tok = h.startsWith("Bearer ") ? h.slice(7) : "";
+      const v = tok ? verifyToken(tok) : null;
+      if (v && v.userId) return "u:" + stripPh(v.userId);
+    } catch { /* fall through to IP */ }
+    return "ip:" + (req.ip || req.socket && req.socket.remoteAddress || "");
+  },
+  message: { error: "You're sending requests too quickly — please slow down and try again in a minute." },
+});
+/* Apply to the money-moving path prefixes. Placed here (before the routes are declared below) so it wraps
+   every matching route. Prefix match means "/api/autobuy" also covers "/api/autobuy/register", etc. */
+app.use(["/api/order", "/api/broker/order", "/api/autobuy", "/api/autoexit", "/api/trades"], perUserWriteLimiter);
+
 /* P2-11 — don't leak raw upstream/internal error text (stack fragments, DB driver messages, provider
    payloads) to the client. Log the full detail server-side; return a generic message. Routes that need
    to surface a SPECIFIC user-facing reason (e.g. "insufficient balance") still send their own message
