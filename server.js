@@ -32,6 +32,7 @@ const { resolveAdminRole, roleSatisfies } = require("./adminRoles");   // RBAC: 
 const { reconstructUserState } = require("./drReconstruct");   // OPS-2: rebuild open positions + risk from the immutable ledger
 const { alertSeverity, alertCategory } = require("./alertSeverity");   // ALERT-1: triage severity + category for notices/push
 const { costMetrics } = require("./driftMetrics");   // FIN-2: cost / slippage / drift metrics from the fills ledger
+const { summarizePortfolio } = require("./portfolioRisk");   // REC-1: account-wide portfolio risk intelligence (advisory)
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -1272,6 +1273,31 @@ app.post("/api/notices/read", requireAuth, async (req, res) => {
    the client can decide whether to show the "Enable notifications" affordance before login. */
 app.get("/api/push/config", (req, res) => {
   res.json({ enabled: PUSH_ENABLED, publicKey: PUSH_ENABLED ? VAPID_PUBLIC_KEY : null });
+});
+
+/* REC-1: PORTFOLIO RISK — account-wide, advisory (never blocks). Reads the caller's OWN open managed
+   positions, derives each stop price from its stored SL% + direction, and returns the concentration /
+   aggregate-stop-risk / direction-skew picture. Marks-to-entry (no per-symbol quote fanout) to stay cheap;
+   pass ?equity= to express risk as a % of account equity. Identity is the verified token, never the body. */
+app.get("/api/portfolio/risk", requireAuth, async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const managed = await db.getManagedPositionsForUser(userId).catch(() => []);
+    const positions = (managed || [])
+      .filter((p) => p && p.status === "open")
+      .map((p) => {
+        const entry = Number(p.entry);
+        const slPct = Number(p.sl);   // stored as a percent at registration
+        const side = p.short ? "SELL" : "BUY";
+        let stop = null;
+        if (slPct > 0 && entry > 0) stop = side === "BUY" ? entry * (1 - slPct / 100) : entry * (1 + slPct / 100);
+        return { symbol: p.symbol, market: p.market || "—", side, qty: Number(p.qty), entry, stop };
+      });
+    const equity = Number(req.query.equity) > 0 ? Number(req.query.equity) : null;
+    res.json({ ok: true, markedToEntry: true, ...summarizePortfolio(positions, { equity }) });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 /* Register (or refresh) this browser's push subscription + the user's category prefs. */
 app.post("/api/push/subscribe", requireAuth, async (req, res) => {
