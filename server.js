@@ -28,6 +28,7 @@ const { evalExitPair, optRanker, lenOptions, costPctFor } = require("./optimizer
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
+const { resolveAdminRole, roleSatisfies } = require("./adminRoles");   // RBAC: owner > admin > support > readonly
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -1795,9 +1796,41 @@ function isAdmin(req) {
   }
   return !!uid && adminIds.includes(uid) && key === adminKey;
 }
-function requireAdmin(req, res) {
+/* The caller's admin ROLE (owner|admin|support|readonly|null) from the VERIFIED token subject + env role lists.
+   Independent of the ADMIN_KEY check — isAdmin() still enforces the key; this resolves *what tier* they are. */
+function adminRole(req) {
+  let uid = req.authUserId ? stripPh(req.authUserId) : null;
+  if (!uid) {
+    const h = req.get("Authorization") || "";
+    const tok = h.startsWith("Bearer ") ? h.slice(7) : "";
+    const v = verifyToken(tok);
+    if (v) uid = stripPh(v.userId);
+  }
+  return resolveAdminRole(uid, process.env);
+}
+/* Gate a route. Still requires the two existing factors (admin id + ADMIN_KEY via isAdmin), AND now a minimum
+   ROLE. `minRole` defaults to "admin" so existing mutating routes keep their prior strength (the current sole
+   admin is an owner, so nothing breaks). Read-only endpoints pass "readonly"; dangerous ones pass "owner". */
+function requireAdmin(req, res, minRole = "admin") {
   if (!isAdmin(req)) { res.status(403).json({ error: "Forbidden" }); return false; }
+  const role = adminRole(req) || "owner";   // isAdmin passed but not in a role list → treat as owner (back-compat)
+  if (!roleSatisfies(role, minRole)) {
+    res.status(403).json({ error: `This action requires the ${minRole} role or higher (you are ${role}).`, role, required: minRole });
+    return false;
+  }
   return true;
+}
+/* Best-effort append to the immutable admin audit trail. Never throws — a logging failure must not block or
+   crash the action, but every privileged action SHOULD leave a record. Call AFTER authorization passes. */
+async function auditAdmin(req, action, target = null, detail = {}) {
+  try {
+    await db.logAdminAction({
+      actor: req.authUserId ? stripPh(req.authUserId) : "unknown",
+      role: adminRole(req) || "owner",
+      action, target, detail,
+      ip: (req.headers["x-forwarded-for"] || req.socket && req.socket.remoteAddress || "").toString().split(",")[0].trim(),
+    });
+  } catch (e) { console.error("[audit] failed to record", action, e && e.message); }
 }
 
 // List all users (basic records, no PINs).
@@ -1826,6 +1859,7 @@ app.post("/api/admin/block", async (req, res) => {
     const blocked = !!(req.body && req.body.blocked);
     if (!phone) return res.status(400).json({ error: "phone required" });
     await db.setUserBlocked(phone, blocked);
+    await auditAdmin(req, blocked ? "user.block" : "user.unblock", phone, { blocked });
     res.json({ ok: true, phone, blocked });
   } catch (e) { serverError(res, e); }
 });
@@ -1837,6 +1871,7 @@ app.post("/api/admin/clear-virtual", async (req, res) => {
     const phone = cleanPhone(req.body && req.body.phone);
     if (!phone) return res.status(400).json({ error: "phone required" });
     const removed = await db.clearVirtualTrades(storageKeyFor(phone));
+    await auditAdmin(req, "trades.clearVirtual", phone, { removed });
     res.json({ ok: true, phone, removed });
   } catch (e) { serverError(res, e); }
 });
@@ -1859,6 +1894,7 @@ app.post("/api/admin/clear-trades", async (req, res) => {
     if (!CLEAR_SCOPES.has(scope)) return res.status(400).json({ error: "invalid scope" });
     const removed = await db.clearTradesByType(storageKeyFor(phone), tradeType, scope);
     logFinancial("admin.clearTrades", { phone: storageKeyFor(phone), tradeType, scope, removed });
+    await auditAdmin(req, "trades.clear", phone, { tradeType, scope, removed });
     res.json({ ok: true, phone, tradeType, scope, removed });
   } catch (e) { serverError(res, e); }
 });
@@ -1892,7 +1928,19 @@ app.post("/api/admin/approve", async (req, res) => {
     } else {
       await db.setUserApproved(phone, true);
     }
+    await auditAdmin(req, approved ? "user.approve" : "user.unapprove", phone, { approved });
     res.json({ ok: true, phone, approved });
+  } catch (e) { serverError(res, e); }
+});
+
+/* Immutable admin audit trail — who did what, when, from where. Read-only, so a support/read-only admin can
+   review it. Rows are append-only and never edited by the app. */
+app.get("/api/admin/audit", async (req, res) => {
+  if (!requireAdmin(req, res, "readonly")) return;
+  try {
+    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 200));
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    res.json({ ok: true, entries: await db.getAdminAudit(limit, offset), role: adminRole(req) });
   } catch (e) { serverError(res, e); }
 });
 
@@ -1947,7 +1995,7 @@ app.post("/api/pin/change", requireAuth, requireFreshSession, async (req, res) =
 // Admin backstop: reset any user's PIN. The last-resort recovery when a user can't answer
 // their security question (or never set one).
 app.post("/api/admin/reset-pin", async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!requireAdmin(req, res, "owner")) return;   // resetting someone's login credential is owner-only
   try {
     const phone = cleanPhone(req.body && req.body.phone);
     const newPin = req.body && req.body.newPin;
@@ -1960,6 +2008,7 @@ app.post("/api/admin/reset-pin", async (req, res) => {
       await db.updateUserPin(phone, hashPin(newPin));
       if (typeof db.bumpTokenVersion === "function") { try { await db.bumpTokenVersion(phone); } catch { /* non-fatal */ } }
     }
+    await auditAdmin(req, "user.resetPin", phone, {});   // never log the PIN itself
     res.json({ ok: true, phone });
   } catch (e) { serverError(res, e); }
 });
@@ -5309,7 +5358,7 @@ app.post("/api/account/delete", requireAuth, requireFreshSessionAllowBlocked, as
 
 // Admin: permanently delete ANY account (by phone) and all its data.
 app.post("/api/admin/delete-user", async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!requireAdmin(req, res, "owner")) return;   // permanent account deletion is owner-only
   try {
     const phone = cleanPhone(req.body && req.body.phone);
     if (!phone) return res.status(400).json({ error: "phone required" });
@@ -5318,6 +5367,7 @@ app.post("/api/admin/delete-user", async (req, res) => {
     await db.deleteAccount(userId, phone);
     for (const [id, s] of brokerSessions) if (s.userId === String(userId)) brokerSessions.delete(id);
     for (const k of appCredCache.keys()) if (k.startsWith(`${userId}|`)) appCredCache.delete(k);
+    await auditAdmin(req, "user.delete", phone, {});
     res.json({ ok: true, phone });
   } catch (e) { serverError(res, e); }
 });

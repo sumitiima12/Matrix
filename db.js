@@ -209,6 +209,11 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
     endpoint TEXT PRIMARY KEY, user_id TEXT, p256dh TEXT, auth TEXT, prefs JSONB, created_at BIGINT)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS push_subs_user ON push_subscriptions (user_id)`);
+  /* Append-only admin audit log. Every privileged admin action is recorded here (who, what role, what action,
+     which target, when, from which IP). Rows are never updated or deleted by the app — it's an evidence trail. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS admin_audit (
+    id TEXT PRIMARY KEY, at BIGINT, actor TEXT, role TEXT, action TEXT, target TEXT, detail JSONB, ip TEXT)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS admin_audit_at ON admin_audit (at DESC)`);
   /* Delayed-fill protection watcher (R16-P2-10). A manual LIMIT entry that asked for app-managed SL/TP but
      hadn't filled within the sync window is parked here; a background sweep re-checks the broker until the
      order is terminal and, on fill, attaches the requested protection to the CONFIRMED filled quantity. */
@@ -2226,6 +2231,33 @@ async function getPushSubscriptions(userId) {
   if (USING_PG) { const r = await pool.query(`SELECT endpoint,p256dh,auth,prefs FROM push_subscriptions WHERE user_id=$1`, [String(userId)]); return r.rows.map((x) => ({ endpoint: x.endpoint, keys: { p256dh: x.p256dh, auth: x.auth }, prefs: x.prefs || {} })); }
   const d = readJSON(PUSH_FILE()); return Object.values(d).filter((x) => x.user_id === String(userId)).map((x) => ({ endpoint: x.endpoint, keys: { p256dh: x.p256dh, auth: x.auth }, prefs: x.prefs || {} }));
 }
+
+/* Append-only admin audit trail. Records are inserted, never updated/deleted by the app. */
+const AUDIT_FILE = () => (FILES.adminAudit || (FILES.adminAudit = process.env.ADMIN_AUDIT_FILE || path.join(__dirname, "admin_audit.json")));
+async function logAdminAction(entry) {
+  const row = {
+    id: `aa_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    at: Date.now(),
+    actor: String(entry.actor || "unknown"),
+    role: String(entry.role || ""),
+    action: String(entry.action || ""),
+    target: entry.target != null ? String(entry.target) : null,
+    detail: entry.detail || {},
+    ip: entry.ip != null ? String(entry.ip) : null,
+  };
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO admin_audit (id,at,actor,role,action,target,detail,ip) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [row.id, row.at, row.actor, row.role, row.action, row.target, row.detail, row.ip]
+    );
+    return row;
+  }
+  const d = readJSON(AUDIT_FILE()); const arr = Array.isArray(d.rows) ? d.rows : []; arr.unshift(row); d.rows = arr.slice(0, 5000); writeJSON(AUDIT_FILE(), d); return row;
+}
+async function getAdminAudit(limit = 200, offset = 0) {
+  if (USING_PG) { const r = await pool.query(`SELECT id,at,actor,role,action,target,detail,ip FROM admin_audit ORDER BY at DESC LIMIT $1 OFFSET $2`, [limit, offset]); return r.rows.map((x) => ({ ...x, at: Number(x.at) })); }
+  const d = readJSON(AUDIT_FILE()); const arr = Array.isArray(d.rows) ? d.rows : []; return arr.slice(offset, offset + limit);
+}
 /* R16-P2-10 delayed-fill protection store. */
 async function savePendingProtection(rec) {
   const row = { id: rec.id, user_id: String(rec.userId), broker: rec.broker, order_id: String(rec.orderId), data: rec, attempts: 0, created_at: Date.now() };
@@ -2349,4 +2381,4 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
+module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, logAdminAction, getAdminAudit, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
