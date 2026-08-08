@@ -1972,6 +1972,83 @@ app.get("/api/admin/audit", async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* OPS-1 — operations overview. One read-only snapshot of everything an operator needs to watch for unattended
+   real-money trading: who's armed for real, halted accounts, unresolved orders, unprotected positions, pending
+   protection, and the oldest-item ages that flag a stuck pipeline. support+ (read). Never mutates. */
+app.get("/api/admin/ops/overview", async (req, res) => {
+  if (!requireAdmin(req, res, "support")) return;
+  try {
+    const now = Date.now();
+    const [halted, managed, unresolved, pending, realStrats] = await Promise.all([
+      db.getHaltedEntryUsers().catch(() => []),
+      db.getOpenManagedPositions(500).catch(() => []),
+      db.listUnresolvedOrderAttempts(500).catch(() => []),
+      db.listPendingProtection(500).catch(() => []),
+      db.getActiveRealStrategies(500).catch(() => []),
+    ]);
+    const isProtected = (p) => !!(p && (p.sl || p.tp || p.tsl || p.stopLoss || p.takeProfit));
+    const unprotected = (managed || []).filter((p) => p && (p.status === "open" || p.status === "closing") && !isProtected(p));
+    const ageOf = (ts) => (ts ? Math.max(0, now - Number(ts)) : null);
+    const oldest = (arr, pick) => (arr || []).reduce((m, x) => { const t = pick(x); return t && (m == null || t < m) ? t : m; }, null);
+    const realUsers = new Set([...(realStrats || []).map((s) => String(s.userId || s.user_id || "")), ...(managed || []).map((p) => String(p.userId || p.user_id || ""))].filter(Boolean));
+
+    res.json({
+      ok: true, at: now, role: adminRole(req),
+      summary: {
+        realTradingUsers: realUsers.size,
+        activeRealStrategies: (realStrats || []).length,
+        openManagedPositions: (managed || []).length,
+        unprotectedPositions: unprotected.length,
+        unresolvedOrders: (unresolved || []).length,
+        pendingProtection: (pending || []).length,
+        haltedAccounts: (halted || []).length,
+        oldestUnresolvedMs: ageOf(oldest(unresolved, (x) => x.created_at || x.createdAt)),
+        oldestPendingProtectionMs: ageOf(oldest(pending, (x) => x.created_at || x.createdAt)),
+      },
+      haltedAccounts: halted,
+      unprotectedPositions: unprotected.map((p) => ({ userId: p.userId || p.user_id, broker: p.broker, symbol: p.symbol, qty: p.qty, status: p.status })),
+      unresolvedOrders: (unresolved || []).map((x) => ({ userId: x.user_id || x.userId, broker: x.broker, orderTag: x.orderTag || x.order_tag, status: x.status, createdAt: x.created_at || x.createdAt })),
+      pendingProtection: (pending || []).map((x) => ({ userId: x.userId, broker: x.broker, orderId: x.orderId, symbol: x.symbol, attempts: x.attempts, since: x.created_at })),
+      realStrategies: (realStrats || []).map((s) => ({ userId: s.userId, name: s.name, symbol: s.symbol, broker: s.broker, market: s.market })),
+    });
+  } catch (e) { serverError(res, e); }
+});
+/* Pause a user's automated entries (halt). support+ — a defensive action, safe to grant broadly. Audited. */
+app.post("/api/admin/ops/pause-user", async (req, res) => {
+  if (!requireAdmin(req, res, "support")) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    await db.setEntryHalt(storageKeyFor(phone), true);
+    await auditAdmin(req, "ops.pauseUser", phone, {});
+    res.json({ ok: true, phone, halted: true });
+  } catch (e) { serverError(res, e); }
+});
+/* Resume a user's automated entries. admin+ — RE-enabling real trading is riskier than pausing, so it needs a
+   higher role. Audited. */
+app.post("/api/admin/ops/resume-user", async (req, res) => {
+  if (!requireAdmin(req, res, "admin")) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    await db.setEntryHalt(storageKeyFor(phone), false);
+    await auditAdmin(req, "ops.resumeUser", phone, {});
+    res.json({ ok: true, phone, halted: false });
+  } catch (e) { serverError(res, e); }
+});
+/* Record a free-text incident note into the immutable audit trail (support+). Lets ops mark an incident
+   opened/updated/resolved with context, so the audit log is the single source of operational truth. */
+app.post("/api/admin/ops/incident-note", async (req, res) => {
+  if (!requireAdmin(req, res, "support")) return;
+  try {
+    const note = String((req.body && req.body.note) || "").slice(0, 2000).trim();
+    const ref = req.body && req.body.ref ? String(req.body.ref).slice(0, 200) : null;
+    if (!note) return res.status(400).json({ error: "note required" });
+    await auditAdmin(req, "incident.note", ref, { note });
+    res.json({ ok: true });
+  } catch (e) { serverError(res, e); }
+});
+
 /* OPS-2 — DR reconstruction. Rebuild a user's open positions + risk-lock decision purely from the IMMUTABLE
    fills ledger, ignoring the mutable projection tables. Run this after a point-in-time restore to confirm the
    live state can be recovered from durable data (and to spot projection-vs-ledger divergence). Owner-only +
