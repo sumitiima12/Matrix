@@ -237,13 +237,36 @@ function logFinancial(event, fields) {
 /* stableStringify + riskEligibleTrades now live in ./orderIntegrity (required at top) — see orderIntegrity.js. */
 /* R17-P2-03: write a durable user-facing notice (used by background jobs like delayed-fill protection so the
    user learns the terminal outcome even though it happened server-side). Best-effort; never throws. */
+/* PERF-9 — server-sent-events hub for money-path state. Connected clients get order/fill/halt/notice events
+   PUSHED the instant they happen (via addUserNotice below) instead of polling for them. It is READ-ONLY: the
+   stream only emits; it never mutates anything. Per-user keyed, best-effort — a dead socket is dropped and the
+   client's polling fallback takes over. No DB work in the hot path (heartbeats are bare), so a stream costs
+   almost nothing. */
+const _sseClients = new Map();   // userKey -> Set<res>
+function sseAdd(userKey, res) {
+  let set = _sseClients.get(userKey);
+  if (!set) { set = new Set(); _sseClients.set(userKey, set); }
+  set.add(res);
+  return () => { const s = _sseClients.get(userKey); if (s) { s.delete(res); if (!s.size) _sseClients.delete(userKey); } };
+}
+function sseBroadcast(userKey, event) {
+  const set = _sseClients.get(String(userKey));
+  if (!set || !set.size) return;
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const res of set) { try { res.write(payload); } catch { /* dead socket; cleaned up on close */ } }
+}
+
 async function addUserNotice(userId, notice) {
   // ALERT-1: stamp a triage SEVERITY (urgent | action | info) and CATEGORY onto every notice so the UI and push
   // can distinguish an urgent financial alert from a routine confirmation. An explicit notice.severity overrides.
   const kind = notice && (notice.kind || notice.type);
   const severity = alertSeverity(kind, notice && notice.severity);
   const category = alertCategory(kind, notice && notice.category);
-  try { await db.addNotice(String(userId), { ...notice, severity, category, at: Date.now() }); } catch { /* non-fatal */ }
+  const stamped = { ...notice, severity, category, at: Date.now() };
+  try { await db.addNotice(String(userId), stamped); } catch { /* non-fatal */ }
+  // PERF-9: push the notice to any live SSE stream for this user so orders/fills/halts arrive instantly (the
+  // client can then poll far less often, or not at all while connected).
+  try { sseBroadcast(String(userId), { type: "notice", notice: stamped }); } catch { /* non-fatal */ }
   // Mirror the durable notice to a push notification (best-effort), carrying the same severity + category so the
   // user's per-category prefs apply and the device can render an urgent alert distinctly.
   try {
@@ -1282,6 +1305,27 @@ app.get("/api/notices", requireAuth, async (req, res) => {
 app.post("/api/notices/read", requireAuth, async (req, res) => {
   try { await db.markNoticesRead(storageKeyFor(req.authUserId)); res.json({ ok: true }); }
   catch (e) { serverError(res, e); }
+});
+
+/* PERF-9: Server-Sent Events for money-path state (notices/orders/positions/risk/connection).
+   One long-lived GET per client; the server pushes events the instant they happen instead of the
+   browser polling /api/notices on a timer. This is additive — the frontend keeps a polling fallback,
+   so an SSE drop degrades to the existing behaviour rather than losing events. Reads only; every
+   side-effectful action still goes through its own authenticated POST route. */
+app.get("/api/stream", requireAuth, (req, res) => {
+  const userKey = String(storageKeyFor(req.authUserId));
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no", // disable proxy buffering (nginx/Render) so events flush immediately
+  });
+  res.write(`retry: 5000\n\n`);                                  // tell EventSource to reconnect after 5s if dropped
+  res.write(`data: ${JSON.stringify({ type: "hello", at: Date.now() })}\n\n`);
+  const remove = sseAdd(userKey, res);
+  // Heartbeat comment (~25s) keeps intermediaries from closing an idle connection; comments are ignored by EventSource.
+  const hb = setInterval(() => { try { res.write(`: ping ${Date.now()}\n\n`); } catch { /* closed */ } }, 25000);
+  req.on("close", () => { clearInterval(hb); try { remove(); } catch { /* ignore */ } });
 });
 
 /* -------------------------- Web Push notifications ------------------------- */
