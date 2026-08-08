@@ -36,10 +36,26 @@ if (USING_PG) {
     : (strict
       ? (ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true })
       : { rejectUnauthorized: false });
+  /* STOR-6 (optimization plan §5 "Pool configuration"): explicit per-instance connection + query budgets so total
+     connections across web instances + CI + admin tools stay under the Render database limit with headroom, and a
+     hung query can't pin a connection forever. All env-overridable; defaults are conservative for a single small
+     instance. `max` caps this process's pool; `statement_timeout`/`query_timeout` bound any single query;
+     idle/lifetime recycle connections so the pool doesn't accumulate stale sockets. `application_name` tags the
+     connection so it's identifiable in pg_stat_activity. */
+  const _int = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) && n > 0 ? n : d; };
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl,
+    max: _int(process.env.PG_POOL_MAX, 10),
+    connectionTimeoutMillis: _int(process.env.PG_CONNECT_TIMEOUT_MS, 10000),
+    idleTimeoutMillis: _int(process.env.PG_IDLE_TIMEOUT_MS, 30000),
+    maxLifetimeSeconds: _int(process.env.PG_MAX_LIFETIME_S, 1800),
+    statement_timeout: _int(process.env.PG_STATEMENT_TIMEOUT_MS, 20000),
+    query_timeout: _int(process.env.PG_QUERY_TIMEOUT_MS, 20000),
+    application_name: process.env.PG_APP_NAME || "matrixone-backend",
   });
+  // A pool 'error' on an idle client must never crash the process — log and let the pool recycle it.
+  pool.on("error", (e) => { try { console.error("[db] idle pool client error:", e && e.message); } catch { /* ignore */ } });
 }
 
 // Create tables on boot (no-op for flat-file mode).
@@ -106,6 +122,22 @@ async function initDb() {
   await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS tags JSONB`);
   await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'`);
   await pool.query(`ALTER TABLE ideas ADD COLUMN IF NOT EXISTS reviewed_at BIGINT`);
+  /* STOR-3 (optimization plan §3 "Remove large objects first"): the base64 screenshot data-URL is a big blob that
+     bloats the frequently-scanned `ideas` row (base64 inflates size ~⅓ before JSON/row overhead). Move it to a
+     SIDE table so the hot `ideas` table stays lean; `ideas` keeps only a has-screenshot signal via this table.
+     This is the interim step toward true object storage — swap the side-table read/write for an S3/R2 URL later
+     without touching the API. Backfill is idempotent and cosmetic-only (screenshots are non-financial), so it is
+     wrapped to never block readiness. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS idea_screenshots (
+    idea_id TEXT PRIMARY KEY, data TEXT, bytes INT, content_type TEXT, created_at BIGINT)`).catch(() => {});
+  try {
+    await pool.query(`INSERT INTO idea_screenshots (idea_id, data, bytes, created_at)
+      SELECT id, screenshot, octet_length(screenshot), created_at FROM ideas
+      WHERE screenshot IS NOT NULL ON CONFLICT (idea_id) DO NOTHING`);
+    // Free the hot table: null legacy inline blobs now safely stored side-table.
+    await pool.query(`UPDATE ideas SET screenshot = NULL
+      WHERE screenshot IS NOT NULL AND id IN (SELECT idea_id FROM idea_screenshots)`);
+  } catch (e) { try { console.warn("[db] idea_screenshots backfill skipped:", e && e.message); } catch { /* ignore */ } }
   /* Encrypted broker credentials — so the server-side auto-exit engine can place a real
      exit while the user's app is closed. `data` is an AES-256-GCM blob (encrypted in
      server.js); the plaintext token/keys NEVER touch this table. One row per user+broker. */
@@ -1354,11 +1386,19 @@ async function listPublicStrategies() {
 async function postIdea(rec) {
   const row = { id: rec.id, owner: rec.owner, owner_name: rec.owner_name || "", symbol: rec.symbol || "", direction: rec.direction || "Long", note: rec.note || "", target: rec.target || "", stop: rec.stop || "", created_at: rec.created_at || Date.now(), tags: Array.isArray(rec.tags) ? rec.tags.slice(0, 4) : [], screenshot: rec.screenshot || null, status: rec.status || "pending", reviewed_at: null };
   if (USING_PG) {
+    // STOR-3: the row no longer stores the blob inline — write metadata to `ideas`, the blob to the side table.
     await pool.query(
-      `INSERT INTO ideas (id, owner, owner_name, symbol, direction, note, target, stop, created_at, tags, screenshot, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-      [row.id, row.owner, row.owner_name, row.symbol, row.direction, row.note, row.target, row.stop, row.created_at, JSON.stringify(row.tags), row.screenshot, row.status]
+      `INSERT INTO ideas (id, owner, owner_name, symbol, direction, note, target, stop, created_at, tags, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [row.id, row.owner, row.owner_name, row.symbol, row.direction, row.note, row.target, row.stop, row.created_at, JSON.stringify(row.tags), row.status]
     );
+    if (row.screenshot) {
+      await pool.query(
+        `INSERT INTO idea_screenshots (idea_id, data, bytes, created_at) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (idea_id) DO UPDATE SET data=EXCLUDED.data, bytes=EXCLUDED.bytes`,
+        [row.id, row.screenshot, Buffer.byteLength(String(row.screenshot)), row.created_at]
+      );
+    }
     return row;
   }
   const all = readJSON(FILES.ideas);
@@ -1373,7 +1413,11 @@ async function reviewIdea(id, status) {
   if (all[id]) { all[id].status = status; all[id].reviewed_at = Date.now(); writeJSON(FILES.ideas, all); }
 }
 async function deleteIdea(id, owner) {
-  if (USING_PG) { await pool.query(`DELETE FROM ideas WHERE id=$1 AND ($2 = '' OR owner=$2)`, [id, owner || ""]); return; }
+  if (USING_PG) {
+    const r = await pool.query(`DELETE FROM ideas WHERE id=$1 AND ($2 = '' OR owner=$2) RETURNING id`, [id, owner || ""]);
+    if (r.rowCount) { await pool.query(`DELETE FROM idea_screenshots WHERE idea_id=$1`, [String(id)]).catch(() => {}); }
+    return;
+  }
   const all = readJSON(FILES.ideas);
   if (all[id] && (!owner || all[id].owner === owner)) { delete all[id]; writeJSON(FILES.ideas, all); }
 }
@@ -1382,7 +1426,9 @@ async function deleteIdea(id, owner) {
    lazy-loads each image from /api/ideas/:id/screenshot only for the cards it actually renders. */
 async function listIdeas() {
   if (USING_PG) {
-    const r = await pool.query(`SELECT id, owner, owner_name, symbol, direction, note, target, stop, created_at, tags, status, (screenshot IS NOT NULL) AS has_screenshot FROM ideas ORDER BY created_at DESC LIMIT 400`);
+    const r = await pool.query(`SELECT i.id, i.owner, i.owner_name, i.symbol, i.direction, i.note, i.target, i.stop, i.created_at, i.tags, i.status,
+        (i.screenshot IS NOT NULL OR s.idea_id IS NOT NULL) AS has_screenshot
+      FROM ideas i LEFT JOIN idea_screenshots s ON s.idea_id = i.id ORDER BY i.created_at DESC LIMIT 400`);
     return r.rows.map((x) => ({ ...x, created_at: Number(x.created_at), tags: x.tags || [], status: x.status || "approved", hasScreenshot: !!x.has_screenshot }));
   }
   const all = readJSON(FILES.ideas);
@@ -1391,6 +1437,9 @@ async function listIdeas() {
 /* Fetch ONE idea's screenshot on demand (data-URL string or null). Keeps the heavy blob out of the list. */
 async function getIdeaScreenshot(id) {
   if (USING_PG) {
+    // STOR-3: side table is the primary store; fall back to any legacy inline blob not yet migrated.
+    const s = await pool.query(`SELECT data FROM idea_screenshots WHERE idea_id=$1`, [String(id)]);
+    if (s.rows[0] && s.rows[0].data) return s.rows[0].data;
     const r = await pool.query(`SELECT screenshot FROM ideas WHERE id=$1`, [String(id)]);
     return r.rows[0] ? (r.rows[0].screenshot || null) : null;
   }
