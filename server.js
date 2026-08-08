@@ -29,6 +29,7 @@ const patterns = require("./patterns");       // chart-pattern detection for the
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
 const { resolveAdminRole, roleSatisfies } = require("./adminRoles");   // RBAC: owner > admin > support > readonly
+const { reconstructUserState } = require("./drReconstruct");   // OPS-2: rebuild open positions + risk from the immutable ledger
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -1968,6 +1969,25 @@ app.get("/api/admin/audit", async (req, res) => {
     const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 200));
     const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
     res.json({ ok: true, entries: await db.getAdminAudit(limit, offset), role: adminRole(req) });
+  } catch (e) { serverError(res, e); }
+});
+
+/* OPS-2 — DR reconstruction. Rebuild a user's open positions + risk-lock decision purely from the IMMUTABLE
+   fills ledger, ignoring the mutable projection tables. Run this after a point-in-time restore to confirm the
+   live state can be recovered from durable data (and to spot projection-vs-ledger divergence). Owner-only +
+   audited because it reads another user's full ledger. */
+app.get("/api/admin/dr-reconstruct", async (req, res) => {
+  if (!requireAdmin(req, res, "owner")) return;
+  try {
+    const phone = cleanPhone(req.query.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    const userId = storageKeyFor(phone);
+    const fills = await db.getFills(userId).catch(() => []);
+    let maxDailyLoss = null;
+    try { const rp = await db.getRiskPolicy(userId); if (rp && Number.isFinite(Number(rp.maxDailyLossAbs))) maxDailyLoss = Number(rp.maxDailyLossAbs); } catch { /* optional */ }
+    const state = reconstructUserState(fills, { maxDailyLoss });
+    await auditAdmin(req, "dr.reconstruct", phone, { openCount: state.openCount, fills: fills.length });
+    res.json({ ok: true, phone, fillsCount: fills.length, ...state });
   } catch (e) { serverError(res, e); }
 });
 
