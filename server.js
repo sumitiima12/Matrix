@@ -41,6 +41,7 @@ const { smartScore } = require("./smartScore");   // REC-2: transparent 4-factor
 const suitability = require("./suitability");   // REC-5: onboarding suitability knowledge check (pure grader)
 const { tradeAnalytics } = require("./tradingAnalytics");   // REC-6: trustworthy trade performance analytics
 const incidents = require("./incidents");   // REC-7: support-ticket normalization + incident lifecycle/severity/SLA
+const dpdp = require("./dpdp");   // MU-1: DPDP consent + data-inventory + portable-export scaffolding
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -1333,6 +1334,43 @@ app.get("/api/suitability/questions", requireAuth, (req, res) => res.json({ ok: 
    admin audit trail so ops can triage it from the console (no new table needed). Money-touching reports are
    auto-escalated so they surface first. Identity + category list are server-owned. */
 app.get("/api/support/categories", requireAuth, (req, res) => res.json({ ok: true, categories: incidents.CATEGORIES, severities: incidents.SEVERITIES }));
+
+/* MU-1 — DPDP: consent (purpose-scoped, versioned, opt-in for non-essential), the data inventory that backs the
+   privacy notice, and a portable data export (right to access). Erasure is the existing account-deletion path;
+   grievance redressal is the support path (REC-7). Consent persists on the user's state blob (merge, not clobber). */
+app.get("/api/privacy/consent", requireAuth, async (req, res) => {
+  try {
+    const st = (await db.getState(routeUserId(req)).catch(() => null)) || {};
+    res.json({ ok: true, purposes: dpdp.PURPOSES, version: dpdp.CONSENT_VERSION, record: st.consent || null, current: dpdp.consentIsCurrent(st.consent) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/privacy/consent", requireAuth, async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const rec = dpdp.buildConsentRecord((req.body || {}).choices, { ip: req.ip || null });
+    const st = (await db.getState(userId).catch(() => null)) || {};
+    st.consent = rec; await db.saveState(userId, st);
+    res.json({ ok: true, record: rec });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.get("/api/privacy/inventory", requireAuth, (req, res) => res.json({ ok: true, inventory: dpdp.DATA_INVENTORY, purposes: dpdp.PURPOSES }));
+
+/* Portable export of the caller's OWN data. Secret material (broker tokens, PIN, push keys) is never included. */
+app.get("/api/privacy/export", requireAuth, async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const st = (await db.getState(userId).catch(() => null)) || {};
+    const [user, trades, pushSubs] = await Promise.all([
+      db.getUser(userId).catch(() => null),
+      db.getTrades(userId, 0, Date.now()).catch(() => []),
+      db.getPushSubscriptions(storageKeyFor(req.authUserId)).catch(() => []),
+    ]);
+    const profile = user ? { username: user.username || null, email: user.email || null, phone: user.phone || null } : null;
+    const bundle = dpdp.buildDataExport({ profile, consent: st.consent || null, trades, pushSubscriptions: pushSubs, brokerConnections: [] });
+    res.setHeader("Content-Disposition", "attachment; filename=matrixone-data-export.json");
+    res.json(bundle);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
 
 app.post("/api/support/ticket", requireAuth, async (req, res) => {
   try {
