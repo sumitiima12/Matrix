@@ -33,6 +33,7 @@ const { reconstructUserState } = require("./drReconstruct");   // OPS-2: rebuild
 const { alertSeverity, alertCategory } = require("./alertSeverity");   // ALERT-1: triage severity + category for notices/push
 const { costMetrics } = require("./driftMetrics");   // FIN-2: cost / slippage / drift metrics from the fills ledger
 const { summarizePortfolio } = require("./portfolioRisk");   // REC-1: account-wide portfolio risk intelligence (advisory)
+const { smartScore } = require("./smartScore");   // REC-2: transparent 4-factor scoring for Smart Auto-Buy picks
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -1295,6 +1296,20 @@ app.get("/api/portfolio/risk", requireAuth, async (req, res) => {
       });
     const equity = Number(req.query.equity) > 0 ? Number(req.query.equity) : null;
     res.json({ ok: true, markedToEntry: true, ...summarizePortfolio(positions, { equity }) });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/* REC-2: TRANSPARENT SCORE — score a candle series into the 4-factor breakdown (trend / momentum / volume /
+   volatility) with a plain-English reason per factor and a coverage-aware total. The client (or the Smart
+   Auto-Buy surface) posts the candles it already holds and the intended side; nothing is fetched here, so
+   it's cheap and side-effect-free. Advisory only — it explains a pick, it never places one. */
+app.post("/api/smart-score", requireAuth, (req, res) => {
+  try {
+    const { candles, side } = req.body || {};
+    if (!Array.isArray(candles) || candles.length < 6) return res.status(400).json({ error: "Provide at least ~30 candles [{o,h,l,c,v}] for a meaningful score." });
+    res.json({ ok: true, ...smartScore(candles, { side: side === "SELL" ? "SELL" : "BUY" }) });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
