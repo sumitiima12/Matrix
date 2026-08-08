@@ -2019,7 +2019,46 @@ app.get("/api/state", requireAuth, async (req, res) => {
   try {
     const userId = storageKeyFor(req.authUserId);   // from the verified token
     const state = await rcWrap(`state:${userId}`, () => db.getState(userId));
-    res.json({ state });
+    sendJSONCached(req, res, { state });
+  } catch (e) { serverError(res, e); }
+});
+
+/* Storage/efficiency (reviewer item #1): consolidated first-paint bootstrap. The app's cold start used to
+   fan out into several separate authed GETs (state, notices, capabilities, app-settings, screeners,
+   strategies) — each its own round-trip + connection. This returns them in ONE response, drawing on the same
+   short-TTL read cache so it costs no extra DB load, and it's ETag'd so an unchanged bootstrap revalidates as a
+   bare 304. Every section is fail-soft: one slow/failing source degrades to its default without sinking the
+   whole payload, and each still has its own dedicated endpoint for targeted refreshes. Read-only. */
+app.get("/api/bootstrap", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const soft = (p, dflt) => Promise.resolve().then(p).catch(() => dflt);
+    const [state, appSettings, notices, strategies, positions, halt] = await Promise.all([
+      soft(() => rcWrap(`state:${userId}`, () => db.getState(userId)), {}),
+      soft(() => rcWrap("app-settings", () => db.getAppSettings()).then(mergeAppSettings), DEFAULT_APP_SETTINGS),
+      soft(() => db.getNotices(userId, 50), []),
+      soft(() => db.getRealStrategiesForUser(userId), []),
+      soft(() => db.getManagedPositionsForUser(userId, 200), []),
+      soft(() => db.getEntryHalt(userId), false),
+    ]);
+    /* Per the reviewer's payload-reduction brief, bootstrap is a LEAN summary: counts + small stable blobs
+       (state, app-settings, capabilities), never the heavy lists. Full notices, complete strategy definitions,
+       trades/fills, screeners and audit records stay behind their own paginated endpoints. */
+    const activeStrategies = (strategies || []).filter((s) => s && (s.status === "active" || s.status === "approved")).length;
+    const openPositions = (positions || []).filter((p) => p && (p.status === "open" || p.open === true || p.status == null)).length;
+    const unreadNoticeCount = (notices || []).filter((n) => n && !n.read).length;
+    sendJSONCached(req, res, {
+      ok: true,
+      state: state || {},
+      appSettings,
+      capabilities: brokerCaps.capabilitiesView(),
+      risk: { entryHalted: !!(halt && (halt.halted || halt.until)) },
+      summary: {
+        unreadNoticeCount,
+        activeStrategies,
+        openPositions,
+      },
+    });
   } catch (e) { serverError(res, e); }
 });
 
@@ -2463,6 +2502,22 @@ function rcSet(key, data) { READ_CACHE.set(key, { at: Date.now(), data }); retur
 function rcBust(prefix) { for (const k of READ_CACHE.keys()) { if (k === prefix || k.startsWith(prefix + ":")) READ_CACHE.delete(k); } }
 /* Wrap a read: return the cached value if fresh, else run fn(), cache and return it. */
 async function rcWrap(key, fn) { const hit = rcGet(key); if (hit !== undefined) return hit; return rcSet(key, await fn()); }
+
+/* Storage/efficiency (reviewer item #2): conditional GETs. sendJSONCached stamps a weak ETag (sha1 of the
+   serialized body) and returns 304 Not Modified when the client already holds that exact body, so a repeated
+   read of an unchanged resource (capabilities, app-settings, per-user state/bootstrap) transfers a bare 304
+   header instead of the full JSON. Purely additive: no If-None-Match ⇒ normal 200 + body as before. Only for
+   safe, idempotent reads — never used on money-moving routes. */
+function sendJSONCached(req, res, obj) {
+  let body;
+  try { body = JSON.stringify(obj); } catch { return res.json(obj); }
+  const etag = 'W/"' + crypto.createHash("sha1").update(body).digest("base64").slice(0, 27) + '"';
+  res.setHeader("ETag", etag);
+  res.setHeader("Cache-Control", "private, no-cache");   // must revalidate; 304 allowed, but never a stale cache hit
+  const inm = req.headers["if-none-match"];
+  if (inm && inm === etag) { res.status(304).end(); return; }
+  res.type("application/json").send(body);
+}
 
 const FETCH_TIMEOUT_MS = 8000;
 /* Timed fetch: aborts after 8s so a hanging upstream (Yahoo, an LLM provider) fails fast
@@ -4780,7 +4835,7 @@ app.get("/api/health", (req, res) => {
 /* S1: SERVER-OWNED broker capability registry. The frontend reads this to decide which REAL operations to offer
    per broker (it must NOT hard-code them); connection + portfolio + all virtual features are always available
    regardless. A capability is true only after that broker's route/failure/recovery/exit/protection suite passed. */
-app.get("/api/broker/capabilities", (req, res) => res.json(brokerCaps.capabilitiesView()));
+app.get("/api/broker/capabilities", (req, res) => sendJSONCached(req, res, brokerCaps.capabilitiesView()));
 /* Admin diagnostic — same data, but an explicit admin-gated view for the ops "effective capabilities" page. */
 app.get("/api/admin/broker-capabilities", (req, res) => {
   if (!requireAdmin(req, res)) return;
@@ -5726,8 +5781,8 @@ function mergeAppSettings(stored) {
 }
 
 // Public read — every client needs this to know what to show. No secrets here.
-app.get("/api/app-settings", async (_req, res) => {
-  try { res.json({ settings: mergeAppSettings(await rcWrap("app-settings", () => db.getAppSettings())) }); }
+app.get("/api/app-settings", async (req, res) => {
+  try { sendJSONCached(req, res, { settings: mergeAppSettings(await rcWrap("app-settings", () => db.getAppSettings())) }); }
   catch { res.json({ settings: DEFAULT_APP_SETTINGS }); }
 });
 
