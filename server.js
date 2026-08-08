@@ -43,6 +43,7 @@ const { tradeAnalytics } = require("./tradingAnalytics");   // REC-6: trustworth
 const incidents = require("./incidents");   // REC-7: support-ticket normalization + incident lifecycle/severity/SLA
 const dpdp = require("./dpdp");   // MU-1: DPDP consent + data-inventory + portable-export scaffolding
 const monitoring = require("./monitoring");   // MU-2: health-snapshot evaluation + on-call de-dup (pure)
+const alertRules = require("./alertRules");   // UX-3: user price-alert evaluation (pure)
 let _lastEngineTickMs = 0;   // MU-2: updated each auto-buy engine sweep; the monitoring heartbeat check reads it
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
@@ -1284,6 +1285,30 @@ app.post("/api/notices/read", requireAuth, async (req, res) => {
    the client can decide whether to show the "Enable notifications" affordance before login. */
 app.get("/api/push/config", (req, res) => {
   res.json({ enabled: PUSH_ENABLED, publicKey: PUSH_ENABLED ? VAPID_PUBLIC_KEY : null });
+});
+
+/* UX-3 — user PRICE ALERTS. Create/list/toggle/delete your own alerts; a background engine evaluates active
+   ones against fresh quotes and pushes on trigger (needs notifications enabled). Alert types: above/below a
+   price, or ±% day move. Identity is the verified token — a user only ever sees/edits their own alerts. */
+app.get("/api/alerts", requireAuth, async (req, res) => {
+  try { res.json({ ok: true, types: alertRules.TYPES, alerts: await db.getAlertsForUser(routeUserId(req)) }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/alerts", requireAuth, async (req, res) => {
+  try {
+    const norm = alertRules.normalizeAlert(req.body || {});
+    if (!norm.ok) return res.status(400).json({ error: norm.error });
+    const saved = await db.saveAlert(routeUserId(req), norm.alert);
+    res.json({ ok: true, alert: saved });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/alerts/:id/toggle", requireAuth, async (req, res) => {
+  try { const ok = await db.setAlertActive(routeUserId(req), req.params.id, !!(req.body || {}).active); return ok ? res.json({ ok: true }) : res.status(404).json({ error: "not found" }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.delete("/api/alerts/:id", requireAuth, async (req, res) => {
+  try { const ok = await db.deleteAlert(routeUserId(req), req.params.id); return ok ? res.json({ ok: true }) : res.status(404).json({ error: "not found" }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 /* REC-1: PORTFOLIO RISK — account-wide, advisory (never blocks). Reads the caller's OWN open managed
@@ -9335,6 +9360,54 @@ if (process.env.EXIT_MONITOR !== "off") {
   setInterval(runAutoBuyEngine, AUTO_BUY_MS);
   setTimeout(runAutoBuyEngine, 20_000);
 }
+
+/* UX-3 — PRICE ALERT engine. Every minute, evaluate active user alerts against fresh quotes and push on
+   trigger (with the alert's own cooldown so one condition doesn't spam). Read-only w.r.t. money — it only
+   sends notifications. Quote fetches are de-duped per (symbol,market) within a sweep. Inert if push is off. */
+async function alertQuote(symbol, market) {
+  try {
+    if (market === "Crypto") {
+      const h = (await deltaHouseQuotes([`${symbol}-USD`]))[`${symbol}-USD`];
+      if (h && h.price != null) return { price: Number(h.price), chgPct: Number(h.chg) };
+    } else if (market === "US") {
+      const h = (await indmoneyHouseQuotes([symbol], true).catch(() => ({})))[symbol];
+      if (h && h.price != null) return { price: Number(h.price), chgPct: Number(h.chg) };
+    } else {
+      const h = (await fyersHouseQuotes([`${symbol}.NS`]).catch(() => ({})))[`${symbol}.NS`];
+      if (h && h.price != null) return { price: Number(h.price), chgPct: Number(h.chg) };
+    }
+    // Yahoo fallback for price + day change (fine for an alert — it's a notification, not an order).
+    const yf = market === "Crypto" ? `${symbol}-USD` : market === "US" ? symbol : `${symbol}.NS`;
+    const d = await j(`${YF}/v8/finance/chart/${encodeURIComponent(fallbackYF(yf))}?range=1d&interval=1d`).catch(() => null);
+    const m = d && d.chart && d.chart.result && d.chart.result[0] && d.chart.result[0].meta;
+    if (m && m.regularMarketPrice != null) {
+      const price = Number(m.regularMarketPrice), prev = Number(m.chartPreviousClose != null ? m.chartPreviousClose : (m.previousClose != null ? m.previousClose : price));
+      return { price, chgPct: prev ? (price / prev - 1) * 100 : 0 };
+    }
+  } catch { /* ignore — a symbol we can't price just doesn't fire this sweep */ }
+  return null;
+}
+async function runAlertEngine() {
+  if (!PUSH_ENABLED) return;
+  let alerts = [];
+  try { alerts = await db.getActiveAlerts(2000); } catch { return; }
+  if (!alerts.length) return;
+  const cache = new Map();
+  for (const a of alerts) {
+    try {
+      const key = `${a.symbol}|${a.market}`;
+      if (!cache.has(key)) cache.set(key, await alertQuote(a.symbol, a.market));
+      const q = cache.get(key);
+      if (!q) continue;
+      const decision = alertRules.shouldFire(a, { price: q.price, chgPct: q.chgPct }, Date.now());
+      if (decision.fire) {
+        await notifyPush(a.userId, { category: "alerts", severity: "info", title: `${a.symbol} price alert`, body: decision.message, url: "/" }).catch(() => {});
+        await db.markAlertFired(a.id, Date.now()).catch(() => {});
+      }
+    } catch (e) { /* one bad alert never stops the sweep */ }
+  }
+}
+if (PUSH_ENABLED) { setInterval(runAlertEngine, 60_000).unref?.(); setTimeout(runAlertEngine, 25_000); }
 
 /* R16-P2-10 / R17-P1-03 delayed-fill protection watcher. Rows are ATOMICALLY LEASED (claimPendingProtection),
    so exactly one replica processes each — no duplicate managed exits. On a confirmed fill it arms app-managed
