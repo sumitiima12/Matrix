@@ -9107,7 +9107,25 @@ async function runAutoBuyEngine() {
         // KILL SWITCH: the user paused NEW real entries. Reconciliation above still ran, and the exit
         // engine is SEPARATE — so open positions keep their stop-loss/target managed; we only skip
         // placing any new entry. Resume is instant (one tap), no re-connect / re-login.
-        if (haltedEntries.has(String(st.userId))) continue;
+        /* FIN-1 — RECONCILIATION-BLOCKS-ENTRY (durable). The in-memory kill-switch set is only a fast mirror and
+           is EMPTY after a restart or on a second replica. So before any automated entry we ALSO consult the
+           DURABLE risk-lock + entry-halt (Postgres automation_flags), keyed by the SAME storage key the
+           reconciliation paths write. This is the parity of the manual route's isRiskLocked gate: an unresolved
+           fill / reconciliation locks the account and no new automated entry goes out until it clears. Fail
+           CLOSED on a read error — skip this cycle rather than trade against an unverifiable safety state. */
+        const abHaltKey = storageKeyFor(st.userId);
+        if (haltedEntries.has(String(st.userId)) || haltedEntries.has(String(abHaltKey))) continue;
+        {
+          let durablyBlocked;
+          try { durablyBlocked = (await db.isRiskLocked(abHaltKey)) || (typeof db.getEntryHalt === "function" && await db.getEntryHalt(abHaltKey)); }
+          catch { await db.updateRealStrategy(st.id, { lastError: "Couldn't verify account trading status (risk lock / entry halt) — skipped this cycle.", lastOrderStatus: "blocked" }).catch(() => {}); continue; }
+          if (durablyBlocked) {
+            haltedEntries.add(String(abHaltKey));   // refresh the fast mirror so subsequent cycles short-circuit
+            await db.updateRealStrategy(st.id, { lastError: "New automated entries are paused: the account is reconciliation-locked (an order/fill needs resolving). Closing/exit orders still run.", lastOrderStatus: "risk-blocked" }).catch(() => {});
+            logFinancial("autobuy.reconciliation_blocked", { userId: st.userId, strategyId: st.id, symbol: st.symbol });
+            continue;
+          }
+        }
         /* R8-audit F-1 (wrong-way trade): a SHORT entry is only correctly implemented for Delta — every
            other broker's entry path hardcodes a BUY, so a short-armed strategy would silently open a LONG.
            Refuse rather than trade the opposite direction. */
