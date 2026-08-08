@@ -33,6 +33,10 @@ const { reconstructUserState } = require("./drReconstruct");   // OPS-2: rebuild
 const { alertSeverity, alertCategory } = require("./alertSeverity");   // ALERT-1: triage severity + category for notices/push
 const { costMetrics } = require("./driftMetrics");   // FIN-2: cost / slippage / drift metrics from the fills ledger
 const { summarizePortfolio } = require("./portfolioRisk");   // REC-1: account-wide portfolio risk intelligence (advisory)
+const { classifyQuote: mdgovClassify } = require("./marketDataGovernance");   // REC-3: market-data governance verdict (used in SHADOW here)
+// REC-3 SHADOW: log what the fail-closed gate WOULD decide on the real-order mark, without blocking. Default ON
+// (log-only is safe); set MDGOV_SHADOW=false to silence, or later MDGOV_ENFORCE=true to actually block.
+const MDGOV_SHADOW = String(process.env.MDGOV_SHADOW || "true").toLowerCase() !== "false";
 const { smartScore } = require("./smartScore");   // REC-2: transparent 4-factor scoring for Smart Auto-Buy picks
 const suitability = require("./suitability");   // REC-5: onboarding suitability knowledge check (pure grader)
 const { tradeAnalytics } = require("./tradingAnalytics");   // REC-6: trustworthy trade performance analytics
@@ -2833,7 +2837,9 @@ async function deltaHouseQuotes(ySyms) {
                     : t.close != null ? Number(t.close)
                     : t.spot_price != null ? Number(t.spot_price) : null;
         const open = t.open != null ? Number(t.open) : null;
-        if (price != null) out[y] = { sym: y, name: y, price, chg: open ? +(((price - open) / open) * 100).toFixed(2) : 0, currency: "USD", src: "delta" };
+        // REC-3 provenance: canonical `source`, a real `asOf` (Delta ticker timestamp is μs → ms; else fetch time),
+        // and delayed=false (this is the live exchange feed). Additive — legacy `src` kept for back-compat.
+        if (price != null) out[y] = { sym: y, name: y, price, chg: open ? +(((price - open) / open) * 100).toFixed(2) : 0, currency: "USD", src: "delta", source: "delta", asOf: (Number(t.timestamp) > 0 ? Math.round(Number(t.timestamp) / 1000) : Date.now()), delayed: false };
       } catch (e) { _deltaLastError = "ticker " + ds + ": " + e.message; }
     }));
     if (Object.keys(out).length) _deltaLastError = null;
@@ -2872,7 +2878,8 @@ async function indmoneyHouseQuotes(ySyms, owner = false) {
       const d = await memo(`im:${sym}`, 20_000, () =>
         j(`${INDM_US}/${encodeURIComponent(sym)}?start_date=${today}&end_date=${today}&label=1D&response_format=json&currency=USD`));
       if (d && d.success && d.price != null) {
-        out[sym] = { sym, name: sym, price: Number(d.price), chg: d["1d_percentage_chane"] != null ? Number(d["1d_percentage_chane"]) : 0, currency: "USD", src: "indmoney" };
+        // REC-3 provenance: IND Money's live US feed → trusted source "indmoney", real-time (not delayed), fetch-time asOf.
+        out[sym] = { sym, name: sym, price: Number(d.price), chg: d["1d_percentage_chane"] != null ? Number(d["1d_percentage_chane"]) : 0, currency: "USD", src: "indmoney", source: "indmoney", asOf: Date.now(), delayed: false };
       }
     } catch (e) { _indmLastError = "im " + sym + ": " + e.message; }
   });
@@ -2913,7 +2920,8 @@ async function fyersHouseQuotes(ySyms) {
     const out = {};
     for (const [y, f] of pairs) {
       const v = byFy[f];
-      if (v && v.lp != null) out[y] = { sym: y, name: y, price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0, currency: "INR", src: "fyers" };
+      // REC-3 provenance: FYERS `tt` is the last-traded epoch (seconds) when present, else fetch time; live feed → not delayed.
+      if (v && v.lp != null) out[y] = { sym: y, name: y, price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0, currency: "INR", src: "fyers", source: "fyers", asOf: (Number(v.tt) > 0 ? Number(v.tt) * 1000 : Date.now()), delayed: false };
     }
     if (Object.keys(out).length) _fyLastError = null;
     return out;
@@ -2973,6 +2981,8 @@ async function mcxHouseQuotes(ySyms) {
           sym: hit.y, name: hit.meta.label || hit.y,
           price: v.lp, chg: v.chp != null ? +Number(v.chp).toFixed(2) : 0,
           currency: "INR", src: "fyers-mcx",
+          // REC-3 provenance: it's the FYERS house feed (MCX contract) → trusted source "fyers", live, fetch-time asOf.
+          source: "fyers", asOf: (Number(v.tt) > 0 ? Number(v.tt) * 1000 : Date.now()), delayed: false,
           contract: hit.meta.ticker, unit: hit.meta.unit || null, lot: hit.meta.lot || 1,
         };
       }
@@ -3089,7 +3099,8 @@ app.get("/api/quote", publicDataLimiter, async (req, res) => {
           const price = m.regularMarketPrice;
           const prev = m.chartPreviousClose ?? m.previousClose ?? price;
           const chg = prev ? (price / prev - 1) * 100 : 0;
-          return { sym, name: m.symbol || sym, price, chg: +chg.toFixed(2), currency: m.currency };
+          // REC-3 provenance: Yahoo is the DELAYED public fallback (~15 min) — mark it so, so a real order can refuse it.
+          return { sym, name: m.symbol || sym, price, chg: +chg.toFixed(2), currency: m.currency, source: "yahoo", asOf: Date.now(), delayed: true };
         } catch { return null; }
       });
       return [...Object.values(houseMap), ...rows.filter(Boolean)];
@@ -6148,18 +6159,39 @@ async function fetchBrokerAccount(sess) {
    trusting a client-supplied number. Returns a Number, or null if we genuinely can't
    price it (in which case the order is still refused, which is the safe outcome). */
 async function liveMarkForOrder(brokerSym, market) {
+  const env = await liveMarkEnvelope(brokerSym, market);
+  // REC-3 SHADOW — evaluate the fail-closed market-data gate on this mark and LOG what it WOULD decide for a real
+  // order, without blocking. This is the evidence-gathering step before enforcement: it shows how often a real
+  // entry would be refused because the mark was stale / delayed (Yahoo fallback) / from an untrusted source / no
+  // timestamp. Wrapped so shadow logging can NEVER affect the order path.
   try {
+    if (MDGOV_SHADOW) {
+      const verdict = mdgovClassify({ symbol: brokerSym, price: env.price, source: env.source, asOf: env.asOf, delayed: env.delayed, market: env.market });
+      if (!verdict.ok) logFinancial("mdgov.shadow_would_block", { brokerSym, market, status: verdict.status, source: env.source, delayed: env.delayed, ageMs: verdict.ageMs, reason: verdict.reason });
+    }
+  } catch { /* never let shadow logging disturb the order path */ }
+  return env.price != null ? Number(env.price) : null;
+}
+
+/* REC-3: the provenance ENVELOPE behind the numeric mark — { price, source, asOf, delayed, market }. Reads the
+   same house feeds as before (Delta for crypto, FYERS for Indian) but now carries the fields the market-data
+   governance gate needs. `liveMarkForOrder` returns just `.price` so every existing caller is unchanged. */
+async function liveMarkEnvelope(brokerSym, market) {
+  const none = { price: null, source: null, asOf: null, delayed: null, market };
+  try {
+    let hit = null;
     if (market === "Crypto") {
       const base = String(brokerSym).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
       const q = await deltaHouseQuotes([`${base}-USD`]);
-      const hit = q[`${base}-USD`];
-      return hit && hit.price != null ? Number(hit.price) : null;
+      hit = q[`${base}-USD`];
+    } else {
+      const base = String(brokerSym).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "").toUpperCase();
+      const q = await fyersHouseQuotes([`${base}.NS`]).catch(() => ({}));
+      hit = q[`${base}.NS`];
     }
-    const base = String(brokerSym).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "").toUpperCase();
-    const q = await fyersHouseQuotes([`${base}.NS`]).catch(() => ({}));
-    const hit = q[`${base}.NS`];
-    return hit && hit.price != null ? Number(hit.price) : null;
-  } catch { return null; }
+    if (!hit || hit.price == null) return none;
+    return { price: Number(hit.price), source: hit.source || hit.src || null, asOf: hit.asOf || null, delayed: hit.delayed === true, market };
+  } catch { return none; }
 }
 
 /* Round a price to the instrument's tick size — Delta rejects prices off the grid. */
