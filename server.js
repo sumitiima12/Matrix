@@ -42,6 +42,8 @@ const suitability = require("./suitability");   // REC-5: onboarding suitability
 const { tradeAnalytics } = require("./tradingAnalytics");   // REC-6: trustworthy trade performance analytics
 const incidents = require("./incidents");   // REC-7: support-ticket normalization + incident lifecycle/severity/SLA
 const dpdp = require("./dpdp");   // MU-1: DPDP consent + data-inventory + portable-export scaffolding
+const monitoring = require("./monitoring");   // MU-2: health-snapshot evaluation + on-call de-dup (pure)
+let _lastEngineTickMs = 0;   // MU-2: updated each auto-buy engine sweep; the monitoring heartbeat check reads it
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -2171,6 +2173,32 @@ app.get("/api/admin/ops/overview", async (req, res) => {
     });
   } catch (e) { serverError(res, e); }
 });
+/* MU-2 — MONITORING health check. Assembles a live snapshot (schema, DB, halt, unresolved/unknown orders,
+   engine heartbeat) and runs the pure evaluator into a healthy/degraded/critical verdict with the failing
+   checks + whether it's page-worthy. support+ read. This is the single endpoint an uptime monitor / on-call
+   dashboard polls; `pageWorthy:true` is the signal to escalate. */
+app.get("/api/admin/monitoring", async (req, res) => {
+  if (!requireAdmin(req, res, "support")) return;
+  try {
+    let dbOk = true;
+    const [halted, unresolved] = await Promise.all([
+      db.getHaltedEntryUsers().catch(() => { dbOk = false; return []; }),
+      db.listUnresolvedOrderAttempts(500).catch(() => { dbOk = false; return []; }),
+    ]);
+    const unknownOrders = (halted || []).length;   // accounts entry-blocked pending an unknown-order resolution
+    const snapshot = {
+      schemaReady, dbOk, liveHalted: !schemaReady ? false : false,   // global live-halt is per-user (haltedEntryUsers); no single global flag
+      unresolvedAttempts: (unresolved || []).length,
+      unknownOrders,
+      lastEngineTickMs: _lastEngineTickMs,
+      nowMs: Date.now(),
+      pushEnabled: PUSH_ENABLED,
+    };
+    const verdict = monitoring.evaluateHealth(snapshot);
+    res.status(verdict.status === "critical" ? 503 : 200).json({ ok: true, at: Date.now(), snapshot, ...verdict });
+  } catch (e) { serverError(res, e); }
+});
+
 /* FIN-2 — cost / slippage / drift metrics for a user, derived from the immutable fills ledger. support+ read.
    Shows net-vs-gross realised P&L, the fee drag, per-broker breakdown, and slippage where a reference price was
    captured (honest "unavailable" otherwise). `days` bounds the window (default 30). */
@@ -8981,6 +9009,7 @@ async function withLease(name, ttlMs, fn) {
 
 async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
+  _lastEngineTickMs = Date.now();   // MU-2: engine heartbeat for the monitoring health check
   if (!schemaReady) return;   // R23-P2-12: never trade against an unproven schema (safety tables may be absent)
   autoBuyRunning = true;
   // R31-P2-04: capture THIS sweep's lease fence so we can re-validate it immediately before each broker send. A
