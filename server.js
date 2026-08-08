@@ -1192,6 +1192,20 @@ app.get("/api/trades", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* STOR-4: keyset-paginated trade history — newest first, cursor = last row's {ts,id}. Bounded page size so a
+   client can never pull unbounded history in one request (optimization-plan acceptance gate). Identity from the
+   verified token. */
+app.get("/api/trades/page", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const cursorTs = req.query.cursorTs != null && req.query.cursorTs !== "" ? Number(req.query.cursorTs) : null;
+    const cursorId = req.query.cursorId != null ? String(req.query.cursorId) : null;
+    const limit = req.query.limit != null ? Number(req.query.limit) : 50;
+    const out = await db.getTradesPage(userId, { cursorTs, cursorId, limit });
+    res.json({ ok: true, ...out });
+  } catch (e) { serverError(res, e); }
+});
+
 /* ARCH-4: durable order-intent reconcile. The order_idempotency ledger IS the intent store — it survives
    restart (Postgres) and records each intent's terminal outcome. This lets the UI resolve an AMBIGUOUS order
    ("outcome unknown—checking broker") after a timeout/reload by polling the SAME idempotency key:
@@ -2241,6 +2255,19 @@ app.get("/api/admin/audit", async (req, res) => {
     const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 200));
     const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
     res.json({ ok: true, entries: await db.getAdminAudit(limit, offset), role: adminRole(req) });
+  } catch (e) { serverError(res, e); }
+});
+
+/* STOR-5 — DRY-RUN retention report (optimization plan §4). Read-only: shows how many rows WOULD be eligible for
+   archival/cleanup under the suggested hot-retention policy, so an operator can size the opportunity before any
+   deletion is ever wired. It never deletes and, by construction, only counts SAFE categories (read notifications,
+   closed paper trades) — financial-truth records are excluded. readonly+ admin. */
+app.get("/api/admin/retention", async (req, res) => {
+  if (!requireAdmin(req, res, "readonly")) return;
+  try {
+    const noticeDays = req.query.noticeDays != null ? Math.max(1, parseInt(req.query.noticeDays, 10) || 90) : 90;
+    const closedVirtualDays = req.query.closedVirtualDays != null ? Math.max(1, parseInt(req.query.closedVirtualDays, 10) || 180) : 180;
+    res.json({ ok: true, report: await db.retentionReport({ noticeDays, closedVirtualDays }), role: adminRole(req) });
   } catch (e) { serverError(res, e); }
 });
 

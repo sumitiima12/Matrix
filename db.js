@@ -1097,6 +1097,55 @@ async function getTrades(userId, from, to) {
   const all = readJSON(FILES.trades)[userId] || [];
   return all.filter((t) => { const x = t.exitAt || t.entryAt || 0; return x >= from && x <= to; });
 }
+
+/* STOR-4 (optimization plan §2/§5): KEYSET pagination for trade history. OFFSET pages scan-and-discard rows and
+   get slower the deeper you go; a keyset cursor of (ts, id) is O(page) at any depth. Callers pass the last row's
+   {ts,id} as the cursor to get the next page. Default 50 rows, hard server max 200. Ordered newest-first so the
+   cursor moves strictly backward through (ts DESC, id DESC). Additive — getTrades (window fetch) is unchanged. */
+async function getTradesPage(userId, { cursorTs = null, cursorId = null, limit = 50 } = {}) {
+  const n = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
+  if (USING_PG) {
+    let rows;
+    if (cursorTs != null) {
+      const r = await pool.query(
+        `SELECT id, ts, data FROM trades
+         WHERE user_id=$1 AND (ts < $2 OR (ts = $2 AND id < $3))
+         ORDER BY ts DESC, id DESC LIMIT $4`,
+        [userId, Number(cursorTs), String(cursorId || ""), n + 1]
+      );
+      rows = r.rows;
+    } else {
+      const r = await pool.query(
+        `SELECT id, ts, data FROM trades WHERE user_id=$1 ORDER BY ts DESC, id DESC LIMIT $2`,
+        [userId, n + 1]
+      );
+      rows = r.rows;
+    }
+    const hasMore = rows.length > n;
+    const page = rows.slice(0, n);
+    const last = page[page.length - 1];
+    return {
+      trades: page.map((x) => x.data),
+      nextCursor: hasMore && last ? { ts: Number(last.ts), id: String(last.id) } : null,
+    };
+  }
+  // Flat-file: sort by ts DESC, id DESC and apply the same keyset window in memory.
+  const all = (readJSON(FILES.trades)[userId] || []).slice()
+    .map((t) => ({ id: String(t.id || ""), ts: Number(t.ts || t.exitAt || t.entryAt || 0), data: t }))
+    .sort((a, b) => (b.ts - a.ts) || (b.id < a.id ? -1 : b.id > a.id ? 1 : 0));
+  let start = 0;
+  if (cursorTs != null) {
+    const cts = Number(cursorTs), cid = String(cursorId || "");
+    start = all.findIndex((x) => (x.ts < cts) || (x.ts === cts && x.id < cid));
+    if (start < 0) start = all.length;
+  }
+  const page = all.slice(start, start + n);
+  const last = page[page.length - 1];
+  return {
+    trades: page.map((x) => x.data),
+    nextCursor: (start + n < all.length) && last ? { ts: last.ts, id: last.id } : null,
+  };
+}
 /* Delete only the user's VIRTUAL (paper) trades — real broker trades are never touched. A trade is
    "real" when data.real is true; everything else is a paper trade and gets removed. Returns how many
    rows were deleted. Scoped strictly to the passed userId, so a user can only clear their own book. */
@@ -2487,4 +2536,44 @@ async function updateRealStrategy(id, patch) {
   return dbf[id];
 }
 
-module.exports = { updateSecurityQuestion, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, saveAlert, getAlertsForUser, deleteAlert, setAlertActive, getActiveAlerts, markAlertFired, getEntryHalt, logAdminAction, getAdminAudit, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
+/* STOR-5 (optimization plan §4): DRY-RUN retention report. Read-only — it COUNTS rows that WOULD be eligible for
+   archival/cleanup under a suggested hot-retention policy, so an operator can see the shape of the data before any
+   deletion is ever wired. It never deletes, and by construction it only looks at SAFE categories: read/expired
+   notifications and CLOSED virtual (paper) trades. It deliberately excludes every financial-truth category — real
+   trades, fills, fees, orders, risk locks, pending protection and unresolved idempotency are NEVER counted here,
+   honouring "never delete unresolved orders, fills, ledger records, risk locks or pending reconciliation work".
+   Each count is independently guarded so one failing query can't sink the report. */
+async function retentionReport({ noticeDays = 90, closedVirtualDays = 180 } = {}) {
+  const now = Date.now();
+  const day = 86400000;
+  const noticeCut = now - noticeDays * day;
+  const cvCut = now - closedVirtualDays * day;
+  const cats = [];
+  if (USING_PG) {
+    try {
+      const r = await pool.query(`SELECT COUNT(*)::int AS n FROM user_notices WHERE read=TRUE AND created_at < $1`, [noticeCut]);
+      cats.push({ key: "read_notifications", description: "Read notifications past hot retention", retentionDays: noticeDays, eligible: r.rows[0].n, action: "delete", safe: true });
+    } catch { cats.push({ key: "read_notifications", eligible: null, error: true }); }
+    try {
+      // Closed = has an exit; virtual = NOT flagged real. Financial (real) trades are excluded entirely.
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM trades
+         WHERE ts < $1 AND (data->>'exitAt') IS NOT NULL
+           AND COALESCE((data->>'real')::boolean, false) = false`,
+        [cvCut]
+      );
+      cats.push({ key: "closed_virtual_trades", description: "Closed paper trades past hot retention (candidate for monthly aggregate + archive)", retentionDays: closedVirtualDays, eligible: r.rows[0].n, action: "aggregate+archive", safe: true });
+    } catch { cats.push({ key: "closed_virtual_trades", eligible: null, error: true }); }
+  } else {
+    cats.push({ key: "read_notifications", eligible: null, note: "flat-file mode — counts only computed on Postgres" });
+    cats.push({ key: "closed_virtual_trades", eligible: null, note: "flat-file mode — counts only computed on Postgres" });
+  }
+  return {
+    generatedAt: now,
+    dryRun: true,
+    note: "Read-only report. No rows are deleted. Financial-truth categories (real trades, fills, fees, orders, risk locks, pending protection, unresolved idempotency) are intentionally excluded.",
+    categories: cats,
+  };
+}
+
+module.exports = { updateSecurityQuestion, getTradesPage, retentionReport, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, saveAlert, getAlertsForUser, deleteAlert, setAlertActive, getActiveAlerts, markAlertFired, getEntryHalt, logAdminAction, getAdminAudit, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
