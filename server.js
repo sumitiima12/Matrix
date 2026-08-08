@@ -37,6 +37,10 @@ const { classifyQuote: mdgovClassify } = require("./marketDataGovernance");   //
 // REC-3 SHADOW: log what the fail-closed gate WOULD decide on the real-order mark, without blocking. Default ON
 // (log-only is safe); set MDGOV_SHADOW=false to silence, or later MDGOV_ENFORCE=true to actually block.
 const MDGOV_SHADOW = String(process.env.MDGOV_SHADOW || "true").toLowerCase() !== "false";
+/* PERF-6: jitter a periodic interval by ±15%, evaluated ONCE per process at registration, so multiple replicas
+   drift out of lockstep instead of all firing the same maintenance scan at the same instant. Applied to the
+   background reconcile/repair/stats/token jobs — the money-path entry/exit engine cadences stay exact. */
+const jitter = (ms) => Math.round(Number(ms) * (0.85 + Math.random() * 0.3));
 const { smartScore } = require("./smartScore");   // REC-2: transparent 4-factor scoring for Smart Auto-Buy picks
 const suitability = require("./suitability");   // REC-5: onboarding suitability knowledge check (pure grader)
 const { tradeAnalytics } = require("./tradingAnalytics");   // REC-6: trustworthy trade performance analytics
@@ -9509,10 +9513,10 @@ async function runProtectionWatcher() {
    skipped under the #441 test seam (tests invoke runC03Reconcile directly). */
 if (C03_ORDER_ATTEMPTS_ON && !MATRIX_NO_LISTEN) {
   const C03_RECON_MS = Number(process.env.C03_RECON_MS) || 60_000;
-  setInterval(() => { runC03Reconcile("periodic").catch((e) => console.error("[c03] periodic reconcile error:", e && e.message)); }, C03_RECON_MS).unref?.();
+  setInterval(() => { runC03Reconcile("periodic").catch((e) => console.error("[c03] periodic reconcile error:", e && e.message)); }, jitter(C03_RECON_MS)).unref?.();
   // S3.2: periodically REPAIR any PROJECTION_PENDING exits (broker fill confirmed, projection write failed) without
   // re-contacting the broker — so a transient DB failure during a close can never leave a stuck-open position.
-  setInterval(() => { repairProjectionPending("periodic").catch((e) => console.error("[projrepair] error:", e && e.message)); }, C03_RECON_MS).unref?.();
+  setInterval(() => { repairProjectionPending("periodic").catch((e) => console.error("[projrepair] error:", e && e.message)); }, jitter(C03_RECON_MS)).unref?.();
 }
 /* R21-P2-05: periodically reconcile stale idempotency records so a dead in-flight request can't block a key
    forever — mark long-in_flight rows 'unknown' (surfaces a reconcile prompt on retry) and purge very old rows. */
@@ -9675,7 +9679,7 @@ async function runEodFeeReconcileJob(reason = "scheduled") {
 }
 if (/^(1|true|yes)$/i.test(String(process.env.EOD_FEE_RECONCILE || "")) && !MATRIX_NO_LISTEN) {
   const EOD_FEE_MS = Number(process.env.EOD_FEE_MS) || 30 * 60 * 1000;   // sweep every 30m; the job self-skips users with nothing to finalize
-  setInterval(() => { runEodFeeReconcileJob("periodic").catch((e) => console.error("[eodfee] error:", e && e.message)); }, EOD_FEE_MS).unref?.();
+  setInterval(() => { runEodFeeReconcileJob("periodic").catch((e) => console.error("[eodfee] error:", e && e.message)); }, jitter(EOD_FEE_MS)).unref?.();
 }
 
 /* Arm a strategy for real-money auto-buy. Requires a live broker session (so we can persist
@@ -10158,7 +10162,7 @@ async function refreshAllBrokerTokens() {
 if (!MATRIX_NO_LISTEN) {
   setTimeout(warmAppCredCache, 3000).unref?.();
   setTimeout(refreshAllBrokerTokens, 15000).unref?.();
-  setInterval(refreshAllBrokerTokens, 6 * 60 * 60 * 1000).unref?.();
+  setInterval(refreshAllBrokerTokens, jitter(6 * 60 * 60 * 1000)).unref?.();
 }
 
 /* WARN on missing/weak critical secrets (audit P1-12). A random per-boot JWT secret silently

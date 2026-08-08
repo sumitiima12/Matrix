@@ -73,6 +73,13 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY, user_id TEXT, ts BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS trades_user_ts ON trades (user_id, ts)`);
+  /* PERF-8: the exit monitor's hot query (getOpenTrades) scans for OPEN, app-protected trades. Without a
+     matching index Postgres full-scans + filters JSONB every sweep. This PARTIAL EXPRESSION index materialises
+     exactly that predicate (open + has SL/TP/TSL) ordered by ts, so the sweep becomes an index scan over only
+     the handful of live protected rows instead of the whole trade history. */
+  await pool.query(`CREATE INDEX IF NOT EXISTS trades_open_managed ON trades (ts DESC)
+    WHERE (data->>'exitAt') IS NULL
+      AND ((data->>'tp') IS NOT NULL OR (data->>'sl') IS NOT NULL OR (data->>'tsl') IS NOT NULL)`).catch(() => {});
   /* ARCH-1: the IMMUTABLE, server-only FILLS ledger. Every verified broker fill is appended here exactly once
      (idempotent on the natural broker key). Clients can NEVER write it. It is the audit/reconciliation source of
      truth and the basis for future risk derivation; the `trades` table above stays as the editable display
@@ -1482,13 +1489,15 @@ async function isRiskLocked(userId) {
 /* ----------------------- open positions (exit monitor) --------------------- */
 // All still-open trades across users that carry a target/stop (so the server-side
 // monitor can close them at real prices even when nobody has the app open).
-async function getOpenTrades(limit = 200) {
+async function getOpenTrades(limit = 2000) {
   if (USING_PG) {
+    // PERF-7: monitor OLDEST-open protected trades FIRST (ts ASC) so a long-lived position is never starved by
+    // a newest-first LIMIT, and a higher cap (the partial index PERF-8 makes this cheap) covers all live rows.
     const r = await pool.query(
       `SELECT user_id, data FROM trades
         WHERE (data->>'exitAt') IS NULL
           AND ( (data->>'tp') IS NOT NULL OR (data->>'sl') IS NOT NULL OR (data->>'tsl') IS NOT NULL )
-        ORDER BY ts DESC LIMIT $1`, [limit]);
+        ORDER BY ts ASC LIMIT $1`, [limit]);
     return r.rows.map((x) => ({ userId: x.user_id, trade: x.data }));
   }
   const db = readJSON(FILES.trades);
@@ -1498,7 +1507,7 @@ async function getOpenTrades(limit = 200) {
       if (t.exitAt == null && (t.tp || t.sl || t.tsl)) out.push({ userId, trade: t });
     }
   }
-  return out.slice(0, limit);
+  return out.sort((a, b) => (a.trade.entryAt || 0) - (b.trade.entryAt || 0)).slice(0, limit);
 }
 async function updateTrade(userId, trade) {
   if (USING_PG) {
