@@ -70,13 +70,14 @@ function atrPct(candles, n = 14) {
   let sum = 0;
   for (let i = candles.length - n; i < candles.length; i++) {
     const c0 = candles[i], p = candles[i - 1];
-    if (c0.h == null || c0.l == null || p.c == null) return null;
-    const tr = Math.max(c0.h - c0.l, Math.abs(c0.h - p.c), Math.abs(c0.l - p.c));
+    const h = Number(c0.h), l = Number(c0.l), pc = Number(p.c);
+    if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(pc)) return null;   // reject NaN/Inf highs
+    const tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
     sum += tr;
   }
   const atr = sum / n;
-  const last = candles[candles.length - 1].c;
-  return last > 0 ? (atr / last) * 100 : null;
+  const last = Number(candles[candles.length - 1].c);
+  return (Number.isFinite(atr) && last > 0) ? (atr / last) * 100 : null;
 }
 
 /**

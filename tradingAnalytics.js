@@ -16,7 +16,8 @@
 function realizedPnl(t) {
   if (!t || t.status === "rejected") return null;
   const entry = Number(t.entry), exit = Number(t.exit), qty = Number(t.qty);
-  if (!(entry > 0) || !(exit > 0) || !(qty > 0)) return null;
+  // Number.isFinite guards so Infinity/NaN can't pass a bare `> 0` and leak a non-finite P&L into the stats.
+  if (!(Number.isFinite(entry) && entry > 0) || !(Number.isFinite(exit) && exit > 0) || !(Number.isFinite(qty) && qty > 0)) return null;
   if (t.exitAt == null) return null;                       // still open → not realised
   const dir = (t.side === "SELL" || t.short === true) ? -1 : 1;
   return (exit - entry) * qty * dir;
@@ -59,7 +60,8 @@ function tradeAnalytics(trades) {
     if (pnl >= 0) { wins += 1; grossProfit += pnl; } else { losses += 1; grossLoss += -pnl; }
     if (pnl > best) best = pnl;
     if (pnl < worst) worst = pnl;
-    if (t.entryAt != null && t.exitAt != null && t.exitAt >= t.entryAt) { holdSum += (t.exitAt - t.entryAt); holdCount += 1; }
+    const eAt = Number(t.entryAt), xAt = Number(t.exitAt);
+    if (Number.isFinite(eAt) && Number.isFinite(xAt) && xAt >= eAt) { holdSum += (xAt - eAt); holdCount += 1; }
   }
   const avgWin = wins ? grossProfit / wins : null;
   const avgLoss = losses ? grossLoss / losses : null;                 // magnitude (positive)

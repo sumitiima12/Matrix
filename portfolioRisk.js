@@ -21,10 +21,13 @@ function normPosition(p) {
   if (!p || typeof p !== "object") return null;
   const qty = Number(p.qty);
   const entry = Number(p.entry);
-  if (!(qty > 0) || !(entry > 0)) return null;                 // a position needs a size and an entry
-  const price = Number(p.price) > 0 ? Number(p.price) : entry; // mark-to-entry when no live price
+  // Guards use Number.isFinite so Infinity/NaN can't slip past a bare `> 0` and poison notionals.
+  if (!(Number.isFinite(qty) && qty > 0) || !(Number.isFinite(entry) && entry > 0)) return null;
+  const priceN = Number(p.price);
+  const price = (Number.isFinite(priceN) && priceN > 0) ? priceN : entry;   // mark-to-entry when no live price
   const side = (p.side === "SELL" || p.short === true) ? "SELL" : "BUY";
-  const stop = Number(p.stop) > 0 ? Number(p.stop) : null;     // optional; null = no protective stop
+  const stopN = Number(p.stop);
+  const stop = (Number.isFinite(stopN) && stopN > 0) ? stopN : null;        // optional; null = no protective stop
   return { symbol: String(p.symbol || p.sym || "—"), market: String(p.market || "—"), side, qty, entry, price, stop };
 }
 
