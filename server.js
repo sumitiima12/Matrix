@@ -36,6 +36,7 @@ const { summarizePortfolio } = require("./portfolioRisk");   // REC-1: account-w
 const { smartScore } = require("./smartScore");   // REC-2: transparent 4-factor scoring for Smart Auto-Buy picks
 const suitability = require("./suitability");   // REC-5: onboarding suitability knowledge check (pure grader)
 const { tradeAnalytics } = require("./tradingAnalytics");   // REC-6: trustworthy trade performance analytics
+const incidents = require("./incidents");   // REC-7: support-ticket normalization + incident lifecycle/severity/SLA
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -1322,6 +1323,26 @@ app.post("/api/smart-score", requireAuth, (req, res) => {
    The result carries the question-bank VERSION so a future revision re-requires the check. Pure grader; storage
    is a merge into the existing state blob. */
 app.get("/api/suitability/questions", requireAuth, (req, res) => res.json({ ok: true, ...suitability.questionsPublic() }));
+
+/* REC-7 — SUPPORT TICKET. A user files an issue; the server normalizes it (bounded category, auto-severity for
+   money/halt reports), acknowledges it back to the user as a durable notice, AND records it on the immutable
+   admin audit trail so ops can triage it from the console (no new table needed). Money-touching reports are
+   auto-escalated so they surface first. Identity + category list are server-owned. */
+app.get("/api/support/categories", requireAuth, (req, res) => res.json({ ok: true, categories: incidents.CATEGORIES, severities: incidents.SEVERITIES }));
+
+app.post("/api/support/ticket", requireAuth, async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const t = incidents.normalizeTicket(req.body || {});
+    if (!t.subject && !t.body) return res.status(400).json({ error: "Describe the issue (subject or body required)." });
+    const ticketId = `t_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // Acknowledge to the user so they see it was received.
+    await db.addNotice(userId, { kind: "support", severity: "info", category: "alerts", title: "Support ticket received", body: `We've logged your ${t.severity.toUpperCase()} ${t.category} report and will follow up.`, url: "/", ts: Date.now(), ticketId }).catch(() => {});
+    // Record on the ops-visible immutable audit trail (actor = the reporting user).
+    await db.logAdminAction({ actor: String(userId), role: "user", action: "support.ticket", target: ticketId, detail: { ...t, ticketId }, ip: req.ip || null }).catch(() => {});
+    res.json({ ok: true, ticketId, severity: t.severity, category: t.category, status: t.status });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
 
 /* REC-6 — TRUSTWORTHY TRADE ANALYTICS. Standard performance stats over the caller's OWN closed trades, computed
    the one disciplined way (win rate, expectancy, profit factor, max drawdown, best/worst, avg hold). Filter by
