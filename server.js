@@ -35,6 +35,7 @@ const { costMetrics } = require("./driftMetrics");   // FIN-2: cost / slippage /
 const { summarizePortfolio } = require("./portfolioRisk");   // REC-1: account-wide portfolio risk intelligence (advisory)
 const { smartScore } = require("./smartScore");   // REC-2: transparent 4-factor scoring for Smart Auto-Buy picks
 const suitability = require("./suitability");   // REC-5: onboarding suitability knowledge check (pure grader)
+const { tradeAnalytics } = require("./tradingAnalytics");   // REC-6: trustworthy trade performance analytics
 const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./marketHours");   // IST market-open + intraday square-off + calendar readiness
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
@@ -1321,6 +1322,23 @@ app.post("/api/smart-score", requireAuth, (req, res) => {
    The result carries the question-bank VERSION so a future revision re-requires the check. Pure grader; storage
    is a merge into the existing state blob. */
 app.get("/api/suitability/questions", requireAuth, (req, res) => res.json({ ok: true, ...suitability.questionsPublic() }));
+
+/* REC-6 — TRUSTWORTHY TRADE ANALYTICS. Standard performance stats over the caller's OWN closed trades, computed
+   the one disciplined way (win rate, expectancy, profit factor, max drawdown, best/worst, avg hold). Filter by
+   ?scope=real|virtual|all and an optional ?from=&to= window (defaults to all time). Figures are ESTIMATED
+   (labelled) and exclude fees unless the trade rows already carry them. Read-only; identity from the token. */
+app.get("/api/analytics/trades", requireAuth, async (req, res) => {
+  try {
+    const userId = routeUserId(req);
+    const from = Number(req.query.from) > 0 ? Number(req.query.from) : 0;
+    const to = Number(req.query.to) > 0 ? Number(req.query.to) : Date.now();
+    const scope = String(req.query.scope || "all");
+    let trades = await db.getTrades(userId, from, to).catch(() => []);
+    if (scope === "real") trades = trades.filter((t) => !!t.real);
+    else if (scope === "virtual") trades = trades.filter((t) => !t.real);
+    res.json({ ok: true, scope, from, to, ...tradeAnalytics(trades) });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
 
 app.get("/api/suitability/status", requireAuth, async (req, res) => {
   try {
