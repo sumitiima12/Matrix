@@ -35,4 +35,15 @@ function strictestRiskPolicy(a, b) {
   return out;
 }
 
-module.exports = { RISK_KEYS, cleanRiskPolicy, strictestRiskPolicy };
+/* RISK-1: the EFFECTIVE policy is the strictest across all levels — platform ceiling, user policy, and (new)
+   per-strategy policy. Precedence is "strictest wins" at every field, so a stricter strategy limit tightens
+   the account limit but can never loosen it, and a missing level is simply skipped. Order of arguments does
+   not matter (strictestRiskPolicy is commutative/associative per field). Pure — safe to unit-test and to call
+   before wiring into the engine. Pass any number of policies (platform, user, strategy, …); nullish are ignored. */
+function effectiveRiskPolicy(...policies) {
+  return policies
+    .filter((p) => p && typeof p === "object")
+    .reduce((acc, p) => strictestRiskPolicy(acc, p), {});
+}
+
+module.exports = { RISK_KEYS, cleanRiskPolicy, strictestRiskPolicy, effectiveRiskPolicy };

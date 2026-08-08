@@ -30,3 +30,31 @@ test("strictestRiskPolicy: a cap present on only one side is carried through", (
   assert.deepEqual(strictestRiskPolicy({ maxTradesPerDay: 4 }, { maxPositionPct: 20 }),
     { maxTradesPerDay: 4, maxPositionPct: 20 });
 });
+
+/* RISK-1: effectiveRiskPolicy = strictest across platform / user / strategy (any number of levels). */
+const { effectiveRiskPolicy } = require("../riskPolicy");
+
+test("effectiveRiskPolicy: strategy limit can tighten but never loosen the account limit", () => {
+  const platform = { maxPositionPct: 100, maxDailyLossPct: 25 };
+  const user = { maxPositionPct: 50, maxTradesPerDay: 20 };
+  const strategy = { maxPositionPct: 10, maxDailyLossPct: 5 };
+  const eff = effectiveRiskPolicy(platform, user, strategy);
+  assert.equal(eff.maxPositionPct, 10, "strictest position cap wins");
+  assert.equal(eff.maxDailyLossPct, 5, "strictest daily-loss cap wins");
+  assert.equal(eff.maxTradesPerDay, 20, "cap present on only one level carries through");
+});
+
+test("effectiveRiskPolicy: a looser strategy value cannot loosen a stricter account cap", () => {
+  const eff = effectiveRiskPolicy({ maxPositionPct: 10 }, { maxPositionPct: 80 });   // strategy tries 80
+  assert.equal(eff.maxPositionPct, 10, "still clamped to the stricter 10");
+});
+
+test("effectiveRiskPolicy: cooldown takes the LONGEST (strictest) across levels", () => {
+  const eff = effectiveRiskPolicy({ cooldownMs: 5000 }, { cooldownMs: 30000 }, { cooldownMs: 10000 });
+  assert.equal(eff.cooldownMs, 30000);
+});
+
+test("effectiveRiskPolicy: nullish levels are ignored; empty input → empty policy", () => {
+  assert.deepEqual(effectiveRiskPolicy(null, undefined, { maxTradesPerDay: 3 }), { maxTradesPerDay: 3 });
+  assert.deepEqual(effectiveRiskPolicy(), {});
+});
