@@ -1249,7 +1249,10 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
     try {
       const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId }), 8000);
       deltaBook = reconcile.buildDeltaBook((pr && pr.result) || []);
-    } catch { return res.status(502).json({ error: "Couldn't read your Delta positions right now — try again in a moment." }); }
+    } catch (e) {
+      const cls = classifyDeltaError(e);
+      return res.status(cls.kind === "network" ? 502 : 400).json({ error: `Couldn't read your Delta positions — ${cls.hint}`, kind: cls.kind });
+    }
     /* R16-P2-05/06: partition using the PURE, unit-tested planner. Only broker="delta" rows are auto-closable;
        untagged phantoms are "broker unknown" and require explicit confirmIds (never auto-closed on the mere
        absence of another broker's saved credential). */
@@ -4978,9 +4981,18 @@ app.get("/api/diag/delta", async (req, res) => {
   // Whitelist THIS on your Delta API key — not your phone's IP.
   try { const ir = await T(pfetch("https://api.ipify.org?format=json", deltaDispatcher ? { dispatcher: deltaDispatcher } : {})); out.serverOutboundIp = (await ir.json()).ip; } catch (e) { out.serverOutboundIp = "unknown (" + (e && e.message) + ")"; }
   try { const t = await T(deltaCall("GET", "/v2/products", { signed: false })); out.public = { ok: true, products: (t.result || []).length }; }
-  catch (e) { out.public = cap(e); }
+  catch (e) { out.public = { ...cap(e), kind: classifyDeltaError(e).kind }; }
   try { await T(deltaCall("GET", "/v2/wallet/balances")); out.signed = { ok: true }; }
-  catch (e) { out.signed = cap(e); }
+  catch (e) { out.signed = { ...cap(e), kind: classifyDeltaError(e).kind }; }
+  /* The CALLER's OWN Delta key (BYOA) — this is what actually places your orders, so it's the probe that
+     matters. Pass ?userId=<yourId> so the signed call uses YOUR stored key (the house `signed` probe above
+     uses env keys). Signs with your key over the same proxy IP, so it reproduces the real failure. */
+  const probeUser = req.query && req.query.userId ? String(req.query.userId) : null;
+  if (probeUser) {
+    try { await T(deltaCall("GET", "/v2/wallet/balances", { userId: probeUser })); out.userSigned = { ok: true }; }
+    catch (e) { out.userSigned = { ...cap(e), kind: classifyDeltaError(e).kind }; }
+  }
+  out.diagnosis = deltaDiagnose(out);   // plain-English verdict: names the single most likely cause
   res.json(out);
 });
 
@@ -5616,6 +5628,41 @@ function deltaHeaders(method, path, query = "", body = "", creds = null) {
   };
 }
 
+/* Classify a Delta failure into a plain-English cause so the UI/notices can say WHY — network/proxy vs
+   IP-whitelist vs bad key vs low balance — instead of a generic "outcome unknown". Pure + string-based so
+   it works on a thrown transport error OR a Delta error-code payload. Returns { kind, hint }. */
+function classifyDeltaError(err) {
+  const s = `${(err && err.message) || err || ""} ${(err && err.cause && (err.cause.code || err.cause.message)) || ""} ${(err && err.status) || ""}`.toLowerCase();
+  if (/ip[_ -]?not[_ -]?whitelist|not[_ ]?whitelisted|ip[_ -]?blocked|ip[_ -]?address|whitelist/.test(s))
+    return { kind: "ipwhitelist", hint: "Delta rejected the request — this server's IP isn't whitelisted on your Delta API key. Whitelist the server IP (shown in the connection check) on your key." };
+  if (/signature|expired.?signature|invalid.?timestamp|clock/.test(s))
+    return { kind: "signature", hint: "Delta rejected the request signature — usually a server clock or key/secret mismatch. Re-connect your Delta key." };
+  if (/unauthor|invalid[_ ]?api|invalid[_ ]?key|forbidden|\b401\b|\b403\b|api[_ ]?key|permission/.test(s))
+    return { kind: "auth", hint: "Delta rejected your API credentials — the key may be wrong, revoked, or missing trade permission. Re-connect your Delta account." };
+  if (/insufficient|not enough|margin|balance/.test(s))
+    return { kind: "balance", hint: "Delta rejected the order for insufficient balance/margin — add funds on Delta before retrying." };
+  if (/fetch failed|cancel|abort|timeout|econnreset|etimedout|socket|closed|network|reach delta|unreachable|proxy|econnrefused|dns|getaddr/.test(s))
+    return { kind: "network", hint: "Couldn't reach Delta through the trading proxy — the proxy or server may be briefly unreachable. Try again in a few seconds." };
+  return { kind: "unknown", hint: "Delta returned an unexpected error — check the connection status and try again." };
+}
+
+/* Plain-English verdict from the /api/diag/delta probe bundle: names the ONE most likely cause. */
+function deltaDiagnose(o) {
+  if (o.proxyConfigured && o.proxyProbe && o.proxyProbe.tcp4 && o.proxyProbe.tcp4.ok === false)
+    return "PROXY UNREACHABLE — the server can't open a socket to the trading proxy, so every signed Delta call fails until the proxy is back.";
+  if (o.public && o.public.ok === false)
+    return "DELTA UNREACHABLE — even public (unsigned) Delta endpoints fail. This is a network/proxy problem, not your API key.";
+  const sig = o.userSigned || o.signed;
+  if (sig && sig.ok === false) {
+    const k = sig.kind || classifyDeltaError({ message: sig.error }).kind;
+    if (k === "ipwhitelist") return `IP NOT WHITELISTED — add ${o.serverOutboundIp || "the server outbound IP"} to your Delta API key's IP whitelist.`;
+    if (k === "auth" || k === "signature") return "KEY REJECTED — your Delta API key is wrong, revoked, or lacks trade permission. Re-connect it.";
+    if (k === "network") return "SIGNED CALL TIMED OUT — retry; if it persists, the proxy exit IP likely isn't whitelisted on your key.";
+    return `SIGNED CALL FAILED — ${sig.error || "unknown"}.`;
+  }
+  return "OK — public and signed Delta calls both succeed. Delta connectivity is healthy.";
+}
+
 async function deltaCall(method, path, { query = "", body = null, signed = true, userId = null } = {}) {
   const bodyStr = body ? JSON.stringify(body) : "";
   // For signed calls tied to a user, sign with THAT user's Delta keys (BYOA). Unsigned public
@@ -5661,7 +5708,9 @@ async function deltaCall(method, path, { query = "", body = null, signed = true,
       try { r = await doFetch(); }
       catch (e2) {
         const why = (e2 && e2.cause && (e2.cause.code || e2.cause.message)) || (e2 && e2.message) || "unreachable";
-        throw new Error(`Couldn't reach Delta through the trading proxy (${why}). The server may have been asleep or the proxy is briefly unreachable — try connecting again in a few seconds.`);
+        const er = new Error(`Couldn't reach Delta through the trading proxy (${why}). The server may have been asleep or the proxy is briefly unreachable — try connecting again in a few seconds.`);
+        er.deltaKind = "network"; er.deltaHint = classifyDeltaError({ message: why }).hint;
+        throw er;
       }
     } else {
       throw e;
@@ -5669,7 +5718,11 @@ async function deltaCall(method, path, { query = "", body = null, signed = true,
   }
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d.success === false) {
-    throw new Error((d.error && (d.error.code || d.error)) || d.message || `delta ${r.status}`);
+    const raw = (d.error && (d.error.code || d.error)) || d.message || `delta ${r.status}`;
+    const cls = classifyDeltaError({ message: String(raw), status: r.status });
+    const e = new Error(cls.kind === "unknown" ? String(raw) : `${raw} — ${cls.hint}`);
+    e.deltaKind = cls.kind; e.deltaHint = cls.hint; e.status = r.status;
+    throw e;
   }
   return d;
 }
