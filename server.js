@@ -5678,7 +5678,7 @@ async function deltaCall(method, path, { query = "", body = null, signed = true,
      "fetch failed (request was cancelled)"). */
   const doFetch = async () => {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15000);
+    const timer = setTimeout(() => ctrl.abort(), 20000);   // was 15s — give a slow proxy/dyno more room before declaring an order "unknown"
     try {
       return await pfetch(DELTA_BASE + path + query, {
         method,
@@ -5703,11 +5703,19 @@ async function deltaCall(method, path, { query = "", body = null, signed = true,
   try {
     r = await doFetch();
   } catch (e) {
+    // Be MORE PATIENT on idempotent GETs (order/fill/position reads that CONFIRM an order): a slow proxy or a
+    // cold dyno shouldn't drop a valid trade to "outcome unknown". Retry up to 3 times with growing backoff.
+    // POSTs (order placement) are still NEVER retried — a duplicate order is far worse than one clear failure.
     if (method === "GET" && transportErr(e)) {
-      await new Promise((res2) => setTimeout(res2, 1200));
-      try { r = await doFetch(); }
-      catch (e2) {
-        const why = (e2 && e2.cause && (e2.cause.code || e2.cause.message)) || (e2 && e2.message) || "unreachable";
+      const backoffs = [1200, 2500, 4000];
+      let ok = false, lastErr = e;
+      for (const wait of backoffs) {
+        await new Promise((res2) => setTimeout(res2, wait));
+        try { r = await doFetch(); ok = true; break; }
+        catch (e2) { lastErr = e2; }
+      }
+      if (!ok) {
+        const why = (lastErr && lastErr.cause && (lastErr.cause.code || lastErr.cause.message)) || (lastErr && lastErr.message) || "unreachable";
         const er = new Error(`Couldn't reach Delta through the trading proxy (${why}). The server may have been asleep or the proxy is briefly unreachable — try connecting again in a few seconds.`);
         er.deltaKind = "network"; er.deltaHint = classifyDeltaError({ message: why }).hint;
         throw er;
