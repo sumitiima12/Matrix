@@ -5769,6 +5769,11 @@ app.get("/api/broker/status", requireAuth, async (req, res) => {
      otherwise anyone could enumerate identifiers to learn whether a given user has broker credentials. */
   const userId = req.authUserId;
   const storeKey = userId ? storageKeyFor(userId) : null;
+  // Opt-in LIVE verification: `hasCreds` only means "keys are stored", NOT that they work — so a badge
+  // built on it shows "connected" even while every signed call fails (bad IP whitelist / revoked key).
+  // With ?verify=1 we run one cheap signed read so the client can show an HONEST status. Off by default
+  // so routine status polls stay fast (no broker round-trip).
+  const doVerify = String((req.query && req.query.verify) || "") === "1" || (req.query && req.query.verify) === "true";
   const out = {};
   for (const [id, b] of Object.entries(BROKERS)) {
     // hasCreds: the server holds resumable creds for this user → the client can auto-resume the
@@ -5785,6 +5790,13 @@ app.get("/api/broker/status", requireAuth, async (req, res) => {
       appConnected: Boolean(getUserAppCred(id, userId)),
       hasCreds,
     };
+  }
+  // Delta is the one broker with a cheap, server-side signed read we can probe right now. When asked to
+  // verify, hit /v2/wallet/balances with the user's own key: verified=true only if it actually succeeds;
+  // otherwise verified=false + a plain-English reason (IP whitelist / key / network).
+  if (doVerify && out.delta && out.delta.hasCreds) {
+    try { await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId }), 8000); out.delta.verified = true; }
+    catch (e) { const cls = classifyDeltaError(e); out.delta.verified = false; out.delta.verifyKind = cls.kind; out.delta.verifyHint = cls.hint; }
   }
   res.json({ brokers: out, tradingEnabled: TRADING_ENABLED, staticIp: brokerStaticIp() });
 });
