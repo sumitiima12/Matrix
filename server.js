@@ -1248,10 +1248,13 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
     let deltaBook;
     try {
       // The Delta read goes Render(SG)→proxy(Mumbai)→Delta(IN); measured round-trips run 6–25s on the free
-      // proxy VM. An 8s cap was aborting a *working* call and the abort got mis-stamped "network"/"proxy
-      // unreachable". Give it the same patience deltaCall itself uses (20s + one GET retry) so a slow-but-
-      // healthy positions read completes instead of being killed and reported as a proxy failure.
-      const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId }), 45000);
+      // proxy VM. deltaCall already enforces its OWN bounded timeout (20s AbortController) + up to 3 backoff
+      // retries on idempotent GETs, so a slow-but-healthy positions read completes instead of being killed.
+      // NOTE: the old `withTimeout(...)` wrapper here was a module-scope ReferenceError ("withTimeout is not
+      // defined" — it's only a LOCAL const inside a few other functions). That threw instantly and, because the
+      // message contains the word "timeout", classifyDeltaError mis-stamped it "network / proxy unreachable" —
+      // which is why every reconcile since this button shipped falsely reported a proxy failure.
+      const pr = await deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId });
       deltaBook = reconcile.buildDeltaBook((pr && pr.result) || []);
     } catch (e) {
       const cls = classifyDeltaError(e);
