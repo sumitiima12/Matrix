@@ -1255,7 +1255,16 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
       deltaBook = reconcile.buildDeltaBook((pr && pr.result) || []);
     } catch (e) {
       const cls = classifyDeltaError(e);
-      return res.status(cls.kind === "network" ? 502 : 400).json({ error: `Couldn't read your Delta positions — ${cls.hint}`, kind: cls.kind });
+      // DIAG: surface the RAW transport cause (proxy 407 vs timeout vs DNS vs Delta payload) so a single
+      // failed reconcile self-diagnoses in the UI, instead of collapsing every cause to "network".
+      const detail = String(
+        (e && e.cause && (e.cause.code || e.cause.message)) ||
+        (e && e.message) || e || ""
+      ).slice(0, 200);
+      return res.status(cls.kind === "network" ? 502 : 400).json({
+        error: `Couldn't read your Delta positions — ${cls.hint}${detail ? ` [cause: ${detail}]` : ""}`,
+        kind: cls.kind, detail,
+      });
     }
     /* R16-P2-05/06: partition using the PURE, unit-tested planner. Only broker="delta" rows are auto-closable;
        untagged phantoms are "broker unknown" and require explicit confirmIds (never auto-closed on the mere
