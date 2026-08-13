@@ -1248,16 +1248,23 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
     let deltaBook;
     try {
       // The Delta read goes Render(SG)→proxy(Mumbai)→Delta(IN); measured round-trips run 6–25s on the free
-      // proxy VM. deltaCall already enforces its OWN bounded timeout (20s AbortController) + up to 3 backoff
-      // retries on idempotent GETs, so a slow-but-healthy positions read completes instead of being killed.
-      // NOTE: the old `withTimeout(...)` wrapper here was a module-scope ReferenceError ("withTimeout is not
-      // defined" — it's only a LOCAL const inside a few other functions). That threw instantly and, because the
-      // message contains the word "timeout", classifyDeltaError mis-stamped it "network / proxy unreachable" —
-      // which is why every reconcile since this button shipped falsely reported a proxy failure.
-      const pr = await deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId });
+      // proxy VM. deltaCall already enforces its own 20s AbortController + up to 3 backoff retries on idempotent
+      // GETs; the 45s outer ceiling (via the module-level withTimeout helper) bounds the worst case predictably.
+      // HISTORICAL BUG: the wrapper used to reference a `withTimeout` that only existed as a LOCAL const in other
+      // functions — a module-scope ReferenceError. It threw instantly and, because its message contains the word
+      // "timeout", classifyDeltaError mis-stamped it "network / proxy unreachable", so a healthy proxy looked
+      // dead. Fixed by defining withTimeout once at module scope + classifying programming faults as "internal".
+      const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId }), 45000, "Delta positions read");
       deltaBook = reconcile.buildDeltaBook((pr && pr.result) || []);
     } catch (e) {
       const cls = classifyDeltaError(e);
+      // A programming fault (ReferenceError/TypeError/…) is a SERVER BUG, not a connection failure: log the full
+      // error server-side for diagnosis and return 500 INTERNAL_RECONCILE_ERROR — never a 502 "network" that
+      // would send us chasing the proxy again. No stack trace / secrets are exposed to the browser.
+      if (cls.kind === "internal") {
+        console.error("[reconcile-real] INTERNAL_RECONCILE_ERROR:", (e && e.stack) || e);
+        return res.status(500).json({ error: "Reconcile hit an internal server error — it's been logged and will be fixed.", kind: "internal", code: "INTERNAL_RECONCILE_ERROR" });
+      }
       // DIAG: surface the RAW transport cause (proxy 407 vs timeout vs DNS vs Delta payload) so a single
       // failed reconcile self-diagnoses in the UI, instead of collapsing every cause to "network".
       const detail = String(
@@ -5673,6 +5680,12 @@ function deltaHeaders(method, path, query = "", body = "", creds = null) {
    IP-whitelist vs bad key vs low balance — instead of a generic "outcome unknown". Pure + string-based so
    it works on a thrown transport error OR a Delta error-code payload. Returns { kind, hint }. */
 function classifyDeltaError(err) {
+  /* A PROGRAMMING fault (ReferenceError/TypeError/RangeError/SyntaxError) is a server bug, NOT a connection
+     problem — classify it "internal" FIRST so its message (which often contains words like "timeout" or
+     "undefined") can't be mis-stamped "network / proxy unreachable". This is exactly the bug that made a
+     `withTimeout is not defined` ReferenceError look like a dead trading proxy. */
+  if (err instanceof ReferenceError || err instanceof TypeError || err instanceof RangeError || err instanceof SyntaxError)
+    return { kind: "internal", hint: "An internal server error occurred while reading Delta — this is a code fault, not a connection problem. It's been logged for a fix." };
   const s = `${(err && err.message) || err || ""} ${(err && err.cause && (err.cause.code || err.cause.message)) || ""} ${(err && err.status) || ""}`.toLowerCase();
   if (/ip[_ -]?not[_ -]?whitelist|not[_ ]?whitelisted|ip[_ -]?blocked|ip[_ -]?address|whitelist/.test(s))
     return { kind: "ipwhitelist", hint: "Delta rejected the request — this server's IP isn't whitelisted on your Delta API key. Whitelist the server IP (shown in the connection check) on your key." };
@@ -5712,10 +5725,9 @@ function deltaDiagnose(o) {
    hoisted function) makes every such call resolve; the three function-local `const withTimeout` definitions
    simply shadow this within their own scope, so their behaviour is unchanged. */
 function withTimeout(p, ms = 15000, label = "operation") {
-  return Promise.race([
-    Promise.resolve(p),
-    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: timed out after ${ms}ms`)), ms)),
-  ]);
+  let timer;
+  const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`${label}: timeout after ${ms}ms`)), ms); });
+  return Promise.race([Promise.resolve(p), timeout]).finally(() => clearTimeout(timer));
 }
 
 async function deltaCall(method, path, { query = "", body = null, signed = true, userId = null } = {}) {
