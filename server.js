@@ -5704,6 +5704,20 @@ function deltaDiagnose(o) {
   return "OK — public and signed Delta calls both succeed. Delta connectivity is healthy.";
 }
 
+/* Module-level timeout helper. Several routes/engines (/api/broker/status Delta verify, runAutoExitEngine's
+   Delta position read, fetchBrokerContractNote's Delta wallet/fills) called `withTimeout(...)` where NO local
+   `withTimeout` const was in scope — a latent `ReferenceError: withTimeout is not defined`. Because that error
+   string contains "timeout", classifyDeltaError mis-stamped it "network / proxy unreachable", so a working proxy
+   looked broken (this is exactly what made reconcile falsely report a proxy failure). Defining it once here (a
+   hoisted function) makes every such call resolve; the three function-local `const withTimeout` definitions
+   simply shadow this within their own scope, so their behaviour is unchanged. */
+function withTimeout(p, ms = 15000, label = "operation") {
+  return Promise.race([
+    Promise.resolve(p),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
 async function deltaCall(method, path, { query = "", body = null, signed = true, userId = null } = {}) {
   const bodyStr = body ? JSON.stringify(body) : "";
   // For signed calls tied to a user, sign with THAT user's Delta keys (BYOA). Unsigned public
