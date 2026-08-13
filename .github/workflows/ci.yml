@@ -2,7 +2,11 @@ name: CI
 on:
   push:
     branches: [main, master]
+    # CI-COST: doc-only commits don't affect the server, so skip the full Postgres suite for them.
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.gitignore']
   pull_request:
+    branches: [main, master]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.gitignore']
   workflow_dispatch:   # allow manually running CI for the current branch/SHA from the Actions tab ("Run workflow")
 # R38-P1-03: cancel superseded revisions so old runs don't pile up for hours and get cancelled at ~6h. One in-flight run
 # per ref; a new push cancels the previous one.
@@ -112,7 +116,12 @@ jobs:
   broker-sandbox:
     runs-on: ubuntu-latest
     timeout-minutes: 15   # R38-P1-03: a real broker lifecycle is seconds-to-minutes; cap it so a hung network call fails fast.
-    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+    # CI-COST: on an ordinary main push (no real-money release, no explicit cert request) this job used to spin a
+    # fresh runner + npm ci just to pass as NOT_CONFIGURED. Now it only runs when certification is actually wanted —
+    # vars.REQUIRE_BROKER_CERT=1 or the real-money release gate. Those are exactly the cases where it must PASS, so
+    # safety is unchanged; routine pushes skip it. (release-gate needs this job only when REAL_MONEY_RELEASE=1, and
+    # that condition still runs it — so the dependency stays satisfied.)
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && (vars.REQUIRE_BROKER_CERT == '1' || vars.REAL_MONEY_RELEASE == '1') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

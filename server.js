@@ -1247,7 +1247,11 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
        actual direction and quantity Delta holds, not merely "some BTC position exists". */
     let deltaBook;
     try {
-      const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId }), 8000);
+      // The Delta read goes Render(SG)→proxy(Mumbai)→Delta(IN); measured round-trips run 6–25s on the free
+      // proxy VM. An 8s cap was aborting a *working* call and the abort got mis-stamped "network"/"proxy
+      // unreachable". Give it the same patience deltaCall itself uses (20s + one GET retry) so a slow-but-
+      // healthy positions read completes instead of being killed and reported as a proxy failure.
+      const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: req.authUserId }), 45000);
       deltaBook = reconcile.buildDeltaBook((pr && pr.result) || []);
     } catch (e) {
       const cls = classifyDeltaError(e);
@@ -2377,6 +2381,31 @@ app.post("/api/admin/ops/resume-user", async (req, res) => {
     await db.setEntryHalt(storageKeyFor(phone), false);
     await auditAdmin(req, "ops.resumeUser", phone, {});
     res.json({ ok: true, phone, halted: false });
+  } catch (e) { serverError(res, e); }
+});
+/* OWNER MANUAL OVERRIDE — fully resolve a stuck trading halt. Unlike Resume (broker-backed, refuses to unlock
+   without a clean broker reconcile), this is an explicit admin override for when the broker state has been
+   verified OUT OF BAND (e.g. the owner checked the Delta app directly and it's flat) but the broker-backed
+   reconcile CAN'T run — e.g. the outbound proxy is down. It clears BOTH the durable entry-halt AND the risk-lock
+   AND the live in-memory pause on this worker. Requires an explicit `confirm:true`, is loudly financial-logged,
+   and is written to the immutable admin audit trail. NOTE: real orders still route through the proxy, so trading
+   only actually resumes once the proxy is reachable again — this clears the LOCK, not the connectivity. */
+app.post("/api/admin/ops/clear-halt", async (req, res) => {
+  if (!requireAdmin(req, res, "admin")) return;
+  try {
+    const phone = cleanPhone(req.body && req.body.phone);
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    if (!(req.body && req.body.confirm === true)) {
+      return res.status(400).json({ error: "confirm:true required — verify the broker state (e.g. open the Delta app and confirm there is no unknown open position) BEFORE manually clearing the halt." });
+    }
+    const key = storageKeyFor(phone);
+    const reason = String((req.body && req.body.reason) || "").slice(0, 500);
+    await db.setEntryHalt(key, false);
+    if (typeof db.setRiskLock === "function") await db.setRiskLock(key, false);
+    try { haltedEntries.delete(String(key)); } catch { /* engine may not be up on this worker */ }
+    logFinancial("ops.clear_halt.manual_override", { phone, key, reason });
+    await auditAdmin(req, "ops.clearHalt", phone, { manualOverride: true, reason });
+    res.json({ ok: true, phone, halted: false, riskLocked: false, note: "Entry halt and risk lock cleared (manual override). Real trading resumes only once the trading proxy is reachable — orders route through it." });
   } catch (e) { serverError(res, e); }
 });
 /* Record a free-text incident note into the immutable audit trail (support+). Lets ops mark an incident
@@ -5803,7 +5832,7 @@ app.get("/api/broker/status", requireAuth, async (req, res) => {
   // verify, hit /v2/wallet/balances with the user's own key: verified=true only if it actually succeeds;
   // otherwise verified=false + a plain-English reason (IP whitelist / key / network).
   if (doVerify && out.delta && out.delta.hasCreds) {
-    try { await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId }), 8000); out.delta.verified = true; }
+    try { await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId }), 20000); out.delta.verified = true; }
     catch (e) { const cls = classifyDeltaError(e); out.delta.verified = false; out.delta.verifyKind = cls.kind; out.delta.verifyHint = cls.hint; }
   }
   res.json({ brokers: out, tradingEnabled: TRADING_ENABLED, staticIp: brokerStaticIp() });
@@ -6409,7 +6438,7 @@ async function fetchBrokerAccount(sess) {
       // WALLET is essential (funds check) — try it, with one retry, before giving up.
       let w = null;
       for (let attempt = 0; attempt < 2 && !w; attempt++) {
-        try { w = await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }), 8000); }
+        try { w = await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }), 20000); }
         catch (e) {
           // undici wraps the real reason (DNS/connection/TLS) in e.cause — surface it.
           const cause = e && e.cause ? (e.cause.code || e.cause.message || String(e.cause)) : "";
@@ -6424,7 +6453,7 @@ async function fetchBrokerAccount(sess) {
       // don't block the whole order; proceed with an empty position list.
       let portfolio = [];
       try {
-        const pos = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: sess.userId }), 8000);
+        const pos = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: sess.userId }), 20000);
         portfolio = (pos.result || []).filter((x) => Number(x.size) !== 0)
           .map((x) => ({ sym: x.product_symbol || (x.product && x.product.symbol) || null, qty: Number(x.size), avg: x.entry_price != null ? Number(x.entry_price) : null, price: x.mark_price != null ? Number(x.mark_price) : null, market: "Crypto" }));
       } catch (e) { console.error("[risk] delta positions fetch failed (non-fatal):", e.message); }
@@ -8250,9 +8279,19 @@ function mapProduct(broker, product) {
 async function verifyFyersFill(sess, orderId, wantQty = 0) {
   if (!orderId) return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
   const auth = brokerAuth("fyers", sess.accessToken, sess.userId);
-  for (let attempt = 0; attempt < 4; attempt++) {
+  // Patience — mirror the Delta confirmation policy. A FYERS order can be slow to surface as filled in the
+  // order book on a laggy network / proxy; the old 4×800ms window (~3s) gave up too early and dropped
+  // slow-but-VALID fills to "outcome unknown". Poll out to ~9s across growing backoffs, and bound each poll
+  // with a 9s AbortController timeout so a single hung read can't stall the whole verify. This is a read-only
+  // order-book GET — retrying it never places a duplicate order (unlike the order POST, which is never retried).
+  const backoffs = [800, 1600, 2600, 4000];
+  for (let attempt = 0; attempt <= backoffs.length; attempt++) {
     try {
-      const r = await fyFetch(`https://api-t1.fyers.in/api/v3/orders?id=${encodeURIComponent(orderId)}`, { headers: auth });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => { try { ctrl.abort(); } catch { /* noop */ } }, 9000);
+      let r;
+      try { r = await fyFetch(`https://api-t1.fyers.in/api/v3/orders?id=${encodeURIComponent(orderId)}`, { headers: auth, signal: ctrl.signal }); }
+      finally { clearTimeout(timer); }
       const d = await r.json().catch(() => ({}));
       // FYERS returns the matched order under orderBook[] (filtered) or orderDetails; fall back to the body.
       const o = (Array.isArray(d.orderBook) && d.orderBook.find((x) => String(x.id) === String(orderId))) ||
@@ -8263,8 +8302,8 @@ async function verifyFyersFill(sess, orderId, wantQty = 0) {
       const execTs = reconcile.brokerFillTsMs([o.orderDateTime, o.tradeTime, o.orderNumStatus]);
       if (c.filled || c.rejected) return { ...c, execTs, reason: o.message || o.orderStatusDescription || null };
       // still transit/pending → wait and re-poll
-    } catch { /* transient — keep polling */ }
-    if (attempt < 3) await new Promise((res) => setTimeout(res, 800));
+    } catch { /* transient (incl. abort) — keep polling */ }
+    if (attempt < backoffs.length) await new Promise((res) => setTimeout(res, backoffs[attempt]));
   }
   return { filled: false, rejected: false, pending: true, filledQty: 0, avgPrice: null, status: null };
 }
@@ -8748,7 +8787,7 @@ async function runAutoExitEngine() {
       if (deltaHeldByUser.has(uid)) return deltaHeldByUser.get(uid);
       let held = null;
       try {
-        const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: uid }), 8000);
+        const pr = await withTimeout(deltaCall("GET", "/v2/positions/margined", { userId: uid }), 20000);
         held = new Set((pr && pr.result || []).filter((x) => Number(x.size) !== 0)
           .map((x) => String(x.product_symbol || (x.product && x.product.symbol) || "")));
       } catch { held = null; }
@@ -9795,12 +9834,12 @@ async function fetchBrokerContractNote(userKey, broker, opts = {}) {
          adapter accept rows that carry no per-row account field; a failure means we do NOT claim provenance and such
          unattributed rows are refused (fees stay provisional) rather than being trusted from a possibly-misrouted page. */
       let accountVerified = false;
-      try { const w = await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }), 8000); accountVerified = !!(w && (w.success === true || Array.isArray(w.result))); } catch { accountVerified = false; }
+      try { const w = await withTimeout(deltaCall("GET", "/v2/wallet/balances", { userId: sess.userId }), 20000); accountVerified = !!(w && (w.success === true || Array.isArray(w.result))); } catch { accountVerified = false; }
       /* R39-P1-02 — paginate with a REAL signed query string. deltaCall transmits ONLY its `query` string, so passing
          page_size/after as loose object keys silently dropped them (fetching page 1 forever / false completeness). The
          pure paginator builds "?page_size=&after=" and decides completeness from the AUTHORITATIVE next cursor. */
       const { rows, complete, pages } = await feeStatement.paginateDeltaFills(
-        (query) => withTimeout(deltaCall("GET", "/v2/fills", { query, userId: sess.userId }), 8000).catch(() => null),
+        (query) => withTimeout(deltaCall("GET", "/v2/fills", { query, userId: sess.userId }), 20000).catch(() => null),
         { pageSize: PAGE, maxPages: MAX_PAGES }
       );
       const norm = feeStatement.normalizeDeltaFills(rows, { tradingDate: expectDay, account: acctExpected, complete, accountVerified });
