@@ -5722,6 +5722,12 @@ function classifyDeltaError(err) {
     return { kind: "balance", hint: "Delta rejected the order for insufficient balance/margin — add funds on Delta before retrying." };
   if (/fetch failed|cancel|abort|timeout|econnreset|etimedout|socket|closed|network|reach delta|unreachable|proxy|econnrefused|dns|getaddr/.test(s))
     return { kind: "network", hint: "Couldn't reach Delta through the trading proxy — the proxy or server may be briefly unreachable. Try again in a few seconds." };
+  /* A schema/validation/parameter reject (bad_schema, bad_request, malformed, invalid size/product, HTTP 400/422) is
+     a CONCLUSIVE broker rejection — Delta refused the request BEFORE any execution, so nothing was placed. It must be
+     terminal-REJECTED (never "unknown", never risk-lock, retry allowed as a new order), distinct from a transport
+     ambiguity. Placed after the network check so a genuine timeout stays "network". */
+  if (/bad[_ ]?schema|bad[_ ]?request|malformed|schema|invalid[_ ]?(order|request|param|size|product|quantity)|\b400\b|\b422\b/.test(s))
+    return { kind: "reject", hint: "Delta rejected the order request (validation/parameters) — nothing was executed. Adjust and place a new order." };
   return { kind: "unknown", hint: "Delta returned an unexpected error — check the connection status and try again." };
 }
 
@@ -7337,7 +7343,18 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           classify: (dd) => ({ status: "ACCEPTED", patch: { brokerOrderId: dd && dd.result && dd.result.id != null ? String(dd.result.id) : null } }),
           // A CONCLUSIVE Delta rejection thrown as an error is terminal (nothing landed); an ambiguous transport
           // failure stays UNKNOWN (recovery resolves it). A business reject returned in the body is handled below.
-          classifyError: (e) => { const m = String((e && e.message) || e || ""); return /reject|insufficient|margin|rms|invalid|not allowed|blocked/i.test(m) ? { status: "REJECTED" } : null; },
+          /* A CONCLUSIVE Delta rejection (the broker refused BEFORE any execution) is terminal-REJECTED — the attempt
+             resolves and the account is NEVER risk-locked, distinct from a transport ambiguity which stays UNKNOWN.
+             Covers bad_schema/validation/param errors, insufficient balance, bad creds/whitelist/signature, and any
+             HTTP 400/422 — all of which mean nothing was placed. Only network/timeout/internal stay ambiguous. */
+          classifyError: (e) => {
+            const m = String((e && e.message) || e || "");
+            const k = e && e.deltaKind;
+            const conclusive = /reject|insufficient|margin|rms|invalid|not allowed|blocked|bad[_ ]?schema|schema|malformed/i.test(m)
+              || k === "reject" || k === "balance" || k === "auth" || k === "ipwhitelist" || k === "signature"
+              || e.status === 400 || e.status === 422;
+            return conclusive ? { status: "REJECTED" } : null;
+          },
         });
         if (out && (out.replay || out.fenced)) {
           return res.status(409).json({ error: "This order was already submitted and is being reconciled — it won't be resubmitted. Check your broker before retrying.", reconcileRequired: true, status: out.status });
