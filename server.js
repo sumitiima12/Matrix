@@ -5730,7 +5730,7 @@ function withTimeout(p, ms = 15000, label = "operation") {
   return Promise.race([Promise.resolve(p), timeout]).finally(() => clearTimeout(timer));
 }
 
-async function deltaCall(method, path, { query = "", body = null, signed = true, userId = null } = {}) {
+async function deltaCall(method, path, { query = "", body = null, signed = true, userId = null, timeoutMs = 20000 } = {}) {
   const bodyStr = body ? JSON.stringify(body) : "";
   // For signed calls tied to a user, sign with THAT user's Delta keys (BYOA). Unsigned public
   // calls (products, candles, tickers) need no creds. When no userId is given, house keys are used.
@@ -5745,7 +5745,7 @@ async function deltaCall(method, path, { query = "", body = null, signed = true,
      "fetch failed (request was cancelled)"). */
   const doFetch = async () => {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20000);   // was 15s — give a slow proxy/dyno more room before declaring an order "unknown"
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);   // per-call budget (default 20s); order POSTs pass a longer one so a slow-but-successful order response isn't aborted to "outcome unknown"
     try {
       return await pfetch(DELTA_BASE + path + query, {
         method,
@@ -7243,7 +7243,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         // THIS order in Delta's order book/fills. Without it, an executed order looks absent → duplicate.
         client_order_id: String(idemKey).slice(0, 64),
       };
-      const _deltaSubmit = async () => deltaCall("POST", "/v2/orders", { userId: sess.userId, body: _deltaBody });
+      const _deltaSubmit = async () => deltaCall("POST", "/v2/orders", { userId: sess.userId, body: _deltaBody, timeoutMs: 40000 });
       /* R40 (Delta automation) — DURABLE WRITE-BEFORE-SEND, same C03 machinery FYERS uses. A PREPARED order_attempt
          is committed BEFORE the Delta call, so a crash / lost response is recoverable by client_order_id; the broker is
          called ONLY if this request wins the PREPARED→SUBMITTING CAS; a replayed/in-flight attempt returns
@@ -8574,7 +8574,7 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
     // qty is stored in COIN units — convert back to contracts to close the exact position.
     const size = deltaCoinToContracts(prod, qty);
     const d = await deltaCall("POST", "/v2/orders", {
-      userId: sess.userId,
+      userId: sess.userId, timeoutMs: 40000,
       body: { product_id: prod.id, size, side: short ? "buy" : "sell", order_type: "market_order", reduce_only: true },
     });
     // R6-lifecycle: verify the exit actually FILLED — a partial/rejected reduce-only leaves the position
@@ -9101,7 +9101,7 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     // later (the durable dedupe key). Delta echoes it back on both live and historical orders.
     const orderBody = { product_id: dprod.id, size: contracts, side: entrySide, order_type: "market_order", ...(entryLimitFields || {}) };
     if (clientOrderId) orderBody.client_order_id = String(clientOrderId).slice(0, 64);
-    const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: orderBody });
+    const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: orderBody, timeoutMs: 40000 });
     // HTTP 200 is NOT a fill — verify, and throw the real reason on a reject/no-fill.
     const o = d.result || {};
     const sizeC = Number(o.size) || contracts;                                   // contracts
