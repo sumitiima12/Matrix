@@ -2435,9 +2435,17 @@ app.post("/api/admin/ops/clear-halt", async (req, res) => {
     await db.setEntryHalt(key, false);
     if (typeof db.setRiskLock === "function") await db.setRiskLock(key, false);
     try { haltedEntries.delete(String(key)); } catch { /* engine may not be up on this worker */ }
-    logFinancial("ops.clear_halt.manual_override", { phone, key, reason });
-    await auditAdmin(req, "ops.clearHalt", phone, { manualOverride: true, reason });
-    res.json({ ok: true, phone, halted: false, riskLocked: false, note: "Entry halt and risk lock cleared (manual override). Real trading resumes only once the trading proxy is reachable — orders route through it." });
+    /* Also release any stuck UNKNOWN idempotency records. The account-wide new-entry block (R25-H01) keys on
+       countUnknownIdempotency(), so a timed-out order whose key the client can no longer reconcile would keep
+       every new order 423-blocked even after the halt/risk-lock are cleared — the exact "outcome unknown" loop.
+       The owner has attested (confirm:true) the broker is flat, so it's safe to clear these here. */
+    let unknownCleared = 0;
+    if (typeof db.releaseUnknownIdempotency === "function") {
+      try { unknownCleared = await db.releaseUnknownIdempotency(key); } catch { /* best-effort */ }
+    }
+    logFinancial("ops.clear_halt.manual_override", { phone, key, reason, unknownCleared });
+    await auditAdmin(req, "ops.clearHalt", phone, { manualOverride: true, reason, unknownCleared });
+    res.json({ ok: true, phone, halted: false, riskLocked: false, unknownCleared, note: `Entry halt, risk lock, and ${unknownCleared} unresolved order record(s) cleared (manual override). Real trading resumes only once the trading proxy is reachable — orders route through it.` });
   } catch (e) { serverError(res, e); }
 });
 /* Record a free-text incident note into the immutable audit trail (support+). Lets ops mark an incident
