@@ -924,8 +924,12 @@ async function _deltaProbeByTag(attempt) {
   // so an attempt whose POST transport-failed BEFORE returning an id could never be resolved and kept the account
   // locked forever, blocking every subsequent entry (the DOGE "outcome unknown" loop). Accepting `tag` fixes that.
   const created = Number(attempt.createdAt ?? attempt.created_at);
-  const oldEnough = Number.isFinite(created) && created > 0 && (Date.now() - created) >= (Number(process.env.DELTA_ABSENCE_MIN_AGE_MS) || 60000);
-  if ((bid || tag) && oldEnough) return { status: "absent" };
+  const ageMs = Number.isFinite(created) && created > 0 ? (Date.now() - created) : null;
+  const oldEnough = ageMs != null && ageMs >= (Number(process.env.DELTA_ABSENCE_MIN_AGE_MS) || 60000);
+  const willAbsent = (bid || tag) && oldEnough;
+  // DIAGNOSTIC: why the probe resolves ABSENT vs stays INCONCLUSIVE (the c03.recover.inconclusive you saw).
+  try { logFinancial("delta.probe.decide", { userId: uid, tag, hasBrokerId: !!bid, histCount: hist.length, oursCount: ours.length, fillsCount: fills.length, filledCoin, posCount: pos.length, ageMs, oldEnough, decision: willAbsent ? "absent" : "inconclusive" }); } catch { /* noop */ }
+  if (willAbsent) return { status: "absent" };
   return null;   // recent/never-accepted unknown ⇒ stay locked, retried on a later sweep
 }
 async function _adoptDeltaFill(attempt, ob) {
@@ -5818,6 +5822,9 @@ async function deltaCall(method, path, { query = "", body = null, signed = true,
     const cls = classifyDeltaError({ message: String(raw), status: r.status });
     const e = new Error(cls.kind === "unknown" ? String(raw) : `${raw} — ${cls.hint}`);
     e.deltaKind = cls.kind; e.deltaHint = cls.hint; e.status = r.status;
+    // Preserve Delta's structured error so a bad_schema/validation reject can be root-caused: `context` names the
+    // offending field. Sanitised (truncated) and surfaced by callers' diagnostics — never in a user-facing message.
+    try { e.deltaError = d && d.error ? JSON.parse(JSON.stringify(d.error)) : null; } catch { e.deltaError = null; }
     throw e;
   }
   return d;
@@ -6598,6 +6605,17 @@ function deltaContracts(prod, coinQty) {
   const cv = Number(prod && prod.contract_value) || 1;
   return { cv, contracts: Math.max(0, Math.floor(Number(coinQty) / cv + 1e-9)) };
 }
+/* Delta caps client_order_id at 32 chars. Our internal idempotency key is `mx_<36-char UUID>` = 39 chars, which
+   Delta rejects with `bad_schema` (the root cause of the manual-order "outcome unknown" loop). Derive a DETERMINISTIC
+   ≤32-char Delta-facing tag from the full key: `mx_` + first 29 hex of SHA-256(idemKey) = 32 chars. Deterministic so
+   the SAME internal key always maps to the SAME Delta tag — the order body, the durable order_attempt.orderTag, and
+   every recovery/fills/history lookup MUST use this one helper so they always match. The full idemKey is unchanged in
+   Matrix's idempotency ledger and the attempt id; only the broker-facing tag is derived. */
+function deltaClientOrderId(idemKey) {
+  const raw = String(idemKey || "");
+  if (!raw) throw new Error("Delta order requires an idempotency key");
+  return "mx_" + crypto.createHash("sha256").update(raw).digest("hex").slice(0, 29);   // 3 + 29 = 32 chars
+}
 function deltaCoinToContracts(prod, coinQty) {
   const cv = Number(prod && prod.contract_value) || 1;
   return Math.max(1, Math.round(Number(coinQty) / cv));   // exits round to the nearest contract, min 1
@@ -7251,6 +7269,9 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         return res.status(400).json({ ok: false, status: "rejected", broker, reason: `Amount too small for ${symbol} on Delta — one contract is ≈ ${cv} unit(s). Increase your amount.` });
       }
       const _deltaIsReduce = (!isBuy || req.body?.reduceOnly === true);
+      // Delta-facing ≤32-char tag derived from the full idemKey — used for BOTH the order body AND the durable
+      // attempt.orderTag below, so the recovery probe finds this exact order. (Delta rejects >32 with bad_schema.)
+      const _deltaTag = deltaClientOrderId(idemKey);
       const _deltaBody = {
         product_id: prod.id,
         size: sendSize,
@@ -7260,19 +7281,41 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         // R27-P1-02: a SELL always reduces a long, and ANY explicitly reduce-only request (a close — incl. a
         // BUY-to-cover of a short) must carry the exchange reduce_only flag so it can only shrink exposure.
         ...(_deltaIsReduce ? { reduce_only: true } : {}),
-        // R26-P1-01: stamp our durable client_order_id (the idempotency key) so the recovery probe can later find
-        // THIS order in Delta's order book/fills. Without it, an executed order looks absent → duplicate.
-        client_order_id: String(idemKey).slice(0, 64),
+        // R26-P1-01: stamp our durable client_order_id so the recovery probe can later find THIS order in Delta's
+        // order book/fills. Without it, an executed order looks absent → duplicate. MUST be ≤32 chars (Delta cap).
+        client_order_id: _deltaTag,
       };
       const _deltaSubmit = async () => {
+        // DIAGNOSTIC INSTRUMENTATION (safe: logs only, no behaviour change). GETs (portfolio) succeeding while the
+        // order POST doesn't points to a POST-specific cause — body-signature, order-endpoint reachability, or a
+        // margin/size reject. These three events name it from the Render logs without guessing.
+        const _t0 = Date.now();
+        logFinancial("delta.order.submit.start", {
+          userId: idemUser, key: idemKey, attempt: `oa_${idemUser}_${idemKey}`,
+          symbol, side, size: _deltaBody && _deltaBody.size, product_id: _deltaBody && _deltaBody.product_id,
+          proxyConfigured: !!deltaDispatcher, timeoutMs: 40000,
+        });
         try {
-          return await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: _deltaBody, timeoutMs: 40000 });
+          const r = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: _deltaBody, timeoutMs: 40000 });
+          logFinancial("delta.order.submit.response", {
+            userId: idemUser, key: idemKey, elapsedMs: Date.now() - _t0,
+            deltaSuccess: r && r.success !== false, orderId: r && r.result && r.result.id != null ? String(r.result.id) : null,
+            state: r && r.result && r.result.state,
+          });
+          return r;
         } catch (e) {
-          // DIAGNOSTIC: surface exactly why the Delta order POST failed (timeout / signature / ipwhitelist / reject),
-          // so the "outcome unknown" loop can be root-caused from the logs. GETs (portfolio) working while this
-          // fails points to a POST-specific cause (body-signature or order-endpoint reachability).
           const cls = classifyDeltaError(e);
-          logFinancial("delta.submit.error", { userId: idemUser, key: idemKey, symbol, side, kind: cls.kind, hint: cls.hint, msg: String((e && e.message) || e).slice(0, 300) });
+          const aborted = !!(e && (e.name === "AbortError" || /abort/i.test(String((e && e.message) || "")) || (e.cause && /abort/i.test(String(e.cause.code || e.cause.message || "")))));
+          logFinancial("delta.order.submit.error", {
+            userId: idemUser, key: idemKey, elapsedMs: Date.now() - _t0,
+            name: e && e.name, kind: e && e.deltaKind ? e.deltaKind : cls.kind, hint: e && e.deltaHint ? e.deltaHint : cls.hint,
+            httpStatus: e && e.status, aborted,
+            causeCode: e && e.cause && e.cause.code, causeMsg: e && e.cause && String(e.cause.message || "").slice(0, 200),
+            // Delta's structured error — `context` names the field a bad_schema/validation reject is objecting to.
+            deltaError: e && e.deltaError ? JSON.stringify(e.deltaError).slice(0, 500) : null,
+            sentSize: _deltaBody && _deltaBody.size, sentProductId: _deltaBody && _deltaBody.product_id, sentOrderType: _deltaBody && _deltaBody.order_type,
+            msg: String((e && e.message) || e).slice(0, 300),
+          });
           throw e;
         }
       };
@@ -7285,7 +7328,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       if (C03_ORDER_ATTEMPTS_ON) {
         const attempt = {
           id: `oa_${idemUser}_${idemKey}`, userId: idemUser, broker: "delta", idemKey,
-          orderTag: String(idemKey).slice(0, 64), fingerprint: idemHash, payload: { orderType: orderDeadlineType },
+          orderTag: _deltaTag, fingerprint: idemHash, payload: { orderType: orderDeadlineType },   // ≤32-char Delta tag = order body's client_order_id (recovery matches on it)
           symbol, side, qty: Number(qty), product,
           protection: _deltaIsReduce ? { reduceOnly: true, entryOrderId: req.body?.entryOrderId != null ? String(req.body.entryOrderId) : null } : null,
         };
@@ -9132,7 +9175,9 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     // R3-#1: stamp our own client_order_id so a timed-out order can be found in Delta's order book
     // later (the durable dedupe key). Delta echoes it back on both live and historical orders.
     const orderBody = { product_id: dprod.id, size: contracts, side: entrySide, order_type: "market_order", ...(entryLimitFields || {}) };
-    if (clientOrderId) orderBody.client_order_id = String(clientOrderId).slice(0, 64);
+    // Delta caps client_order_id at 32 chars — derive the ≤32-char tag (same helper the recovery probe uses) so
+    // automated/screener/smart-auto-buy entries aren't rejected with bad_schema. Shared with orderTag by the caller.
+    if (clientOrderId) orderBody.client_order_id = deltaClientOrderId(clientOrderId);
     const d = await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: orderBody, timeoutMs: 40000 });
     // HTTP 200 is NOT a fill — verify, and throw the real reason on a reject/no-fill.
     const o = d.result || {};
