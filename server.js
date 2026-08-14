@@ -7264,7 +7264,18 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         // THIS order in Delta's order book/fills. Without it, an executed order looks absent → duplicate.
         client_order_id: String(idemKey).slice(0, 64),
       };
-      const _deltaSubmit = async () => deltaCall("POST", "/v2/orders", { userId: sess.userId, body: _deltaBody, timeoutMs: 40000 });
+      const _deltaSubmit = async () => {
+        try {
+          return await deltaCall("POST", "/v2/orders", { userId: sess.userId, body: _deltaBody, timeoutMs: 40000 });
+        } catch (e) {
+          // DIAGNOSTIC: surface exactly why the Delta order POST failed (timeout / signature / ipwhitelist / reject),
+          // so the "outcome unknown" loop can be root-caused from the logs. GETs (portfolio) working while this
+          // fails points to a POST-specific cause (body-signature or order-endpoint reachability).
+          const cls = classifyDeltaError(e);
+          logFinancial("delta.submit.error", { userId: idemUser, key: idemKey, symbol, side, kind: cls.kind, hint: cls.hint, msg: String((e && e.message) || e).slice(0, 300) });
+          throw e;
+        }
+      };
       /* R40 (Delta automation) — DURABLE WRITE-BEFORE-SEND, same C03 machinery FYERS uses. A PREPARED order_attempt
          is committed BEFORE the Delta call, so a crash / lost response is recoverable by client_order_id; the broker is
          called ONLY if this request wins the PREPARED→SUBMITTING CAS; a replayed/in-flight attempt returns
