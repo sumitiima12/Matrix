@@ -123,6 +123,14 @@ function isHouseOwner(req) {
 const stripPh = (s) => String(s || "").replace(/^ph_/, "");   // "ph_9167..." -> "9167..."   // server-side risk checks for real orders   // Postgres when DATABASE_URL is set, else flat files
 
 const app = express();
+/* PROXY TRUST — Render (and any reverse proxy / load balancer) terminates TLS and forwards the request with an
+   X-Forwarded-For header carrying the real client IP. express-rate-limit v7 VALIDATES this: if it sees an XFF
+   header while Express doesn't trust any proxy, it throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR from inside the
+   limiter middleware — which 500s the request BEFORE the route runs. That silently broke every money-moving POST
+   (/api/broker/order etc.) with a generic "outcome unknown" while GET reads (skipped by the write-limiter) kept
+   working. Trust exactly ONE hop (Render's LB); `1` is the correct, non-permissive value — `true` would trip
+   express-rate-limit's OPPOSITE permissive-trust-proxy guard. Env-overridable if the infra ever adds hops. */
+app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
 /* #441 test seam — when MATRIX_NO_LISTEN=1 the module wires up the FULL Express app (all routes/middleware,
    schema init, C03 startup re-arm) but does NOT bind a port or start network-touching token timers. A route-level
    integration test sets DATABASE_URL/ORDER_ATTEMPTS_FILE/C03_ORDER_ATTEMPTS first, requires this module to get the
