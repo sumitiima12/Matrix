@@ -47,3 +47,42 @@ test("plan: delta-tagged phantom is auto-closable; untagged phantom needs confir
   assert.deepEqual(phantomDelta.map((t) => t.id), ["a"]);
   assert.deepEqual(phantomUnknown.map((t) => t.id), ["b"]);
 });
+
+/* ── Homepage "4 stale open rows" incident — regression guards (ChatGPT item G, planner-level) ── */
+test("incident: XAUT/PAXG closed at Delta (empty book) → all delta-tagged rows are phantom (would close)", () => {
+  const book = buildDeltaBook([]);   // Delta holds NOTHING (account flat)
+  const rows = [
+    { id: "xaut", broker: "delta", sym: "XAUT", side: "BUY", qty: 1 },
+    { id: "paxg", broker: "delta", sym: "PAXG", side: "BUY", qty: 1 },
+    { id: "doge1", broker: "delta", sym: "DOGE", side: "BUY", qty: 143 },
+  ];
+  const { phantomDelta, phantomUnknown } = deltaReconcilePlan(rows, book);
+  assert.deepEqual(phantomDelta.map((t) => t.id).sort(), ["doge1", "paxg", "xaut"]);
+  assert.equal(phantomUnknown.length, 0);
+});
+
+test("incident: filled-then-sold DOGE — Delta flat → the leftover open journal row is phantom", () => {
+  const book = buildDeltaBook([]);   // sold on Delta → no position remains
+  const rows = [{ id: "doge", broker: "delta", sym: "DOGEUSD", side: "BUY", qty: 143 }];
+  const { phantomDelta } = deltaReconcilePlan(rows, book);
+  assert.deepEqual(phantomDelta.map((t) => t.id), ["doge"]);
+});
+
+test("incident: one filled + a still-held position → only the unheld rows are phantom (rejected rows never reach the planner)", () => {
+  // Rejected bad_schema attempts have entry==null and are filtered out UPSTREAM, so the planner only sees real opens.
+  const book = buildDeltaBook([{ product_symbol: "DOGEUSD", size: 143 }]);   // Delta still holds ONE DOGE long
+  const rows = [
+    { id: "held", broker: "delta", sym: "DOGE", side: "BUY", qty: 143, entryAt: 1 },   // covered → kept
+    { id: "ghost", broker: "delta", sym: "DOGE", side: "BUY", qty: 143, entryAt: 2 },  // second open, pool exhausted → phantom
+  ];
+  const { phantomDelta } = deltaReconcilePlan(rows, book);
+  assert.deepEqual(phantomDelta.map((t) => t.id), ["ghost"]);
+});
+
+test("incident: broker truth UNAVAILABLE is never proof of closure (empty positions ≠ read failure — guarded by the route/UI, not the planner)", () => {
+  // The planner only runs on a SUCCESSFUL positions read; a failed read short-circuits before this in the route.
+  // This asserts the planner itself makes no closure claim without an explicit book entry decision.
+  const held = buildDeltaBook([{ product_symbol: "DOGEUSD", size: 143 }]);
+  const { phantomDelta } = deltaReconcilePlan([{ id: "x", broker: "delta", sym: "DOGE", side: "BUY", qty: 143 }], held);
+  assert.equal(phantomDelta.length, 0, "a genuinely-held position is never classified phantom");
+});
