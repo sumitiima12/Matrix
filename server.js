@@ -909,10 +909,15 @@ async function _deltaProbeByTag(attempt) {
   try { const pr = await deltaCall("GET", "/v2/positions/margined", { userId: uid }); if (!pr || pr.success === false || !Array.isArray(pr.result)) return null; pos = pr.result; } catch { return null; }
   const clean = (s) => String(s || "").replace(/(USDT|USD|INR)$/i, "").toUpperCase();
   if (pos.some((p) => clean(p.product_symbol || p.symbol) === clean(attempt.symbol) && Math.abs(Number(p.size) || 0) > 0)) return null;
-  // History + fills + positions ALL readable, none reference our order. ABSENT only if accepted (have order id) + old enough.
+  // History + fills + positions ALL readable, none reference our order. Declare ABSENT (never placed) when it's old
+  // enough for propagation lag to have cleared AND we can identify it on Delta by EITHER a broker order id OR our
+  // client_order_id tag. The tag is stamped INTO the Delta order body (see the submit body), and history/fills are
+  // queried server-side by that tag, so an empty result is conclusive. Previously this required a broker order id —
+  // so an attempt whose POST transport-failed BEFORE returning an id could never be resolved and kept the account
+  // locked forever, blocking every subsequent entry (the DOGE "outcome unknown" loop). Accepting `tag` fixes that.
   const created = Number(attempt.createdAt ?? attempt.created_at);
   const oldEnough = Number.isFinite(created) && created > 0 && (Date.now() - created) >= (Number(process.env.DELTA_ABSENCE_MIN_AGE_MS) || 60000);
-  if (bid && oldEnough) return { status: "absent" };
+  if ((bid || tag) && oldEnough) return { status: "absent" };
   return null;   // recent/never-accepted unknown ⇒ stay locked, retried on a later sweep
 }
 async function _adoptDeltaFill(attempt, ob) {
