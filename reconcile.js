@@ -277,6 +277,43 @@ function deltaReconcilePlan(openCryptoRealTrades, book) {
   return { phantomDelta: allocate(deltaTagged), phantomUnknown: allocate(untagged) };
 }
 
+/* item C (pure): reconstruct the REAL exit of a Delta-tagged phantom row from Delta fills, so reconciliation books
+   the actual realized P&L instead of a break-even placeholder. CONSERVATIVE by design — returns a result ONLY when
+   the closing-side fills after entry FULLY cover the row's quantity (a proven exit); otherwise null (caller keeps the
+   honest break-even reconciled marker). Never fabricates: no partial guesses, no cross-symbol borrowing.
+   Inputs: row {broker,sym,side/short,qty(coin units),entry,entryAt(ms)}, fills (Delta /v2/fills rows), contractValue
+   (coin units per contract for this symbol; Delta fill `size` is in CONTRACTS). Delta timestamps may be µs or ms. */
+function reconstructExitFromDeltaFills(row, fills, { contractValue = 1 } = {}) {
+  if (!row || String((row.broker) || "").toLowerCase() !== "delta") return null;
+  const entry = Number(row.entry);
+  const wantCoin = Math.abs(Number(row.qty) || 0);
+  if (!(entry > 0) || !(wantCoin > 0)) return null;
+  const cv = Number(contractValue) > 0 ? Number(contractValue) : 1;
+  const wantContracts = wantCoin / cv;
+  const isShort = String(row.side || "").toUpperCase() === "SELL" || row.short === true;
+  const closeSide = isShort ? "buy" : "sell";   // closing a long = SELL fills; covering a short = BUY fills
+  const sym = _normSym(row.sym);
+  const entryMs = Number(row.entryAt) || 0;
+  const tsMs = (f) => { const t = Number(f.created_at || f.timestamp || 0); return t > 1e14 ? Math.round(t / 1000) : t; };   // µs → ms
+  const cand = (fills || [])
+    .filter((f) => _normSym(f.product_symbol || (f.product && f.product.symbol) || f.symbol) === sym
+      && String(f.side || "").toLowerCase() === closeSide
+      && (!entryMs || tsMs(f) >= entryMs - 1000)   // 1s slack for clock skew
+      && Number(f.size) > 0 && Number(f.price) > 0)
+    .sort((a, b) => tsMs(a) - tsMs(b));
+  let filledC = 0, notional = 0, lastTs = 0;
+  for (const f of cand) {
+    const take = Math.min(Math.abs(Number(f.size)), wantContracts - filledC);
+    if (take <= 1e-12) break;
+    filledC += take; notional += take * Number(f.price); lastTs = tsMs(f);
+    if (filledC >= wantContracts - 1e-9) break;
+  }
+  if (filledC < wantContracts - 1e-9) return null;   // not enough proven closing fills → can't reconstruct
+  const exitPx = notional / filledC;
+  const dir = isShort ? -1 : 1;
+  return { exit: exitPx, exitAt: lastTs > 0 ? lastTs : Date.now(), pnl: +((exitPx - entry) * wantCoin * dir).toFixed(6), source: "delta_fill" };
+}
+
 /* R27-P1-03 / C02 (pure): confirm each Matrix-managed OPEN position is present at the broker with at least the
    tracked quantity. `positions` = [{symbol|brokerSym, qty}] for ONE broker; `held` = that broker's portfolio
    snapshot [{sym, qty}]. Returns { ok, verified, shortfall }. Fails closed on the FIRST position the broker
@@ -379,4 +416,4 @@ function safeToDeclareAbsent(attempt, { now = Date.now(), minAgeMs = 120000, cov
   return age >= (Number(minAgeMs) || 0);
 }
 
-module.exports = { parseDeltaTs, brokerFillTsMs, correlateOrphanToAttempt, safeToDeclareAbsent, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, verifyManagedAgainstBroker };
+module.exports = { parseDeltaTs, brokerFillTsMs, correlateOrphanToAttempt, safeToDeclareAbsent, hasClientOrderId, pageConclusive, redirectAllowed, redirectBindingOk, classifyDeltaOrder, classifyFyersOrder, fyersOrderTag, hasFyersOrderTag, attributeFyersFills, fyersExitPlan, closingIsStale, fyersTaggedExitState, exitOutcomeAction, exitPreflightAction, buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, reconstructExitFromDeltaFills, verifyManagedAgainstBroker };

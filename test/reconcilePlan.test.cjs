@@ -4,7 +4,7 @@
  */
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildDeltaBook, deltaHoldsCover, deltaReconcilePlan } = require("../reconcile");
+const { buildDeltaBook, deltaHoldsCover, deltaReconcilePlan, reconstructExitFromDeltaFills } = require("../reconcile");
 
 test("buildDeltaBook nets long/short by base symbol, ignores zero size", () => {
   const book = buildDeltaBook([
@@ -85,4 +85,56 @@ test("incident: broker truth UNAVAILABLE is never proof of closure (empty positi
   const held = buildDeltaBook([{ product_symbol: "DOGEUSD", size: 143 }]);
   const { phantomDelta } = deltaReconcilePlan([{ id: "x", broker: "delta", sym: "DOGE", side: "BUY", qty: 143 }], held);
   assert.equal(phantomDelta.length, 0, "a genuinely-held position is never classified phantom");
+});
+
+/* ── item C: reconstruct REAL exit P&L from Delta fills (pure, conservative) ── */
+test("exit-from-fills: long closed by a covering SELL fill → real exit price + realized P&L", () => {
+  const row = { broker: "delta", sym: "DOGEUSD", side: "BUY", qty: 143, entry: 0.07, entryAt: 1000 };
+  const fills = [{ product_symbol: "DOGEUSD", side: "sell", size: 143, price: 0.08, created_at: 2000 }];
+  const r = reconstructExitFromDeltaFills(row, fills, { contractValue: 1 });
+  assert.equal(r.exit, 0.08);
+  assert.equal(r.exitAt, 2000);
+  assert.ok(Math.abs(r.pnl - (0.08 - 0.07) * 143) < 1e-6, "P&L = (exit-entry)*qty for a long");
+  assert.equal(r.source, "delta_fill");
+});
+
+test("exit-from-fills: short covered by BUY fills → P&L uses short direction", () => {
+  const row = { broker: "delta", sym: "DOGEUSD", side: "SELL", qty: 100, entry: 0.09, entryAt: 1000 };
+  const fills = [{ product_symbol: "DOGEUSD", side: "buy", size: 100, price: 0.08, created_at: 3000 }];
+  const r = reconstructExitFromDeltaFills(row, fills, { contractValue: 1 });
+  assert.ok(Math.abs(r.pnl - (0.08 - 0.09) * 100 * -1) < 1e-6, "short profits when exit < entry");
+});
+
+test("exit-from-fills: NOT enough closing fills → null (never a partial guess)", () => {
+  const row = { broker: "delta", sym: "DOGEUSD", side: "BUY", qty: 143, entry: 0.07, entryAt: 1000 };
+  const fills = [{ product_symbol: "DOGEUSD", side: "sell", size: 50, price: 0.08, created_at: 2000 }];
+  assert.equal(reconstructExitFromDeltaFills(row, fills, { contractValue: 1 }), null);
+});
+
+test("exit-from-fills: wrong-side fills only (no close) → null", () => {
+  const row = { broker: "delta", sym: "DOGEUSD", side: "BUY", qty: 100, entry: 0.07, entryAt: 1000 };
+  const fills = [{ product_symbol: "DOGEUSD", side: "buy", size: 100, price: 0.08, created_at: 2000 }];   // more buys, not a close
+  assert.equal(reconstructExitFromDeltaFills(row, fills, { contractValue: 1 }), null);
+});
+
+test("exit-from-fills: non-delta row is ineligible → null", () => {
+  const row = { broker: "fyers", sym: "RELIANCE", side: "BUY", qty: 1, entry: 100, entryAt: 1 };
+  assert.equal(reconstructExitFromDeltaFills(row, [{ product_symbol: "RELIANCE", side: "sell", size: 1, price: 110, created_at: 2 }]), null);
+});
+
+test("exit-from-fills: contract_value>1 converts coin qty to contracts", () => {
+  // 20 coin units, 4 units/contract → 5 contracts needed. One fill of 5 contracts covers it.
+  const row = { broker: "delta", sym: "PAXGUSD", side: "BUY", qty: 20, entry: 4000, entryAt: 1000 };
+  const fills = [{ product_symbol: "PAXGUSD", side: "sell", size: 5, price: 4300, created_at: 2000 }];
+  const r = reconstructExitFromDeltaFills(row, fills, { contractValue: 4 });
+  assert.equal(r.exit, 4300);
+  assert.ok(Math.abs(r.pnl - (4300 - 4000) * 20) < 1e-6);
+});
+
+test("exit-from-fills: real µs epoch timestamp normalises to ms", () => {
+  const entryMs = 1_700_000_000_000;                 // realistic ms epoch
+  const fillUs  = 1_700_000_100_000_000;             // realistic µs epoch (= entryMs+100s in ms)
+  const row = { broker: "delta", sym: "DOGEUSD", side: "BUY", qty: 1, entry: 0.07, entryAt: entryMs };
+  const r = reconstructExitFromDeltaFills(row, [{ product_symbol: "DOGEUSD", side: "sell", size: 1, price: 0.08, created_at: fillUs }], { contractValue: 1 });
+  assert.equal(r.exitAt, 1_700_000_100_000, "µs epoch normalised to ms epoch");
 });

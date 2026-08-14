@@ -1317,10 +1317,30 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
        and the history is preserved. Delta-tagged phantoms auto-close; untagged only if user-confirmed. */
     const toClose = phantomDelta.concat(phantomUnknown.filter((t) => confirmIds.has(String(t.id))));
     const now = Date.now();
+    /* item C: reconstruct the REAL exit from Delta fills so reconciliation books actual realized P&L, not a
+       break-even placeholder. Best-effort: if fills/products can't be read, every row falls back to the honest
+       break-even reconciled marker (never blocks reconcile, never fabricates). Only Delta-tagged rows are eligible,
+       and only a fully-covering closing-fill sequence is used (reconstructExitFromDeltaFills is conservative). */
+    let deltaFills = null; const cvBySym = new Map();
+    try {
+      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { userId: req.authUserId }), 45000, "Delta fills read");
+      if (fr && Array.isArray(fr.result)) deltaFills = fr.result;
+      const prods = await deltaCall("GET", "/v2/products", { signed: false }).catch(() => null);
+      for (const p of (prods && prods.result) || []) { const s = String(p.symbol || "").toUpperCase().replace(/(USDT|USD|INR)$/i, ""); if (s) cvBySym.set(s, Number(p.contract_value) || 1); }
+    } catch { deltaFills = null; }   // any failure → break-even fallback below
+    let reconstructed = 0;
     for (const t of toClose) {
-      await db.updateTrade(userId, { ...t, exit: Number(t.entry) || t.exit || 0, exitAt: now, pnl: 0, status: "closed",
-        reconciled: true, reconciledAt: now, reconcileReason: "Closed via Delta reconciliation — Delta held no matching position." }).catch(() => {});
+      let close = { exit: Number(t.entry) || t.exit || 0, exitAt: now, pnl: 0,
+        reconcileReason: "Closed via Delta reconciliation — Delta held no matching position." };
+      if (deltaFills) {
+        const cv = cvBySym.get(String(t.sym || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "")) || 1;
+        const real = reconcile.reconstructExitFromDeltaFills(t, deltaFills, { contractValue: cv });
+        if (real) { close = { exit: real.exit, exitAt: real.exitAt || now, pnl: real.pnl,
+          reconcileReason: "Closed via Delta reconciliation — exit price/P&L reconstructed from Delta fills." }; reconstructed++; }
+      }
+      await db.updateTrade(userId, { ...t, ...close, status: "closed", reconciled: true, reconciledAt: now, exitType: "Closed (reconciled)" }).catch(() => {});
     }
+    logFinancial("trades.reconcileReal.exitReconstruct", { userId, closed: toClose.length, reconstructed });
     rcBust(`trades:${userId}`);
     logFinancial("trades.reconcileReal", { userId, closed: toClose.length, held: heldSymbols });
     res.json({ ok: true, removed: toClose.length, heldSymbols,
