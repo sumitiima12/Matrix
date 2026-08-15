@@ -1238,6 +1238,22 @@ app.get("/api/order/intent-status", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* User-facing "Resolve" for the account-wide unknown-order entry block (R25-H01). It triggers the SAME
+   broker-probe reconciliation the periodic worker runs (probe/adopt/cancel per CERTIFIED find-by-tag adapter —
+   it never fabricates an outcome), then reports whether the block cleared. It is NOT a blanket clear (that stays
+   the admin-only override): a genuinely in-flight order remains blocked until the broker proves its outcome, so
+   this can never create duplicate-order risk. Read + safe-probe only — it places no orders. */
+app.post("/api/order/resolve-unknown", requireAuth, async (req, res) => {
+  const userId = storageKeyFor(req.authUserId);
+  let reconciled = null;
+  try { reconciled = await runC03Reconcile("user-resolve"); } catch { /* best-effort — still report the count below */ }
+  let remaining = 0;
+  try { remaining = typeof db.countUnknownIdempotency === "function" ? await db.countUnknownIdempotency(userId) : 0; }
+  catch { return res.status(503).json({ error: "Couldn't verify your account's order status right now — please retry in a moment." }); }
+  try { logFinancial("order.resolveUnknown", { user: userId, remaining, reconciled: !!(reconciled && !reconciled.skipped) }); } catch { /* optional */ }
+  return res.json({ ok: true, remaining, cleared: remaining === 0 });
+});
+
 /* Clear the caller's VIRTUAL (paper) trades across all markets. Real broker trades are never
    touched. Scoped to the verified token's own userId, so a user can only wipe their own book. */
 app.post("/api/trades/clear-virtual", requireAuth, async (req, res) => {
