@@ -5671,17 +5671,13 @@ function angelHeaders(apiKey, jwt) {
 /* ── Delta request signing ───────────────────────────────────────────────────────
    signature = HMAC_SHA256(secret, method + timestamp + path + query + body)
    Sent as: api-key, timestamp, signature. The secret never leaves this process. */
-/* Set DELTA_TESTNET=true (with TESTNET api keys in DELTA_API_KEY/SECRET) to route ALL Delta
-   traffic to the testnet — real API, fake money — so the crypto order + reconciliation path can
-   be exercised end-to-end without real funds. Production (india.delta.exchange) is the default. */
-/* DELTA_API_BASE is a hermetic-test seam (mirrors FYERS_API_BASE): when set, EVERY Delta call — tickers, signed
-   orders, positions, wallet, fills — is redirected to it, so a fake Delta HTTP server can exercise the crypto
-   order → verified-fill → protection → exit → restart journey with zero real funds and no network. Unset in
-   production, where the testnet/prod hosts below apply. */
-const DELTA_BASE = process.env.DELTA_API_BASE
-  || (String(process.env.DELTA_TESTNET || "").toLowerCase() === "true"
-    ? (process.env.DELTA_TESTNET_BASE || "https://cdn-ind.testnet.deltaex.org")
-    : "https://api.india.delta.exchange");
+/* DELTA is LIVE-ONLY. The testnet routing branch (DELTA_TESTNET / DELTA_TESTNET_BASE) has been removed so
+   there is no configuration under which real user Delta traffic can be silently pointed at the testnet host
+   (fake money) while the UI says "REAL" — every signed Delta call goes to the live india.delta.exchange host.
+   DELTA_API_BASE remains ONLY as a hermetic-test seam (mirrors FYERS_API_BASE): when explicitly set in CI it
+   redirects every Delta call to a fake in-process HTTP server so the order → fill → protection → exit → restart
+   journey runs with no network and no real funds. It is unset in production, so production is always live. */
+const DELTA_BASE = process.env.DELTA_API_BASE || "https://api.india.delta.exchange";
 
 /* ── Delta outbound proxy ─────────────────────────────────────────────────────────
    Delta whitelists API keys by IP. Render's outbound IP isn't (and can't reliably be)
