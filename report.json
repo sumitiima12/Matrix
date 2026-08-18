@@ -1,0 +1,12 @@
+{
+  "agg": {
+    "inspected": 0,
+    "corrected": 0,
+    "unresolved": 0,
+    "unchanged": 0,
+    "duplicateGroups": 0,
+    "phantomOpen": 0,
+    "applied": 0
+  },
+  "report": []
+}

@@ -28,6 +28,8 @@ const { evalExitPair, optRanker, lenOptions, costPctFor } = require("./optimizer
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
 const { validateOrder: serverValidateOrder } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
+const { computePortfolio } = require("./portfolioAnalytics");   // THE canonical dashboard analytics (source of truth)
+const { resolveProvenance, ORIGIN: PROV_ORIGIN } = require("./provenance");
 const { resolveAdminRole, roleSatisfies } = require("./adminRoles");   // RBAC: owner > admin > support > readonly
 const { reconstructUserState } = require("./drReconstruct");   // OPS-2: rebuild open positions + risk from the immutable ledger
 const { alertSeverity, alertCategory } = require("./alertSeverity");   // ALERT-1: triage severity + category for notices/push
@@ -1206,6 +1208,37 @@ app.get("/api/trades", requireAuth, async (req, res) => {
     const to = req.query.to ? +req.query.to : Date.now();
     const trades = await rcWrap(`trades:${userId}:${from}:${to}`, () => db.getTrades(userId, from, to));
     res.json({ trades });
+  } catch (e) { serverError(res, e); }
+});
+
+/* THE CANONICAL PORTFOLIO ANALYTICS endpoint. Every dashboard widget (Total, category boxes, Screener dash,
+   Live Positions, Trade History, Portfolio) reads from THIS so the headline, category P&Ls, win rate and open
+   count all reconcile (defects #1/#2/#5/#8). The SERVER owns the aggregation + provenance (which trades, their
+   canonical origin, open/closed, category buckets, win rate, the total===Σcategories invariant); the CLIENT
+   passes its live price snapshot (`marks`) so the prices shown and the totals use the SAME snapshot. Read-only. */
+app.post("/api/analytics/portfolio", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const b = req.body || {};
+    const mode = String(b.mode || "REAL").toUpperCase() === "VIRTUAL" ? "VIRTUAL" : "REAL";
+    const market = b.market ? String(b.market) : null;
+    const broker = b.broker ? String(b.broker) : null;
+    const from = b.from != null && b.from !== "" ? Number(b.from) : null;
+    const to = b.to != null && b.to !== "" ? Number(b.to) : null;
+    const marks = (b.marks && typeof b.marks === "object") ? b.marks : {};
+    const all = (await db.getTrades(userId, 0, Date.now()).catch(() => [])) || [];
+    // Attach the CANONICAL origin to each row (row self-evidence recovers a screener/strategy attribution even when
+    // tradeType says "Manual" — e.g. SOXLB→Screener). For DISPLAY we keep an explicit "Manual" as Manual (the
+    // strict manual→UNKNOWN policy is the backfill's job for data repair, not the live view); empty stays UNKNOWN.
+    const enriched = all.map((t) => {
+      if (t && t.origin) return t;
+      const p = resolveProvenance(t || {}, {});
+      let origin = p.origin;
+      if (origin === PROV_ORIGIN.UNKNOWN && String((t || {}).tradeType || "").toLowerCase() === "manual") origin = PROV_ORIGIN.MANUAL;
+      return { ...t, origin };
+    });
+    const report = computePortfolio({ trades: enriched, marks, filter: { userId, mode, market, broker, from, to, timeframeLabel: b.timeframeLabel || null, valuationTs: b.valuationTs != null ? Number(b.valuationTs) : Date.now(), valuationSource: b.valuationSource || "client-mark-snapshot" } });
+    res.json({ ok: true, report });
   } catch (e) { serverError(res, e); }
 });
 
