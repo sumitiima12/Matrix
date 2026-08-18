@@ -3407,6 +3407,28 @@ function reqUserIdOptional(req) {
   } catch { return null; }
 }
 
+/* Delta contract sizes (coin units per contract) for the whole crypto universe, keyed by both the full
+   symbol (SLVONUSD) and the bare base (SLVON). Read-only, cached 1h. The frontend uses this to PREVIEW the
+   real amount an auto-buy / screener / ideas order will deploy (contracts × contract_value × price) and to
+   skip picks whose slice is below one contract — so the displayed size matches what actually hits Delta. */
+app.get("/api/delta/contract-values", publicDataLimiter, async (req, res) => {
+  try {
+    const map = await memo("delta:cv", 3600_000, async () => {
+      const prods = await deltaCall("GET", "/v2/products", { signed: false });
+      const out = {};
+      for (const p of (prods && prods.result) || []) {
+        const cv = Number(p.contract_value) || 1;
+        const sym = String(p.symbol || "").toUpperCase();
+        if (sym) out[sym] = cv;
+        const base = sym.replace(/(USDT|USD|INR)$/i, "");
+        if (base && !(base in out)) out[base] = cv;
+      }
+      return out;
+    });
+    res.json({ ok: true, contractValues: map });
+  } catch { res.json({ ok: false, contractValues: {} }); }   // best-effort; the frontend degrades gracefully
+});
+
 app.get("/api/quote", publicDataLimiter, async (req, res) => {
   const symbols = String(req.query.symbols || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!symbols.length) return res.status(400).json({ error: "symbols required" });
@@ -6641,7 +6663,12 @@ function roundToTick(price, tick) {
    convert to/from an integer contract count only at the order boundary. */
 function deltaContracts(prod, coinQty) {
   const cv = Number(prod && prod.contract_value) || 1;
-  return { cv, contracts: Math.max(0, Math.floor(Number(coinQty) / cv + 1e-9)) };
+  // ROUND to the nearest whole contract (not floor). Flooring systematically under-deployed every crypto
+  // entry — a $50 slice on a $14.48/contract instrument floored 3.45→3 ($43) instead of rounding to 3 ($43)
+  // or, for a 3.6 slice, 3 instead of 4. Rounding tracks the intended capital far more closely. A slice
+  // smaller than half a contract still rounds to 0 and is rejected upstream with a clear "amount too small"
+  // message (min-notional guard), so this never fabricates size the user didn't ask for.
+  return { cv, contracts: Math.max(0, Math.round(Number(coinQty) / cv)) };
 }
 /* Delta caps client_order_id at 32 chars. Our internal idempotency key is `mx_<36-char UUID>` = 39 chars, which
    Delta rejects with `bad_schema` (the root cause of the manual-order "outcome unknown" loop). Derive a DETERMINISTIC
