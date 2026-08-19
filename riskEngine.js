@@ -105,15 +105,23 @@ function validateOrder(order, account) {
   const openInMarket = portfolio.filter((h) => (h.market || "IN") === market);
 
   if (side === "BUY") {
-    // --- funds ---
-    if (value > wallet) reasons.push(`Insufficient funds: order needs ${value.toFixed(2)} but ${wallet.toFixed(2)} is available.`);
+    /* LEVERAGE-AWARE sizing. On a leveraged market (crypto perps) an order commits MARGIN = notional ×
+       marginFraction, not the full notional — so a $500 position at ~25x needs ≈$20 of wallet, not $500.
+       Spot markets (IN / US / Commodity) keep marginFraction = 1 (full cash), so their behaviour is
+       unchanged. The broker still enforces exact margin; this only stops the obviously-unaffordable order
+       and applies the %-of-equity cap to the MARGIN actually at risk (the meaningful figure), so a normal
+       leveraged trade the user set up on purpose isn't blocked as "408% of equity". */
+    const marginFrac = market === "Crypto" ? shortMarginFraction(market) : 1;
+    const marginNeeded = value * marginFrac;
+    // --- funds (margin required) ---
+    if (marginNeeded > wallet) reasons.push(`Insufficient funds: order needs ${marginNeeded.toFixed(2)} margin but ${wallet.toFixed(2)} is available.`);
 
-    // --- position sizing ---
+    // --- position sizing: margin committed as a % of equity ---
     const equity = wallet + portfolio.reduce((a, h) => a + (h.qty || 0) * (h.price || h.avg || 0), 0);
-    const existing = held ? (held.qty || 0) * price : 0;
-    const pct = equity > 0 ? ((value + existing) / equity) * 100 : 100;
+    const existingMargin = (held ? (held.qty || 0) * price : 0) * marginFrac;
+    const pct = equity > 0 ? ((marginNeeded + existingMargin) / equity) * 100 : 100;
     if (pct > limits.maxPositionPct) {
-      reasons.push(`Position size ${pct.toFixed(1)}% of ${market} equity exceeds the ${limits.maxPositionPct}% cap.`);
+      reasons.push(`Position margin ${pct.toFixed(1)}% of ${market} equity exceeds the ${limits.maxPositionPct}% cap.`);
     }
 
     // --- max open positions ---
@@ -137,11 +145,12 @@ function validateOrder(order, account) {
       if (px > 0) {
         const equity = wallet + portfolio.reduce((a, h) => a + Math.abs(h.qty || 0) * (h.price || h.avg || 0), 0);
         const shortValue = shortQty * px;
-        const pct = equity > 0 ? (shortValue / equity) * 100 : 100;
-        if (pct > limits.maxPositionPct) reasons.push(`Short size ${pct.toFixed(1)}% of ${market} equity exceeds the ${limits.maxPositionPct}% cap.`);
-        // R3-#6: actually validate MARGIN — a short the wallet can't margin gets rejected by the broker,
-        // so catch it here first. Uses a conservative (generous-leverage) initial-margin estimate.
+        // MARGIN, not notional — a leveraged short commits notional × marginFraction of equity. The %-cap is
+        // applied to that margin so a normal leveraged short isn't blocked as "408% of equity". The broker
+        // does the exact margin math; this catches the clearly-unaffordable case first (R3-#6).
         const reqMargin = shortValue * shortMarginFraction(market);
+        const pct = equity > 0 ? (reqMargin / equity) * 100 : 100;
+        if (pct > limits.maxPositionPct) reasons.push(`Short margin ${pct.toFixed(1)}% of ${market} equity exceeds the ${limits.maxPositionPct}% cap.`);
         if (reqMargin > wallet) reasons.push(`Insufficient margin to short: needs ≈ ${reqMargin.toFixed(2)} but ${wallet.toFixed(2)} is available.`);
       }
       if (!held && openInMarket.length >= limits.maxOpenPositions) {

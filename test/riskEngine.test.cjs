@@ -45,7 +45,7 @@ test("a position larger than the 25% cap is blocked (when the user sets a 25% ca
   // 20 * 2000 = 40,000 = 40% of a 100k wallet-only equity.
   const r = validateOrder({ sym: "RELIANCE", side: "BUY", qty: 20, price: 2000, market: "IN" }, acct({ limits: { maxPositionPct: 25 } }));
   assert.strictEqual(r.ok, false);
-  assert.match(r.reasons.join(" "), /Position size/i);
+  assert.match(r.reasons.join(" "), /Position (size|margin)/i);
 });
 
 test("a position under the cap is allowed (with a 25% cap set)", () => {
@@ -70,7 +70,7 @@ test("P1-03: a naked short larger than 100% of equity is blocked by default", ()
   const a = acct({ wallet: 1000, portfolio: [] });                 // equity 1000
   const r = validateOrder({ sym: "X", side: "SELL", qty: 10, price: 2000, market: "IN" }, a);  // 20,000 short
   assert.strictEqual(r.ok, false);
-  assert.match(r.reasons.join(" "), /Short size/i);
+  assert.match(r.reasons.join(" "), /Short (size|margin)/i);
 });
 
 test("P1-02: default daily-loss circuit breaker (25%) halts after a big loss", () => {
