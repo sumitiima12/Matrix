@@ -56,6 +56,7 @@ const { createPinLock } = require("./pinLock");       // per-account PIN/answer 
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
 const fyoc = require("./fyersOptionChain");            // India NSE/NFO derivative resolver (pure) + FYERS master normalizer
+const dhanCommodity = require("./dhanCommodity");      // MCX commodity derivative resolver (pure) + Dhan scrip-master normalizer
 const contractSpecs = require("./contractSpecs");      // provenance-tagged contract-spec service (crypto/US/commodity reference + fail-closed)
 const strategyStates = require("./strategyStates");   // §8: canonical automated-strategy state vocabulary + derivation
 const signalGuards = require("./signalGuards");        // §10/§13: stale-signal + duplicate-symbol pre-entry guards
@@ -3335,6 +3336,22 @@ async function foSymbolRows() {
   return _foRows;
 }
 
+/* Dhan DETAILED scrip master (has the derivative columns: strike/expiry/option-type/lot). Cached 12h. Normalised via
+   the PURE, tested dhanCommodity.parseDhanMcxMaster (header-based; fails closed if a column is missing). Used for MCX
+   commodity options/futures (the user's commodity broker is Dhan). Real-money gated on MATRIX_DHAN_MCX_VALIDATED. */
+const DHAN_MASTER_URL = process.env.DHAN_MASTER_URL || "https://images.dhan.co/api-data/api-scrip-master-detailed.csv";
+let _dhanMcx = { rows: [], headerLooksValid: false, at: 0 };
+async function dhanMcxRows() {
+  if (_dhanMcx.rows.length && (Date.now() - _dhanMcx.at) < 12 * 3600 * 1000) return _dhanMcx;
+  try {
+    const res = await fetchT(DHAN_MASTER_URL, {}, 30000);
+    const txt = await res.text();
+    const parsed = dhanCommodity.parseDhanMcxMaster(txt);
+    if (parsed.rows.length) { _dhanMcx = { ...parsed, at: Date.now() }; return _dhanMcx; }
+  } catch (e) { _fyLastError = "dhan mcx master: " + e.message; }
+  return _dhanMcx;
+}
+
 /* Canonical derivative contract resolution (Parts 20/36). Frontend collects INTENT (market, underlying, product,
    side/optionType/moneyness, expiry rule, lots) + the live spot it already has; the BACKEND owns capability, expiry,
    strike, lot size, executable symbol and quantity — the client never determines the broker symbol. FAIL-CLOSED for
@@ -3353,8 +3370,23 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
     if (productType !== "FUTURE" && productType !== "OPTION") {
       return res.status(400).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "invalid_product_type" });
     }
-    // India NSE/NFO is the first supported derivatives market. Others (US/Crypto/Commodity) resolve against their own
-    // masters — not yet wired here — so they fail closed rather than guess.
+    // COMMODITY (MCX via Dhan) — resolve from the Dhan detailed scrip master.
+    if (market === "Commodity") {
+      const dhanValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_DHAN_MCX_VALIDATED || ""));
+      const { rows, headerLooksValid } = await dhanMcxRows();
+      if (mode === "real" && (!headerLooksValid || !dhanValidated)) {
+        return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: !headerLooksValid ? "instrument_master_unavailable" : "real_execution_master_not_validated", realExecution: false });
+      }
+      if (!headerLooksValid) return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "instrument_master_unavailable" });
+      const rc = dhanCommodity.resolveCommodityContract({
+        rows, underlying: b.underlying, productType, optionType: b.optionType, moneyness: b.moneyness,
+        expiryIntent: b.expiryIntent, side: b.side, spot: Number(b.spot), lots: Number(b.lots),
+      });
+      if (rc.error) return res.status(409).json({ ok: false, error: rc.error, detail: rc.detail });
+      return res.json({ ok: true, resolved: rc, realExecution: mode === "real" && dhanValidated && headerLooksValid });
+    }
+    // India NSE/NFO is the other supported derivatives market. US/Crypto resolve against their own masters — not yet
+    // wired here — so they fail closed rather than guess.
     if (market !== "IN") {
       const spec = contractSpecs.getContractSpec({ market, underlying: b.underlying, productType }, { mode: "virtual" });
       return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "market_not_yet_supported", market, referenceSpec: spec || null });
