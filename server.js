@@ -55,6 +55,8 @@ const { marketOpenIST, intradaySquareDue, holidayCalendarReady } = require("./ma
 const { createPinLock } = require("./pinLock");       // per-account PIN/answer brute-force lockout
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
+const fyoc = require("./fyersOptionChain");            // India NSE/NFO derivative resolver (pure) + FYERS master normalizer
+const contractSpecs = require("./contractSpecs");      // provenance-tagged contract-spec service (crypto/US/commodity reference + fail-closed)
 const strategyStates = require("./strategyStates");   // §8: canonical automated-strategy state vocabulary + derivation
 const signalGuards = require("./signalGuards");        // §10/§13: stale-signal + duplicate-symbol pre-entry guards
 /* R30-P1-01 — single enforcement point for the capability registry. Every REAL operation maps to a capability and
@@ -3314,6 +3316,68 @@ async function mcxSymbolRows() {
   } catch (e) { _fyLastError = "mcx master: " + e.message; }
   return _mcxRows.rows || [];
 }
+
+/* NSE F&O symbol master — same public FYERS file family as MCX. Cached 12h (rolls with expiries). Normalised via the
+   PURE, tested fyersOptionChain.parseFoSymbolMaster (defensive: cross-checks the ticker CE/PE suffix vs the option-type
+   column, skips mismatches, flags format drift). All strike/expiry/lot data + the executable ticker come from here —
+   nothing is guessed. Real-money resolution stays gated on headerLooksValid AND MATRIX_FO_MASTER_VALIDATED (an ops flag
+   confirming the column mapping was checked against a live sample for this build). */
+const FO_MASTER_URL = process.env.FO_MASTER_URL || "https://public.fyers.in/sym_details/NSE_FO.csv";
+let _foRows = { rows: [], headerLooksValid: false, skipped: 0, at: 0 };
+async function foSymbolRows() {
+  if (_foRows.rows.length && (Date.now() - _foRows.at) < 12 * 3600 * 1000) return _foRows;
+  try {
+    const r = await pfetch(FO_MASTER_URL, fyFetchOpts);
+    const txt = await r.text();
+    const parsed = fyoc.parseFoSymbolMaster(txt);
+    if (parsed.rows.length) { _foRows = { ...parsed, at: Date.now() }; return _foRows; }
+  } catch (e) { _fyLastError = "fo master: " + e.message; }
+  return _foRows;
+}
+
+/* Canonical derivative contract resolution (Parts 20/36). Frontend collects INTENT (market, underlying, product,
+   side/optionType/moneyness, expiry rule, lots) + the live spot it already has; the BACKEND owns capability, expiry,
+   strike, lot size, executable symbol and quantity — the client never determines the broker symbol. FAIL-CLOSED for
+   real money (Part 28): if the exact contract can't be resolved from the master, or real execution isn't validated
+   yet for this market, return DERIVATIVE_CONTRACT_RESOLUTION_FAILED and place nothing. Preview/virtual returns the
+   resolved contract for display. STOCK passes through (existing behaviour). */
+app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const market = String(b.market || "");
+    const productType = String(b.productType || "").toUpperCase();
+    const mode = String(b.mode || "virtual").toLowerCase();
+    if (productType === "STOCK") {
+      return res.json({ ok: true, resolved: { productType: "STOCK", underlying: b.underlying, lotSize: 1, contractMultiplier: 1 }, realExecution: false });
+    }
+    if (productType !== "FUTURE" && productType !== "OPTION") {
+      return res.status(400).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "invalid_product_type" });
+    }
+    // India NSE/NFO is the first supported derivatives market. Others (US/Crypto/Commodity) resolve against their own
+    // masters — not yet wired here — so they fail closed rather than guess.
+    if (market !== "IN") {
+      const spec = contractSpecs.getContractSpec({ market, underlying: b.underlying, productType }, { mode: "virtual" });
+      return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "market_not_yet_supported", market, referenceSpec: spec || null });
+    }
+    const foValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || ""));
+    const { rows, headerLooksValid } = await foSymbolRows();
+    if (mode === "real" && (!headerLooksValid || !foValidated)) {
+      // Fail closed for real orders until the live NSE_FO column mapping is validated for this build.
+      return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: !headerLooksValid ? "instrument_master_unavailable" : "real_execution_master_not_validated", realExecution: false });
+    }
+    if (!headerLooksValid) {
+      return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "instrument_master_unavailable" });
+    }
+    const resolved = fyoc.resolveIndiaContract({
+      rows, underlying: b.underlying, productType,
+      optionType: b.optionType, moneyness: b.moneyness, expiryIntent: b.expiryIntent,
+      side: b.side, spot: Number(b.spot), lots: Number(b.lots),
+    });
+    if (resolved.error) return res.status(409).json({ ok: false, error: resolved.error, detail: resolved.detail });
+    return res.json({ ok: true, resolved, realExecution: mode === "real" && foValidated && headerLooksValid });
+  } catch (e) { serverError(res, e); }
+});
+
 async function mcxHouseQuotes(ySyms) {
   if (!mcxFeedOn()) return {};
   const wanted = (ySyms || []).filter((y) => mcx.COMEX_TO_MCX[y]);
