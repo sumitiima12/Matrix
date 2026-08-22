@@ -157,6 +157,13 @@ if (!["", "0", "1"].includes(_c03raw)) {
   throw new Error(`[startup] C03_ORDER_ATTEMPTS must be unset, "1" or "0" — got ${JSON.stringify(_c03raw)}. Refusing to start with an ambiguous safety flag.`);
 }
 const C03_ORDER_ATTEMPTS_ON = _c03raw !== "0";
+/* OWNER OFF-SWITCH for the account-wide entry lock. When MATRIX_DISABLE_ENTRY_LOCK is set, an unresolved/unknown
+   order or a risk-lock NO LONGER blocks new entries, and the "Resolve" button force-clears the stuck records. This
+   trades away the duplicate-order safety net (an order whose outcome we couldn't confirm might have filled), so it's
+   the account owner's explicit choice — default OFF keeps the protection on. Requested by the owner after the Delta
+   read path (proxy) went down and left orders un-resolvable, permanently blocking trading. */
+const ENTRY_LOCK_DISABLED = /^(1|true|yes|on)$/i.test(String(process.env.MATRIX_DISABLE_ENTRY_LOCK || ""));
+if (ENTRY_LOCK_DISABLED) console.warn("[safety] MATRIX_DISABLE_ENTRY_LOCK is ON — unknown-order / risk-lock entry blocking is DISABLED (owner override).");
 /* R43-P1-01: CoinDCX AUTOMATIC find-by-tag crash recovery. The adapter (_coindcxProbeByTag) is built and safe, but
    the capability registry must not advertise unattended crash recovery for CoinDCX until a LIVE cold-restart cert
    proves the tag lookup end-to-end on a real account. Default OFF: until certified, CoinDCX still fails closed to
@@ -1289,6 +1296,19 @@ app.get("/api/order/intent-status", requireAuth, async (req, res) => {
    this can never create duplicate-order risk. Read + safe-probe only — it places no orders. */
 app.post("/api/order/resolve-unknown", requireAuth, async (req, res) => {
   const userId = storageKeyFor(req.authUserId);
+  /* OWNER FORCE-CLEAR: when the entry lock is disabled by env (MATRIX_DISABLE_ENTRY_LOCK), the owner has accepted the
+     duplicate-order trade-off, so Resolve no longer needs a broker-proven outcome — it directly releases the stuck
+     unknown records and clears halt + risk-lock. This is what lets the "6 unresolved" that the down proxy could never
+     confirm finally go away. Only reachable when the owner explicitly set the env flag. */
+  if (ENTRY_LOCK_DISABLED) {
+    let cleared = 0;
+    try { if (typeof db.releaseUnknownIdempotency === "function") cleared = await db.releaseUnknownIdempotency(userId); } catch { /* best-effort */ }
+    try { if (typeof db.setEntryHalt === "function") await db.setEntryHalt(userId, false); } catch { /* best-effort */ }
+    try { if (typeof db.setRiskLock === "function") await db.setRiskLock(userId, false); } catch { /* best-effort */ }
+    try { haltedEntries.delete(String(userId)); } catch { /* engine may not be up */ }
+    try { logFinancial("order.resolveUnknown.forceClear", { user: userId, cleared }); } catch { /* optional */ }
+    return res.json({ ok: true, remaining: 0, cleared: true, forced: true });
+  }
   let reconciled = null;
   try { reconciled = await runC03Reconcile("user-resolve"); } catch { /* best-effort — still report the count below */ }
   let remaining = 0;
@@ -6880,7 +6900,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
      risk. Exit paths set body.reduceOnly or the X-Reduce-Only header. */
   {
     const isReduceOnly = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
-    if (!isReduceOnly && typeof db.isRiskLocked === "function") {
+    if (!isReduceOnly && !ENTRY_LOCK_DISABLED && typeof db.isRiskLocked === "function") {
       /* R22-C03: a safety gate must FAIL CLOSED. If we can't read the risk-lock (DB incident), do NOT let a new
          real entry through on the assumption it's unlocked — reject with 503 until the lock can be verified. */
       let locked;
@@ -6906,7 +6926,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
      broker and resolves it. Fail closed on a read error. */
   {
     const isReduceOnlyNow = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
-    if (!isReduceOnlyNow && typeof db.countUnknownIdempotency === "function") {
+    if (!isReduceOnlyNow && !ENTRY_LOCK_DISABLED && typeof db.countUnknownIdempotency === "function") {
       let unknownCount;
       try { unknownCount = await db.countUnknownIdempotency(idemUser); }
       catch { return res.status(503).json({ error: "Couldn't verify your account's order status right now — please retry in a moment." }); }
@@ -9478,7 +9498,8 @@ app.get("/api/automation/entry-halt", requireAuth, async (req, res) => {
       unknownCount = (all || []).filter((a) => a && String(storageKeyFor(String(a.userId))) === key).length;
     }
   } catch { /* best-effort count */ }
-  res.json({ halted, riskLocked, unknownCount, safety: !!(riskLocked || unknownCount > 0) });
+  // With the owner off-switch on, nothing blocks entries, so never surface the "trading paused" banner.
+  res.json({ halted, riskLocked, unknownCount, safety: ENTRY_LOCK_DISABLED ? false : !!(riskLocked || unknownCount > 0) });
 });
 app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (req, res) => {
   const uid = String(storageKeyFor(req.authUserId));
@@ -9869,10 +9890,12 @@ async function runAutoBuyEngine() {
            for them until a server reconciliation clears the lock. On a positive read we also sync this worker's
            local set so the rest of the sweep skips this user cheaply. */
         let riskLockedNow = false;
-        try { if (typeof db.isRiskLocked === "function") riskLockedNow = await db.isRiskLocked(storageKeyFor(String(st.userId))); }
-        catch { riskLockedNow = true; }   // unreadable lock ⇒ do NOT place a real order
-        if (riskLockedNow) haltedEntries.add(String(st.userId));
-        if ((fresh && fresh.status !== "active") || haltedEntries.has(String(st.userId)) || riskLockedNow) {
+        if (!ENTRY_LOCK_DISABLED) {   // owner off-switch: skip the risk-lock read + halt entirely when disabled
+          try { if (typeof db.isRiskLocked === "function") riskLockedNow = await db.isRiskLocked(storageKeyFor(String(st.userId))); }
+          catch { riskLockedNow = true; }   // unreadable lock ⇒ do NOT place a real order
+          if (riskLockedNow) haltedEntries.add(String(st.userId));
+        }
+        if ((fresh && fresh.status !== "active") || (!ENTRY_LOCK_DISABLED && (haltedEntries.has(String(st.userId)) || riskLockedNow))) {
           /* R31-P3-01: a post-claim safety block intentionally CONSUMES this candle (the intent stays claimed so we
              never re-fire this exact bar and never resubmit after an ambiguous send). But surface WHY, and whether it
              is RETRYABLE or TERMINAL for this signal, instead of an opaque "skipped": a risk-halt is RETRYABLE (the
