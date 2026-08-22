@@ -928,8 +928,16 @@ async function _deltaProbeByTag(attempt) {
   // queried server-side by that tag, so an empty result is conclusive. Previously this required a broker order id —
   // so an attempt whose POST transport-failed BEFORE returning an id could never be resolved and kept the account
   // locked forever, blocking every subsequent entry (the DOGE "outcome unknown" loop). Accepting `tag` fixes that.
-  const created = Number(attempt.createdAt ?? attempt.created_at);
-  const ageMs = Number.isFinite(created) && created > 0 ? (Date.now() - created) : null;
+  /* ROBUST age parse. Postgres returns created_at as a Date object or ISO string, not an epoch number — the old
+     `Number(created_at)` gave NaN for those, so ageMs stayed null, `oldEnough` was never true, and a tag-absent order
+     could NEVER resolve as "absent": it stayed locked forever (the "6 still unresolved, 0 cleared" loop). Accept a
+     Date, an epoch number, an ISO string, or a numeric string, and fall back to other stamped timestamps. */
+  const _rawCreated = attempt.createdAt ?? attempt.created_at ?? attempt.submittedAt ?? attempt.updatedAt ?? attempt.updated_at ?? attempt.at;
+  let created = null;
+  if (_rawCreated instanceof Date) created = _rawCreated.getTime();
+  else if (typeof _rawCreated === "number" && Number.isFinite(_rawCreated)) created = _rawCreated;
+  else if (typeof _rawCreated === "string") { const p = Date.parse(_rawCreated); created = Number.isFinite(p) ? p : (Number.isFinite(Number(_rawCreated)) ? Number(_rawCreated) : null); }
+  const ageMs = created != null && created > 0 ? (Date.now() - created) : null;
   const oldEnough = ageMs != null && ageMs >= (Number(process.env.DELTA_ABSENCE_MIN_AGE_MS) || 60000);
   const willAbsent = (bid || tag) && oldEnough;
   // DIAGNOSTIC: why the probe resolves ABSENT vs stays INCONCLUSIVE (the c03.recover.inconclusive you saw).
