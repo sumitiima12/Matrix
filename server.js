@@ -9455,8 +9455,22 @@ const autoBuyLiveOn = () => autoBuyLiveOverride != null ? autoBuyLiveOverride : 
    than useless). Exits are a separate engine, so a halted account still gets protected. */
 const haltedEntries = new Set();
 (async () => { try { (await db.getHaltedEntryUsers()).forEach((u) => haltedEntries.add(String(u))); if (haltedEntries.size) console.log(`[killswitch] ${haltedEntries.size} account(s) have new entries paused`); } catch (e) { console.error("[killswitch] load failed:", e.message); } })();
-app.get("/api/automation/entry-halt", requireAuth, (req, res) => {
-  res.json({ halted: haltedEntries.has(String(storageKeyFor(req.authUserId))) });
+app.get("/api/automation/entry-halt", requireAuth, async (req, res) => {
+  const key = String(storageKeyFor(req.authUserId));
+  const halted = haltedEntries.has(key);
+  /* Lock #4 (visible banner): also report the DURABLE safety state so the client can show a "Trading paused —
+     an order needs reconciling → Resolve" banner that is accurate on a fresh load (before any engine sweep has
+     repopulated the in-memory set). riskLocked = durable safety lock; unknownCount = this user's unresolved order
+     attempts. `safety` is the signal to show the Resolve banner (a *manual* kill switch alone is not "safety"). */
+  let riskLocked = false, unknownCount = 0;
+  try { if (typeof db.isRiskLocked === "function") riskLocked = await db.isRiskLocked(key); } catch { riskLocked = true; }   // unreadable ⇒ assume locked (fail closed for the banner)
+  try {
+    if (typeof db.listUnresolvedOrderAttempts === "function") {
+      const all = await db.listUnresolvedOrderAttempts(500);
+      unknownCount = (all || []).filter((a) => a && String(storageKeyFor(String(a.userId))) === key).length;
+    }
+  } catch { /* best-effort count */ }
+  res.json({ halted, riskLocked, unknownCount, safety: !!(riskLocked || unknownCount > 0) });
 });
 app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (req, res) => {
   const uid = String(storageKeyFor(req.authUserId));
@@ -10070,7 +10084,10 @@ async function runProtectionWatcher() {
    in a multi-instance deploy only one node sweeps. Flag-gated (attempts exist only when C03 is enabled) and
    skipped under the #441 test seam (tests invoke runC03Reconcile directly). */
 if (C03_ORDER_ATTEMPTS_ON && !MATRIX_NO_LISTEN) {
-  const C03_RECON_MS = Number(process.env.C03_RECON_MS) || 60_000;
+  // Lock #2 (auto-clear speed): reconcile every 15s by default (was 60s) so a risk lock clears within seconds of the
+  // broker becoming readable again, instead of a user waiting up to a minute. The sweep is cheap when nothing is
+  // unresolved (it early-outs on an empty attempts query) and single-owner via the pg advisory lock. Env-overridable.
+  const C03_RECON_MS = Number(process.env.C03_RECON_MS) || 15_000;
   setInterval(() => { runC03Reconcile("periodic").catch((e) => console.error("[c03] periodic reconcile error:", e && e.message)); }, jitter(C03_RECON_MS)).unref?.();
   // S3.2: periodically REPAIR any PROJECTION_PENDING exits (broker fill confirmed, projection write failed) without
   // re-contacting the broker — so a transient DB failure during a close can never leave a stuck-open position.
