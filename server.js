@@ -57,6 +57,8 @@ const reconcile = require("./reconcile");             // PURE, unit-tested recon
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
 const fyoc = require("./fyersOptionChain");            // India NSE/NFO derivative resolver (pure) + FYERS master normalizer
 const dhanCommodity = require("./dhanCommodity");      // MCX commodity derivative resolver (pure) + Dhan scrip-master normalizer
+const usOptions = require("./usOptions");              // US equity/index option resolver (OCC symbology, deterministic + chain moneyness)
+const cryptoOptions = require("./cryptoOptions");      // Delta crypto option resolver (BTC/ETH only, Delta symbology)
 const contractSpecs = require("./contractSpecs");      // provenance-tagged contract-spec service (crypto/US/commodity reference + fail-closed)
 const strategyStates = require("./strategyStates");   // §8: canonical automated-strategy state vocabulary + derivation
 const signalGuards = require("./signalGuards");        // §10/§13: stale-signal + duplicate-symbol pre-entry guards
@@ -3413,8 +3415,34 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
       if (rc.error) return res.status(409).json({ ok: false, error: rc.error, detail: rc.detail });
       return res.json({ ok: true, resolved: rc, realExecution: mode === "real" && dhanValidated && headerLooksValid });
     }
-    // India NSE/NFO is the other supported derivatives market. US/Crypto resolve against their own masters — not yet
-    // wired here — so they fail closed rather than guess.
+    // US equity/index OPTIONS — OCC symbology. Deterministic when an explicit strike+expiry is supplied; moneyness
+    // needs a live option chain (pass `chain` rows) or it fails closed. Real execution gated on MATRIX_US_OPTIONS_VALIDATED.
+    if (market === "US" && productType === "OPTION") {
+      const usValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_US_OPTIONS_VALIDATED || ""));
+      const rc = usOptions.resolveUsOption({
+        underlying: b.underlying, optionType: b.optionType, moneyness: b.moneyness, expiryIntent: b.expiryIntent,
+        spot: Number(b.spot), lots: Number(b.lots),
+        explicitStrike: b.strike != null ? Number(b.strike) : undefined, explicitExpiry: b.expiry || undefined,
+        rows: Array.isArray(b.chain) ? b.chain : [],
+      });
+      if (rc.error) return res.status(409).json({ ok: false, error: rc.error, detail: rc.detail });
+      if (mode === "real" && !usValidated) return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "real_execution_not_validated", resolved: rc, realExecution: false });
+      return res.json({ ok: true, resolved: rc, realExecution: mode === "real" && usValidated });
+    }
+    // CRYPTO OPTIONS — Delta symbology, BTC/ETH only. (Crypto perps/futures use the live order path, not this endpoint.)
+    if (market === "Crypto" && productType === "OPTION") {
+      const cxValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_CRYPTO_OPTIONS_VALIDATED || ""));
+      const rc = cryptoOptions.resolveCryptoOption({
+        underlying: b.underlying, optionType: b.optionType, moneyness: b.moneyness, expiryIntent: b.expiryIntent,
+        spot: Number(b.spot), lots: Number(b.lots),
+        explicitStrike: b.strike != null ? Number(b.strike) : undefined, explicitExpiry: b.expiry || undefined,
+        rows: Array.isArray(b.chain) ? b.chain : [],
+      });
+      if (rc.error) return res.status(409).json({ ok: false, error: rc.error, detail: rc.detail });
+      if (mode === "real" && !cxValidated) return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "real_execution_not_validated", resolved: rc, realExecution: false });
+      return res.json({ ok: true, resolved: rc, realExecution: mode === "real" && cxValidated });
+    }
+    // India NSE/NFO is the other supported derivatives market. Anything else fails closed rather than guess.
     if (market !== "IN") {
       const spec = contractSpecs.getContractSpec({ market, underlying: b.underlying, productType }, { mode: "virtual" });
       return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "market_not_yet_supported", market, referenceSpec: spec || null });
