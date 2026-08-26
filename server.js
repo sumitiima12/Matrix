@@ -57,6 +57,7 @@ const reconcile = require("./reconcile");             // PURE, unit-tested recon
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
 const fyoc = require("./fyersOptionChain");            // India NSE/NFO derivative resolver (pure) + FYERS master normalizer
 const dhanCommodity = require("./dhanCommodity");      // MCX commodity derivative resolver (pure) + Dhan scrip-master normalizer
+const derivativeGate = require("./derivativeGate");    // fail-closed per-market gate for REAL options/futures execution
 const usOptions = require("./usOptions");              // US equity/index option resolver (OCC symbology, deterministic + chain moneyness)
 const cryptoOptions = require("./cryptoOptions");      // Delta crypto option resolver (BTC/ETH only, Delta symbology)
 const contractSpecs = require("./contractSpecs");      // provenance-tagged contract-spec service (crypto/US/commodity reference + fail-closed)
@@ -7076,6 +7077,28 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
   const symbol = req.body?.symbol;
   const qty = req.body?.qty;
   if (!["BUY", "SELL"].includes(side)) return res.status(400).json({ error: "side must be exactly BUY or SELL." });
+  /* DERIVATIVE EXECUTION GATE (options/futures). This route is symbol-agnostic — it forwards whatever `symbol` it's
+     given to the broker adapter — so a resolved option/future contract would otherwise go live like any equity.
+     Live options/futures execution is validated per market behind an ops flag (the same flags gating
+     /api/derivatives/resolve). Fail closed for a REAL ENTRY on an unvalidated market; a reduce-only/closing order is
+     always allowed so a user can flatten risk. The client sends productType (OPTION|FUTURE) + derivMarket from the
+     resolved contract. */
+  {
+    const dg = derivativeGate.evaluateDerivativeOrder({
+      productType: req.body?.productType,
+      market: req.body?.derivMarket || req.body?.market,
+      reduceOnly: req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes",
+    }, process.env);
+    if (dg.isDerivative && !dg.allowed) {
+      const pt = String(req.body?.productType || "").toLowerCase();
+      const mk = String(req.body?.derivMarket || req.body?.market || "").trim();
+      logFinancial("derivative.real_blocked", { userId: storageKeyFor(sess.userId), broker: sess.broker, productType: pt, market: mk, reason: dg.reason });
+      return res.status(409).json({
+        error: `Live ${pt || "derivative"} trading${mk ? ` for ${mk}` : ""} isn't certified on this server yet. Contract resolution and paper preview work; real execution stays disabled until it's validated.`,
+        derivativeNotValidated: true, productType: pt || null, market: mk || null, reason: dg.reason,
+      });
+    }
+  }
   // A LIMIT order needs a price; the client may send it as `limitPrice` or `price`.
   const price = req.body?.limitPrice != null ? req.body.limitPrice : req.body?.price;
   // Stop / stop-limit trigger price (the price at which the order arms).
