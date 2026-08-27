@@ -21,6 +21,36 @@ const fyoc = require("./fyersOptionChain");
 
 const PLAN_FAILED = "OPTION_LEG_PLAN_FAILED";
 
+/* Index aliases: a strategy's trading symbol isn't always the F&O master's underlying. The indices are the
+   common mismatch (equities match 1:1 by their bare symbol). e.g. a strategy on "NIFTY50" must resolve to the
+   master's "NIFTY" chain. We only ever MAP to a name the master actually lists (checked below) — never guess. */
+const INDEX_ALIASES = {
+  NIFTY: "NIFTY", NIFTY50: "NIFTY", "NIFTY 50": "NIFTY", NIFTYINDEX: "NIFTY",
+  BANKNIFTY: "BANKNIFTY", NIFTYBANK: "BANKNIFTY", "NIFTY BANK": "BANKNIFTY",
+  FINNIFTY: "FINNIFTY", NIFTYFIN: "FINNIFTY", NIFTYFINSERVICE: "FINNIFTY",
+  MIDCPNIFTY: "MIDCPNIFTY", NIFTYMIDSELECT: "MIDCPNIFTY", MIDCAPNIFTY: "MIDCPNIFTY",
+  SENSEX: "SENSEX", BANKEX: "BANKEX",
+};
+
+/** Bare, upper-cased symbol with exchange prefix / -EQ suffix / spaces stripped. */
+function cleanSymbol(sym) {
+  return String(sym || "").toUpperCase().replace(/^[A-Z]+:/, "").replace(/-EQ$/, "").replace(/\s+/g, "");
+}
+
+/**
+ * Resolve a strategy symbol to the underlying the F&O master actually lists. Tries, in order: the bare symbol,
+ * then an index alias — but ONLY accepts a candidate that is present in `available` (the set of underlyings in the
+ * loaded master). Returns null (fail closed) when nothing matches, so we never trade a wrong or nonexistent chain.
+ */
+function resolveUnderlying(sym, available) {
+  const set = available instanceof Set ? available : new Set(available || []);
+  const bare = cleanSymbol(sym);
+  if (set.has(bare)) return bare;
+  const alias = INDEX_ALIASES[bare];
+  if (alias && set.has(alias)) return alias;
+  return null;
+}
+
 /** "Current week"/"Current month" (OptionLeg.jsx) -> the resolver's expiry intent. */
 function expiryIntentOf(expiryLabel) {
   const s = String(expiryLabel || "Current week").toLowerCase();
@@ -52,6 +82,12 @@ function planOptionLegs(p = {}) {
   if (!(Number(spot) > 0)) return { error: PLAN_FAILED, detail: "no_spot" };
   if (!Array.isArray(rows) || !rows.length) return { error: PLAN_FAILED, detail: "instrument_master_unavailable" };
 
+  /* Normalise the strategy symbol to a chain the master actually lists (e.g. NIFTY50 -> NIFTY). Fail closed if
+     no listed underlying matches — never resolve strikes against a wrong or empty chain. */
+  const available = new Set(rows.map((r) => String((r && r.underlying) || "").toUpperCase()));
+  const canonUnderlying = resolveUnderlying(underlying, available);
+  if (!canonUnderlying) return { error: PLAN_FAILED, detail: "underlying_not_in_master" };
+
   const expiryIntent = expiryIntentOf(opt.expiry);
   const out = [];
   for (let i = 0; i < legs.length; i++) {
@@ -61,7 +97,7 @@ function planOptionLegs(p = {}) {
     const side = leg.side === "SELL" ? "SELL" : "BUY";
     const lots = Math.max(1, Math.floor(Number(leg.lots) || 1));
     const resolved = fyoc.resolveIndiaContract({
-      rows, underlying, productType: "OPTION",
+      rows, underlying: canonUnderlying, productType: "OPTION",
       optionType, moneyness: String(leg.mny || "ATM").toUpperCase(),
       expiryIntent, side, spot: Number(spot), lots, nowMs,
     });
@@ -69,7 +105,7 @@ function planOptionLegs(p = {}) {
     // Carry the leg's requested side onto the resolved contract (the resolver echoes side only for FUTURE).
     out.push({ ...resolved, side, legIndex: i });
   }
-  return { ok: true, legs: out, expiryIntent, strategy: opt.strategy || null };
+  return { ok: true, legs: out, expiryIntent, underlying: canonUnderlying, strategy: opt.strategy || null };
 }
 
-module.exports = { planOptionLegs, expiryIntentOf, optionTypeOf, PLAN_FAILED };
+module.exports = { planOptionLegs, expiryIntentOf, optionTypeOf, resolveUnderlying, cleanSymbol, INDEX_ALIASES, PLAN_FAILED };

@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { planOptionLegs, expiryIntentOf, optionTypeOf, PLAN_FAILED } = require("../optionLegPlan");
+const { planOptionLegs, expiryIntentOf, optionTypeOf, resolveUnderlying, cleanSymbol, PLAN_FAILED } = require("../optionLegPlan");
 
 /* Synthetic NIFTY NSE_FO master (already normalised to the fyersOptionChain row shape). Two Sept 2026 expiries
    in the same month → the earlier one is "weekly", the later (last of month) is "monthly". Strikes straddle a
@@ -107,7 +107,27 @@ test("FAIL CLOSED: whole plan fails if ANY leg can't resolve (no partial spread)
 test("FAIL CLOSED: unknown underlying yields no chain (won't trade a wrong contract)", () => {
   const r = planOptionLegs({
     opt: { enabled: true, expiry: "Current week", legs: [{ side: "BUY", type: "CE", mny: "ATM", lots: 1 }] },
-    underlying: "BANKNIFTY", spot: 25000, rows: ROWS, nowMs: NOW,
+    underlying: "BANKNIFTY", spot: 25000, rows: ROWS, nowMs: NOW,   // master only has NIFTY
   });
   assert.equal(r.error, PLAN_FAILED);
+  assert.equal(r.detail, "underlying_not_in_master");
+});
+
+test("underlying normalization: strategy symbol NIFTY50 resolves to the master's NIFTY chain", () => {
+  const r = planOptionLegs({
+    opt: { enabled: true, expiry: "Current week", legs: [{ side: "BUY", type: "CE", mny: "ATM", lots: 1 }] },
+    underlying: "NIFTY50", spot: 25000, rows: ROWS, nowMs: NOW,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.underlying, "NIFTY");
+  assert.equal(r.legs[0].tradingSymbol, `NSE:NIFTY${WEEK}25000CE`);
+});
+
+test("underlying normalization: NSE: prefix + -EQ suffix + spaces are stripped", () => {
+  assert.equal(cleanSymbol("NSE:RELIANCE-EQ"), "RELIANCE");
+  assert.equal(cleanSymbol("nifty 50"), "NIFTY50");
+  // alias only accepted when the master actually lists the target
+  assert.equal(resolveUnderlying("NIFTY50", new Set(["NIFTY"])), "NIFTY");
+  assert.equal(resolveUnderlying("BANKNIFTY", new Set(["NIFTY"])), null);
+  assert.equal(resolveUnderlying("RELIANCE", new Set(["RELIANCE"])), "RELIANCE");
 });

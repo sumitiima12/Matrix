@@ -3330,6 +3330,34 @@ async function fyersHouseQuotes(ySyms) {
   } catch (e) { _fyLastError = "quotes error: " + e.message; console.error("[fyers-house]", _fyLastError); return {}; }
 }
 
+/* Live LTP for an EXACT FYERS NFO option ticker (e.g. "NSE:NIFTY2591825000CE"). Used to price a LIVE automated
+   option entry as a LIMIT (Indian options are limit-only — a market option order is disallowed). Reads the house
+   FYERS quote feed (market data only; the order itself still signs with the user's session token). Returns the
+   premium (last-traded price) or null — the caller FAILS CLOSED and does not place a market order on a null. */
+async function fyersOptionLtp(fyersSymbol) {
+  if (!EQUITY_HOUSE_FEED) return null;
+  const sym = String(fyersSymbol || "").trim();
+  if (!sym) return null;
+  const token = await fyersHouseToken();
+  if (!token) return null;
+  const appId = process.env.FYERS_APP_ID || "";
+  try {
+    const r = await pfetch(_fyRewrite(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(sym)}`), {
+      headers: { Authorization: `${appId}:${token}` },
+      ...fyFetchOpts,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") {
+      if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };
+      _fyLastError = "opt quote: " + (d.message || ("HTTP " + r.status));
+      return null;
+    }
+    const row = (d.d || [])[0];
+    const v = (row && row.v) || {};
+    return v.lp != null && Number(v.lp) > 0 ? Number(v.lp) : null;
+  } catch (e) { _fyLastError = "opt quote error: " + e.message; return null; }
+}
+
 /* ── MCX (Indian commodity) house feed ──────────────────────────────────────────────────
    OPT-IN via MCX_HOUSE_FEED. When on (and a FYERS house token exists), commodity quotes come from
    the near-month MCX futures contract in INR instead of COMEX/NYMEX in USD. MCX contracts roll
@@ -10060,29 +10088,51 @@ async function runAutoBuyEngine() {
           /* OPTION LEG PLACEMENT. Each resolved leg is placed as its own BUY order on the exact NFO option
              symbol (SELL legs were refused above for live). Every leg gets a distinct idempotent client id
              (`${pendingClientId}_L{i}`) so a timed-out leg is found by it, its own managed position (P&L uses
-             the option premium, contractMultiplier 1) and its own authoritative trade row. The whole thing is
-             only reached when live && MATRIX_FO_MASTER_VALIDATED. NOTE (certification follow-up): live option
-             entries should rest as LIMIT at the premium rather than MARKET — wired once the FO live path is
-             certified; kept MARKET here because the gate keeps this dry until then. */
+             the option premium, contractMultiplier 1) and its own authoritative trade row. Only reached when
+             live && MATRIX_FO_MASTER_VALIDATED.
+             PRICING PRE-PASS: Indian options are LIMIT-only (a market option order is disallowed — the broker
+             requires a price and market fills on illiquid strikes are unsafe). We price EVERY leg at its live
+             premium (1% marketable-limit buffer so a BUY crosses the spread and fills) BEFORE sending any order,
+             so a missing premium on a later leg can't leave a half-placed spread — FAIL CLOSED for the whole
+             strategy instead. `st.limitPrice` (a user override) wins if set. */
+          const legLimits = [];
+          let priceAbort = null;
+          for (const leg of optPlan.legs) {
+            let legLimit = Number(st.limitPrice) > 0 ? Number(st.limitPrice) : 0;
+            if (!(legLimit > 0)) {
+              const prem = await fyersOptionLtp(leg.tradingSymbol);
+              if (!(Number(prem) > 0)) { priceAbort = `${optPlan.underlying} ${leg.strike} ${leg.optionType === "CALL" ? "CE" : "PE"}`; break; }
+              legLimit = +(Number(prem) * 1.01).toFixed(2);
+            }
+            legLimits.push(legLimit);
+          }
+          if (priceAbort) {
+            /* No order was sent — clearing the pending marker is safe and correct (this is NOT an ambiguous broker
+               outcome). The candle intent stays consumed so we don't re-fire this exact bar; a later candle can retry. */
+            await db.updateRealStrategy(st.id, { lastError: `Couldn't get a live premium for ${priceAbort} to price the limit order — no order placed (Indian options are limit-only).`, lastOrderStatus: "blocked", pendingSince: null, pendingClientId: null });
+            logFinancial("autobuy.option_no_premium", { userId: st.userId, strategyId: st.id, leg: priceAbort });
+            continue;
+          }
           let firstPosId = null, placedLegs = 0;
           for (let li = 0; li < optPlan.legs.length; li++) {
             const leg = optPlan.legs[li];
             const legClientId = `${pendingClientId}_L${li}`;
-            const legDisplay = `${optPlan.strategy ? optPlan.strategy + " · " : ""}${st.symbol} ${leg.strike} ${leg.optionType === "CALL" ? "CE" : "PE"}`;
-            const rr = await placeBuyOrder(sess, leg.tradingSymbol, leg.quantity, "IN", st.product, null, null, false, legClientId, st.orderType || "MARKET", st.limitPrice || 0);
+            const legDisplay = `${optPlan.strategy ? optPlan.strategy + " · " : ""}${optPlan.underlying} ${leg.strike} ${leg.optionType === "CALL" ? "CE" : "PE"}`;
+            const legLimit = legLimits[li];
+            const rr = await placeBuyOrder(sess, leg.tradingSymbol, leg.quantity, "IN", st.product, null, null, false, legClientId, "LIMIT", legLimit);
             const legFillQty = Number(rr.filledQty) > 0 ? Number(rr.filledQty) : leg.quantity;
-            const legFillPx = Number(rr.avgPrice) > 0 ? Number(rr.avgPrice) : null;   // option premium (may be null if broker didn't echo avg)
+            const legFillPx = Number(rr.avgPrice) > 0 ? Number(rr.avgPrice) : legLimit;   // premium: broker avg, else our limit
             const legPos = await registerManagedPosition({
               sess, symbol: legDisplay, brokerSym: leg.tradingSymbol, qty: legFillQty, entry: legFillPx, market: "IN",
               sl: null, tp: null, tsl: null, cfg: st.cfg, yahoo: null, interval: st.interval, product: st.product, short: false,
-              isOpt: true, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, contractMultiplier: 1, underlying: st.symbol,
+              isOpt: true, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, contractMultiplier: 1, underlying: optPlan.underlying,
             });
             if (!firstPosId) firstPosId = legPos.id;
             const legJournaled = await recordAuthoritativeFill(storageKeyFor(st.userId), {
               id: `ab_${st.id}_${candleKey}_L${li}`, sym: legDisplay, side: "BUY", qty: legFillQty,
               entry: legFillPx, entryAt: Date.now(), market: "IN", real: true, broker: st.broker,
               tradeType: "Auto Buy", orderId: rr.orderId || null, managedId: legPos.id, serverAuthored: true,
-              productType: "OPTION", contractMultiplier: 1, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, underlying: st.symbol,
+              productType: "OPTION", contractMultiplier: 1, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, underlying: optPlan.underlying,
             }, { haltUserIdOnFail: st.userId });
             if (!legJournaled) { haltedEntries.add(String(st.userId)); logFinancial("autobuy.halted_unjournaled_fill", { userId: st.userId, symbol: legDisplay, orderId: rr.orderId }); }
             placedLegs++;
