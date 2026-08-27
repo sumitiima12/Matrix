@@ -56,6 +56,7 @@ const { createPinLock } = require("./pinLock");       // per-account PIN/answer 
 const reconcile = require("./reconcile");             // PURE, unit-tested reconciliation + OAuth-binding decisions
 const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker capability certification registry
 const fyoc = require("./fyersOptionChain");            // India NSE/NFO derivative resolver (pure) + FYERS master normalizer
+const optionLegPlan = require("./optionLegPlan");      // fire-time resolution of an OptionLeg config -> exact IN option contracts (pure, fail-closed)
 const dhanCommodity = require("./dhanCommodity");      // MCX commodity derivative resolver (pure) + Dhan scrip-master normalizer
 const derivativeGate = require("./derivativeGate");    // fail-closed per-market gate for REAL options/futures execution
 const optionQuote = require("./optionQuote");          // live option-premium feed (Delta public tickers / Yahoo options)
@@ -9074,7 +9075,7 @@ async function placeExitOrder(sess, symbol, qty, market, product, short = false,
 
 /* Register a real position for the engine to watch. Called from /api/broker/order after a
    real buy that opted into auto-exit. Persists the creds needed to act on it later. */
-async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval, product, short = false, entryOrderId = null }) {
+async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, market, sl, tp, tsl, cfg, yahoo, interval, product, short = false, entryOrderId = null, isOpt = false, optType = null, strike = null, expiry = null, contractMultiplier = null, underlying = null }) {
   await persistSessionCred(sess);
   /* R17-P1-03: when the caller supplies the broker entry-order id, registration is IDEMPOTENT by
      (broker,user,entryOrderId) — if a managed position for that entry already exists (e.g. another replica's
@@ -9095,6 +9096,11 @@ async function registerManagedPosition({ sess, symbol, brokerSym, qty, entry, ma
     cfg: cfg || null,                       // strategy { defs, exit } for indicator exits
     yahoo: yahoo || symbol, interval: interval || (market === "IN" || market === "Commodity" ? "5m" : "5m"),
     ...(entryOrderId ? { entryOrderId: String(entryOrderId) } : {}),
+    /* Option metadata (only set for derivative positions). Kept optional + null-defaulted so every existing
+       stock/crypto caller persists exactly as before; the exit engine / P&L read these to price and close an
+       option leg (premium × contractMultiplier) rather than treating it like a spot holding. */
+    ...(isOpt ? { isOpt: true, optType: optType || null, strike: strike != null ? Number(strike) : null, expiry: expiry || null, underlying: underlying || null } : {}),
+    ...(contractMultiplier != null ? { contractMultiplier: Number(contractMultiplier) } : {}),
     status: "open",
   };
   try {
@@ -9841,14 +9847,59 @@ async function runAutoBuyEngine() {
 
         const px = sig.price || await liveMarkForOrder(st.brokerSym, st.market) || null;
         if (!(px > 0)) { await db.updateRealStrategy(st.id, { lastError: "no live price" }); continue; }
+
+        /* OPTION MODE ("Trade options instead of the stock" — OptionLeg config on the strategy). When the entry
+           rule fires we resolve the leg moneyness/expiry PREFERENCE into EXACT NSE/NFO option contracts against
+           the LIVE FYERS master + the current spot (px) — today's ATM/OTM, today's expiry. This is Indian-only
+           for now (US-index / MCX option automation are separate, data-gated tracks). Everything is FAIL-CLOSED:
+             • REAL execution requires MATRIX_FO_MASTER_VALIDATED (the same flag that gates the manual/resolve path).
+               Until it's certified this stays DRY (paper preview only) — a live option order is never placed.
+             • The whole spread is all-or-nothing: if any leg can't be resolved to a listed contract, the strategy
+               does NOT trade (never a partial spread, never a guessed strike).
+             • Live SELL (option-writing) legs are refused until a sell-side option executor is certified — placeBuyOrder
+               only opens BUYs on FYERS, so a SELL here would silently open the wrong direction. */
+        const optMode = st.market === "IN" && st.opt && st.opt.enabled === true && Array.isArray(st.opt.legs) && st.opt.legs.length > 0;
+        let optPlan = null;
+        if (optMode) {
+          const foValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || ""));
+          if (live && !foValidated) {
+            await db.updateRealStrategy(st.id, { lastError: "Automated Indian OPTION execution isn't certified for live trading yet (MATRIX_FO_MASTER_VALIDATED off) — the strategy fired but no real option order was placed.", lastOrderStatus: "blocked", lastSignalAt: Date.now() });
+            logFinancial("autobuy.option_live_blocked", { userId: st.userId, strategyId: st.id, symbol: st.symbol });
+            continue;
+          }
+          const { rows: foRows, headerLooksValid } = await foSymbolRows();
+          if (!headerLooksValid || !foRows.length) {
+            await db.updateRealStrategy(st.id, { lastError: "Couldn't load the NSE option master to resolve the option legs — the strategy fired but no option order was placed.", lastOrderStatus: "blocked" });
+            continue;
+          }
+          optPlan = optionLegPlan.planOptionLegs({ opt: st.opt, underlying: st.symbol, spot: px, rows: foRows });
+          if (optPlan.error) {
+            await db.updateRealStrategy(st.id, { lastError: `Couldn't resolve the option legs against the live chain (${optPlan.detail || optPlan.error}${optPlan.legIndex != null ? `, leg ${optPlan.legIndex + 1}` : ""}) — the strategy did not trade rather than guess a contract.`, lastOrderStatus: "blocked" });
+            logFinancial("autobuy.option_plan_failed", { userId: st.userId, strategyId: st.id, symbol: st.symbol, detail: optPlan.detail || optPlan.error, legIndex: optPlan.legIndex });
+            continue;
+          }
+          if (live && optPlan.legs.some((l) => l.side === "SELL")) {
+            await db.updateRealStrategy(st.id, { lastError: "This option strategy has a SELL (option-writing) leg — live option writing isn't certified yet, so no real order was placed. Buy-only option strategies can go live once MATRIX_FO_MASTER_VALIDATED is enabled.", lastOrderStatus: "blocked" });
+            logFinancial("autobuy.option_sell_leg_blocked", { userId: st.userId, strategyId: st.id, symbol: st.symbol });
+            continue;
+          }
+        }
+
         let notional = Number(st.notional) || 0;
         if (AB_MAX_NOTIONAL > 0) notional = Math.min(notional, AB_MAX_NOTIONAL);
-        const qty = st.market === "Crypto" ? +(notional / px).toFixed(6) : Math.max(1, Math.floor(notional / px));
-        if (!(qty > 0)) { await db.updateRealStrategy(st.id, { lastError: "amount too small for one unit" }); continue; }
+        // Stock sizing (notional/price). Option mode sizes by lots × lotSize on each resolved leg, so skip this.
+        const qty = optMode ? 0 : (st.market === "Crypto" ? +(notional / px).toFixed(6) : Math.max(1, Math.floor(notional / px)));
+        if (!optMode && !(qty > 0)) { await db.updateRealStrategy(st.id, { lastError: "amount too small for one unit" }); continue; }
 
         if (!live) {
-          console.log(`[autobuy] DRY-RUN (AUTO_BUY_LIVE!=true): would BUY ${qty} ${st.symbol} for ${st.userId} — ${sig.reason}`);
-          await db.updateRealStrategy(st.id, { lastError: null, lastSignalAt: Date.now() });
+          if (optMode) {
+            const preview = optPlan.legs.map((l) => `${l.side} ${l.quantity} ${l.tradingSymbol}`).join(" + ");
+            console.log(`[autobuy] DRY-RUN (option) would place: ${preview} for ${st.userId} — ${sig.reason}`);
+            await db.updateRealStrategy(st.id, { lastError: null, lastSignalAt: Date.now(), lastOrderStatus: "dry_run_option", skipReason: `Paper preview: ${preview}` });
+          } else {
+            console.log(`[autobuy] DRY-RUN (AUTO_BUY_LIVE!=true): would BUY ${qty} ${st.symbol} for ${st.userId} — ${sig.reason}`);
+            await db.updateRealStrategy(st.id, { lastError: null, lastSignalAt: Date.now() });
+          }
           continue;
         }
         const sess = await sessionFromCred(st.userId, st.broker);
@@ -10004,6 +10055,44 @@ async function runAutoBuyEngine() {
             logFinancial("autobuy.fenced_before_send", { userId: st.userId, strategyId: st.id, broker: st.broker, symbol: st.symbol, fence: engineFence });
             continue;
           }
+        }
+        if (optMode) {
+          /* OPTION LEG PLACEMENT. Each resolved leg is placed as its own BUY order on the exact NFO option
+             symbol (SELL legs were refused above for live). Every leg gets a distinct idempotent client id
+             (`${pendingClientId}_L{i}`) so a timed-out leg is found by it, its own managed position (P&L uses
+             the option premium, contractMultiplier 1) and its own authoritative trade row. The whole thing is
+             only reached when live && MATRIX_FO_MASTER_VALIDATED. NOTE (certification follow-up): live option
+             entries should rest as LIMIT at the premium rather than MARKET — wired once the FO live path is
+             certified; kept MARKET here because the gate keeps this dry until then. */
+          let firstPosId = null, placedLegs = 0;
+          for (let li = 0; li < optPlan.legs.length; li++) {
+            const leg = optPlan.legs[li];
+            const legClientId = `${pendingClientId}_L${li}`;
+            const legDisplay = `${optPlan.strategy ? optPlan.strategy + " · " : ""}${st.symbol} ${leg.strike} ${leg.optionType === "CALL" ? "CE" : "PE"}`;
+            const rr = await placeBuyOrder(sess, leg.tradingSymbol, leg.quantity, "IN", st.product, null, null, false, legClientId, st.orderType || "MARKET", st.limitPrice || 0);
+            const legFillQty = Number(rr.filledQty) > 0 ? Number(rr.filledQty) : leg.quantity;
+            const legFillPx = Number(rr.avgPrice) > 0 ? Number(rr.avgPrice) : null;   // option premium (may be null if broker didn't echo avg)
+            const legPos = await registerManagedPosition({
+              sess, symbol: legDisplay, brokerSym: leg.tradingSymbol, qty: legFillQty, entry: legFillPx, market: "IN",
+              sl: null, tp: null, tsl: null, cfg: st.cfg, yahoo: null, interval: st.interval, product: st.product, short: false,
+              isOpt: true, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, contractMultiplier: 1, underlying: st.symbol,
+            });
+            if (!firstPosId) firstPosId = legPos.id;
+            const legJournaled = await recordAuthoritativeFill(storageKeyFor(st.userId), {
+              id: `ab_${st.id}_${candleKey}_L${li}`, sym: legDisplay, side: "BUY", qty: legFillQty,
+              entry: legFillPx, entryAt: Date.now(), market: "IN", real: true, broker: st.broker,
+              tradeType: "Auto Buy", orderId: rr.orderId || null, managedId: legPos.id, serverAuthored: true,
+              productType: "OPTION", contractMultiplier: 1, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, underlying: st.symbol,
+            }, { haltUserIdOnFail: st.userId });
+            if (!legJournaled) { haltedEntries.add(String(st.userId)); logFinancial("autobuy.halted_unjournaled_fill", { userId: st.userId, symbol: legDisplay, orderId: rr.orderId }); }
+            placedLegs++;
+            logFinancial("autobuy.option_filled", { userId: st.userId, broker: st.broker, underlying: st.symbol, leg: legDisplay, qty: legFillQty, premium: legFillPx, orderId: rr.orderId, reason: sig.reason });
+            console.log(`[autobuy] OPTION FILLED ${legFillQty} ${leg.tradingSymbol} for ${st.userId} — ${sig.reason} (order ${rr.orderId})`);
+          }
+          await db.updateRealStrategy(st.id, { openPositionId: firstPosId, lastOrderAt: Date.now(), lastError: null, lastOrderStatus: "filled", pendingSince: null, pendingClientId: null });
+          posCache.delete(st.userId);
+          bought++;
+          continue;
         }
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
