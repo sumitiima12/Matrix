@@ -21,9 +21,13 @@ test("US equity option multiplier is 100 (reference)", () => {
 });
 
 test("MCX bullion contract sizes present (reference), gated for real without live master", () => {
-  assert.equal(getContractSpec({ market: "Commodity", underlying: "GOLD", productType: "FUTURE" }, { mode: "virtual" }).lotSize, 1);
-  assert.equal(getContractSpec({ market: "Commodity", underlying: "GOLDGUINEA", productType: "FUTURE" }, { mode: "virtual" }).lotSize, 8);
-  assert.equal(getContractSpec({ market: "Commodity", underlying: "SILVERMINI", productType: "FUTURE" }, { mode: "virtual" }).lotSize, 5);
+  // CONVENTION: lotSize = 1 (one contract per lot; broker qty = lots); contractMultiplier = underlying units/contract.
+  const gold = getContractSpec({ market: "Commodity", underlying: "GOLD", productType: "FUTURE" }, { mode: "virtual" });
+  assert.equal(gold.lotSize, 1); assert.equal(gold.contractMultiplier, 1000);
+  const guinea = getContractSpec({ market: "Commodity", underlying: "GOLDGUINEA", productType: "FUTURE" }, { mode: "virtual" });
+  assert.equal(guinea.lotSize, 1); assert.equal(guinea.contractMultiplier, 8);
+  const silverMini = getContractSpec({ market: "Commodity", underlying: "SILVERMINI", productType: "FUTURE" }, { mode: "virtual" });
+  assert.equal(silverMini.lotSize, 1); assert.equal(silverMini.contractMultiplier, 5);
   // real-money without a live master → fail closed
   assert.equal(getContractSpec({ market: "Commodity", underlying: "GOLD", productType: "FUTURE" }, { mode: "real" }), null);
 });

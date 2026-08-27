@@ -43,13 +43,17 @@ const SEED = {
 
   // ---- COMMODITY (MCX) — contract SIZES verified (Gold 1kg / Silver 30kg confirmed this session; mini/guinea/petal
   //      are long-standing MCX product definitions). Real execution stays gated on the live master (per-account
-  //      lot/tick/expiry) — reference/virtual only here. ----
-  "Commodity:GOLD:FUTURE":        { lotSize: 1,   unit: "kg",    contractMultiplier: 1000, quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: true,  realExecution: false, note: "Gold 1 kg." },
-  "Commodity:GOLDMINI:FUTURE":    { lotSize: 100, unit: "g",     contractMultiplier: 100,  quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Gold Mini 100 g — confirm vs live master." },
-  "Commodity:GOLDGUINEA:FUTURE":  { lotSize: 8,   unit: "g",     contractMultiplier: 8,    quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Gold Guinea 8 g — confirm vs live master." },
-  "Commodity:GOLDPETAL:FUTURE":   { lotSize: 1,   unit: "g",     contractMultiplier: 1,    quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Gold Petal 1 g — confirm vs live master." },
-  "Commodity:SILVER:FUTURE":      { lotSize: 30,  unit: "kg",    contractMultiplier: 30,   quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: true,  realExecution: false, note: "Silver 30 kg." },
-  "Commodity:SILVERMINI:FUTURE":  { lotSize: 5,   unit: "kg",    contractMultiplier: 5,    quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Silver Mini 5 kg — confirm vs live master." },
+  //      lot/tick/expiry) — reference/virtual only here.
+  //      CONVENTION (must match the crypto/US resolvers): lotSize = ONE contract per lot (broker order qty = lots),
+  //      contractMultiplier = underlying units the contract represents (its price-point value). So broker qty = lots
+  //      and P&L = qty × contractMultiplier × Δprice. Earlier the minis folded the unit count into lotSize (e.g. Gold
+  //      Mini lotSize 100), which made a 2-lot order resolve to qty 200 and double-counted P&L — fixed to lotSize 1. ----
+  "Commodity:GOLD:FUTURE":        { lotSize: 1, unit: "kg", contractMultiplier: 1000, quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: true,  realExecution: false, note: "Gold 1 kg = 1000 g/contract." },
+  "Commodity:GOLDMINI:FUTURE":    { lotSize: 1, unit: "g",  contractMultiplier: 100,  quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Gold Mini 100 g/contract — confirm vs live master." },
+  "Commodity:GOLDGUINEA:FUTURE":  { lotSize: 1, unit: "g",  contractMultiplier: 8,    quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Gold Guinea 8 g/contract — confirm vs live master." },
+  "Commodity:GOLDPETAL:FUTURE":   { lotSize: 1, unit: "g",  contractMultiplier: 1,    quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Gold Petal 1 g/contract — confirm vs live master." },
+  "Commodity:SILVER:FUTURE":      { lotSize: 1, unit: "kg", contractMultiplier: 30,   quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: true,  realExecution: false, note: "Silver 30 kg/contract." },
+  "Commodity:SILVERMINI:FUTURE":  { lotSize: 1, unit: "kg", contractMultiplier: 5,    quantityStep: 1, minQty: 1, tickSize: 1, exchange: "MCX", metadataSource: "mcx_bullion_spec", verified: false, realExecution: false, note: "Silver Mini 5 kg/contract — confirm vs live master." },
 
   // ---- INDIA EQUITY/INDEX DERIVATIVES — lot sizes CHANGE and MUST come from the live FYERS/NSE instrument master.
   //      Deliberately NOT seeded → getContractSpec returns null → fail closed for real execution (Part 16/28). ----
