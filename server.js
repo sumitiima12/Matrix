@@ -58,6 +58,7 @@ const brokerCaps = require("./brokerCapabilities");   // S1: server-owned broker
 const fyoc = require("./fyersOptionChain");            // India NSE/NFO derivative resolver (pure) + FYERS master normalizer
 const dhanCommodity = require("./dhanCommodity");      // MCX commodity derivative resolver (pure) + Dhan scrip-master normalizer
 const derivativeGate = require("./derivativeGate");    // fail-closed per-market gate for REAL options/futures execution
+const optionQuote = require("./optionQuote");          // live option-premium feed (Delta public tickers / Yahoo options)
 const usOptions = require("./usOptions");              // US equity/index option resolver (OCC symbology, deterministic + chain moneyness)
 const cryptoOptions = require("./cryptoOptions");      // Delta crypto option resolver (BTC/ETH only, Delta symbology)
 const contractSpecs = require("./contractSpecs");      // provenance-tagged contract-spec service (crypto/US/commodity reference + fail-closed)
@@ -3464,6 +3465,35 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
     });
     if (resolved.error) return res.status(409).json({ ok: false, error: resolved.error, detail: resolved.detail });
     return res.json({ ok: true, resolved, realExecution: mode === "real" && foValidated && headerLooksValid });
+  } catch (e) { serverError(res, e); }
+});
+
+/* LIVE OPTION-PREMIUM FEED. Given a resolved option (market + underlying + type + strike + expiry), returns its live
+   premium so paper option P&L and real limit pricing have a real number. Crypto uses Delta's PUBLIC ticker; US uses
+   Yahoo's option chain; IN is served by the FYERS option chain (the resolver already carries it) and Commodity has no
+   public feed yet. Fail-closed: { ok:true, premium:null, reason } is returned rather than any fabricated price. */
+app.get("/api/derivatives/quote", requireAuth, async (req, res) => {
+  try {
+    const q = req.query || {};
+    const market = String(q.market || "");
+    const optionType = String(q.optionType || "").toUpperCase();
+    const strike = Number(q.strike);
+    const expiryISO = String(q.expiry || "");
+    const underlying = String(q.underlying || "").toUpperCase();
+
+    // Live JSON getters, memoised briefly, using the same fetch helpers as the rest of the server.
+    const deltaGet = async (symbol) => memo(`optq:delta:${symbol}`, 10_000, () => j(`${DELTA_BASE}/v2/tickers/${encodeURIComponent(symbol)}`));
+    const yahooGet = async (under, epoch) => memo(`optq:yf:${under}:${epoch}`, 15_000, () => j(`${YF}/v7/finance/options/${encodeURIComponent(under)}?date=${epoch}`));
+
+    // For crypto, build the Delta option symbol from the intent so the ticker lookup has a concrete symbol.
+    const deltaSymbol = (market === "Crypto" && (optionType === "CALL" || optionType === "PUT") && strike > 0 && expiryISO)
+      ? cryptoOptions.deltaOptionSymbol(underlying, expiryISO, optionType, strike) : null;
+
+    const out = await optionQuote.fetchOptionPremium(
+      { market, underlying, optionType, strike, expiryISO, deltaSymbol },
+      { deltaGet, yahooGet },
+    );
+    return res.json({ ok: true, ...out });
   } catch (e) { serverError(res, e); }
 });
 
