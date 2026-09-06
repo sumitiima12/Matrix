@@ -9256,6 +9256,59 @@ async function runAutoExitEngine() {
       return held;
     }
 
+    /* Per-user Delta FILLS + contract-value cache — fetched once per sweep per user, reused across all of that
+       user's flat positions. Same source the manual reconcileReal endpoint uses. `null` ⇒ unreadable this sweep
+       (fail-closed: the caller keeps the honest break-even marker rather than fabricating). */
+    const deltaFillsByUser = new Map();
+    let _cvBySym = null;
+    async function deltaCvBySym() {
+      if (_cvBySym) return _cvBySym;
+      const m = new Map();
+      try { const prods = await deltaCall("GET", "/v2/products", { signed: false }); for (const p of (prods && prods.result) || []) { const s = String(p.symbol || "").toUpperCase().replace(/(USDT|USD|INR)$/i, ""); if (s) m.set(s, Number(p.contract_value) || 1); } } catch { /* default cv=1 per sym */ }
+      _cvBySym = m; return m;
+    }
+    async function deltaFillsFor(uid) {
+      if (deltaFillsByUser.has(uid)) return deltaFillsByUser.get(uid);
+      let fills = null;
+      try { const fr = await withTimeout(deltaCall("GET", "/v2/fills", { userId: uid }), 45000, "Delta fills read"); if (fr && Array.isArray(fr.result)) fills = fr.result; } catch { fills = null; }
+      deltaFillsByUser.set(uid, fills);
+      return fills;
+    }
+    /* AUTOMATE what the manual "Resolve" (reconcileReal) does: when Delta reports a managed position flat (closed on
+       the broker — Delta's own bracket SL/TP, or a manual close in the Delta app), reconstruct the REAL exit
+       price/P&L from Delta's fills and write it onto the matching open TRADE row so realized P&L is captured, instead
+       of leaving it at break-even ($0) until the user manually reconciles. Display-truth via db.updateTrade — same
+       write the manual path uses; no ledger/applyReduceOnlyExit here (matches reconcileReal). Fail-closed: if fills
+       are unreadable or a fully-covering closing-fill sequence isn't found, we leave the trade row for manual
+       reconcile (never fabricate an exit). Returns true if a trade row was reconciled. */
+    async function reconcileDeltaTradeExit(pos) {
+      try {
+        const uid = pos.userId, key = storageKeyFor(uid);
+        const rows = await db.getTrades(key, 0, Date.now()).catch(() => []);
+        // The trade(s) for this managed position: same managedId, still open, real, Delta, this symbol.
+        const bare = (s) => String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/(USDT|USD|INR)$/i, "");
+        const mine = (rows || []).filter((t) => t && t.real === true && t.status !== "rejected" && (t.exitAt == null || t.exit == null)
+          && (String(t.managedId || "") === String(pos.id) || bare(t.sym) === bare(pos.symbol || pos.brokerSym)));
+        if (!mine.length) return false;
+        const fills = await deltaFillsFor(uid);
+        if (!fills) return false;                                   // unreadable ⇒ fail-closed (manual reconcile still available)
+        const cvBySym = await deltaCvBySym();
+        const now = Date.now();
+        let did = false;
+        for (const t of mine) {
+          const cv = cvBySym.get(bare(t.sym)) || 1;
+          const real = reconcile.reconstructExitFromDeltaFills(t, fills, { contractValue: cv });
+          if (!real) continue;                                     // no fully-covering closing fills ⇒ leave for manual
+          await db.updateTrade(key, { ...t, exit: real.exit, exitAt: real.exitAt || now, pnl: real.pnl, status: "closed",
+            reconciled: true, reconciledAt: now, exitType: "Closed (reconciled)",
+            reconcileReason: "Auto-reconciled — exit price/P&L reconstructed from Delta fills." }).catch(() => {});
+          did = true;
+        }
+        if (did) { rcBust(`trades:${storageKeyFor(uid)}`); logFinancial("autoexit.delta_trade_reconciled", { userId: uid, managedId: pos.id, sym: pos.symbol }); }
+        return did;
+      } catch (e) { logFinancial("autoexit.delta_trade_reconcile_failed", { userId: pos && pos.userId, managedId: pos && pos.id, err: String((e && e.message) || e) }); return false; }
+    }
+
     for (const pos of open) {
       if (pos.status === "closing") {
         /* R11-P1-01: "closing" is a transient claim — set just before the broker call and cleared to
@@ -9285,7 +9338,7 @@ async function runAutoExitEngine() {
           if (pos.broker === "delta") { const held = await deltaHeldFor(pos.userId); if (held && !held.has(String(pos.brokerSym))) flat = true; }
           else if (pos.broker === "fyers") { const sess = await sessionFromCred(pos.userId, "fyers"); const q = sess ? await fyersSellableLong(sess, pos.brokerSym, pos.product) : null; if (q != null && q <= 0) flat = true; }   // R14-P1-02: product-aware, so a settled CNC holding isn't seen as flat
         } catch { /* couldn't verify → reopen to keep it protected */ }
-        if (flat) { await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — flat after stale close", closingSince: null, exitTag: null }); reconciled++; continue; }
+        if (flat) { if (pos.broker === "delta") await reconcileDeltaTradeExit(pos); await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — flat after stale close", closingSince: null, exitTag: null }); reconciled++; continue; }
         await db.updateManagedPosition(pos.id, { status: "open", closingSince: null, exitTag: null, lastError: "recovered a stranded 'closing' state — resumed monitoring" });
         console.warn(`[autoexit] recovered STRANDED closing ${pos.symbol} for ${pos.userId} → resumed monitoring`);
         continue;   // re-processed as an open position on the next sweep
@@ -9302,6 +9355,8 @@ async function runAutoExitEngine() {
       if (pos.broker === "delta") {
         const held = await deltaHeldFor(pos.userId);
         if (held && !held.has(String(pos.brokerSym))) {
+          // Capture the REAL exit price/P&L from Delta fills onto the trade row (else it books $0). Best-effort.
+          await reconcileDeltaTradeExit(pos);
           await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — closed on Delta" });
           reconciled++;
           continue;
