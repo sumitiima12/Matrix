@@ -2132,7 +2132,9 @@ app.post("/api/forgot/reset", authLimiter, async (req, res) => {
       const u0 = await db.getUser(phone); newTv = Number(u0 && u0.tokenVersion) || 0;
     }
     const u = await db.getUser(phone);
-    res.json({ ok: true, userId: phone, name: (u && u.name) || "", token: signToken(phone, undefined, undefined, newTv) });
+    // Return the account's username (+ email/createdAt) like /api/login does, so the client doesn't re-show the
+    // "Choose your user ID" mandate modal to an account that already has one after a PIN reset.
+    res.json({ ok: true, userId: phone, name: (u && u.name) || "", username: (u && u.username) || null, email: (u && u.email) || null, createdAt: (u && u.createdAt) || null, token: signToken(phone, undefined, undefined, newTv) });
   } catch (e) { serverError(res, e); }
 });
 
