@@ -284,6 +284,61 @@ jobs:
           path: artifacts/
           retention-days: 90
 
+  # FYERS F&O (OPTION) certification — the derivative analogue of the equity FYERS sandbox job, run as its OWN opt-in
+  # job so it never retroactively blocks the equity certification (which does not exercise options). Gated on
+  # vars.CERT_FYERS_FNO=1 + the option contract vars/secrets. This is the evidence a reviewer must have before flipping
+  # MATRIX_FO_MASTER_VALIDATED to enable automated Indian option execution. Publishes a per-SHA evidence artifact.
+  broker-sandbox-fyers-fno:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.CERT_FYERS_FNO == '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: FYERS F&O option order + fill certification (UAT)
+        env:
+          FYERS_SANDBOX_APP_ID: ${{ secrets.FYERS_SANDBOX_APP_ID }}
+          FYERS_SANDBOX_TOKEN: ${{ secrets.FYERS_SANDBOX_TOKEN }}
+          FYERS_SANDBOX_BASE: ${{ vars.FYERS_SANDBOX_BASE }}
+          FYERS_SANDBOX_ACCOUNT_ALLOW: ${{ vars.FYERS_SANDBOX_ACCOUNT_ALLOW }}
+          FYERS_SANDBOX_ALLOWED_HOSTS: ${{ vars.FYERS_SANDBOX_ALLOWED_HOSTS }}
+          # F&O-specific (options roll weekly, so the exact contract + one-lot qty must be supplied per cert run):
+          FYERS_FNO_SANDBOX_SYMBOL: ${{ vars.FYERS_FNO_SANDBOX_SYMBOL }}
+          FYERS_FNO_SANDBOX_QTY: ${{ vars.FYERS_FNO_SANDBOX_QTY }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [ -z "${FYERS_SANDBOX_APP_ID:-}" ] || [ -z "${FYERS_SANDBOX_TOKEN:-}" ] || [ -z "${FYERS_SANDBOX_BASE:-}" ]; then
+            echo "fyers_fno=NOT_CONFIGURED (creds/base missing)" | tee artifacts/broker-sandbox-fyers-fno.txt
+            echo "::error::CERT_FYERS_FNO=1 but FYERS sandbox creds/base are missing"; exit 1
+          fi
+          if [ -z "${FYERS_FNO_SANDBOX_SYMBOL:-}" ] || [ -z "${FYERS_FNO_SANDBOX_QTY:-}" ]; then
+            echo "fyers_fno=NOT_CONFIGURED (option contract/qty missing)" | tee artifacts/broker-sandbox-fyers-fno.txt
+            echo "::error::CERT_FYERS_FNO=1 but FYERS_FNO_SANDBOX_SYMBOL / FYERS_FNO_SANDBOX_QTY are missing (options roll weekly — set the exact contract)"; exit 1
+          fi
+          ls test/fyersFnoSandbox*.cjs >/dev/null 2>&1 || { echo "::error::fyers f&o sandbox suite file missing"; exit 1; }
+          BROKER_SANDBOX=1 node --test test/fyersFnoSandbox*.cjs 2>&1 | tee artifacts/broker-sandbox-fyers-fno.tap
+          PASS=$(grep -c '^ok ' artifacts/broker-sandbox-fyers-fno.tap || true)
+          FAIL=$(grep -c '^not ok ' artifacts/broker-sandbox-fyers-fno.tap || true)
+          SKIP=$(grep -Ec '^(ok|not ok) .*# (SKIP|skip)\b' artifacts/broker-sandbox-fyers-fno.tap || true)
+          echo "commit=${GITHUB_SHA} want_fyers_fno=1 pass=${PASS} fail=${FAIL} skipped=${SKIP}" | tee artifacts/broker-sandbox-fyers-fno.txt
+          if [ "${PASS:-0}" -le 0 ] || [ "${FAIL:-0}" -ne 0 ] || [ "${SKIP:-0}" -ne 0 ]; then
+            echo "fyers_fno=NOT_CERTIFIED" | tee -a artifacts/broker-sandbox-fyers-fno.txt
+            echo "::error::FYERS F&O certification invalid (need pass>0, fail=0, skipped=0)"; exit 1
+          fi
+          echo "fyers_fno=CERTIFIED" | tee -a artifacts/broker-sandbox-fyers-fno.txt
+      - name: Upload FYERS F&O certification evidence (per-SHA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-sandbox-fyers-fno-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 90
+
   # R39-P1-03: MatrixOne-PATH real-broker E2E on a STATIC-IP self-hosted runner. Delta whitelists egress IPs, so this
   # can't run on GitHub's shared runners — it targets `runs-on: [self-hosted, linux]` (register the Oracle VM as a
   # repo runner with those labels). It boots a REAL PostgreSQL service + drives an order through MatrixOne's own route

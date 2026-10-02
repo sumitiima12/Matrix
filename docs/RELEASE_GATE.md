@@ -58,3 +58,26 @@ The live broker suites refuse to run unless the resolved base host is on an appr
 Every opened position is wrapped in `try/finally` with a bounded emergency flatten that verifies flat; if flat cannot be
 proven the run fails with a `MANUAL INTERVENTION REQUIRED` marker. Use a dedicated isolated sandbox account with strict
 broker-side quantity/notional caps (`*_SANDBOX_MAX_SIZE` / `*_SANDBOX_MAX_QTY`).
+
+## FYERS F&O (option) certification — gates `MATRIX_FO_MASTER_VALIDATED`
+
+Automated Indian **option** execution (the "Trade options instead of the stock" auto-buy path) is a **separate
+capability** from equity auto-buy, so it has its own certification. The equity FYERS/Delta certs above do NOT exercise
+an option contract, a limit-priced entry, or an option square-off, so passing them does not certify options.
+
+Before `MATRIX_FO_MASTER_VALIDATED=1` may take effect (it enables live option orders), the deploy SHA must carry a
+passing FYERS-F&O evidence artifact:
+
+| Artifact | Must show |
+|---|---|
+| `broker-sandbox-fyers-fno-evidence-<sha>` | `fyers_fno=CERTIFIED`, `pass>0`, `fail=0`, `skipped=0`, non-zero placement/fillVerify/close/quote counts |
+
+- Runs in the opt-in `broker-sandbox-fyers-fno` CI job, gated on `vars.CERT_FYERS_FNO=1` (so it never retroactively
+  blocks the equity cert). It reuses the FYERS UAT creds/base/account-allow-list and adds `FYERS_FNO_SANDBOX_SYMBOL`
+  (the exact NFO option contract — **no default**, options roll weekly) and `FYERS_FNO_SANDBOX_QTY` (one lot).
+- The suite (`test/fyersFnoSandbox.sandbox.cjs`) proves the exact auto-buy option lifecycle: read the live premium →
+  place a **marketable LIMIT** BUY (asserted `type:1` + positive `limitPrice` — never a market option order) → verify
+  the fill from `/tradebook` → reduce-only square-off → verify flat, with the same host allow-list + `try/finally`
+  emergency flatten as the equity cert.
+- The MatrixOne-path option journey through the auto-buy engine (resolve legs at fire time → LIMIT-at-premium → journal
+  → managed exit) is the follow-on to the raw-endpoint cert above, analogous to `brokerPipelineE2E` for equity/crypto.
