@@ -1435,6 +1435,80 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* ONE-TIME BACKFILL of stale $0-exit crypto trades. The phantom reconcile above only revisits OPEN rows; a
+   trade that was closed broker-side BEFORE the exit-reconstruction fix shipped is already CLOSED but booked at
+   its ENTRY price (exit≈entry → $0 realized P&L → counts as a loss → drags win-rate to 0%). Those rows are
+   never re-examined. This endpoint re-reconstructs the TRUE exit for exactly those rows from Delta's own fills,
+   using the SAME pure, conservative reconstructor the live path uses. Guarantees:
+     • Delta only, this token's own book, real + Crypto + already-closed rows with entry>0, qty>0.
+     • A row is a candidate ONLY if it's booked at ~break-even (exit missing, or exit≈entry, or pnl===0) — a
+       genuinely break-even trade stays a candidate but is only REWRITTEN when the reconstruction yields a
+       materially different exit/P&L, so re-running is idempotent and never churns correct rows.
+     • Fail-closed: if Delta fills can't be read, NOTHING is touched.
+     • Preview by default (reports what WOULD change); pass { apply: true } to write. */
+app.post("/api/trades/backfill-exits", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const sess = await sessionFromCred(req.authUserId, "delta");
+    if (!sess) return res.status(400).json({ error: "Connect your Delta account first — the backfill reconstructs exits from Delta's own fills." });
+    const apply = req.body && req.body.apply === true;
+    const EPS = 1e-9;
+    const baseSym = (s) => String(s || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "");
+    const trades = await db.getTrades(userId, 0, Date.now()).catch(() => []);
+    // Closed, real, crypto rows booked at ~break-even (the $0-exit signature).
+    const stale = (trades || []).filter((t) => {
+      if (!t || t.real !== true || (t.market || "") !== "Crypto") return false;
+      if (t.status === "rejected") return false;
+      if (!(Number(t.entry) > 0) || !(Number(t.qty) > 0)) return false;
+      const isClosed = t.exitAt != null || t.status === "closed";
+      if (!isClosed) return false;   // open rows are handled by /reconcile-real, not here
+      const exit = Number(t.exit);
+      const atEntry = !(exit > 0) || Math.abs(exit - Number(t.entry)) <= Math.abs(Number(t.entry)) * 1e-6;
+      const zeroPnl = Math.abs(Number(t.pnl) || 0) <= EPS;
+      return atEntry || zeroPnl;   // break-even signature → eligible for re-reconstruction
+    });
+    // Read Delta fills + per-symbol contract value once (same plumbing as reconcile-real). Fail-closed.
+    let deltaFills = null; const cvBySym = new Map();
+    try {
+      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { userId: req.authUserId }), 45000, "Delta fills read");
+      if (fr && Array.isArray(fr.result)) deltaFills = fr.result;
+      const prods = await deltaCall("GET", "/v2/products", { signed: false }).catch(() => null);
+      for (const p of (prods && prods.result) || []) { const s = baseSym(p.symbol); if (s) cvBySym.set(s, Number(p.contract_value) || 1); }
+    } catch { deltaFills = null; }
+    if (!deltaFills) return res.status(502).json({ ok: false, error: "Couldn't read your Delta fills right now — nothing was changed. Try again in a moment." });
+    const now = Date.now();
+    const changes = [];
+    for (const t of stale) {
+      const cv = cvBySym.get(baseSym(t.sym)) || 1;
+      // Real crypto is Delta-only in MatrixOne; force the broker tag so an older row that predates broker
+      // stamping is still reconstructable (the reconstructor requires broker==="delta").
+      const real = reconcile.reconstructExitFromDeltaFills({ ...t, broker: "delta" }, deltaFills, { contractValue: cv });
+      if (!real || !(Number(real.exit) > 0)) continue;   // no covering closing-fill sequence → leave the row as-is
+      const newPnl = Number(real.pnl) || 0;
+      const oldPnl = Number(t.pnl) || 0;
+      const exitMoved = Math.abs(Number(real.exit) - Number(t.exit || t.entry)) > Math.abs(Number(t.entry)) * 1e-6;
+      const pnlMoved = Math.abs(newPnl - oldPnl) > Math.max(EPS, Math.abs(oldPnl) * 1e-6);
+      if (!exitMoved && !pnlMoved) continue;   // reconstruction agrees with what's booked → idempotent no-op
+      changes.push({ id: t.id, sym: t.sym, entry: Number(t.entry), oldExit: Number(t.exit) || null, newExit: Number(real.exit), oldPnl, newPnl, exitAt: real.exitAt || t.exitAt || now });
+    }
+    if (!apply) {
+      return res.json({ ok: true, preview: true, candidates: stale.length, wouldUpdate: changes.length, changes });
+    }
+    let updated = 0;
+    for (const c of changes) {
+      const t = stale.find((x) => String(x.id) === String(c.id));
+      if (!t) continue;
+      await db.updateTrade(userId, { ...t, broker: t.broker || "delta", exit: c.newExit, exitAt: c.exitAt, pnl: c.newPnl, status: "closed",
+        reconciled: true, reconciledAt: now, exitType: "Closed (reconciled)",
+        reconcileReason: "Exit price/P&L backfilled from Delta fills (stale $0-exit row)." }).catch(() => {});
+      updated++;
+    }
+    logFinancial("trades.backfillExits", { userId, candidates: stale.length, updated });
+    rcBust(`trades:${userId}`);
+    res.json({ ok: true, candidates: stale.length, updated, changes });
+  } catch (e) { serverError(res, e); }
+});
+
 /* SERVER-OWNED RISK POLICY (R15-P1-02). The per-user caps are the REAL safety control, so they must be
    stored server-side and loaded on every order — a tampered/old client can't drop them by omitting the
    body. Only clean positive numbers are kept. `merge` returns the STRICTER of two policies per field so a
@@ -10257,8 +10331,75 @@ async function runAutoBuyEngine() {
         }
       }
     }
+    // AUTO-RECONCILE stuck-order review. Runs under the SAME engine lease we already hold (single-owner),
+    // so a strategy whose outcome is now VERIFIABLE at the broker clears itself instead of waiting for the
+    // user to tap "Resume" every session. Fail-closed: anything unreadable stays in review untouched.
+    await reconcileStuckStrategies(posCache).catch((e) => console.error("[autobuy] reconcile pass failed:", e && e.message));
   } catch (e) { console.error("[autobuy] sweep failed:", e.message); }
   finally { autoBuyRunning = false; lastAutoBuy = { at: Date.now(), checked, bought, live }; }
+}
+
+/* AUTO-RECONCILE of strategies parked under unknown-order review. This re-runs, with NO human in the loop,
+   exactly the SAFE broker-evidence branches the manual Resume (/api/autobuy/pause) uses — and ONLY those.
+   Every branch requires positive broker evidence before it clears the review marker, so it can never create
+   a duplicate entry or invent position truth:
+     • a matching OPEN managed position already exists  → LINK it + activate (no order placed)
+     • the broker's order book confirms the order never landed (probe===false) → clear + activate
+     • the broker shows an OPEN position for the instrument (size>0) → ADOPT it (links, no new order) + activate
+     • the broker shows the account FLAT (size===0) AND the order book is readable → the round-trip is done →
+       clear + activate
+     • ANYTHING unreadable (probe===null / size===null / transport error) → LEAVE in review (fail-closed)
+   Only reconcilable brokers (Delta/FYERS) have the position/order lookups this depends on; others are skipped
+   and keep waiting for the user, exactly as the manual route already requires. */
+async function reconcileStuckStrategies(posCache) {
+  let review = [];
+  try { review = await db.getRealStrategiesNeedingReview(200); } catch { return; }
+  if (!review.length) return;
+  const managedFor = async (uid) => {
+    if (posCache && posCache.has(uid)) return posCache.get(uid);
+    const m = await db.getManagedPositionsForUser(uid).catch(() => []);
+    if (posCache) posCache.set(uid, m);
+    return m;
+  };
+  for (const st of review) {
+    try {
+      if (!RECONCILABLE_BROKERS.has(st.broker)) continue;   // can't verify → keep waiting for the user
+      // 1) A matching OPEN managed position already exists → link + resume. No broker call, no order. Safe.
+      const openMatch = (await managedFor(st.userId)).find((p) => (p.status === "open" || p.status === "closing") && String(p.brokerSym) === String(st.brokerSym) && Number(p.entry) > 0);
+      if (openMatch) {
+        await db.updateRealStrategy(st.id, { status: "active", openPositionId: openMatch.id, pendingSince: null, pendingClientId: null, needsReview: false, lastError: null, lastOrderStatus: "linked" });
+        logFinancial("autobuy.autoreconcile.linked", { userId: st.userId, id: st.id, positionId: openMatch.id });
+        continue;
+      }
+      // 2) Ask the broker's own order book whether our order ever landed.
+      const probe = await brokerOrderProbe(st);
+      if (probe === false) {
+        // Verified absent at the broker — nothing executed. Clear + resume fresh. Safe.
+        await db.updateRealStrategy(st.id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null, lastOrderStatus: "no-order" });
+        logFinancial("autobuy.autoreconcile.resumedClean", { userId: st.userId, id: st.id });
+        continue;
+      }
+      if (probe == null) continue;   // couldn't read the order book → unverifiable → stay in review (fail-closed)
+      // probe === true: the order DID reach the broker. Read the broker's actual position to decide.
+      const os = await brokerOpenSize(st);
+      if (os == null) continue;      // couldn't read the position → unverifiable → stay in review (fail-closed)
+      if (os.size > 0) {
+        // Broker HOLDS a position for this instrument → adopt it (links the real position, places NO order) + resume.
+        let adopted = null;
+        try { adopted = await adoptBrokerPosition(st); } catch { continue; }   // broker unreachable mid-adopt → retry next tick
+        if (adopted) {
+          await db.updateRealStrategy(st.id, { status: "active", openPositionId: adopted.id, pendingSince: null, pendingClientId: null, needsReview: false, lastError: null, lastOrderStatus: "filled" });
+          logFinancial("autobuy.autoreconcile.adopted", { userId: st.userId, id: st.id, positionId: adopted.id });
+        }
+        continue;   // couldn't attribute a clean fill → leave in review for the user
+      }
+      // os.size === 0: the order landed but the account is FLAT for this instrument → the position round-tripped
+      // (entry + exit both done). No duplicate is possible from clearing. Resume. The exit engine / Delta-flat
+      // reconcile path books the realised P&L on the managed row separately.
+      await db.updateRealStrategy(st.id, { status: "active", pendingSince: null, pendingClientId: null, needsReview: false, lastError: null, lastOrderStatus: "flat" });
+      logFinancial("autobuy.autoreconcile.flat", { userId: st.userId, id: st.id });
+    } catch (e) { console.error("[autobuy] reconcile strategy failed:", st && st.id, e && e.message); }
+  }
 }
 /* Auto-BUY entry engine. 120s default (was 60s) halves its Neon reads; a 2-minute entry check is fine
    for the 5m+ strategies it runs, and it early-outs (one small query) when no strategy is armed. */
