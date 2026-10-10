@@ -32,12 +32,20 @@ const AUTOMATED_ORIGINS = Object.freeze(new Set([
    their engine). "Manual" is LOW-CONFIDENCE (it was also the missing-value default), so evidence can override
    it UP to an automated origin — but an automated origin is NEVER downgraded to MANUAL. Empty ⇒ no signal. */
 function originFromTradeType(tt) {
-  switch (String(tt || "").trim().toLowerCase()) {
+  const s = String(tt || "").trim().toLowerCase();
+  // Exit legs are stamped "<Entry Type> Exit" (e.g. "Manual Exit", "Auto Buy Exit"). Resolve them to the SAME
+  // origin as their entry instead of letting them fall through to UNKNOWN (which dumped every exit row into the
+  // "Unknown/Imported" P&L bucket and mislabeled the Source column).
+  if (s.endsWith(" exit")) return originFromTradeType(s.slice(0, -5));
+  switch (s) {
     case "auto buy": return { origin: ORIGIN.SMART_AUTO_BUY, trusted: true };
     case "screener auto buy": return { origin: ORIGIN.SCREENER, trusted: true };
     case "automate": return { origin: ORIGIN.AUTOMATE, trusted: true };
     case "ideas": case "idea": return { origin: ORIGIN.IDEA, trusted: true };
     case "manual": return { origin: ORIGIN.MANUAL, trusted: false };   // ambiguous — was also the default
+    // Server-authored reconstruction/recovery rows are not a trading origin; treat as MANUAL (low-confidence) so
+    // they stop landing in "Unknown/Imported". Evidence can still override UP to an automated origin.
+    case "recovery": return { origin: ORIGIN.MANUAL, trusted: false };
     default: return { origin: null, trusted: false };                  // empty / unrecognised ⇒ no signal
   }
 }

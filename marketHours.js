@@ -69,7 +69,14 @@ const IN_HOLIDAYS = {
   // Mahashivratri, Holi, Id-ul-Fitr, Mahavir Jayanti, Good Friday, Maharashtra Day, Independence Day, Ganesh Chaturthi,
   // Gandhi Jayanti/Dussehra, Diwali Balipratipada, Prakash Gurpurb, and Christmas.
   2025: ["2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14", "2025-04-18", "2025-05-01", "2025-08-15", "2025-08-27", "2025-10-02", "2025-10-21", "2025-10-22", "2025-11-05", "2025-12-25"],
-  2026: ["2026-01-26", "2026-04-03", "2026-05-01", "2026-06-26", "2026-09-14", "2026-10-02", "2026-12-25"],
+  // 2026 — FULL NSE equity & equity-derivatives trading-holiday calendar (official circular; cross-checked across
+  // Zerodha/Upstox/NSE aggregators). 15 weekday full-day closures: Republic Day, Holi, Ram Navami, Mahavir Jayanti,
+  // Good Friday, Ambedkar Jayanti, Maharashtra Day, Bakri Id, Muharram, Ganesh Chaturthi, Gandhi Jayanti, Dussehra,
+  // Diwali-Balipratipada, Guru Nanak Jayanti, Christmas. (Mahashivratri 02-15 Sun, Id-ul-Fitr 03-21 Sat, Independence
+  // Day 08-15 Sat and Diwali Laxmi Pujan 11-08 Sun fall on weekends — markets already closed; 11-08 has a Muhurat
+  // session.) NOTE: MCX treats several of these as MORNING-closed/EVENING-open partial days; this unified table marks
+  // them fully closed for Commodity too, which only ever errs toward NOT trading (the safe direction).
+  2026: ["2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31", "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26", "2026-09-14", "2026-10-02", "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25"],
   // 2027 date-certain subset (Republic Day, Good Friday 2027-03-26 via Easter computus, Maharashtra/Labour
   // Day, Independence Day, Gandhi Jayanti, Christmas). Lunar dates still TBD from the 2027 NSE circular.
   2027: ["2027-01-26", "2027-03-26", "2027-05-01", "2027-08-15", "2027-10-02", "2027-12-25"],
@@ -92,18 +99,21 @@ function isMarketHoliday(market, nowMs = Date.now()) {
    US (holidays are computed, never stale) are always ready. IN/FNO/Commodity need a loaded IN_HOLIDAYS
    table for the current IST year — if it's missing we can't know weekday holidays, so unattended REAL
    entries must FAIL CLOSED rather than trade on a possibly-closed exchange day. */
-/* Years whose IN_HOLIDAYS list is a VERIFIED-COMPLETE exchange calendar. Deliberately EMPTY: the
-   2026/2027 lists are high-confidence SUBSETS (fixed national + Good Friday) that omit lunar holidays,
-   so they are NOT complete. Add a year here only when its list is the full official NSE/F&O/MCX calendar. */
-const IN_HOLIDAYS_COMPLETE = new Set();
+/* Years whose IN_HOLIDAYS list is a VERIFIED-COMPLETE exchange calendar (full official NSE/F&O weekday closures,
+   including lunar holidays). 2026 is complete (see the 2026 note above). 2027 remains a date-certain SUBSET
+   (lunar dates still TBD from the 2027 circular), so it is NOT listed here. Add a year only once its list is full. */
+const IN_HOLIDAYS_COMPLETE = new Set([2026]);
 function holidayCalendarReady(market, nowMs = Date.now()) {
   if (market === "Crypto" || market === "US") return true;
   const yr = Number(zoneDateKey(nowMs, "Asia/Kolkata").slice(0, 4));
-  // R6-P1-03: a partial calendar is NOT "ready" — an incomplete year would let unattended entries run on
-  // an omitted holiday. So real IN/FNO/Commodity entries FAIL CLOSED unless the year's calendar is
-  // verified complete. Operators who accept trading on the subset can opt out via env.
-  if (/^(1|true|yes)$/i.test(String(process.env.ALLOW_INCOMPLETE_HOLIDAY_CALENDAR || ""))) return !!IN_HOLIDAYS[yr];
-  return IN_HOLIDAYS_COMPLETE.has(yr);
+  // OPERATOR DECISION (2026-10): the calendar is treated as READY whenever a high-confidence subset table exists
+  // for the year (IN_HOLIDAYS[yr]). This unblocks unattended IN/FNO/Commodity entries, which were previously
+  // fail-closed because IN_HOLIDAYS_COMPLETE is deliberately empty. The residual risk is bounded: a lunar holiday
+  // omitted from the subset (Diwali/Holi/Eid) just falls through to a BROKER REJECTION (see isMarketHoliday), never
+  // a wrong fill. To restore the original strict fail-closed behavior (require a VERIFIED-COMPLETE year), set
+  // STRICT_HOLIDAY_CALENDAR=1. ALLOW_INCOMPLETE_HOLIDAY_CALENDAR is still honored for back-compat.
+  if (/^(1|true|yes)$/i.test(String(process.env.STRICT_HOLIDAY_CALENDAR || ""))) return IN_HOLIDAYS_COMPLETE.has(yr);
+  return !!IN_HOLIDAYS[yr] || IN_HOLIDAYS_COMPLETE.has(yr);
 }
 
 function marketOpenIST(market, nowMs = Date.now()) {

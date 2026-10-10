@@ -1316,11 +1316,50 @@ app.post("/api/order/resolve-unknown", requireAuth, async (req, res) => {
   }
   let reconciled = null;
   try { reconciled = await runC03Reconcile("user-resolve"); } catch { /* best-effort — still report the count below */ }
+
+  /* R36 (2026-10) — BROKER-PROVEN clear for MANUAL_RECONCILIATION_REQUIRED attempts. An order the broker can no
+     longer prove (e.g. a FYERS previous-session order) is stamped MANUAL_RECONCILIATION_REQUIRED and left
+     resolved=FALSE, so it never leaves listUnresolvedOrderAttempts and the periodic C03 sweep RE-LOCKS the account
+     every ~15s — the kill-switch Resume clears the lock but the next sweep re-engages it, and the user is stuck
+     re-Resolving forever. Fix WITHOUT weakening fail-closed: take the SAME fresh broker snapshot the Resume gate
+     uses (brokerSnapshotForUnlock). ONLY if the broker is readable AND proves the account flat do we finalize those
+     manual attempts as resolved (with the broker-flat evidence) and clear halt + risk-lock. No proof (broker
+     unreachable, stale, or holding exposure) ⇒ nothing is resolved and the lock stays on. This never fabricates a
+     fill and never creates duplicate-order risk — it only acknowledges a broker-confirmed-flat unprovable order. */
+  let brokerCleared = false;
+  try {
+    let myAttempts = [];
+    try { myAttempts = typeof db.getOrderAttemptsForUser === "function" ? await db.getOrderAttemptsForUser(userId, 5000) : []; } catch { myAttempts = []; }
+    const manual = (myAttempts || []).filter((a) => a && !a.resolved && String(a.status) === "MANUAL_RECONCILIATION_REQUIRED");
+    if (manual.length) {
+      let snap = null;
+      try { snap = await brokerSnapshotForUnlock(userId); } catch { snap = { ok: false, reason: "broker snapshot threw" }; }
+      if (snap && snap.ok) {
+        for (const a of manual) {
+          try {
+            await db.finalizeOrderAttempt(a.id, "MANUAL_RECONCILIATION_REQUIRED", {
+              resolved: true,
+              resolution: { manual: true, brokerFlat: true, via: "user-resolve", verifiedAt: Date.now(),
+                snapshot: { reason: snap.reason || null, checked: snap.checked ?? null, verified: snap.verified ?? null, watermark: snap.watermark ?? null } },
+            });
+          } catch { /* best-effort per attempt — the sweep will retry the rest */ }
+        }
+        try { if (typeof db.setEntryHalt === "function") await db.setEntryHalt(userId, false); } catch { /* best-effort */ }
+        try { if (typeof db.setRiskLock === "function") await db.setRiskLock(userId, false); } catch { /* best-effort */ }
+        try { haltedEntries.delete(String(userId)); } catch { /* engine may not be up */ }
+        brokerCleared = true;
+        try { logFinancial("order.resolveUnknown.brokerCleared", { user: userId, cleared: manual.length, reason: snap.reason || null }); } catch { /* optional */ }
+      } else {
+        try { logFinancial("order.resolveUnknown.brokerStillLocked", { user: userId, pending: manual.length, reason: (snap && snap.reason) || null }); } catch { /* optional */ }
+      }
+    }
+  } catch { /* best-effort — fall through to the count below */ }
+
   let remaining = 0;
   try { remaining = typeof db.countUnknownIdempotency === "function" ? await db.countUnknownIdempotency(userId) : 0; }
   catch { return res.status(503).json({ error: "Couldn't verify your account's order status right now — please retry in a moment." }); }
-  try { logFinancial("order.resolveUnknown", { user: userId, remaining, reconciled: !!(reconciled && !reconciled.skipped) }); } catch { /* optional */ }
-  return res.json({ ok: true, remaining, cleared: remaining === 0 });
+  try { logFinancial("order.resolveUnknown", { user: userId, remaining, reconciled: !!(reconciled && !reconciled.skipped), brokerCleared }); } catch { /* optional */ }
+  return res.json({ ok: true, remaining, cleared: remaining === 0, brokerCleared });
 });
 
 /* Clear the caller's VIRTUAL (paper) trades across all markets. Real broker trades are never
@@ -7485,7 +7524,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         } else {
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: bareKiteSym, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-            entryAt: Date.now(), market: kiteMarket, real: true, broker: "zerodha", tradeType: String(req.body?.tradeType || "Manual"), orderId: kiteOrderId, serverAuthored: true,
+            entryAt: Date.now(), market: kiteMarket, real: true, broker: "zerodha", tradeType: String(req.body?.tradeType || "Manual"), orderId: kiteOrderId, serverAuthored: true, ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}),
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });
           if (!journaled) kiteTrackingFailed = true;
@@ -7597,7 +7636,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: String(symbol).replace(/^NSE:/, "").replace(/-EQ$/, ""), side,
             qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-            entryAt: c.execTs || Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true,
+            entryAt: c.execTs || Date.now(), market: regMarket, real: true, broker: "fyers", tradeType: String(req.body?.tradeType || "Manual"), orderId: d.id, serverAuthored: true, ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}),
             // R27-P2-02: durable strategy attribution so a real Screener/Automate fill stays on its card after reload.
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });   // H2: if the fill can't be journaled, halt AUTOMATED entries so risk isn't computed on an incomplete book
@@ -7814,7 +7853,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       } else {
         // M02: prefer Delta's own execution timestamp (updated_at/created_at) for the journal entry time.
         const deltaExecTs = reconcile.brokerFillTsMs([o.updated_at, o.created_at]) || Date.now();
-        deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: deltaSym, side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: deltaExecTs, market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}) }, { haltUserIdOnFail: sess.userId });
+        deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: deltaSym, side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: deltaExecTs, market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}), ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}) }, { haltUserIdOnFail: sess.userId });
       }
       // R25-H07: a filled Delta order whose fill couldn't be journaled is reconciliation-required, not a plain success.
       if (!deltaJournaled) {
@@ -7896,7 +7935,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         } else {
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: base, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-            entryAt: Date.now(), market: "Crypto", real: true, broker: "coindcx", tradeType: String(req.body?.tradeType || "Manual"), orderId: coinOrderId, serverAuthored: true,
+            entryAt: Date.now(), market: "Crypto", real: true, broker: "coindcx", tradeType: String(req.body?.tradeType || "Manual"), orderId: coinOrderId, serverAuthored: true, ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}),
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });
           if (!journaled) coinTrackingFailed = true;
@@ -8035,7 +8074,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         } else {
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: bareDhanSym, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-            entryAt: Date.now(), market: dhanMarket, real: true, broker: "dhan", tradeType: String(req.body?.tradeType || "Manual"), orderId: dhanOrderId, serverAuthored: true,
+            entryAt: Date.now(), market: dhanMarket, real: true, broker: "dhan", tradeType: String(req.body?.tradeType || "Manual"), orderId: dhanOrderId, serverAuthored: true, ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}),
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });
           if (!journaled) dhanTrackingFailed = true;
@@ -8125,7 +8164,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         } else {
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: bare, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-            entryAt: Date.now(), market: growwMarket, real: true, broker: "groww", tradeType: String(req.body?.tradeType || "Manual"), orderId: growwOrderId, serverAuthored: true,
+            entryAt: Date.now(), market: growwMarket, real: true, broker: "groww", tradeType: String(req.body?.tradeType || "Manual"), orderId: growwOrderId, serverAuthored: true, ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}),
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });
           if (!journaled) growwTrackingFailed = true;
@@ -8203,7 +8242,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         } else {
           const journaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), {
             sym: bareIndmSym, side, qty: c.filledQty || Number(qty), entry: Number(c.avgPrice) || Number(price) || 0,
-            entryAt: Date.now(), market: indmMarket, real: true, broker: "indmoney", tradeType: String(req.body?.tradeType || "Manual"), orderId: indmOrderId, serverAuthored: true,
+            entryAt: Date.now(), market: indmMarket, real: true, broker: "indmoney", tradeType: String(req.body?.tradeType || "Manual"), orderId: indmOrderId, serverAuthored: true, ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}),
             ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}),
           }, { haltUserIdOnFail: sess.userId });
           if (!journaled) indmTrackingFailed = true;
