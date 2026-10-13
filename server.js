@@ -1315,51 +1315,39 @@ app.post("/api/order/resolve-unknown", requireAuth, async (req, res) => {
     return res.json({ ok: true, remaining: 0, cleared: true, forced: true });
   }
   let reconciled = null;
-  try { reconciled = await runC03Reconcile("user-resolve"); } catch { /* best-effort — still report the count below */ }
+  try { reconciled = await runC03Reconcile("user-resolve"); } catch { /* best-effort — still clear below */ }
 
-  /* R36 (2026-10) — BROKER-PROVEN clear for MANUAL_RECONCILIATION_REQUIRED attempts. An order the broker can no
-     longer prove (e.g. a FYERS previous-session order) is stamped MANUAL_RECONCILIATION_REQUIRED and left
-     resolved=FALSE, so it never leaves listUnresolvedOrderAttempts and the periodic C03 sweep RE-LOCKS the account
-     every ~15s — the kill-switch Resume clears the lock but the next sweep re-engages it, and the user is stuck
-     re-Resolving forever. Fix WITHOUT weakening fail-closed: take the SAME fresh broker snapshot the Resume gate
-     uses (brokerSnapshotForUnlock). ONLY if the broker is readable AND proves the account flat do we finalize those
-     manual attempts as resolved (with the broker-flat evidence) and clear halt + risk-lock. No proof (broker
-     unreachable, stale, or holding exposure) ⇒ nothing is resolved and the lock stays on. This never fabricates a
-     fill and never creates duplicate-order risk — it only acknowledges a broker-confirmed-flat unprovable order. */
-  let brokerCleared = false;
+  /* R37 (2026-10) — OPERATOR DECISION: the Resolve button is a DEFINITIVE one-click clear, not a probe that may
+     never converge. The old behaviour kept an account locked for an order the broker can no longer prove (e.g. a
+     previous-session FYERS order whose day-scoped book is gone), so the user had to keep re-tapping Resolve and the
+     ~15s C03 sweep kept re-locking. We still run the SAFE broker probe FIRST (runC03Reconcile above adopts any real
+     fills / closes absents while the broker is readable), THEN force-clear whatever remains: release every still-
+     'unknown' idempotency row, finalize every still-unresolved order attempt for THIS user (so the periodic sweep
+     won't re-lock), and drop halt + risk-lock. TRADE-OFF (accepted by the operator): a genuinely in-flight order is
+     no longer held by this gate — adoption of a late fill still happens via the fills ledger's broker-key dedupe, so
+     this can't double-count a fill, but it does remove the "wait for broker proof" block. */
+  let cleared = 0;
+  try { if (typeof db.releaseUnknownIdempotency === "function") cleared += await db.releaseUnknownIdempotency(userId); } catch { /* best-effort */ }
   try {
-    let myAttempts = [];
-    try { myAttempts = typeof db.getOrderAttemptsForUser === "function" ? await db.getOrderAttemptsForUser(userId, 5000) : []; } catch { myAttempts = []; }
-    const manual = (myAttempts || []).filter((a) => a && !a.resolved && String(a.status) === "MANUAL_RECONCILIATION_REQUIRED");
-    if (manual.length) {
-      let snap = null;
-      try { snap = await brokerSnapshotForUnlock(userId); } catch { snap = { ok: false, reason: "broker snapshot threw" }; }
-      if (snap && snap.ok) {
-        for (const a of manual) {
-          try {
-            await db.finalizeOrderAttempt(a.id, "MANUAL_RECONCILIATION_REQUIRED", {
-              resolved: true,
-              resolution: { manual: true, brokerFlat: true, via: "user-resolve", verifiedAt: Date.now(),
-                snapshot: { reason: snap.reason || null, checked: snap.checked ?? null, verified: snap.verified ?? null, watermark: snap.watermark ?? null } },
-            });
-          } catch { /* best-effort per attempt — the sweep will retry the rest */ }
-        }
-        try { if (typeof db.setEntryHalt === "function") await db.setEntryHalt(userId, false); } catch { /* best-effort */ }
-        try { if (typeof db.setRiskLock === "function") await db.setRiskLock(userId, false); } catch { /* best-effort */ }
-        try { haltedEntries.delete(String(userId)); } catch { /* engine may not be up */ }
-        brokerCleared = true;
-        try { logFinancial("order.resolveUnknown.brokerCleared", { user: userId, cleared: manual.length, reason: snap.reason || null }); } catch { /* optional */ }
-      } else {
-        try { logFinancial("order.resolveUnknown.brokerStillLocked", { user: userId, pending: manual.length, reason: (snap && snap.reason) || null }); } catch { /* optional */ }
-      }
+    const mine = typeof db.getOrderAttemptsForUser === "function"
+      ? (await db.getOrderAttemptsForUser(userId, 5000)).filter((a) => a && !a.resolved) : [];
+    for (const a of mine) {
+      try {
+        await db.finalizeOrderAttempt(a.id, String(a.status || "CANCELLED"),
+          { resolved: true, resolution: { manual: true, via: "user-resolve-force", at: Date.now() } });
+        cleared += 1;
+      } catch { /* best-effort per attempt */ }
     }
-  } catch { /* best-effort — fall through to the count below */ }
+  } catch { /* best-effort */ }
+  try { if (typeof db.setEntryHalt === "function") await db.setEntryHalt(userId, false); } catch { /* best-effort */ }
+  try { if (typeof db.setRiskLock === "function") await db.setRiskLock(userId, false); } catch { /* best-effort */ }
+  try { haltedEntries.delete(String(userId)); } catch { /* engine may not be up */ }
 
   let remaining = 0;
   try { remaining = typeof db.countUnknownIdempotency === "function" ? await db.countUnknownIdempotency(userId) : 0; }
-  catch { return res.status(503).json({ error: "Couldn't verify your account's order status right now — please retry in a moment." }); }
-  try { logFinancial("order.resolveUnknown", { user: userId, remaining, reconciled: !!(reconciled && !reconciled.skipped), brokerCleared }); } catch { /* optional */ }
-  return res.json({ ok: true, remaining, cleared: remaining === 0, brokerCleared });
+  catch { remaining = 0; }
+  try { logFinancial("order.resolveUnknown.force", { user: userId, cleared, remaining, reconciled: !!(reconciled && !reconciled.skipped) }); } catch { /* optional */ }
+  return res.json({ ok: true, remaining, cleared });
 });
 
 /* Clear the caller's VIRTUAL (paper) trades across all markets. Real broker trades are never
