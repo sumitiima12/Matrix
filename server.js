@@ -162,13 +162,16 @@ if (!["", "0", "1"].includes(_c03raw)) {
   throw new Error(`[startup] C03_ORDER_ATTEMPTS must be unset, "1" or "0" — got ${JSON.stringify(_c03raw)}. Refusing to start with an ambiguous safety flag.`);
 }
 const C03_ORDER_ATTEMPTS_ON = _c03raw !== "0";
-/* OWNER OFF-SWITCH for the account-wide entry lock. When MATRIX_DISABLE_ENTRY_LOCK is set, an unresolved/unknown
-   order or a risk-lock NO LONGER blocks new entries, and the "Resolve" button force-clears the stuck records. This
-   trades away the duplicate-order safety net (an order whose outcome we couldn't confirm might have filled), so it's
-   the account owner's explicit choice — default OFF keeps the protection on. Requested by the owner after the Delta
-   read path (proxy) went down and left orders un-resolvable, permanently blocking trading. */
-const ENTRY_LOCK_DISABLED = /^(1|true|yes|on)$/i.test(String(process.env.MATRIX_DISABLE_ENTRY_LOCK || ""));
-if (ENTRY_LOCK_DISABLED) console.warn("[safety] MATRIX_DISABLE_ENTRY_LOCK is ON — unknown-order / risk-lock entry blocking is DISABLED (owner override).");
+/* ACCOUNT-WIDE ENTRY LOCK — DEFAULT OFF (operator decision, 2026-10). An unresolved/unknown order or a risk-lock
+   does NOT block new entries, and "Resolve" force-clears the stuck records. The owner repeatedly hit the case where
+   an un-confirmable order (e.g. the Delta read proxy down, or a previous-session order) left trading permanently
+   paused, so the resolve/entry-pause gate is now disabled by default. TRADE-OFF (accepted): the duplicate-order
+   safety net is off — an order whose outcome we couldn't confirm might have filled, and a new entry can still go out.
+   To RE-ENABLE the protection, set MATRIX_ENABLE_ENTRY_LOCK=1 (MATRIX_DISABLE_ENTRY_LOCK is still honored for
+   back-compat and forces it off). */
+const ENTRY_LOCK_DISABLED = /^(1|true|yes|on)$/i.test(String(process.env.MATRIX_DISABLE_ENTRY_LOCK || ""))
+  || !/^(1|true|yes|on)$/i.test(String(process.env.MATRIX_ENABLE_ENTRY_LOCK || ""));
+if (ENTRY_LOCK_DISABLED) console.warn("[safety] entry lock is OFF (default) — unknown-order / risk-lock entry blocking is DISABLED. Set MATRIX_ENABLE_ENTRY_LOCK=1 to restore it.");
 /* R43-P1-01: CoinDCX AUTOMATIC find-by-tag crash recovery. The adapter (_coindcxProbeByTag) is built and safe, but
    the capability registry must not advertise unattended crash recovery for CoinDCX until a LIVE cold-restart cert
    proves the tag lookup end-to-end on a real account. Default OFF: until certified, CoinDCX still fails closed to
@@ -9399,7 +9402,11 @@ async function runAutoExitEngine() {
         const now = Date.now();
         let did = false;
         for (const t of mine) {
-          const cv = cvBySym.get(bare(t.sym)) || 1;
+          // Don't GUESS the contract value: cv=1 on an instrument whose real contract_value≠1 inflates the required
+          // closing-fill size so reconstruction always fails → silent $0. If cv is unknown, leave the row for manual
+          // reconcile instead of reconstructing against a wrong denominator.
+          const cv = cvBySym.get(bare(t.sym));
+          if (!cv || !(cv > 0)) continue;
           const real = reconcile.reconstructExitFromDeltaFills(t, fills, { contractValue: cv });
           if (!real) continue;                                     // no fully-covering closing fills ⇒ leave for manual
           await db.updateTrade(key, { ...t, exit: real.exit, exitAt: real.exitAt || now, pnl: real.pnl, status: "closed",
@@ -9458,6 +9465,17 @@ async function runAutoExitEngine() {
       if (pos.broker === "delta") {
         const held = await deltaHeldFor(pos.userId);
         if (held && !held.has(String(pos.brokerSym))) {
+          /* R38 (2026-10) — RECENCY GATE. Delta's /v2/positions/margined can lag a just-filled order (and never
+             lists spot), so a position that filled seconds ago was being mis-read as "flat on the broker" on the
+             very next 60s sweep and force-closed at exit=entry ($0). Do NOT declare a Delta position flat until it
+             has aged past DELTA_FLAT_MIN_AGE_MS (default 120s) — give the broker time to propagate. A genuinely
+             closed position is still reconciled on a later sweep; this only prevents the false instant-$0 close. */
+          const DELTA_FLAT_MIN_AGE_MS = Number(process.env.DELTA_FLAT_MIN_AGE_MS) || 120000;
+          const ageMs = Date.now() - Number(pos.entryAt || pos.openedAt || pos.createdAt || 0);
+          if (ageMs < DELTA_FLAT_MIN_AGE_MS) {
+            logFinancial("autoexit.delta_flat_too_recent", { userId: pos.userId, managedId: pos.id, sym: pos.symbol, ageMs });
+            continue;   // too soon to trust "flat" — re-check next sweep
+          }
           // Capture the REAL exit price/P&L from Delta fills onto the trade row (else it books $0). Best-effort.
           await reconcileDeltaTradeExit(pos);
           await db.updateManagedPosition(pos.id, { status: "closed", closedAt: Date.now(), exitReason: "reconciled — closed on Delta" });
@@ -9992,8 +10010,10 @@ async function runAutoBuyEngine() {
            fill / reconciliation locks the account and no new automated entry goes out until it clears. Fail
            CLOSED on a read error — skip this cycle rather than trade against an unverifiable safety state. */
         const abHaltKey = storageKeyFor(st.userId);
-        if (haltedEntries.has(String(st.userId)) || haltedEntries.has(String(abHaltKey))) continue;
-        {
+        // When the entry lock is disabled (default), the in-memory halt mirror and the durable risk-lock/entry-halt
+        // read below must NOT pause new entries — otherwise a stale halt would keep blocking despite the gate being off.
+        if (!ENTRY_LOCK_DISABLED && (haltedEntries.has(String(st.userId)) || haltedEntries.has(String(abHaltKey)))) continue;
+        if (!ENTRY_LOCK_DISABLED) {
           let durablyBlocked;
           try { durablyBlocked = (await db.isRiskLocked(abHaltKey)) || (typeof db.getEntryHalt === "function" && await db.getEntryHalt(abHaltKey)); }
           catch { await db.updateRealStrategy(st.id, { lastError: "Couldn't verify account trading status (risk lock / entry halt) — skipped this cycle.", lastOrderStatus: "blocked" }).catch(() => {}); continue; }

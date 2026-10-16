@@ -171,7 +171,10 @@ function computePortfolio({ trades = [], marks = {}, filter = {}, feePolicy = {}
       realizedPnl += rp;
       byCategory[cat] += rp;
       // Win-rate eligibility: fully-closed with determinable realised P&L, excluding breakeven (#12 rules).
-      if (Math.abs(rp) <= EPS) breakevens += 1;
+      // A close booked AT its entry price is an unreconciled placeholder (the real broker exit was never
+      // reconstructed) — its rp is just the fees, which would otherwise count it as a decided LOSS and drag the
+      // win rate to 0%. Treat it as undecided (breakeven) so win rate reflects only trades with a real exit.
+      if (Number(t.exit) === Number(t.entry) || Math.abs(rp) <= EPS) breakevens += 1;
       else if (rp > 0) wins += 1; else losses += 1;
       closedTrades.push({ id: t.id, orderId: t.orderId || null, sym: t.sym, origin: originOf(t), category: cat, realizedPnl: +rp.toFixed(2), exitAt: t.exitAt });
       includedTradeIds.push(t.id);
