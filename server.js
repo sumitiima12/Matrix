@@ -1438,7 +1438,7 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
        and only a fully-covering closing-fill sequence is used (reconstructExitFromDeltaFills is conservative). */
     let deltaFills = null; const cvBySym = new Map();
     try {
-      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { userId: req.authUserId }), 45000, "Delta fills read");
+      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { query: "?page_size=1000", userId: req.authUserId }), 45000, "Delta fills read");
       if (fr && Array.isArray(fr.result)) deltaFills = fr.result;
       const prods = await deltaCall("GET", "/v2/products", { signed: false }).catch(() => null);
       for (const p of (prods && prods.result) || []) { const s = String(p.symbol || "").toUpperCase().replace(/(USDT|USD|INR)$/i, ""); if (s) cvBySym.set(s, Number(p.contract_value) || 1); }
@@ -1500,7 +1500,7 @@ app.post("/api/trades/backfill-exits", requireAuth, async (req, res) => {
     // Read Delta fills + per-symbol contract value once (same plumbing as reconcile-real). Fail-closed.
     let deltaFills = null; const cvBySym = new Map();
     try {
-      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { userId: req.authUserId }), 45000, "Delta fills read");
+      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { query: "?page_size=1000", userId: req.authUserId }), 45000, "Delta fills read");
       if (fr && Array.isArray(fr.result)) deltaFills = fr.result;
       const prods = await deltaCall("GET", "/v2/products", { signed: false }).catch(() => null);
       for (const p of (prods && prods.result) || []) { const s = baseSym(p.symbol); if (s) cvBySym.set(s, Number(p.contract_value) || 1); }
@@ -7134,6 +7134,25 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       }
     }
   }
+  /* R39 (2026-10) — SERVER-SIDE DUPLICATE-OPEN-SYMBOL BACKSTOP for AUTOMATED entries. The client screener/auto-buy
+     guard is per-device (localStorage), so two devices, a reload, or two screeners flagging the same symbol could
+     still fire it twice. For an AUTOMATED entry (Screener Auto Buy / Auto Buy / Automate) that isn't reduce-only,
+     reject a new OPEN order when this (broker, symbol) already has an open/closing position. Manual orders and
+     closing/reduce-only orders are never blocked; a read error does NOT block (client guard + idempotency still
+     apply) so this can't brick manual trading. Opt out per order with allowDuplicateSymbol:true. */
+  {
+    const isReduceOnlyDup = req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes";
+    const ttDup = String(req.body?.tradeType || "").toLowerCase();
+    const isAutomatedDup = ttDup === "screener auto buy" || ttDup === "auto buy" || ttDup === "automate";
+    if (!isReduceOnlyDup && isAutomatedDup && req.body?.allowDuplicateSymbol !== true && typeof db.getManagedPositionsForUser === "function") {
+      try {
+        const openPos = await db.getManagedPositionsForUser(storageKeyFor(sess.userId), 500);
+        if (signalGuards.duplicateOpenSymbol(openPos, sess.broker, req.body?.symbol)) {
+          return res.status(409).json({ error: `You already have an open ${req.body?.symbol} position from automation — skipping the duplicate entry.`, duplicateOpenSymbol: true });
+        }
+      } catch { /* best-effort — a read error must not block a legitimate order */ }
+    }
+  }
   /* R19-P2-04: the payload hash must cover EVERY field that changes what actually gets placed — not just
      symbol/side/qty/price. Two requests that share a key but differ in SL/TP/trailing/auto-exit/interval
      are DIFFERENT orders and must be rejected as a key-reuse mismatch, never silently replayed. */
@@ -9376,7 +9395,7 @@ async function runAutoExitEngine() {
     async function deltaFillsFor(uid) {
       if (deltaFillsByUser.has(uid)) return deltaFillsByUser.get(uid);
       let fills = null;
-      try { const fr = await withTimeout(deltaCall("GET", "/v2/fills", { userId: uid }), 45000, "Delta fills read"); if (fr && Array.isArray(fr.result)) fills = fr.result; } catch { fills = null; }
+      try { const fr = await withTimeout(deltaCall("GET", "/v2/fills", { query: "?page_size=1000", userId: uid }), 45000, "Delta fills read"); if (fr && Array.isArray(fr.result)) fills = fr.result; } catch { fills = null; }
       deltaFillsByUser.set(uid, fills);
       return fills;
     }

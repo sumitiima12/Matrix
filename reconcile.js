@@ -292,11 +292,15 @@ function reconstructExitFromDeltaFills(row, fills, { contractValue = 1 } = {}) {
   const wantContracts = wantCoin / cv;
   const isShort = String(row.side || "").toUpperCase() === "SELL" || row.short === true;
   const closeSide = isShort ? "buy" : "sell";   // closing a long = SELL fills; covering a short = BUY fills
-  const sym = _normSym(row.sym);
+  // Stronger local matcher (not the shared _normSym, which the unlock/book code depends on): also drop ALL
+  // punctuation and a PERP suffix so "BTC-USD", "XYZPERP", "BTC_USDT" all collapse to their base. This fixes the
+  // class of $0 placeholders caused by the trade's stored symbol and Delta's product_symbol normalizing differently.
+  const _match = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/PERP$/, "").replace(/(USDT|USD|INR)$/i, "");
+  const sym = _match(row.sym);
   const entryMs = Number(row.entryAt) || 0;
   const tsMs = (f) => { const t = Number(f.created_at || f.timestamp || 0); return t > 1e14 ? Math.round(t / 1000) : t; };   // µs → ms
   const cand = (fills || [])
-    .filter((f) => _normSym(f.product_symbol || (f.product && f.product.symbol) || f.symbol) === sym
+    .filter((f) => _match(f.product_symbol || (f.product && f.product.symbol) || f.symbol) === sym
       && String(f.side || "").toLowerCase() === closeSide
       && (!entryMs || tsMs(f) >= entryMs - 1000)   // 1s slack for clock skew
       && Number(f.size) > 0 && Number(f.price) > 0)
