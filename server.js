@@ -734,8 +734,9 @@ let schemaReady = false;
     if (C03_ORDER_ATTEMPTS_ON) {
       const r = await require("./orderRecovery").rearmFromUnresolvedAttempts({
         db,
-        setLock: (uid, v) => { haltedEntries.add(String(uid)); return db.setRiskLock(String(uid), v); },
-        setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
+        // Entry lock disabled (default) ⇒ startup never re-arms the durable lock from leftover unresolved attempts.
+        setLock: (uid, v) => { if (ENTRY_LOCK_DISABLED) return; haltedEntries.add(String(uid)); return db.setRiskLock(String(uid), v); },
+        setHalt: (uid, v) => { if (ENTRY_LOCK_DISABLED) return; return db.setEntryHalt(String(uid), v); },
         logger: (evt, o) => { try { logFinancial(evt, o); } catch { /* pre-logger */ } },
       });   // throws ⇒ rejects this .then ⇒ retried by .catch; schemaReady stays FALSE (fail closed)
       if (r && r.unresolved) console.warn(`[c03] startup re-armed ${r.users.length} account(s) with ${r.unresolved} unresolved order attempt(s)`);
@@ -1165,8 +1166,10 @@ async function runC03Reconcile(reason = "periodic") {
       // Fill-or-cancel: an order still open past its deadline (market 60s / limit 15min) is cancelled at the broker.
       // Best-effort + non-authoritative — the next sweep's probe confirms the real terminal outcome.
       cancelStale: (a) => cancelStaleOrderAttempt(a),
-      setLock: (uid, v) => { try { haltedEntries.add(String(uid)); } catch { /* engine may not be up */ } return db.setRiskLock(String(uid), v); },
-      setHalt: (uid, v) => db.setEntryHalt(String(uid), v),
+      // Entry lock disabled (default) ⇒ the sweep still resolves/adopts/cancels attempts, but NEVER re-locks the
+      // account — this is what stopped the ~15s re-lock churn that kept surfacing the "Resolve stuck orders" state.
+      setLock: (uid, v) => { if (ENTRY_LOCK_DISABLED) return; try { haltedEntries.add(String(uid)); } catch { /* engine may not be up */ } return db.setRiskLock(String(uid), v); },
+      setHalt: (uid, v) => { if (ENTRY_LOCK_DISABLED) return; return db.setEntryHalt(String(uid), v); },
       acquireOwner: async () => { owner = await db.tryAdvisoryLock(C03_RECON_ADVISORY_KEY); return owner; },
       // Always release the single-owner advisory lock when the sweep ends — a leaked lock would make the NEXT
       // periodic sweep (a different pooled connection) see owner=false and silently no-op, wedging reconciliation.
