@@ -84,7 +84,7 @@ const IN_HOLIDAYS = {
 const _warnedHolidayYears = new Set();
 function zoneDateKey(nowMs, tz) { return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(nowMs)); }
 function isMarketHoliday(market, nowMs = Date.now()) {
-  if (market === "Crypto") return false;
+  if (market === "Crypto" || market === "USStockTokens") return false;
   if (market === "US") { const k = zoneDateKey(nowMs, "America/New_York"); return usMarketHolidays(Number(k.slice(0, 4))).has(k); }
   const k = zoneDateKey(nowMs, "Asia/Kolkata");                    // IN / FNO / Commodity use the IST calendar date
   const yr = Number(k.slice(0, 4));
@@ -104,7 +104,7 @@ function isMarketHoliday(market, nowMs = Date.now()) {
    (lunar dates still TBD from the 2027 circular), so it is NOT listed here. Add a year only once its list is full. */
 const IN_HOLIDAYS_COMPLETE = new Set([2026]);
 function holidayCalendarReady(market, nowMs = Date.now()) {
-  if (market === "Crypto" || market === "US") return true;
+  if (market === "Crypto" || market === "USStockTokens" || market === "US") return true;
   const yr = Number(zoneDateKey(nowMs, "Asia/Kolkata").slice(0, 4));
   // OPERATOR DECISION (2026-10): the calendar is treated as READY whenever a high-confidence subset table exists
   // for the year (IN_HOLIDAYS[yr]). This unblocks unattended IN/FNO/Commodity entries, which were previously
@@ -117,7 +117,7 @@ function holidayCalendarReady(market, nowMs = Date.now()) {
 }
 
 function marketOpenIST(market, nowMs = Date.now()) {
-  if (market === "Crypto") return true;
+  if (market === "Crypto" || market === "USStockTokens") return true;
   if (isMarketHoliday(market, nowMs)) return false;                // exchange holiday — shut even on a weekday
   if (market === "US") { const { day, mins } = etParts(nowMs); return day >= 1 && day <= 5 && mins >= 570 && mins <= 960; }  // 09:30–16:00 ET (DST-correct)
   const { day, mins } = istParts(nowMs);
@@ -131,7 +131,7 @@ function marketOpenIST(market, nowMs = Date.now()) {
    negative number once the session is over. US wraps past midnight (closes 01:30 IST), handled
    for both the evening (mins ≥ 19:00) and the early-morning tail (mins ≤ 01:30). */
 function minsToCloseIST(market, nowMs = Date.now()) {
-  if (market === "Crypto") return null;
+  if (market === "Crypto" || market === "USStockTokens") return null;
   const { mins } = istParts(nowMs);
   if (market === "IN" || market === "FNO") return 930 - mins;        // close 15:30
   if (market === "Commodity") return 1410 - mins;                    // close 23:30
@@ -144,7 +144,7 @@ function minsToCloseIST(market, nowMs = Date.now()) {
    Crypto never squares. This mirrors what the broker does to MIS positions, so the app's own
    tracking doesn't leave an intraday trade sitting "open" past the session. */
 function intradaySquareDue(market, nowMs = Date.now(), bufferMin = 15) {
-  if (market === "Crypto") return false;
+  if (market === "Crypto" || market === "USStockTokens") return false;
   if (!marketOpenIST(market, nowMs)) return true;                    // closed but still tracked open
   const m = minsToCloseIST(market, nowMs);
   return m != null && m <= bufferMin;

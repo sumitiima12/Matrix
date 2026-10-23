@@ -6356,7 +6356,7 @@ app.post("/api/broker/app-creds", requireAuth, requireActiveUser, async (req, re
      allowBrokerConnect{mkt} — may non-admin users connect their own broker for that market?
    Both default to FALSE (locked down): a fresh deploy does NOT let members trade real money
    or connect brokers until the admin explicitly turns it on. Admins are never gated by these. */
-const MARKETS = ["IN", "US", "Crypto", "Commodity"];
+const MARKETS = ["IN", "US", "Crypto", "Commodity", "USStockTokens"];
 const DEFAULT_APP_SETTINGS = {
   // Per-market, like allowBrokerConnect: may non-admins switch to REAL trading on this market?
   allowRealMode: MARKETS.reduce((o, m) => { o[m] = false; return o; }, {}),
@@ -7017,12 +7017,21 @@ function roundToTick(price, tick) {
    convert to/from an integer contract count only at the order boundary. */
 function deltaContracts(prod, coinQty) {
   const cv = Number(prod && prod.contract_value) || 1;
-  // ROUND to the nearest whole contract (not floor). Flooring systematically under-deployed every crypto
-  // entry — a $50 slice on a $14.48/contract instrument floored 3.45→3 ($43) instead of rounding to 3 ($43)
-  // or, for a 3.6 slice, 3 instead of 4. Rounding tracks the intended capital far more closely. A slice
-  // smaller than half a contract still rounds to 0 and is rejected upstream with a clear "amount too small"
-  // message (min-notional guard), so this never fabricates size the user didn't ask for.
-  return { cv, contracts: Math.max(0, Math.round(Number(coinQty) / cv)) };
+  const raw = Number(coinQty) / cv;
+  let contracts = Math.max(0, Math.round(raw));
+  /* ROUND to the nearest whole contract. Previously a slice under HALF a contract rounded to 0 and was rejected
+     "amount too small", which skipped many small-slice auto/screener crypto picks (esp. low-priced coins) — the
+     main reason real crypto counts trailed virtual. Now, if it would round to 0 but the intended slice is at least
+     DELTA_MIN_CONTRACT_FRACTION of a contract, round UP to 1 so the pick still places. The fraction bounds the
+     over-deploy: at the default 0.25 a forced pick deploys at most ~4× its intended slice. Set
+     DELTA_MIN_CONTRACT_FRACTION=0 to force 1 contract for ANY positive qty (max fills, max over-deploy);
+     set it to 0.5 to restore the old reject-below-half-contract behaviour. */
+  if (contracts < 1 && raw > 0) {
+    const mf = Number(process.env.DELTA_MIN_CONTRACT_FRACTION);
+    const frac = Number.isFinite(mf) ? mf : 0.25;
+    if (raw >= frac) contracts = 1;
+  }
+  return { cv, contracts };
 }
 /* Delta caps client_order_id at 32 chars. Our internal idempotency key is `mx_<36-char UUID>` = 39 chars, which
    Delta rejects with `bad_schema` (the root cause of the manual-order "outcome unknown" loop). Derive a DETERMINISTIC
@@ -7333,7 +7342,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
   // A BRACKET (or a broker that needs a Matrix-managed stop) forces auto-exit arming.
   const wantAutoExit = req.body?.autoExit === true || isBracketOrder || (brokerOT.managed && (slPct > 0 || tpPct > 0 || tslPct > 0));
   const exitCfg = req.body?.strategy || null;      // { defs, exit } from the strategy builder
-  const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
+  // Delta also lists US Stock Token perps — when the client flags the order as that market, journal it there so it
+  // shows under the "US Tokens" tab instead of Crypto. Everything else about the Delta path is identical.
+  const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker)
+    ? ((broker === "delta" && req.body?.market === "USStockTokens") ? "USStockTokens" : "Crypto") : "IN";
   async function registerAutoExit(qtyOverride, entryOverride) {
     if (!wantAutoExit) return null;   // register for BOTH longs and shorts (exit math is direction-aware)
     /* R14-P1-05/06: only arm an app-managed exit for brokers whose exit path returns VERIFIED fill truth
@@ -7348,7 +7360,7 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       const entryRef = Number(entryOverride) > 0 ? Number(entryOverride) : (Number(req.body?.entryPrice) || await liveMarkForOrder(symbol, regMarket) || null);
       if (!(Number(entryRef) > 0)) { console.warn(`[autoexit] not arming ${broker} ${symbol} — no usable entry price for SL/TP`); return null; }
       const regQty = Number(qtyOverride) > 0 ? Number(qtyOverride) : nQty;
-      const yahoo = req.body?.yahoo || (regMarket === "Crypto"
+      const yahoo = req.body?.yahoo || ((regMarket === "Crypto" || regMarket === "USStockTokens")
         ? `${String(symbol).replace(/(USDT|USD|INR)$/i, "")}-USD`
         : `${bareSym}.NS`);
       const pos = await registerManagedPosition({
@@ -7375,7 +7387,8 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
      sell-vs-held, daily-loss cap. Client-supplied values are never trusted here.
      If we CAN'T fetch account state, we refuse rather than place blind — this is real money. */
   {
-    const rkMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker) ? "Crypto" : "IN";
+    const rkMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker)
+      ? ((broker === "delta" && req.body?.market === "USStockTokens") ? "USStockTokens" : "Crypto") : "IN";
     const account = await fetchBrokerAccount(sess);
     if (!account) {
       return res.status(503).json({ error: "Could not verify your account state with the broker to risk-check this order. Try again in a moment." + (lastAcctError ? ` (${lastAcctError})` : "") });
