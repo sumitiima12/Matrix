@@ -19,7 +19,7 @@ const DEFAULT_LIMITS = {
   maxPositionPct: 100,      // max % of that market's equity in a single position (kept permissive)
   maxOpenPositions: 50,     // per market — stops a runaway opening hundreds of positions
   maxTradesPerDay: 100,     // per market
-  maxDailyLossPct: 25,      // circuit breaker: halt a market after −25% realised on the day
+  maxDailyLossPct: 90,      // circuit breaker: halt a market only after −90% realised on the day (raised from 25%)
   cooldownMs: 15000,        // 15s min gap between two entries in the same symbol
 };
 
@@ -57,7 +57,7 @@ const shortMarginFraction = (market) => SHORT_MARGIN_FRACTION[market] != null ? 
    So even if a client saves maxDailyLossPct=100 or maxTradesPerDay=99999, the effective value is clamped to
    the platform maximum. These are the real safety floor; DEFAULT_LIMITS are the defaults applied when the
    user saved nothing. */
-const PLATFORM_CEILING = { maxPositionPct: 100, maxOpenPositions: 50, maxTradesPerDay: 100, maxDailyLossPct: 25 };
+const PLATFORM_CEILING = { maxPositionPct: 100, maxOpenPositions: 50, maxTradesPerDay: 100, maxDailyLossPct: 90 };
 /* R19-P2-08: cooldownMs is a FLOOR-type limit (unlike the ceilings above) — a longer gap is safer, a shorter
    one is riskier — so the platform enforces a MINIMUM. A client that saves cooldownMs=0 (or omits it) can't
    defeat the same-symbol anti-spam guard; the effective cooldown is max(userValue, platformMinimum). */
