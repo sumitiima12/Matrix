@@ -172,6 +172,9 @@ const C03_ORDER_ATTEMPTS_ON = _c03raw !== "0";
 const ENTRY_LOCK_DISABLED = /^(1|true|yes|on)$/i.test(String(process.env.MATRIX_DISABLE_ENTRY_LOCK || ""))
   || !/^(1|true|yes|on)$/i.test(String(process.env.MATRIX_ENABLE_ENTRY_LOCK || ""));
 if (ENTRY_LOCK_DISABLED) console.warn("[safety] entry lock is OFF (default) — unknown-order / risk-lock entry blocking is DISABLED. Set MATRIX_ENABLE_ENTRY_LOCK=1 to restore it.");
+/* DERIVATIVES: real options/futures execution is ALLOWED BY DEFAULT (operator decision 2026-10). Set
+   MATRIX_STRICT_DERIVATIVES=1 to require the per-market MATRIX_*_VALIDATED certification flags again (fail-closed). */
+const DERIVATIVES_DEFAULT_ON = !/^(1|true|yes|on)$/i.test(String(process.env.MATRIX_STRICT_DERIVATIVES || ""));
 /* R43-P1-01: CoinDCX AUTOMATIC find-by-tag crash recovery. The adapter (_coindcxProbeByTag) is built and safe, but
    the capability registry must not advertise unattended crash recovery for CoinDCX until a LIVE cold-restart cert
    proves the tag lookup end-to-end on a real account. Default OFF: until certified, CoinDCX still fails closed to
@@ -3542,7 +3545,7 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
     }
     // COMMODITY (MCX via Dhan) — resolve from the Dhan detailed scrip master.
     if (market === "Commodity") {
-      const dhanValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_DHAN_MCX_VALIDATED || ""));
+      const dhanValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_DHAN_MCX_VALIDATED || "")));
       const { rows, headerLooksValid } = await dhanMcxRows();
       if (mode === "real" && (!headerLooksValid || !dhanValidated)) {
         return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: !headerLooksValid ? "instrument_master_unavailable" : "real_execution_master_not_validated", realExecution: false });
@@ -3558,7 +3561,7 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
     // US equity/index OPTIONS — OCC symbology. Deterministic when an explicit strike+expiry is supplied; moneyness
     // needs a live option chain (pass `chain` rows) or it fails closed. Real execution gated on MATRIX_US_OPTIONS_VALIDATED.
     if (market === "US" && productType === "OPTION") {
-      const usValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_US_OPTIONS_VALIDATED || ""));
+      const usValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_US_OPTIONS_VALIDATED || "")));
       const rc = usOptions.resolveUsOption({
         underlying: b.underlying, optionType: b.optionType, moneyness: b.moneyness, expiryIntent: b.expiryIntent,
         spot: Number(b.spot), lots: Number(b.lots),
@@ -3571,7 +3574,7 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
     }
     // CRYPTO OPTIONS — Delta symbology, BTC/ETH only. (Crypto perps/futures use the live order path, not this endpoint.)
     if (market === "Crypto" && productType === "OPTION") {
-      const cxValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_CRYPTO_OPTIONS_VALIDATED || ""));
+      const cxValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_CRYPTO_OPTIONS_VALIDATED || "")));
       const rc = cryptoOptions.resolveCryptoOption({
         underlying: b.underlying, optionType: b.optionType, moneyness: b.moneyness, expiryIntent: b.expiryIntent,
         spot: Number(b.spot), lots: Number(b.lots),
@@ -3582,12 +3585,20 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
       if (mode === "real" && !cxValidated) return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "real_execution_not_validated", resolved: rc, realExecution: false });
       return res.json({ ok: true, resolved: rc, realExecution: mode === "real" && cxValidated });
     }
+    // CRYPTO FUTURES = Delta PERPETUALS. There is no separate futures contract to resolve — the tradable symbol is
+    // the perp (<COIN>USD), same instrument the plain crypto order path uses. Resolve to it so the Future pill works.
+    if (market === "Crypto" && productType === "FUTURE") {
+      const base = String(b.underlying || "").toUpperCase().replace(/(USDT|USD|INR|PERP)$/i, "");
+      if (!base) return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "no_underlying" });
+      const rc = { tradingSymbol: `${base}USD`, market: "Crypto", productType: "FUTURE", underlying: base, lots: Number(b.lots) || 1, realExecution: false };
+      return res.json({ ok: true, resolved: rc, realExecution: mode === "real" });
+    }
     // India NSE/NFO is the other supported derivatives market. Anything else fails closed rather than guess.
     if (market !== "IN") {
       const spec = contractSpecs.getContractSpec({ market, underlying: b.underlying, productType }, { mode: "virtual" });
       return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "market_not_yet_supported", market, referenceSpec: spec || null });
     }
-    const foValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || ""));
+    const foValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || "")));
     const { rows, headerLooksValid } = await foSymbolRows();
     if (mode === "real" && (!headerLooksValid || !foValidated)) {
       // Fail closed for real orders until the live NSE_FO column mapping is validated for this build.
@@ -10106,7 +10117,7 @@ async function runAutoBuyEngine() {
         const optMode = st.market === "IN" && st.opt && st.opt.enabled === true && Array.isArray(st.opt.legs) && st.opt.legs.length > 0;
         let optPlan = null;
         if (optMode) {
-          const foValidated = /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || ""));
+          const foValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || "")));
           if (live && !foValidated) {
             await db.updateRealStrategy(st.id, { lastError: "Automated Indian OPTION execution isn't certified for live trading yet (MATRIX_FO_MASTER_VALIDATED off) — the strategy fired but no real option order was placed.", lastOrderStatus: "blocked", lastSignalAt: Date.now() });
             logFinancial("autobuy.option_live_blocked", { userId: st.userId, strategyId: st.id, symbol: st.symbol });

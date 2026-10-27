@@ -40,8 +40,12 @@ function evaluateDerivativeOrder(p = {}, env = process.env) {
 
   const market = String(p.market || "").trim();
   const flag = MARKET_FLAG[market];
-  if (!flag) return { allowed: false, isDerivative: true, reason: "unknown_market_fail_closed" };
-  if (!truthy(env[flag])) return { allowed: false, isDerivative: true, reason: "real_execution_not_validated", flag };
+  if (!flag) return { allowed: false, isDerivative: true, reason: "unknown_market_fail_closed" };   // unknown market still fail-closed
+  // OPERATOR DECISION (2026-10): real derivative execution is ALLOWED BY DEFAULT for known markets. The owner
+  // accepted that options/futures go live without the per-market MATRIX_*_VALIDATED certification. To restore the
+  // original fail-closed behavior (require the matching flag), set MATRIX_STRICT_DERIVATIVES=1.
+  const strict = truthy(env.MATRIX_STRICT_DERIVATIVES);
+  if (strict && !truthy(env[flag])) return { allowed: false, isDerivative: true, reason: "real_execution_not_validated", flag };
   return { allowed: true, isDerivative: true, flag };
 }
 
