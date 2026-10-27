@@ -1416,7 +1416,7 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
        absence of another broker's saved credential). */
     const trades = await db.getTrades(userId, 0, Date.now()).catch(() => []);
     const openCryptoReal = (trades || []).filter((t) =>
-      t && t.real === true && (t.market || "") === "Crypto" &&
+      t && t.real === true && ((t.market || "") === "Crypto" || (t.market || "") === "USStockTokens") &&
       t.entryAt != null && (t.exitAt == null || t.exit == null) && t.status !== "rejected");
     const { phantomDelta, phantomUnknown } = reconcile.deltaReconcilePlan(openCryptoReal, deltaBook);
 
@@ -1490,7 +1490,7 @@ app.post("/api/trades/backfill-exits", requireAuth, async (req, res) => {
     const trades = await db.getTrades(userId, 0, Date.now()).catch(() => []);
     // Closed, real, crypto rows booked at ~break-even (the $0-exit signature).
     const stale = (trades || []).filter((t) => {
-      if (!t || t.real !== true || (t.market || "") !== "Crypto") return false;
+      if (!t || t.real !== true || !((t.market || "") === "Crypto" || (t.market || "") === "USStockTokens")) return false;
       if (t.status === "rejected") return false;
       if (!(Number(t.entry) > 0) || !(Number(t.qty) > 0)) return false;
       const isClosed = t.exitAt != null || t.status === "closed";
@@ -6983,7 +6983,7 @@ async function liveMarkEnvelope(brokerSym, market) {
   const none = { price: null, source: null, asOf: null, delayed: null, market };
   try {
     let hit = null;
-    if (market === "Crypto") {
+    if (market === "Crypto" || market === "USStockTokens") {
       const base = String(brokerSym).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
       const q = await deltaHouseQuotes([`${base}-USD`]);
       hit = q[`${base}-USD`];
@@ -10129,7 +10129,7 @@ async function runAutoBuyEngine() {
         let notional = Number(st.notional) || 0;
         if (AB_MAX_NOTIONAL > 0) notional = Math.min(notional, AB_MAX_NOTIONAL);
         // Stock sizing (notional/price). Option mode sizes by lots × lotSize on each resolved leg, so skip this.
-        const qty = optMode ? 0 : (st.market === "Crypto" ? +(notional / px).toFixed(6) : Math.max(1, Math.floor(notional / px)));
+        const qty = optMode ? 0 : ((st.market === "Crypto" || st.market === "USStockTokens") ? +(notional / px).toFixed(6) : Math.max(1, Math.floor(notional / px)));
         if (!optMode && !(qty > 0)) { await db.updateRealStrategy(st.id, { lastError: "amount too small for one unit" }); continue; }
 
         if (!live) {
@@ -10168,7 +10168,7 @@ async function runAutoBuyEngine() {
            floor); if not, we pass no `limits` so the engine applies its built-in DEFAULT_LIMITS (25% daily-loss
            breaker, open-position/trade caps, per-symbol cooldown, funds/margin). Fail CLOSED if the account
            can't be verified — never trade blind with real money. */
-        const abMarketKind = st.market === "Crypto" ? "Crypto" : (st.market === "US" ? "US" : "IN");
+        const abMarketKind = st.market === "Crypto" ? "Crypto" : (st.market === "USStockTokens" ? "USStockTokens" : (st.market === "US" ? "US" : "IN"));
         const abStoreKey = storageKeyFor(st.userId);   // same key manual orders + /api/risk-policy use
         /* R26-P1-03: FAIL CLOSED on a policy/history read failure — never risk-check an unattended real entry
            against empty history or a dropped policy. A DB error skips this cycle (retried next sweep). */
@@ -10496,7 +10496,7 @@ if (process.env.EXIT_MONITOR !== "off") {
    sends notifications. Quote fetches are de-duped per (symbol,market) within a sweep. Inert if push is off. */
 async function alertQuote(symbol, market) {
   try {
-    if (market === "Crypto") {
+    if (market === "Crypto" || market === "USStockTokens") {
       const h = (await deltaHouseQuotes([`${symbol}-USD`]))[`${symbol}-USD`];
       if (h && h.price != null) return { price: Number(h.price), chgPct: Number(h.chg) };
     } else if (market === "US") {
@@ -10826,7 +10826,7 @@ app.post("/api/autobuy/register", requireAuth, requireSchemaReady, requireActive
       sl: sl || null, tp: tp || null, tsl: tsl || null,
       // Entry order type for the engine (MARKET default, or LIMIT at limitPrice). Normalized fail-safe.
       orderType: orderTypes.normalizeOrderType(orderType) === "LIMIT" ? "LIMIT" : "MARKET", limitPrice: Number(limitPrice) || 0,
-      yahoo: yahoo || (market === "Crypto" ? `${String(brokerSym).replace(/(USDT|USD|INR)$/i, "")}-USD` : `${String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "")}.NS`),
+      yahoo: yahoo || ((market === "Crypto" || market === "USStockTokens") ? `${String(brokerSym).replace(/(USDT|USD|INR)$/i, "")}-USD` : `${String(symbol).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "")}.NS`),
       // RISK-1: optional STRATEGY-LEVEL risk tier — cleaned so only valid positive caps are stored. At entry
       // time it's combined with the account policy via effectiveRiskPolicy (strictest wins), so this can only
       // tighten the account limits for THIS strategy, never loosen them.

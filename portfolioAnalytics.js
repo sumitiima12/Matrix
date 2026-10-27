@@ -26,7 +26,7 @@ function _normSym(s) { return String(s || "").replace(/(USDT|USD|INR|PERP)$/i, "
 /* Instrument-specific "is this quantity effectively zero" tolerance. Crypto can hold tiny fractional residuals;
    equities are whole units. A position is OPEN only when |openQty| exceeds this. */
 function qtyTolerance(market) {
-  return String(market || "").toLowerCase() === "crypto" ? 1e-8 : 1e-6;
+  return (String(market || "").toLowerCase() === "crypto" || String(market || "").toLowerCase() === "usstocktokens") ? 1e-8 : 1e-6;
 }
 
 /* Signed direction: +1 long, -1 short. */
@@ -218,7 +218,7 @@ function computePortfolio({ trades = [], marks = {}, filter = {}, feePolicy = {}
       from: Number.isFinite(_lo(filter.from)) ? _lo(filter.from) : null,   // null ⇒ unbounded (all-time)
       to: Number.isFinite(_hi(filter.to)) ? _hi(filter.to) : null,
       valuationSource: filter.valuationSource || "mark-snapshot",
-      currency: filter.currency || (String(filter.market).toLowerCase() === "crypto" || String(filter.market).toUpperCase() === "US" ? "USD" : "INR"),
+      currency: filter.currency || (String(filter.market).toLowerCase() === "crypto" || String(filter.market).toLowerCase() === "usstocktokens" || String(filter.market).toUpperCase() === "US" ? "USD" : "INR"),
       includedPositionIds, includedTradeIds,
     },
   };

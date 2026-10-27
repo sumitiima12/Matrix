@@ -27,7 +27,7 @@ const DEFAULT_LIMITS = {
    not the server's local/UTC midnight. On a UTC host an Indian loss at 01:00 IST would otherwise count against
    the previous day. Derive midnight in the market's timezone (IST / ET-with-DST / UTC for 24×7 crypto). */
 function startOfSessionDay(market) {
-  const tz = market === "US" ? "America/New_York" : (market === "Crypto" ? "UTC" : "Asia/Kolkata");
+  const tz = (market === "US" || market === "USStockTokens") ? "America/New_York" : (market === "Crypto" ? "UTC" : "Asia/Kolkata");
   const now = new Date();
   const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
@@ -44,7 +44,7 @@ const startOfDay = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return 
    we only ever reject a short the account clearly can't afford (e.g. $10 wallet shorting $10k notional),
    never a normal leveraged short. The broker still does the exact margin math; this just stops the
    obvious "insufficient margin" rejection before it reaches the broker. */
-const SHORT_MARGIN_FRACTION = { Crypto: 0.04, FNO: 0.15, IN: 0.20, US: 0.30, Commodity: 0.10 };
+const SHORT_MARGIN_FRACTION = { Crypto: 0.04, USStockTokens: 0.04, FNO: 0.15, IN: 0.20, US: 0.30, Commodity: 0.10 };
 const shortMarginFraction = (market) => SHORT_MARGIN_FRACTION[market] != null ? SHORT_MARGIN_FRACTION[market] : 0.20;
 
 /**
@@ -111,7 +111,7 @@ function validateOrder(order, account) {
        unchanged. The broker still enforces exact margin; this only stops the obviously-unaffordable order
        and applies the %-of-equity cap to the MARGIN actually at risk (the meaningful figure), so a normal
        leveraged trade the user set up on purpose isn't blocked as "408% of equity". */
-    const marginFrac = market === "Crypto" ? shortMarginFraction(market) : 1;
+    const marginFrac = (market === "Crypto" || market === "USStockTokens") ? shortMarginFraction(market) : 1;
     const marginNeeded = value * marginFrac;
     // --- funds (margin required) ---
     if (marginNeeded > wallet) reasons.push(`Insufficient funds: order needs ${marginNeeded.toFixed(2)} margin but ${wallet.toFixed(2)} is available.`);

@@ -57,7 +57,8 @@ function tradeAnalytics(trades) {
   let best = -Infinity, worst = Infinity;
   for (const { t, pnl } of closed) {
     total += pnl;
-    if (pnl >= 0) { wins += 1; grossProfit += pnl; } else { losses += 1; grossLoss += -pnl; }
+    if (Math.abs(pnl) <= 1e-9 || Number(t.exit) === Number(t.entry)) { /* break-even / unreconciled $0 exit — not a win */ }
+    else if (pnl > 0) { wins += 1; grossProfit += pnl; } else { losses += 1; grossLoss += -pnl; }
     if (pnl > best) best = pnl;
     if (pnl < worst) worst = pnl;
     const eAt = Number(t.entryAt), xAt = Number(t.exitAt);
