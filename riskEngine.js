@@ -190,4 +190,4 @@ function validateOrder(order, account) {
   return { ok: reasons.length === 0, reasons, warnings };
 }
 
-module.exports = { validateOrder, DEFAULT_LIMITS };
+module.exports = { validateOrder, DEFAULT_LIMITS, startOfSessionDay };

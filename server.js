@@ -26,7 +26,7 @@ const { stableStringify, riskEligibleTrades } = require("./orderIntegrity");   /
 const strat = require("./strategyEngine");   // server-side port of the strategy exit engine
 const { evalExitPair, optRanker, lenOptions, costPctFor } = require("./optimizerCore");   // pure optimiser scoring math (unit-tested)
 const patterns = require("./patterns");       // chart-pattern detection for the screener scan
-const { validateOrder: serverValidateOrder } = require("./riskEngine");
+const { validateOrder: serverValidateOrder, startOfSessionDay: riskSessionDayStart } = require("./riskEngine");
 const { signToken, verifyToken, requireAuth, storageKeyFor } = require("./auth");   // must be required BEFORE any route uses requireAuth
 const { computePortfolio } = require("./portfolioAnalytics");   // THE canonical dashboard analytics (source of truth)
 const { resolveProvenance, ORIGIN: PROV_ORIGIN } = require("./provenance");
@@ -7440,11 +7440,15 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       // R31-M03: the daily risk boundary resets at IST (exchange/account tz) midnight, NOT the deployment host's local
       // midnight — otherwise a server in UTC would classify late-evening IST trades into the wrong risk day and let the
       // daily-trade / loss caps roll over early. IST is UTC+5:30 with no DST (19,800,000 ms).
-      const IST_OFFSET_MS = 19800000;
-      const dayStart = Math.floor((Date.now() + IST_OFFSET_MS) / 86400000) * 86400000 - IST_OFFSET_MS;
+      // Risk day boundary in the ORDER MARKET's timezone (ET for US/US-Tokens, UTC for crypto, IST for IN/Commodity)
+      // so the daily-trade/loss window matches when that market's session actually rolls over.
+      const dayStart = riskSessionDayStart(regMarket);
       let fillsRk = null;
       try { const fills = await db.getFills(uidKey, dayStart, Date.now()); fillsRk = db.deriveRiskFromFills(fills, { from: dayStart, to: Date.now() }); }
       catch { return res.status(503).json({ error: "Couldn't read your execution ledger to safely risk-check this order (temporary). Please retry in a moment." }); }
+      // A4: an exit fill that couldn't be matched to its entry contributes $0 to realized loss — if that's material it
+      // could understate the daily-loss breaker, so surface it for reconciliation (alert only; never blocks).
+      try { if (fillsRk && Number(fillsRk.unmatchedExits) > 0) logFinancial("risk.fills_unmatched_exits", { user: uidKey, unmatchedExits: fillsRk.unmatchedExits, realizedLoss: fillsRk.realizedLoss }); } catch { /* optional */ }
       const isEntryOrder = !(req.body?.reduceOnly === true || req.get("X-Reduce-Only") === "yes");
       if (isEntryOrder && userLimits) {
         const maxTrades = Number(userLimits.maxTradesPerDay) || 0;
@@ -10200,7 +10204,7 @@ async function runAutoBuyEngine() {
           if (typeof db.deriveRiskFromFills === "function") {
             const abMaxLossPct = Number(abPolicy.maxDailyLossPct) || 25;   // platform default floor
             const IST_OFF = 19800000;
-            const abDayStart = Math.floor((Date.now() + IST_OFF) / 86400000) * 86400000 - IST_OFF;
+            const abDayStart = riskSessionDayStart(abMarketKind);
             let abFillsRk;
             try { abFillsRk = db.deriveRiskFromFills(await db.getFills(abStoreKey, abDayStart, Date.now()), { from: abDayStart, to: Date.now() }); }
             catch { await db.updateRealStrategy(st.id, { lastError: "Couldn't read the execution ledger to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }).catch(() => {}); continue; }

@@ -1636,12 +1636,22 @@ async function getOpenTrades(limit = 2000) {
 }
 async function updateTrade(userId, trade) {
   if (USING_PG) {
-    await pool.query(`UPDATE trades SET data=$3, ts=$2 WHERE id=$1`,
-      [trade.id, trade.exitAt || trade.entryAt || Date.now(), trade]);
+    // Scope by user_id (never touch another user's row), and PROTECT a reconciled row: a non-reconciled write
+    // (e.g. a stale $0 break-even placeholder) must not overwrite a row already carrying a reconstructed exit
+    // (reconciled=true). A reconciled write always wins. This closes the lost-update race on concurrent reconcile.
+    await pool.query(
+      `UPDATE trades SET data=$3, ts=$2
+       WHERE id=$1 AND user_id=$4
+         AND ((data->>'reconciled') IS DISTINCT FROM 'true' OR ($3::jsonb->>'reconciled') = 'true')`,
+      [trade.id, trade.exitAt || trade.entryAt || Date.now(), trade, String(userId)]);
     return;
   }
   const db = readJSON(FILES.trades);
-  db[userId] = (db[userId] || []).map((t) => (t.id === trade.id ? trade : t));
+  db[userId] = (db[userId] || []).map((t) => {
+    if (t.id !== trade.id) return t;
+    if (t.reconciled === true && trade.reconciled !== true) return t;   // don't clobber a reconciled exit with a stale write
+    return trade;
+  });
   writeJSON(FILES.trades, db);
 }
 
