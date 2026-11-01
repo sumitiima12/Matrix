@@ -3982,7 +3982,7 @@ function techIdea(sym, c) {
   if (!(tpPct >= 1 && slPct > 0.2)) return null;
   return {
     sym, tf: "1d", pattern: "technical", name, candlestick: null,
-    entry: +px.toFixed(2), target: +target.toFixed(2), stop: +stop.toFixed(2),
+    entry: _roundExitPx(px), target: _roundExitPx(target), stop: _roundExitPx(stop),
     tpPct, slPct, rr: slPct > 0 ? +(tpPct / slPct).toFixed(1) : null, strength,
   };
 }
@@ -4008,7 +4008,7 @@ async function scanOneIdea(sym) {
     return {
       sym, tf, pattern: chart ? chart.key : cndl.key, name: chart ? chart.name : cndl.name,
       candlestick: cndl ? cndl.name : null,
-      entry: +px.toFixed(2), target: +target.toFixed(2), stop: +stop.toFixed(2),
+      entry: _roundExitPx(px), target: _roundExitPx(target), stop: _roundExitPx(stop),
       tpPct, slPct, rr: slPct > 0 ? +(tpPct / slPct).toFixed(1) : null,
       strength: (chart ? 2 : 0) + (cndl ? (cndl.strength || 1) : 0),
     };
@@ -4692,6 +4692,18 @@ async function deltaCandles(deltaSym, resolution, range) {
     .sort((a, b) => a.t - b.t);
 }
 
+/* Tokenised US stock → underlying US-stock ticker, used ONLY as a last-resort candle source when Delta
+   returns no history for the token perp (the token has no Yahoo "<SYM>-USD" feed of its own, so without
+   this the scan gets zero candles and never fires). An explicit map — NOT a suffix-strip — because a
+   strip would misfire on crypto tickers that end in X/B (AVAX-USD would wrongly read "AVA" stock). Keep
+   in sync with US_STOCK_TOKENS in the frontend universe. SpaceX (SPCXX) is private → no underlying. */
+const TOKEN_UNDERLYING = {
+  TSLAX: "TSLA", AAPLX: "AAPL", MSFTB: "MSFT", NVDAX: "NVDA", AMZNX: "AMZN", GOOGLX: "GOOGL",
+  METAX: "META", AMDB: "AMD", AVGOB: "AVGO", ORCLB: "ORCL", MRVLB: "MRVL", ARMB: "ARM", TSMB: "TSM",
+  INTCB: "INTC", WDCB: "WDC", SNDKB: "SNDK", PLTRB: "PLTR", COINX: "COIN", HOODB: "HOOD", MSTRB: "MSTR",
+  CRCLX: "CRCL", RKLBB: "RKLB", AAOIB: "AAOI", MRNAB: "MRNA", BABAB: "BABA", SPYX: "SPY", QQQX: "QQQ",
+  SOXLB: "SOXL",
+};
 async function candlesFor(symbol, range = "5d", interval = "5m") {
   // Crypto: use Delta's own candles so the exit engine and charts match the perpetual mark the
   // position is held against. BUT Delta's intraday history is short — for the deep look-backs the
@@ -4706,11 +4718,27 @@ async function candlesFor(symbol, range = "5d", interval = "5m") {
   const yMapped = Y_SPECIAL[String(symbol)] || String(symbol);
   const cx = yMapped.match(/^([A-Z0-9]+)-USD$/);
   const LONG_RANGE = new Set(["1mo", "3mo", "6mo", "1y", "2y"]);
-  if (cx && !LONG_RANGE.has(range)) {
+  if (cx) {
     try {
       const dc = await memo(`dc:${cx[1]}:${range}:${interval}`, 60_000, () => deltaCandles(`${cx[1]}USD`, deltaResolution(interval), range));
-      if (dc && dc.length) return dc;
-    } catch (e) { /* fall through to Yahoo */ }
+      // Delta is the LIVE-mark source for crypto AND the ONLY candle source for tokenised US stocks
+      // (TSLAX-USD, AMDB-USD, … — Yahoo carries no "<SYM>-USD" feed for these, so the technical scan
+      // got zero candles and the screener/automation never generated US-Token signals). Use Delta's
+      // candles whenever it returns a usable set. For a LONG look-back on crypto, Delta's intraday
+      // history is thin, so if it came back short we still fall through to Yahoo's far wider window;
+      // but for short ranges — and for tokens, which have no Yahoo fallback at all — Delta is taken as
+      // long as it returned anything. This is the former behaviour PLUS long-range/idea-scan coverage
+      // for tokens (previously the whole branch was skipped on long ranges → tokens dead-ended to zero).
+      if (dc && dc.length && (!LONG_RANGE.has(range) || dc.length >= 30)) return dc;
+    } catch (e) { /* fall through */ }
+    // Delta returned no usable candles for this "-USD" perp. If it's a tokenised US stock, read the
+    // UNDERLYING stock's candles so the scan still gets a signal (the token tracks the stock; the trade
+    // still executes on the token at the Delta price). Crypto "-USD" bases aren't in the map, so they
+    // skip this and keep the Yahoo fallback below.
+    const und = TOKEN_UNDERLYING[cx[1]];
+    if (und) {
+      try { const uc = await candlesFor(und, range, interval); if (uc && uc.length) return uc; } catch (e) { /* genuine no-data */ }
+    }
   }
   // GENERAL CRYPTO PROBE. A bare ticker (BTC, ETH, LAB, PEPE…) collides with US stock tickers by shape
   // — isUsTicker matches any 1-5 letters — so we can't tell a Delta coin from a stock by name alone, and
@@ -4801,6 +4829,13 @@ function isShortTrade(trade) {
 }
 // Same rules as the in-app engine: TP / hard SL / trailing SL, worst-case on ties. Direction-aware:
 // a LONG exits on a drop to its stop or a rise to its target; a SHORT is the mirror.
+/* Round an exit price to its magnitude's precision — `+x.toFixed(2)` collapsed sub-cent token prices to
+   $0.00 and booked bogus −100% losses (the "TAC −100%" trades). ~5 significant figures. */
+function _roundExitPx(v) {
+  const a = Math.abs(Number(v) || 0);
+  const dp = a >= 1 ? 2 : a >= 0.1 ? 4 : a >= 0.001 ? 6 : 8;
+  return +Number(v).toFixed(dp);
+}
 function resolveExit(trade, candles) {
   const { tp, sl, tsl, entry, entryAt } = trade;
   if (!tp && !sl && !tsl) return null;
@@ -4817,8 +4852,8 @@ function resolveExit(trade, candles) {
       const hitStop = hasStop && c.h >= stop;              // price rose into the stop → loss
       const hitTarget = target != null && c.l <= target;   // price fell to target → profit
       const stopLabel = (trailStop != null && stop === trailStop) ? "Trailing stop" : "Stop loss";
-      if (hitStop) return { exit: +stop.toFixed(2), exitAt: c.t, exitType: stopLabel };
-      if (hitTarget) return { exit: +target.toFixed(2), exitAt: c.t, exitType: "Exit trigger" };
+      if (hitStop) return { exit: _roundExitPx(stop), exitAt: c.t, exitType: stopLabel };
+      if (hitTarget) return { exit: _roundExitPx(target), exitAt: c.t, exitType: "Exit trigger" };
       if (c.l < trough) trough = c.l;
     }
     return null;
@@ -4833,8 +4868,8 @@ function resolveExit(trade, candles) {
     const hitStop = hasStop && c.l <= stop;
     const hitTarget = target != null && c.h >= target;
     const stopLabel = (trailStop != null && stop === trailStop) ? "Trailing stop" : "Stop loss";
-    if (hitStop) return { exit: +stop.toFixed(2), exitAt: c.t, exitType: stopLabel };
-    if (hitTarget) return { exit: +target.toFixed(2), exitAt: c.t, exitType: "Exit trigger" };
+    if (hitStop) return { exit: _roundExitPx(stop), exitAt: c.t, exitType: stopLabel };
+    if (hitTarget) return { exit: _roundExitPx(target), exitAt: c.t, exitType: "Exit trigger" };
     if (c.h > peak) peak = c.h;
   }
   return null;
