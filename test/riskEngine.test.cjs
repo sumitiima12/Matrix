@@ -73,10 +73,10 @@ test("P1-03: a naked short larger than 100% of equity is blocked by default", ()
   assert.match(r.reasons.join(" "), /Short (size|margin)/i);
 });
 
-test("P1-02: default daily-loss circuit breaker (25%) halts after a big loss", () => {
-  const over = acct({ wallet: 70000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -30000 }] });   // −30% of 100k start
+test("P1-02: default daily-loss circuit breaker (90%) halts after a big loss", () => {
+  const over = acct({ wallet: 5000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -95000 }] });   // −95% of 100k start
   assert.ok(validateOrder({ sym: "X", side: "BUY", qty: 1, price: 100, market: "IN" }, over).reasons.some((x) => /loss limit/i.test(x)));
-  const under = acct({ wallet: 80000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -20000 }] });   // −20%
+  const under = acct({ wallet: 20000, trades: [{ exitAt: Date.now(), market: "IN", pnl: -80000 }] });   // −80% (under the 90% cap)
   assert.ok(!validateOrder({ sym: "X", side: "BUY", qty: 1, price: 100, market: "IN" }, under).reasons.some((x) => /loss limit/i.test(x)));
 });
 
@@ -140,15 +140,15 @@ test("a normal leveraged short within margin is allowed (R3-#6)", () => {
 });
 
 /* M2-04: a user policy can only TIGHTEN the platform ceiling, never loosen it. */
-test("M2-04: user cannot loosen the daily-loss ceiling above the platform max (25%)", () => {
+test("M2-04: user cannot loosen the daily-loss ceiling above the platform max (90%)", () => {
   const startOfDayMs = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime() + 60000; })();
-  // Realised −40% today; user tries to disable the breaker with maxDailyLossPct: 100.
-  const trades = [{ exitAt: Date.now(), entryAt: startOfDayMs, pnl: -40000, market: "IN" }];
+  // Realised −95% today; user tries to disable the breaker with maxDailyLossPct: 100.
+  const trades = [{ exitAt: Date.now(), entryAt: startOfDayMs, pnl: -95000, market: "IN" }];
   const r = validateOrder(
     { sym: "TCS", side: "BUY", qty: 1, price: 3000, market: "IN" },
-    { wallet: 60000, portfolio: [], trades, limits: { maxDailyLossPct: 100 } },
+    { wallet: 5000, portfolio: [], trades, limits: { maxDailyLossPct: 100 } },
   );
-  // The platform ceiling (25%) still applies → the order is blocked despite the loose user cap.
+  // The platform ceiling (90%) still applies → the order is blocked despite the loose user cap.
   assert.strictEqual(r.ok, false);
   assert.ok(r.reasons.some((x) => /daily loss/i.test(x)));
 });

@@ -19,6 +19,14 @@ test("Crypto is always open", () => {
   assert.equal(marketOpenIST("Crypto", istEpoch(SUN, 23, 59)), true);
 });
 
+// US Tokens are Delta 24/7 perps — open any hour, any day, never a holiday, never square off.
+test("US Tokens are always open (24/7, like Crypto)", () => {
+  assert.equal(marketOpenIST("USStockTokens", istEpoch(SAT, 3, 0)), true);
+  assert.equal(marketOpenIST("USStockTokens", istEpoch("2026-11-02", 14, 0)), true);   // IST afternoon = US pre-open
+  assert.equal(isMarketHoliday("USStockTokens", istEpoch("2026-12-25", 12, 0)), false); // US Christmas — tokens still trade
+  assert.equal(intradaySquareDue("USStockTokens", istEpoch("2026-11-02", 14, 0)), false);
+});
+
 /* P1-04 — exchange holidays close a market even on a weekday. */
 test("US market holidays are computed correctly (2026)", () => {
   const h = usMarketHolidays(2026);
@@ -100,7 +108,9 @@ test("holidayCalendarReady: crypto/US always; IN fails closed on partial calenda
   delete process.env.ALLOW_INCOMPLETE_HOLIDAY_CALENDAR;
   assert.equal(holidayCalendarReady("Crypto", istEpoch("2099-01-05", 12, 0)), true);
   assert.equal(holidayCalendarReady("US", istEpoch("2099-01-05", 12, 0)), true);
-  assert.equal(holidayCalendarReady("IN", istEpoch("2026-06-01", 12, 0)), false);   // partial subset → not ready (fail closed)
+  // OPERATOR DECISION (2026-10): a loaded subset table counts as ready by default (2026 is also VERIFIED-COMPLETE);
+  // only STRICT_HOLIDAY_CALENDAR=1 restores the fail-closed "verified-complete only" behaviour.
+  assert.equal(holidayCalendarReady("IN", istEpoch("2026-06-01", 12, 0)), true);    // 2026 subset present → ready
   assert.equal(holidayCalendarReady("IN", istEpoch("2035-06-01", 12, 0)), false);   // no table → not ready
 });
 

@@ -27,7 +27,7 @@ const DEFAULT_LIMITS = {
    not the server's local/UTC midnight. On a UTC host an Indian loss at 01:00 IST would otherwise count against
    the previous day. Derive midnight in the market's timezone (IST / ET-with-DST / UTC for 24×7 crypto). */
 function startOfSessionDay(market) {
-  const tz = (market === "US" || market === "USStockTokens") ? "America/New_York" : (market === "Crypto" ? "UTC" : "Asia/Kolkata");
+  const tz = market === "US" ? "America/New_York" : (market === "Crypto" || market === "USStockTokens" ? "UTC" : "Asia/Kolkata");   // US Tokens are 24/7 → UTC risk-day (like Crypto)
   const now = new Date();
   const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
