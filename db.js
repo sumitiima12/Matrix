@@ -172,6 +172,13 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS real_strategies (
     id TEXT PRIMARY KEY, user_id TEXT, status TEXT, updated_at BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS real_strats_status ON real_strategies (status)`);
+  /* Per-user AUTO-TRADING SETTINGS (screener on/off, Smart-Auto-Buy + Ideas capital/symbols/toggles) that the
+     server-side auto engines read so Smart-Auto-Buy / Screener / Ideas run 24/7 regardless of whether the app is
+     open. One row per user; `any_enabled` is indexed so the engine can cheaply load only users who have something
+     turned on. `data` holds the full settings blob (per market + mode). */
+  await pool.query(`CREATE TABLE IF NOT EXISTS auto_settings (
+    user_id TEXT PRIMARY KEY, any_enabled BOOLEAN DEFAULT false, updated_at BIGINT, data JSONB)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS auto_settings_enabled ON auto_settings (any_enabled)`);
   // Row-version for optimistic, conditional lifecycle transitions (R16-P2-01). Existing rows start at 0.
   await pool.query(`ALTER TABLE real_strategies ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 0`);
   /* Durable at-most-once entry ledger (R16-P1-01). One row per (strategy, closed-candle) — the UNIQUE
@@ -360,6 +367,7 @@ const FILES = {
   appSettings: process.env.APP_SETTINGS_FILE || path.join(__dirname, "app_settings.json"),
   managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
   realStrats: process.env.REAL_STRATS_FILE || path.join(__dirname, "real_strategies.json"),
+  autoSettings: process.env.AUTO_SETTINGS_FILE || path.join(__dirname, "auto_settings.json"),
   screeners: process.env.SCREENERS_FILE || path.join(__dirname, "user_screeners.json"),
   riskPolicy: process.env.RISK_POLICY_FILE || path.join(__dirname, "risk_policy.json"),
   autoFlags: process.env.AUTO_FLAGS_FILE || path.join(__dirname, "automation_flags.json"),
@@ -2647,4 +2655,42 @@ async function retentionReport({ noticeDays = 90, closedVirtualDays = 180 } = {}
   };
 }
 
-module.exports = { updateSecurityQuestion, getTradesPage, retentionReport, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, releaseUnknownIdempotency, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, saveAlert, getAlertsForUser, deleteAlert, setAlertActive, getActiveAlerts, markAlertFired, getEntryHalt, logAdminAction, getAdminAudit, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesNeedingReview, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, getOrderAttemptsForUser, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
+/* ---- Per-user AUTO-TRADING SETTINGS (server-side source of truth for the auto engines) ----
+   `settings` is the full blob the client mirrors from its UI. `anyEnabled` is a derived boolean the caller
+   computes (any screener on, or Smart-Auto-Buy/Ideas enabled in any market+mode) so the engine can load only
+   users who have something turned on. Upsert one row per user. */
+async function saveAutoSettings(userId, settings, anyEnabled) {
+  const now = Date.now();
+  const payload = { ...(settings || {}), updatedAt: now };
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO auto_settings (user_id, any_enabled, updated_at, data) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (user_id) DO UPDATE SET any_enabled=$2, updated_at=$3, data=$4`,
+      [String(userId), !!anyEnabled, now, payload]
+    );
+    return payload;
+  }
+  const all = readJSON(FILES.autoSettings);
+  all[String(userId)] = { anyEnabled: !!anyEnabled, updated_at: now, data: payload };
+  writeJSON(FILES.autoSettings, all);
+  return payload;
+}
+async function getAutoSettings(userId) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT data FROM auto_settings WHERE user_id=$1`, [String(userId)]);
+    return r.rows[0] ? r.rows[0].data : null;
+  }
+  const all = readJSON(FILES.autoSettings);
+  return all[String(userId)] ? all[String(userId)].data : null;
+}
+/* Every user with ANYTHING enabled — the engine's work list. Returns [{ userId, settings }]. */
+async function getUsersWithAutoEnabled(limit = 1000) {
+  if (USING_PG) {
+    const r = await pool.query(`SELECT user_id, data FROM auto_settings WHERE any_enabled=true ORDER BY updated_at ASC LIMIT $1`, [limit]);
+    return r.rows.map((x) => ({ userId: x.user_id, settings: x.data }));
+  }
+  const all = readJSON(FILES.autoSettings);
+  return Object.entries(all).filter(([, v]) => v && v.anyEnabled).slice(0, limit).map(([userId, v]) => ({ userId, settings: v.data }));
+}
+
+module.exports = { saveAutoSettings, getAutoSettings, getUsersWithAutoEnabled, updateSecurityQuestion, getTradesPage, retentionReport, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, releaseUnknownIdempotency, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, saveAlert, getAlertsForUser, deleteAlert, setAlertActive, getActiveAlerts, markAlertFired, getEntryHalt, logAdminAction, getAdminAudit, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesNeedingReview, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, getOrderAttemptsForUser, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };

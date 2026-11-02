@@ -2297,6 +2297,40 @@ app.get("/api/state", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* AUTO-TRADING SETTINGS (Phase 1 of server-side automation). The client mirrors its screener/Smart-Auto-Buy/
+   Ideas toggles + capital + symbols here so the backend auto engines can run them 24/7 regardless of whether the
+   app is open. `anyEnabled` is computed SERVER-SIDE from the blob (never trusted from the client) so the engine's
+   work-list is authoritative. The blob is opaque and size-bounded like /api/state. */
+function computeAutoAnyEnabled(s) {
+  if (!s || typeof s !== "object") return false;
+  const scr = s.screeners || {};
+  for (const mkt of Object.keys(scr)) { const m = scr[mkt] || {}; for (const k of Object.keys(m)) { if (m[k] === true) return true; } }
+  for (const grp of [s.smartAutoBuy, s.ideas]) {
+    if (!grp || typeof grp !== "object") continue;
+    for (const mkt of Object.keys(grp)) { const modes = grp[mkt] || {}; for (const md of Object.keys(modes)) { if (modes[md] && modes[md].enabled === true) return true; } }
+  }
+  return false;
+}
+app.post("/api/auto-settings", requireAuth, requireFreshSession, async (req, res) => {
+  try {
+    const settings = (req.body && req.body.settings && typeof req.body.settings === "object" && !Array.isArray(req.body.settings)) ? req.body.settings : {};
+    let size = 0; try { size = Buffer.byteLength(JSON.stringify(settings)); } catch { size = Infinity; }
+    if (size > 256 * 1024) return res.status(413).json({ error: "Auto-settings are too large to save." });
+    const userId = storageKeyFor(req.authUserId);
+    const anyEnabled = computeAutoAnyEnabled(settings);
+    await db.saveAutoSettings(userId, settings, anyEnabled);
+    rcBust(`autoset:${userId}`);
+    res.json({ ok: true, anyEnabled });
+  } catch (e) { serverError(res, e); }
+});
+app.get("/api/auto-settings", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const settings = await rcWrap(`autoset:${userId}`, () => db.getAutoSettings(userId));
+    sendJSONCached(req, res, { settings: settings || null });
+  } catch (e) { serverError(res, e); }
+});
+
 /* Storage/efficiency (reviewer item #1): consolidated first-paint bootstrap. The app's cold start used to
    fan out into several separate authed GETs (state, notices, capabilities, app-settings, screeners,
    strategies) — each its own round-trip + connection. This returns them in ONE response, drawing on the same
