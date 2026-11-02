@@ -10059,9 +10059,11 @@ async function withLease(name, ttlMs, fn) {
    Entry dedup is once-per-(user,source,symbol,market,mode,day) via db.claimSignal (at-most-once across
    replicas/restarts), mirroring the client's once-per-day guard. =================================== */
 
-const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens"]);   // Delta-only for now
+const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens", "IN"]);   // Delta (Crypto/US Tokens) + Indian equities (FYERS)
 const _autoDayIdx = () => Math.floor(Date.now() / 86400000);
-const _deltaBase = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/(USDT|USD|INR|PERP)$/i, "");
+const _deltaBase = (s) => String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/i, "").replace(/\.NS$/i, "").replace(/[^A-Z0-9]/g, "").replace(/(USDT|USD|INR|PERP)$/i, "");
+// Candle/indicator symbol for a market: Delta perps price on "<BASE>-USD", Indian equities on "<BASE>.NS".
+const _candleSym = (market, base) => ((market === "Crypto" || market === "USStockTokens") ? `${_deltaBase(base)}-USD` : `${_deltaBase(base)}.NS`);
 
 /* Shared ENTRY for an auto source (screener / smart-buy / ideas). Runs all real-money gates then places &
    books the order (real) or simulates the fill into the server paper book (virtual). Returns {placed, reason}.
@@ -10072,11 +10074,19 @@ async function executeAutoEntry(ctx) {
   try {
     if (!AUTO_SRC_MARKETS.has(market)) return { placed: false, reason: "unsupported-market" };
     if (!(Number(px) > 0) || !(Number(notional) > 0) || !base) return { placed: false, reason: "bad-input" };
-    const brokerSym = `${base}USD`, symbol = base, yahoo = `${base}-USD`, broker = "delta";
+    /* Market-aware routing. Delta (Crypto/US Tokens): fractional coin qty, "<BASE>USD". IN equities: whole-share
+       qty, FYERS "NSE:<BASE>-EQ" (deterministic + fill-verified; dhan/others need a security-id lookup, a later
+       slice). The candle/quote symbol feeds indicatorsFor + liveMarkForOrder. */
+    const isDelta = (market === "Crypto" || market === "USStockTokens");
+    const broker = isDelta ? "delta" : "fyers";
+    const brokerSym = isDelta ? `${base}USD` : `NSE:${base}-EQ`;
+    const symbol = base, yahoo = isDelta ? `${base}-USD` : `${base}.NS`;
+    const prod = product || "CNC";
     const dayIdx = _autoDayIdx();
     const dedupId = `auto_${source}_${userId}_${market}_${mode}_${base}_${short ? "s" : "l"}_${dayIdx}`;
-    const qty = +(Number(notional) / Number(px)).toFixed(6);
+    const qty = isDelta ? +(Number(notional) / Number(px)).toFixed(6) : Math.max(1, Math.floor(Number(notional) / Number(px)));
     if (!(qty > 0)) return { placed: false, reason: "amount-too-small" };
+    if (short && !isDelta) return { placed: false, reason: "short-not-supported" };   // IN auto-short not wired
 
     // ---- VIRTUAL (paper): simulate a fill at the live price into the server-side paper book (Phase 3) ----
     if (mode === "virtual") {
@@ -10134,10 +10144,10 @@ async function executeAutoEntry(ctx) {
     if (engineFence != null) { let ok = false; try { ok = await db.fenceValid("engine:autobuy", engineFence); } catch { ok = false; } if (!ok) return { placed: false, reason: "lease-takeover" }; }
 
     const clientId = `mx_${source}_${dedupId}`;
-    const r = await placeBuyOrder(sess, brokerSym, qty, market, product, sl, tp, short, clientId, "MARKET", 0);
+    const r = await placeBuyOrder(sess, brokerSym, qty, market, prod, sl, tp, short, clientId, "MARKET", 0);
     const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
     const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : Number(px);
-    const pos = await registerManagedPosition({ sess, symbol, brokerSym, qty: fillQty, entry: fillPx, market, sl, tp, tsl, cfg: null, yahoo, interval: "5m", product, short });
+    const pos = await registerManagedPosition({ sess, symbol, brokerSym, qty: fillQty, entry: fillPx, market, sl, tp, tsl, cfg: null, yahoo, interval: "5m", product: prod, short });
     const journaled = await recordAuthoritativeFill(storeKey, {
       id: `${source}_${dedupId}`, sym: symbol, side: short ? "SELL" : "BUY", qty: fillQty, entry: fillPx, entryAt: Date.now(),
       market, real: true, broker, tradeType, orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
@@ -10193,7 +10203,7 @@ async function runUserScreenerEntries(userId, settings, live) {
       const syms = Array.isArray(s.symbols) ? s.symbols : [];
       if (!syms.length) continue;
       const cfg = { defs: s.defs || [], entry: s.entry, tf: s.tf || "5m" };
-      const matches = await scanSymbolsForEntry(syms.map((x) => `${_deltaBase(x)}-USD`), cfg);
+      const matches = await scanSymbolsForEntry(syms.map((x) => _candleSym(market, x)), cfg);
       if (!matches.length) continue;
       const perNotional = (Number(s.capital) || 0) / matches.length;   // split the screener's capital across today's matches
       const modes = s.modes || {};
@@ -10219,7 +10229,7 @@ async function runUserIdeaEntries(userId, settings, live) {
     if (!anyOn) continue;
     const syms = (Object.values(perMode).find((m) => m && Array.isArray(m.symbols) && m.symbols.length) || {}).symbols || [];
     if (!syms.length) continue;
-    const scan = await scanIdeasForSymbols(syms.map((x) => `${_deltaBase(x)}-USD`)).catch(() => []);
+    const scan = await scanIdeasForSymbols(syms.map((x) => _candleSym(market, x))).catch(() => []);
     for (const idea of scan) {
       const base = _deltaBase(idea.sym);
       for (const mode of ["virtual", "real"]) {
@@ -10233,7 +10243,46 @@ async function runUserIdeaEntries(userId, settings, live) {
   }
 }
 
-/* The sweep: every user with something enabled gets their screener + ideas (+ smart-buy, next slice) evaluated. */
+/* Server-side SMART-AUTO-BUY picks — the SAME dailyPicks the app shows, computed from indicatorsFor() so the
+   server ranks identically. `appSyms` is the market universe; returns ranked picks with pickSide/pickSlPct/pickTpPct. */
+const _sigEngine = require("./signals");
+async function computeSmartPicks(market, appSyms, allowShorts) {
+  const list = []; const CONC = 5;
+  const uniq = [...new Set((appSyms || []).map(_deltaBase))].slice(0, 80);
+  for (let i = 0; i < uniq.length; i += CONC) {
+    const rs = await Promise.all(uniq.slice(i, i + CONC).map(async (base) => {
+      try { const ind = await indicatorsFor(_candleSym(market, base)); if (!ind || ind.price == null) return null; return Object.assign({}, ind, { sym: base, market, hasData: true }); }
+      catch { return null; }
+    }));
+    rs.forEach((r) => { if (r) list.push(r); });
+  }
+  return _sigEngine.dailyPicks(list, { allowShorts });
+}
+/* Evaluate ONE user's SMART-AUTO-BUY (both modes). Picks are computed once per market; capital is split across
+   the top picks. Shorts only on Delta markets (the app's rule). */
+async function runUserSmartBuyEntries(userId, settings, live) {
+  const sab = (settings && settings.smartAutoBuy) || {};
+  for (const market of Object.keys(sab)) {
+    if (!AUTO_SRC_MARKETS.has(market)) continue;
+    const perMode = sab[market] || {};
+    if (!Object.values(perMode).some((m) => m && m.enabled === true)) continue;
+    const syms = (Object.values(perMode).find((m) => m && Array.isArray(m.symbols) && m.symbols.length) || {}).symbols || [];
+    if (!syms.length) continue;
+    const allowShorts = (market === "Crypto" || market === "USStockTokens");
+    const picks = (await computeSmartPicks(market, syms, allowShorts)).slice(0, 10);   // cap entries/day/market
+    if (!picks.length) continue;
+    for (const mode of ["virtual", "real"]) {
+      const cfgM = perMode[mode]; if (!cfgM || cfgM.enabled !== true) continue;
+      const capital = Number(cfgM.capital) || 0; if (!(capital > 0)) continue;
+      const per = capital / picks.length;
+      for (const p of picks) {
+        await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live });
+      }
+    }
+  }
+}
+
+/* The sweep: every user with something enabled gets their screener + ideas + smart-buy evaluated. */
 let signalAutoRunning = false;
 async function runSignalAutoEngine() {
   if (signalAutoRunning) return;
@@ -10246,6 +10295,7 @@ async function runSignalAutoEngine() {
       if (!u || !u.settings) continue;
       try { await runUserScreenerEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.screener.sweep_error", { userId: u.userId, err: e && e.message }); }
       try { await runUserIdeaEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.ideas.sweep_error", { userId: u.userId, err: e && e.message }); }
+      try { await runUserSmartBuyEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.smartbuy.sweep_error", { userId: u.userId, err: e && e.message }); }
     }
   } finally { signalAutoRunning = false; }
 }
