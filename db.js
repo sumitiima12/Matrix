@@ -179,6 +179,11 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS auto_settings (
     user_id TEXT PRIMARY KEY, any_enabled BOOLEAN DEFAULT false, updated_at BIGINT, data JSONB)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS auto_settings_enabled ON auto_settings (any_enabled)`);
+  /* Server-side VIRTUAL (paper) positions — so the paper auto engines run 24/7 and a paper exit monitor can
+     close on SL/TP even with the app closed. `status` is open|closed. One row per paper position. */
+  await pool.query(`CREATE TABLE IF NOT EXISTS paper_positions (
+    id TEXT PRIMARY KEY, user_id TEXT, status TEXT, updated_at BIGINT, data JSONB)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS paper_pos_status ON paper_positions (status)`);
   // Row-version for optimistic, conditional lifecycle transitions (R16-P2-01). Existing rows start at 0.
   await pool.query(`ALTER TABLE real_strategies ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 0`);
   /* Durable at-most-once entry ledger (R16-P1-01). One row per (strategy, closed-candle) — the UNIQUE
@@ -368,6 +373,7 @@ const FILES = {
   managed: process.env.MANAGED_FILE || path.join(__dirname, "managed_positions.json"),
   realStrats: process.env.REAL_STRATS_FILE || path.join(__dirname, "real_strategies.json"),
   autoSettings: process.env.AUTO_SETTINGS_FILE || path.join(__dirname, "auto_settings.json"),
+  paperPos: process.env.PAPER_POS_FILE || path.join(__dirname, "paper_positions.json"),
   screeners: process.env.SCREENERS_FILE || path.join(__dirname, "user_screeners.json"),
   riskPolicy: process.env.RISK_POLICY_FILE || path.join(__dirname, "risk_policy.json"),
   autoFlags: process.env.AUTO_FLAGS_FILE || path.join(__dirname, "automation_flags.json"),
@@ -2693,4 +2699,25 @@ async function getUsersWithAutoEnabled(limit = 1000) {
   return Object.entries(all).filter(([, v]) => v && v.anyEnabled).slice(0, limit).map(([userId, v]) => ({ userId, settings: v.data }));
 }
 
-module.exports = { saveAutoSettings, getAutoSettings, getUsersWithAutoEnabled, updateSecurityQuestion, getTradesPage, retentionReport, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, releaseUnknownIdempotency, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, saveAlert, getAlertsForUser, deleteAlert, setAlertActive, getActiveAlerts, markAlertFired, getEntryHalt, logAdminAction, getAdminAudit, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesNeedingReview, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, getOrderAttemptsForUser, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };
+/* ---- Server-side VIRTUAL (paper) positions ---- */
+async function savePaperPosition(p) {
+  const now = Date.now(); const row = { ...p, updated_at: now };
+  if (USING_PG) {
+    await pool.query(
+      `INSERT INTO paper_positions (id, user_id, status, updated_at, data) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, updated_at=EXCLUDED.updated_at, data=EXCLUDED.data`,
+      [p.id, String(p.userId), p.status || "open", now, row]);
+    return row;
+  }
+  const all = readJSON(FILES.paperPos); all[p.id] = row; writeJSON(FILES.paperPos, all); return row;
+}
+async function getOpenPaperPositions(limit = 2000) {
+  if (USING_PG) { const r = await pool.query(`SELECT data FROM paper_positions WHERE status='open' ORDER BY updated_at ASC LIMIT $1`, [limit]); return r.rows.map((x) => x.data); }
+  return Object.values(readJSON(FILES.paperPos)).filter((p) => p.status === "open").slice(0, limit);
+}
+async function getPaperPositionsForUser(userId, limit = 500) {
+  if (USING_PG) { const r = await pool.query(`SELECT data FROM paper_positions WHERE user_id=$1 ORDER BY updated_at DESC LIMIT $2`, [String(userId), limit]); return r.rows.map((x) => x.data); }
+  return Object.values(readJSON(FILES.paperPos)).filter((p) => String(p.userId) === String(userId)).slice(0, limit);
+}
+
+module.exports = { savePaperPosition, getOpenPaperPositions, getPaperPositionsForUser, saveAutoSettings, getAutoSettings, getUsersWithAutoEnabled, updateSecurityQuestion, getTradesPage, retentionReport, getSecurityQuestion, getSecurityAnswerHash, listUsers, setUserBlocked, isUserBlocked, setUserApproved, unapproveUserAndRevoke, listPendingUsers, getUserFull, initDb, saveTrade, recordFill, recordFillAndTrade, recordExitAtomic, getFills, getFillById, getUsersWithProvisionalFills, getProvisionalFills, getReconcilableFills, getOrderExecCounts, computeLedgerDrift, projectFills, deriveRiskFromFills, computeExitDrift, reconcileRiskVsLedger, reconcileForUnlock, countUnknownIdempotency, idempotencyStats, getTrades, reassignTrades, recordTradeArchive, reassignAndArchiveTrades, getArchivedTradesForPhone, deleteTradesByIds, clearVirtualTrades, clearTradesByType, getUser, createUser, updateUserPin, updateUserPinAndBumpToken, bumpTokenVersion, getTokenVersion, getState, saveState, getScreeners, saveScreeners, setEntryHalt, getHaltedEntryUsers, setRiskLock, isRiskLocked, getOpenTrades, updateTrade, getUserByUsername, setUsername, setEmail, setLastLogin, publishStrategy, unpublishStrategy, listPublicStrategies, postIdea, deleteIdea, listIdeas, getIdeaScreenshot, reviewIdea, saveBrokerCred, getBrokerCred, deleteBrokerCred, saveBrokerApp, getBrokerApp, getAllBrokerApps, deleteBrokerApp, getAppSettings, saveAppSettings, deleteAccount, saveManagedPosition, getOpenManagedPositions, getManagedPositionsForUser, updateManagedPosition, claimManagedForExit, claimRealStrategyForEntry, transitionRealStrategy, claimIdempotencyKey, getIdempotencyRecord, markIdempotencyTagged, finalizeIdempotency, releaseIdempotencyKey, releaseUnknownIdempotency, reconcileStaleIdempotency, purgeLedgersForUser, savePendingProtection, listPendingProtection, listPendingProtectionForUser, claimPendingProtection, bumpPendingProtection, deletePendingProtection, saveOAuthState, consumeOAuthStateRow, addNotice, getNotices, markNoticesRead, savePushSubscription, deletePushSubscription, updatePushPrefs, getPushSubscriptions, saveAlert, getAlertsForUser, deleteAlert, setAlertActive, getActiveAlerts, markAlertFired, getEntryHalt, logAdminAction, getAdminAudit, saveRiskPolicy, getRiskPolicy, saveRealStrategy, getActiveRealStrategies, getRealStrategiesNeedingReview, getRealStrategiesForUser, updateRealStrategy, prepareOrderAttempt, transitionOrderAttempt, finalizeOrderAttempt, getOrderAttempt, listUnresolvedOrderAttempts, getOrderAttemptsForUser, tryAdvisoryLock, releaseAdvisoryLock, saveProjectionPending, listProjectionPending, deleteProjectionPending, bumpProjectionPending, acquireLease, renewLease, releaseLease, fenceValid, getLease, claimSignal, runSchemaMigrations, schemaIsAtTarget, USING_PG };

@@ -10047,6 +10047,260 @@ async function withLease(name, ttlMs, fn) {
   finally { db.renewLease(name, INSTANCE_ID, lease.fence, 0).catch(() => {}); db.releaseLease(name, INSTANCE_ID).catch(() => {}); }
 }
 
+/* ===================================================================================================
+   PHASE 2/3 — server-side SMART-AUTO-BUY / SCREENER / IDEAS engines.
+   These run on the engine timer so the three auto paths place entries 24/7 regardless of whether the app
+   is open — the gap the user hit ("opening the app triggered the trades"). They reuse the SAME hardened
+   real-order pipeline as the strategy engine (owner auth, capability gate, fill-verified brokers, the
+   shared risk engine + execution-ledger daily-loss breaker, duplicate-symbol guard, managed-exit
+   registration, authoritative-fill journaling, halt-on-unjournaled), and add a parallel VIRTUAL (paper)
+   book for mode:"virtual" (Phase 3). Scoped to the Delta markets the user trades (Crypto + US Tokens);
+   IN/US-equity server-side automation is a later slice (needs each broker's symbol/order routing).
+   Entry dedup is once-per-(user,source,symbol,market,mode,day) via db.claimSignal (at-most-once across
+   replicas/restarts), mirroring the client's once-per-day guard. =================================== */
+
+const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens"]);   // Delta-only for now
+const _autoDayIdx = () => Math.floor(Date.now() / 86400000);
+const _deltaBase = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/(USDT|USD|INR|PERP)$/i, "");
+
+/* Shared ENTRY for an auto source (screener / smart-buy / ideas). Runs all real-money gates then places &
+   books the order (real) or simulates the fill into the server paper book (virtual). Returns {placed, reason}.
+   Never throws — a failure is logged and reported so the sweep continues to the next candidate. */
+async function executeAutoEntry(ctx) {
+  const { userId, market, mode, base, notional, px, sl = null, tp = null, tsl = null, short = false,
+    product = "CNC", tradeType, source, live, engineFence = null } = ctx;
+  try {
+    if (!AUTO_SRC_MARKETS.has(market)) return { placed: false, reason: "unsupported-market" };
+    if (!(Number(px) > 0) || !(Number(notional) > 0) || !base) return { placed: false, reason: "bad-input" };
+    const brokerSym = `${base}USD`, symbol = base, yahoo = `${base}-USD`, broker = "delta";
+    const dayIdx = _autoDayIdx();
+    const dedupId = `auto_${source}_${userId}_${market}_${mode}_${base}_${short ? "s" : "l"}_${dayIdx}`;
+    const qty = +(Number(notional) / Number(px)).toFixed(6);
+    if (!(qty > 0)) return { placed: false, reason: "amount-too-small" };
+
+    // ---- VIRTUAL (paper): simulate a fill at the live price into the server-side paper book (Phase 3) ----
+    if (mode === "virtual") {
+      const claimed = await db.claimSignal(dedupId, userId, "auto-paper").catch(() => true);
+      if (!claimed) return { placed: false, reason: "already-today" };
+      const r = await paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry: Number(px), sl, tp, tsl, short, tradeType, source });
+      return { placed: !!(r && r.ok), reason: r && r.reason };
+    }
+
+    // ---- REAL: full gate stack, then place on Delta + register managed exit + journal ----
+    if (!live) { console.log(`[auto:${source}] DRY-RUN would BUY ${qty} ${symbol} (${market}) for ${userId}`); return { placed: false, reason: "dry-run" }; }
+    // owner auth — fail closed
+    let owner; try { owner = await db.getUser(stripPh(String(userId))); } catch { return { placed: false, reason: "owner-unverifiable" }; }
+    if (!owner || owner.blocked || owner.deleted || owner.approved !== true) return { placed: false, reason: "account-inactive" };
+    // broker capability + fill-verified
+    if (capabilityBlock(broker, "unattendedAutomation")) return { placed: false, reason: "capability" };
+    if (!FILL_VERIFIED_BROKERS.has(broker)) return { placed: false, reason: "fill-unverified-broker" };
+    const sess = await sessionFromCred(userId, broker);
+    if (!sess) return { placed: false, reason: "no-broker-session" };
+    // account-wide entry halt / risk lock (durable, cross-instance) — fail closed
+    const storeKey = storageKeyFor(userId);
+    if (!ENTRY_LOCK_DISABLED) {
+      let blocked; try { blocked = (await db.isRiskLocked(storeKey)) || (typeof db.getEntryHalt === "function" && await db.getEntryHalt(storeKey)); }
+      catch { return { placed: false, reason: "risk-state-unreadable" }; }
+      if (blocked) return { placed: false, reason: "reconciliation-locked" };
+    }
+    // the SHARED risk engine (account truth) + the execution-ledger daily-loss breaker — same as the strategy engine
+    const abMarketKind = market;   // "Crypto" | "USStockTokens"
+    let policyRaw, trades;
+    try { policyRaw = await db.getRiskPolicy(storeKey); trades = await db.getTrades(storeKey, 0, Date.now()); }
+    catch { return { placed: false, reason: "risk-read-failed" }; }
+    const policy = effectiveRiskPolicy(cleanRiskPolicy(policyRaw), {});
+    const account = await fetchBrokerAccount(sess).catch(() => null);
+    if (!account) return { placed: false, reason: "account-unverifiable" };
+    const check = serverValidateOrder(
+      { sym: base, side: short ? "SELL" : "BUY", qty, price: Number(px), market: abMarketKind },
+      { wallet: account.wallet, portfolio: account.portfolio, trades: riskEligibleTrades(trades), ...(Object.keys(policy).length ? { limits: policy } : {}) },
+    );
+    if (!check.ok) { logFinancial(`auto.${source}.risk_blocked`, { userId, symbol, reasons: check.reasons }); return { placed: false, reason: "risk:" + (check.reasons[0] || "blocked") }; }
+    if (typeof db.deriveRiskFromFills === "function") {
+      const maxLossPct = Number(policy.maxDailyLossPct) || 90;
+      const dayStart = riskSessionDayStart(abMarketKind);
+      let fillsRk; try { fillsRk = db.deriveRiskFromFills(await db.getFills(storeKey, dayStart, Date.now()), { from: dayStart, to: Date.now() }); }
+      catch { return { placed: false, reason: "ledger-read-failed" }; }
+      const startEquity = (Number(account.wallet) || 0) - (Number(fillsRk.realizedPnl) || 0);
+      const lossCap = Math.max(0, (startEquity * maxLossPct) / 100);
+      if (lossCap > 0 && Number(fillsRk.realizedLoss) >= lossCap) { logFinancial(`auto.${source}.risk_blocked`, { userId, symbol, cap: "maxDailyLossPct" }); return { placed: false, reason: "daily-loss-limit" }; }
+    }
+    // don't stack a duplicate open in this (broker, symbol) — first claim wins across ALL automation
+    if (signalGuards.duplicateOpenSymbol(await db.getManagedPositionsForUser(userId).catch(() => []), broker, brokerSym)) return { placed: false, reason: "already-open" };
+    // at-most-once for today — claim BEFORE touching the broker (an ambiguous send stays claimed, never re-fires today)
+    const claimed = await db.claimSignal(dedupId, userId, "auto-entry").catch(() => false);
+    if (!claimed) return { placed: false, reason: "already-today" };
+    // last-instant lease fence (another replica may now own the engine) — avoid a duplicate order
+    if (engineFence != null) { let ok = false; try { ok = await db.fenceValid("engine:autobuy", engineFence); } catch { ok = false; } if (!ok) return { placed: false, reason: "lease-takeover" }; }
+
+    const clientId = `mx_${source}_${dedupId}`;
+    const r = await placeBuyOrder(sess, brokerSym, qty, market, product, sl, tp, short, clientId, "MARKET", 0);
+    const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
+    const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : Number(px);
+    const pos = await registerManagedPosition({ sess, symbol, brokerSym, qty: fillQty, entry: fillPx, market, sl, tp, tsl, cfg: null, yahoo, interval: "5m", product, short });
+    const journaled = await recordAuthoritativeFill(storeKey, {
+      id: `${source}_${dedupId}`, sym: symbol, side: short ? "SELL" : "BUY", qty: fillQty, entry: fillPx, entryAt: Date.now(),
+      market, real: true, broker, tradeType, orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
+    }, { haltUserIdOnFail: userId });
+    if (!journaled) { haltedEntries.add(String(userId)); logFinancial(`auto.${source}.halted_unjournaled_fill`, { userId, symbol, orderId: r.orderId }); }
+    logFinancial(`auto.${source}.filled`, { userId, broker, symbol, side: short ? "SELL" : "BUY", qty: fillQty, price: fillPx, orderId: r.orderId });
+    console.log(`[auto:${source}] FILLED ${fillQty} ${symbol} (${market}) for ${userId} (order ${r.orderId})`);
+    return { placed: true };
+  } catch (e) {
+    const msg = String((e && (e.message || e)) || "error");
+    logFinancial(`auto.${ctx.source}.error`, { userId: ctx.userId, base: ctx.base, msg });
+    console.error(`[auto:${ctx.source}] ${ctx.base} error:`, msg);
+    return { placed: false, reason: "error:" + msg };
+  }
+}
+
+/* Per-symbol entry scan (the body of /api/screener-scan), reused by the server-side screener engine. `syms`
+   are candle-fetchable symbols (e.g. "BTC-USD"). Returns [{ sym, price }] for symbols whose entry rule fires now. */
+async function scanSymbolsForEntry(syms, cfg) {
+  const range = cfg.tf === "1d" ? "1y" : "5d";
+  const list = [...new Set((syms || []).map(String))].slice(0, 60);
+  const out = []; const CONC = 5;
+  for (let i = 0; i < list.length; i += CONC) {
+    const rs = await Promise.all(list.slice(i, i + CONC).map(async (sym) => {
+      try { const candles = await candlesForTf(sym, cfg.tf, range); if (!candles || candles.length < 30) return null;
+        const r = strat.entrySignalFired(cfg, candles); if (!r || !r.fired) return null;
+        return { sym, price: +Number(candles[candles.length - 1].c).toFixed(6) };
+      } catch { return null; }
+    }));
+    rs.forEach((r) => { if (r) out.push(r); });
+  }
+  return out;
+}
+
+/* Today's ideas for a set of candle-fetchable symbols — the same per-symbol idea detector /api/idea-scan uses. */
+async function scanIdeasForSymbols(syms) {
+  const list = [...new Set((syms || []).map(String))].slice(0, 60);
+  const out = []; const CONC = 5;
+  for (let i = 0; i < list.length; i += CONC) {
+    const rs = await Promise.all(list.slice(i, i + CONC).map((s) => scanOneIdea(s).catch(() => null)));
+    rs.forEach((r) => { if (r) out.push(r); });
+  }
+  return out;
+}
+
+/* Evaluate ONE user's enabled SCREENERS (both modes) and place entries for current matches. */
+async function runUserScreenerEntries(userId, settings, live) {
+  const scr = (settings && settings.screeners) || {};
+  for (const market of Object.keys(scr)) {
+    if (!AUTO_SRC_MARKETS.has(market)) continue;
+    for (const key of Object.keys(scr[market] || {})) {
+      const s = scr[market][key]; if (!s || s.enabled !== true || !Array.isArray(s.entry) || !s.entry.length) continue;
+      const syms = Array.isArray(s.symbols) ? s.symbols : [];
+      if (!syms.length) continue;
+      const cfg = { defs: s.defs || [], entry: s.entry, tf: s.tf || "5m" };
+      const matches = await scanSymbolsForEntry(syms.map((x) => `${_deltaBase(x)}-USD`), cfg);
+      if (!matches.length) continue;
+      const perNotional = (Number(s.capital) || 0) / matches.length;   // split the screener's capital across today's matches
+      const modes = s.modes || {};
+      for (const m of matches) {
+        const base = _deltaBase(m.sym);
+        for (const mode of ["virtual", "real"]) {
+          if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
+          await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live });
+        }
+      }
+    }
+  }
+}
+
+/* Evaluate ONE user's enabled IDEAS auto-buy (both modes) and place entries for today's ideas. Reuses the
+   same idea scan the /api/idea-scan endpoint uses so paper and real see the same signals. */
+async function runUserIdeaEntries(userId, settings, live) {
+  const ideas = (settings && settings.ideas) || {};
+  for (const market of Object.keys(ideas)) {
+    if (!AUTO_SRC_MARKETS.has(market)) continue;
+    const perMode = ideas[market] || {};
+    const anyOn = Object.values(perMode).some((m) => m && m.enabled === true);
+    if (!anyOn) continue;
+    const syms = (Object.values(perMode).find((m) => m && Array.isArray(m.symbols) && m.symbols.length) || {}).symbols || [];
+    if (!syms.length) continue;
+    const scan = await scanIdeasForSymbols(syms.map((x) => `${_deltaBase(x)}-USD`)).catch(() => []);
+    for (const idea of scan) {
+      const base = _deltaBase(idea.sym);
+      for (const mode of ["virtual", "real"]) {
+        const cfgM = perMode[mode]; if (!cfgM || cfgM.enabled !== true) continue;
+        const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
+        if (!(px > 0)) continue;
+        const slPct = Number(idea.slPct) || null, tpPct = Number(idea.tpPct) || null;
+        await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: slPct, tp: tpPct, short: false, tradeType: "Ideas", source: "ideas", live });
+      }
+    }
+  }
+}
+
+/* The sweep: every user with something enabled gets their screener + ideas (+ smart-buy, next slice) evaluated. */
+let signalAutoRunning = false;
+async function runSignalAutoEngine() {
+  if (signalAutoRunning) return;
+  signalAutoRunning = true;
+  try {
+    if (!schemaReady || typeof db.getUsersWithAutoEnabled !== "function") return;
+    const live = autoBuyLiveOn();
+    const users = await db.getUsersWithAutoEnabled(1000).catch(() => []);
+    for (const u of users) {
+      if (!u || !u.settings) continue;
+      try { await runUserScreenerEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.screener.sweep_error", { userId: u.userId, err: e && e.message }); }
+      try { await runUserIdeaEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.ideas.sweep_error", { userId: u.userId, err: e && e.message }); }
+    }
+  } finally { signalAutoRunning = false; }
+}
+
+/* ---- Phase 3: server-side VIRTUAL (paper) book ----
+   A paper entry writes a server-authored virtual trade (real:false) the client reads via /api/trades, plus a
+   paper_positions row the monitor below watches. No real money, no broker — fills at the live price. */
+async function paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry, sl, tp, tsl, short, tradeType, source }) {
+  try {
+    const open = await db.getPaperPositionsForUser(userId).catch(() => []);
+    if (open.some((p) => p.status === "open" && _deltaBase(p.base) === _deltaBase(base) && p.market === market)) return { ok: false, reason: "already-open" };
+    const id = `paper_${source}_${userId}_${market}_${base}_${_autoDayIdx()}`;
+    const now = Date.now();
+    await db.savePaperPosition({ id, userId: String(userId), status: "open", base, brokerSym, symbol, market, qty: Number(qty), entry: Number(entry), sl, tp, tsl, short: !!short, source, openedAt: now });
+    await db.saveTrade(storageKeyFor(userId), {
+      id: `${id}_t`, sym: symbol, side: short ? "SELL" : "BUY", qty: Number(qty), entry: Number(entry), entryAt: now,
+      market, real: false, tradeType, exitType: "Open", paperPositionId: id, short: short || undefined,
+    }, { authoritative: true });
+    logFinancial(`auto.${source}.paper_open`, { userId, symbol, qty, entry });
+    console.log(`[auto:${source}] PAPER open ${qty} ${symbol} (${market}) @ ${entry} for ${userId}`);
+    return { ok: true };
+  } catch (e) { return { ok: false, reason: "error:" + (e && e.message) }; }
+}
+let paperExitRunning = false;
+async function runPaperExitMonitor() {
+  if (paperExitRunning) return; paperExitRunning = true;
+  try {
+    if (!schemaReady) return;
+    const open = await db.getOpenPaperPositions(3000).catch(() => []);
+    for (const p of open) {
+      try {
+        const entry = Number(p.entry); if (!(entry > 0)) continue;
+        const px = await liveMarkForOrder(p.brokerSym, p.market).catch(() => null);
+        if (!(px > 0)) continue;
+        const dir = p.short ? -1 : 1;
+        const movePct = ((px - entry) / entry) * 100 * dir;   // favourable move is positive
+        let hit = null;
+        if (p.tp != null && movePct >= Number(p.tp)) hit = { type: "Exit trigger", px: _roundExitPx(entry * (1 + dir * Number(p.tp) / 100)) };
+        else if (p.sl != null && movePct <= -Number(p.sl)) hit = { type: "Stop loss", px: _roundExitPx(entry * (1 - dir * Number(p.sl) / 100)) };
+        if (!hit) continue;
+        const now = Date.now();
+        const pnl = +((hit.px - entry) * Number(p.qty) * dir).toFixed(6);
+        await db.savePaperPosition({ ...p, status: "closed", exit: hit.px, exitAt: now });
+        await db.saveTrade(storageKeyFor(p.userId), {
+          id: `${p.id}_t`, sym: p.symbol, side: p.short ? "SELL" : "BUY", qty: Number(p.qty), entry,
+          entryAt: p.openedAt || now, exit: hit.px, exitAt: now, pnl, market: p.market, real: false,
+          tradeType: p.source === "screener" ? "Screener Auto Buy" : p.source === "ideas" ? "Ideas" : "Auto Buy",
+          exitType: hit.type, paperPositionId: p.id, short: p.short || undefined,
+        }, { authoritative: true });
+        logFinancial(`auto.${p.source}.paper_exit`, { userId: p.userId, symbol: p.symbol, exit: hit.px, pnl, exitType: hit.type });
+      } catch { /* per-position best-effort */ }
+    }
+  } finally { paperExitRunning = false; }
+}
+
 async function runAutoBuyEngine() {
   if (autoBuyRunning) return;
   _lastEngineTickMs = Date.now();   // MU-2: engine heartbeat for the monitoring health check
@@ -10573,6 +10827,15 @@ const AUTO_BUY_MS = Math.max(30_000, Number(process.env.AUTO_BUY_MS) || 120_000)
 if (process.env.EXIT_MONITOR !== "off") {
   setInterval(runAutoBuyEngine, AUTO_BUY_MS);
   setTimeout(runAutoBuyEngine, 20_000);
+  /* Phase 2/3: the server-side Smart-Auto-Buy / Screener / Ideas entry sweep + the paper exit monitor, on the
+     SAME cadence as the strategy engine so all auto paths run 24/7 regardless of whether the app is open. The
+     entry sweep is lease-guarded per candidate (executeAutoEntry re-checks the engine lease fence before any
+     real order); the paper monitor is read-mostly. Both early-out when no user has auto enabled / no paper
+     position is open. */
+  setInterval(runSignalAutoEngine, AUTO_BUY_MS);
+  setTimeout(runSignalAutoEngine, 30_000);
+  setInterval(runPaperExitMonitor, AUTO_BUY_MS);
+  setTimeout(runPaperExitMonitor, 40_000);
 }
 
 /* UX-3 — PRICE ALERT engine. Every minute, evaluate active user alerts against fresh quotes and push on
