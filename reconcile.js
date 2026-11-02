@@ -284,7 +284,12 @@ function deltaReconcilePlan(openCryptoRealTrades, book) {
    Inputs: row {broker,sym,side/short,qty(coin units),entry,entryAt(ms)}, fills (Delta /v2/fills rows), contractValue
    (coin units per contract for this symbol; Delta fill `size` is in CONTRACTS). Delta timestamps may be µs or ms. */
 function reconstructExitFromDeltaFills(row, fills, { contractValue = 1 } = {}) {
-  if (!row || String((row.broker) || "").toLowerCase() !== "delta") return null;
+  // Accept a Delta-stamped row OR any real crypto / US-token row (those markets are Delta-only, so an un-stamped
+  // row — e.g. a screener/auto fill that never got broker:"delta" written — is still a Delta trade). Without this
+  // the reconcile booked a break-even $0 instead of the real fills, so a manually-closed +$ position lost its P&L.
+  const _brokerOk = String((row && row.broker) || "").toLowerCase() === "delta";
+  const _deltaMkt = row && (row.market === "Crypto" || row.market === "USStockTokens");
+  if (!row || (!_brokerOk && !_deltaMkt)) return null;
   const entry = Number(row.entry);
   const wantCoin = Math.abs(Number(row.qty) || 0);
   if (!(entry > 0) || !(wantCoin > 0)) return null;
