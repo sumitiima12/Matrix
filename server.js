@@ -3579,18 +3579,17 @@ app.post("/api/derivatives/resolve", requireAuth, async (req, res) => {
     }
     // COMMODITY (MCX via Dhan) — resolve from the Dhan detailed scrip master.
     if (market === "Commodity") {
-      const dhanValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_DHAN_MCX_VALIDATED || "")));
+      /* MCX real execution is NO LONGER flag-gated (operator decision — MATRIX_DHAN_MCX_VALIDATED removed). The
+         scrip master must still LOAD (headerLooksValid): resolving a contract from a missing/garbled master would
+         pick the wrong instrument, so that data-safety guard stays and is the only block on real resolution. */
       const { rows, headerLooksValid } = await dhanMcxRows();
-      if (mode === "real" && (!headerLooksValid || !dhanValidated)) {
-        return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: !headerLooksValid ? "instrument_master_unavailable" : "real_execution_master_not_validated", realExecution: false });
-      }
-      if (!headerLooksValid) return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "instrument_master_unavailable" });
+      if (!headerLooksValid) return res.status(409).json({ ok: false, error: "DERIVATIVE_CONTRACT_RESOLUTION_FAILED", detail: "instrument_master_unavailable", realExecution: false });
       const rc = dhanCommodity.resolveCommodityContract({
         rows, underlying: b.underlying, productType, optionType: b.optionType, moneyness: b.moneyness,
         expiryIntent: b.expiryIntent, side: b.side, spot: Number(b.spot), lots: Number(b.lots),
       });
       if (rc.error) return res.status(409).json({ ok: false, error: rc.error, detail: rc.detail });
-      return res.json({ ok: true, resolved: rc, realExecution: mode === "real" && dhanValidated && headerLooksValid });
+      return res.json({ ok: true, resolved: rc, realExecution: mode === "real" && headerLooksValid });
     }
     // US equity/index OPTIONS — OCC symbology. Deterministic when an explicit strike+expiry is supplied; moneyness
     // needs a live option chain (pass `chain` rows) or it fails closed. Real execution gated on MATRIX_US_OPTIONS_VALIDATED.
