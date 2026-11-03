@@ -46,9 +46,11 @@ function techSignal(s) {
   if (s.rsi > 50 && s.rsi < 68) score += 0.5;
   if (s.chg != null) score += Math.max(-1, Math.min(1, s.chg * 0.15));
 
-  const tpCap = px * (isCrypto ? 1.30 : 1.20);
-  const slFloor = px * (isCrypto ? 0.85 : 0.90);
-  let target = (res != null && res <= tpCap) ? res : px + 2.5 * atr;
+  // WIN-RATE TUNING (kept in sync with the frontend): crypto targets tightened — cap +12% (was +30%) and
+  // project 1.5×ATR (was 2.5×) so high-ATR coins stop setting 20%+ targets that rarely fill. Equities unchanged.
+  const tpCap = px * (isCrypto ? 1.12 : 1.20);
+  const slFloor = px * (isCrypto ? 0.88 : 0.90);
+  let target = (res != null && res <= tpCap) ? res : px + (isCrypto ? 1.5 : 2.5) * atr;
   target = Math.min(Math.max(target, px * 1.01), tpCap);
   let stop = (sup != null && sup >= slFloor) ? Math.max(sup - 0.25 * atr, slFloor) : px - 2 * atr;
   stop = Math.min(Math.max(stop, slFloor), px * 0.995);
@@ -81,9 +83,9 @@ function techSignalShort(s) {
   if (volRatio != null && volRatio > 1.3) score += 0.7;
   if (s.rsi < 30) score -= 0.8;
   if (s.chg != null) score += Math.max(-1, Math.min(1, -s.chg * 0.15));
-  const tpFloor = px * (isCrypto ? 0.70 : 0.80);
-  const slCap = px * (isCrypto ? 1.15 : 1.10);
-  let target = (sup != null && sup >= tpFloor) ? Math.min(sup + 0.25 * atr, px * 0.99) : px - 2.5 * atr;
+  const tpFloor = px * (isCrypto ? 0.88 : 0.80);
+  const slCap = px * (isCrypto ? 1.12 : 1.10);
+  let target = (sup != null && sup >= tpFloor) ? Math.min(sup + 0.25 * atr, px * 0.99) : px - (isCrypto ? 1.5 : 2.5) * atr;
   target = Math.max(Math.min(target, px * 0.99), tpFloor);
   let stop = (res != null && res <= slCap) ? Math.min(res + 0.25 * atr, slCap) : px + 2 * atr;
   stop = Math.max(Math.min(stop, slCap), px * 1.005);

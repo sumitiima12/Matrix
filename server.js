@@ -4042,11 +4042,16 @@ async function scanOneIdea(sym) {
     if (!chart && !cndl) continue;
     const atr = atrOf(candles) || px * 0.02;
     const swingLow = Math.min(...candles.slice(-10).map((x) => x.l));
-    const target = (chart && chart.target && chart.target > px && chart.target < px * 1.6) ? chart.target : px + 2 * atr;
+    // WIN-RATE TUNING: crypto ideas (symbol "<X>-USD") use TIGHTER targets — a chart target only up to +12%
+    // (else 1.5×ATR) and a tpPct cap of 15%, so volatile coins stop generating 20–40% targets that rarely fill.
+    // Equities keep the wider pattern targets. Mirrors the techSignal change for Smart-Auto-Buy picks.
+    const _isC = /-USD$/i.test(String(sym));
+    const _tgtCapMul = _isC ? 1.12 : 1.6, _atrMul = _isC ? 1.5 : 2, _maxTp = _isC ? 15 : 40;
+    const target = (chart && chart.target && chart.target > px && chart.target < px * _tgtCapMul) ? chart.target : px + _atrMul * atr;
     const stop = (swingLow < px && swingLow > px * 0.85) ? swingLow : px - 1.2 * atr;
     const tpPct = +(((target / px) - 1) * 100).toFixed(1);
     const slPct = +((1 - stop / px) * 100).toFixed(1);
-    if (!(tpPct >= 1 && tpPct <= 40 && slPct > 0.2 && slPct <= 25)) continue;
+    if (!(tpPct >= 1 && tpPct <= _maxTp && slPct > 0.2 && slPct <= 25)) continue;
     return {
       sym, tf, pattern: chart ? chart.key : cndl.key, name: chart ? chart.name : cndl.name,
       candlestick: cndl ? cndl.name : null,
