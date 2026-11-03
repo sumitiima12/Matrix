@@ -10098,6 +10098,9 @@ async function executeAutoEntry(ctx) {
   try {
     if (!AUTO_SRC_MARKETS.has(market)) return { placed: false, reason: "unsupported-market" };
     if (!(Number(px) > 0) || !(Number(notional) > 0) || !base) return { placed: false, reason: "bad-input" };
+    // Respect exchange hours: Crypto/US-Tokens are 24/7, but IN/US/Commodity only trade in-session (and not on
+    // holidays). Skip otherwise — for both real (the broker would reject) and paper (mirror real behaviour).
+    if (!marketOpenIST(market)) return { placed: false, reason: "market-closed" };
     /* Market-aware routing. Delta (Crypto/US Tokens): fractional coin qty, "<BASE>USD". IN equities: whole-share
        qty, FYERS "NSE:<BASE>-EQ" (deterministic + fill-verified; dhan/others need a security-id lookup, a later
        slice). The candle/quote symbol feeds indicatorsFor + liveMarkForOrder. */
