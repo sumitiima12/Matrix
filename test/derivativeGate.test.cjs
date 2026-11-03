@@ -7,12 +7,19 @@ test("non-derivative (STOCK/undefined) always allowed, not flagged", () => {
   assert.deepEqual(evaluateDerivativeOrder({}, {}), { allowed: true, isDerivative: false });
 });
 
-test("derivative blocked when the market flag is off (fail closed)", () => {
-  const r = evaluateDerivativeOrder({ productType: "OPTION", market: "US" }, {});
+test("STRICT mode: derivative blocked when the market flag is off (fail closed)", () => {
+  // Default is now ALLOW (operator decision); the original fail-closed path still exists under MATRIX_STRICT_DERIVATIVES=1.
+  const r = evaluateDerivativeOrder({ productType: "OPTION", market: "US" }, { MATRIX_STRICT_DERIVATIVES: "1" });
   assert.equal(r.allowed, false);
   assert.equal(r.isDerivative, true);
   assert.equal(r.reason, "real_execution_not_validated");
   assert.equal(r.flag, "MATRIX_US_OPTIONS_VALIDATED");
+});
+
+test("DEFAULT (non-strict): a certified-market derivative is allowed even without its flag", () => {
+  const r = evaluateDerivativeOrder({ productType: "OPTION", market: "US" }, {});
+  assert.equal(r.allowed, true);
+  assert.equal(r.isDerivative, true);
 });
 
 test("derivative allowed when the matching flag is truthy — each market", () => {
@@ -22,8 +29,8 @@ test("derivative allowed when the matching flag is truthy — each market", () =
   assert.equal(evaluateDerivativeOrder({ productType: "FUTURE", market: "IN" }, { MATRIX_FO_MASTER_VALIDATED: "on" }).allowed, true);
 });
 
-test("wrong flag doesn't unlock a different market", () => {
-  const r = evaluateDerivativeOrder({ productType: "OPTION", market: "US" }, { MATRIX_CRYPTO_OPTIONS_VALIDATED: "1" });
+test("STRICT mode: wrong flag doesn't unlock a different market", () => {
+  const r = evaluateDerivativeOrder({ productType: "OPTION", market: "US" }, { MATRIX_STRICT_DERIVATIVES: "1", MATRIX_CRYPTO_OPTIONS_VALIDATED: "1" });
   assert.equal(r.allowed, false);
 });
 
