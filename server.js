@@ -2330,6 +2330,15 @@ app.get("/api/auto-settings", requireAuth, async (req, res) => {
     sendJSONCached(req, res, { settings: settings || null });
   } catch (e) { serverError(res, e); }
 });
+/* Last auto-engine outcome per (market, source) — so the app can show the user WHY an auto-entry did or didn't
+   fire (market-closed, amount-too-small, no-qualifying-pick, already-today, no-broker-session, risk:…, placed). */
+app.get("/api/auto-status", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const status = typeof db.getAutoStatus === "function" ? await db.getAutoStatus(userId) : null;
+    res.json({ status: status || null });
+  } catch (e) { serverError(res, e); }
+});
 
 /* Storage/efficiency (reviewer item #1): consolidated first-paint bootstrap. The app's cold start used to
    fan out into several separate authed GETs (state, notices, capabilities, app-settings, screeners,
@@ -10229,24 +10238,25 @@ async function scanIdeasForSymbols(syms) {
 }
 
 /* Evaluate ONE user's enabled SCREENERS (both modes) and place entries for current matches. */
-async function runUserScreenerEntries(userId, settings, live) {
+async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
   const scr = (settings && settings.screeners) || {};
   for (const market of Object.keys(scr)) {
     if (!AUTO_SRC_MARKETS.has(market)) continue;
     for (const key of Object.keys(scr[market] || {})) {
       const s = scr[market][key]; if (!s || s.enabled !== true || !Array.isArray(s.entry) || !s.entry.length) continue;
+      const modes = s.modes || {};
       const syms = Array.isArray(s.symbols) ? s.symbols : [];
-      if (!syms.length) continue;
+      if (!syms.length) { for (const mode of ["virtual", "real"]) if (modes[mode] === true) rec(market, "screener", mode, false, "no-symbols"); continue; }
       const cfg = { defs: s.defs || [], entry: s.entry, tf: s.tf || "5m" };
       const matches = await scanSymbolsForEntry(syms.map((x) => _candleSym(market, x)), cfg);
-      if (!matches.length) continue;
+      if (!matches.length) { for (const mode of ["virtual", "real"]) if (modes[mode] === true) rec(market, "screener", mode, false, "no-screener-match"); continue; }
       const perNotional = (Number(s.capital) || 0) / matches.length;   // split the screener's capital across today's matches
-      const modes = s.modes || {};
       for (const m of matches) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live });
+          rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
     }
@@ -10255,24 +10265,25 @@ async function runUserScreenerEntries(userId, settings, live) {
 
 /* Evaluate ONE user's enabled IDEAS auto-buy (both modes) and place entries for today's ideas. Reuses the
    same idea scan the /api/idea-scan endpoint uses so paper and real see the same signals. */
-async function runUserIdeaEntries(userId, settings, live) {
+async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
   const ideas = (settings && settings.ideas) || {};
   for (const market of Object.keys(ideas)) {
     if (!AUTO_SRC_MARKETS.has(market)) continue;
     const perMode = ideas[market] || {};
-    const anyOn = Object.values(perMode).some((m) => m && m.enabled === true);
-    if (!anyOn) continue;
+    const onModes = ["virtual", "real"].filter((mode) => perMode[mode] && perMode[mode].enabled === true);
+    if (!onModes.length) continue;
     const syms = (Object.values(perMode).find((m) => m && Array.isArray(m.symbols) && m.symbols.length) || {}).symbols || [];
-    if (!syms.length) continue;
+    if (!syms.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-symbols"); continue; }
     const scan = await scanIdeasForSymbols(syms.map((x) => _candleSym(market, x))).catch(() => []);
+    if (!scan.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-idea-today"); continue; }
     for (const idea of scan) {
       const base = _deltaBase(idea.sym);
-      for (const mode of ["virtual", "real"]) {
-        const cfgM = perMode[mode]; if (!cfgM || cfgM.enabled !== true) continue;
+      for (const mode of onModes) {
+        const cfgM = perMode[mode];
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
-        if (!(px > 0)) continue;
-        const slPct = Number(idea.slPct) || null, tpPct = Number(idea.tpPct) || null;
-        await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: slPct, tp: tpPct, short: false, tradeType: "Ideas", source: "ideas", live });
+        if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, short: false, tradeType: "Ideas", source: "ideas", live });
+        rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
   }
@@ -10295,23 +10306,26 @@ async function computeSmartPicks(market, appSyms, allowShorts) {
 }
 /* Evaluate ONE user's SMART-AUTO-BUY (both modes). Picks are computed once per market; capital is split across
    the top picks. Shorts only on Delta markets (the app's rule). */
-async function runUserSmartBuyEntries(userId, settings, live) {
+async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
   const sab = (settings && settings.smartAutoBuy) || {};
   for (const market of Object.keys(sab)) {
     if (!AUTO_SRC_MARKETS.has(market)) continue;
     const perMode = sab[market] || {};
-    if (!Object.values(perMode).some((m) => m && m.enabled === true)) continue;
+    const onModes = ["virtual", "real"].filter((mode) => perMode[mode] && perMode[mode].enabled === true);
+    if (!onModes.length) continue;
     const syms = (Object.values(perMode).find((m) => m && Array.isArray(m.symbols) && m.symbols.length) || {}).symbols || [];
-    if (!syms.length) continue;
+    if (!syms.length) { for (const mode of onModes) rec(market, "smartbuy", mode, false, "no-symbols"); continue; }
     const allowShorts = (market === "Crypto" || market === "USStockTokens");
     const picks = (await computeSmartPicks(market, syms, allowShorts)).slice(0, 10);   // cap entries/day/market
-    if (!picks.length) continue;
-    for (const mode of ["virtual", "real"]) {
-      const cfgM = perMode[mode]; if (!cfgM || cfgM.enabled !== true) continue;
-      const capital = Number(cfgM.capital) || 0; if (!(capital > 0)) continue;
+    if (!picks.length) { for (const mode of onModes) rec(market, "smartbuy", mode, false, "no-qualifying-pick"); continue; }
+    for (const mode of onModes) {
+      const cfgM = perMode[mode];
+      const capital = Number(cfgM.capital) || 0;
+      if (!(capital > 0)) { rec(market, "smartbuy", mode, false, "no-capital-set"); continue; }
       const per = capital / picks.length;
       for (const p of picks) {
-        await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live });
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live });
+        rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
   }
@@ -10328,9 +10342,22 @@ async function runSignalAutoEngine() {
     const users = await db.getUsersWithAutoEnabled(1000).catch(() => []);
     for (const u of users) {
       if (!u || !u.settings) continue;
-      try { await runUserScreenerEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.screener.sweep_error", { userId: u.userId, err: e && e.message }); }
-      try { await runUserIdeaEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.ideas.sweep_error", { userId: u.userId, err: e && e.message }); }
-      try { await runUserSmartBuyEntries(u.userId, u.settings, live); } catch (e) { logFinancial("auto.smartbuy.sweep_error", { userId: u.userId, err: e && e.message }); }
+      // Collect the outcome of every (market, source, mode) this sweep so the app can show WHY entries did/didn't
+      // fire. Within a sweep, a "placed" wins over any skip; otherwise the latest skip reason is kept.
+      const status = {}; const now = Date.now();
+      const rec = (market, source, mode, placed, reason) => {
+        const m = status[market] = status[market] || {};
+        const key = `${source}:${mode}`;
+        const s = m[key] = m[key] || { source, mode, at: now, placed: 0, attempts: 0, lastReason: null };
+        s.attempts += 1; if (placed) s.placed += 1; s.at = now;
+        s.lastReason = placed ? "placed" : (reason || s.lastReason);
+      };
+      try { await runUserScreenerEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.screener.sweep_error", { userId: u.userId, err: e && e.message }); }
+      try { await runUserIdeaEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.ideas.sweep_error", { userId: u.userId, err: e && e.message }); }
+      try { await runUserSmartBuyEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.smartbuy.sweep_error", { userId: u.userId, err: e && e.message }); }
+      if (Object.keys(status).length && typeof db.saveAutoStatus === "function") {
+        try { await db.saveAutoStatus(u.userId, { live, markets: status }); } catch { /* best-effort diagnostics */ }
+      }
     }
   } finally { signalAutoRunning = false; }
 }
