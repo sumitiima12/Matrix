@@ -7067,6 +7067,12 @@ async function liveMarkEnvelope(brokerSym, market) {
       const base = String(brokerSym).replace(/(USDT|USD|INR)$/i, "").toUpperCase();
       const q = await deltaHouseQuotes([`${base}-USD`]);
       hit = q[`${base}-USD`];
+    } else if (market === "US" || market === "Commodity") {
+      /* US (INDmoney) and MCX commodity have no house-quote feed here — use the latest intraday candle close
+         (COMEX/NYMEX for commodity, the US ticker for equities) as the mark. Good enough for paper SL/TP and
+         risk sizing; real fills still execute at the broker's market price. */
+      const base = String(brokerSym).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "").toUpperCase();
+      try { const c = await candlesFor(_candleSym(market, base), "5d", "5m"); const last = c && c.length ? c[c.length - 1] : null; if (last && last.c != null) hit = { price: Number(last.c), source: "candle", asOf: Math.round((last.t < 1e12 ? last.t * 1000 : last.t) / 1000), delayed: true }; } catch { /* none */ }
     } else {
       const base = String(brokerSym).replace(/^[A-Z]+:/, "").replace(/-EQ$/i, "").toUpperCase();
       const q = await fyersHouseQuotes([`${base}.NS`]).catch(() => ({}));
@@ -10059,11 +10065,30 @@ async function withLease(name, ttlMs, fn) {
    Entry dedup is once-per-(user,source,symbol,market,mode,day) via db.claimSignal (at-most-once across
    replicas/restarts), mirroring the client's once-per-day guard. =================================== */
 
-const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens", "IN"]);   // Delta (Crypto/US Tokens) + Indian equities (FYERS)
+const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens", "IN", "US", "Commodity"]);   // Delta + Indian + US + MCX
 const _autoDayIdx = () => Math.floor(Date.now() / 86400000);
 const _deltaBase = (s) => String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/i, "").replace(/\.NS$/i, "").replace(/[^A-Z0-9]/g, "").replace(/(USDT|USD|INR|PERP)$/i, "");
-// Candle/indicator symbol for a market: Delta perps price on "<BASE>-USD", Indian equities on "<BASE>.NS".
-const _candleSym = (market, base) => ((market === "Crypto" || market === "USStockTokens") ? `${_deltaBase(base)}-USD` : `${_deltaBase(base)}.NS`);
+// Commodity app-symbol → Yahoo COMEX/NYMEX ticker (server Y_SPECIAL covers most; CRUDEOIL isn't listed there).
+const _COMMODITY_YF = { GOLD: "GC=F", SILVER: "SI=F", CRUDEOIL: "CL=F", CRUDE: "CL=F", NATGAS: "NG=F", COPPER: "HG=F", ALUMINIUM: "ALI=F" };
+// Candle/indicator symbol for a market: Delta perps "<BASE>-USD", IN "<BASE>.NS", US bare ticker, Commodity COMEX.
+const _candleSym = (market, base) => {
+  const b = _deltaBase(base);
+  if (market === "Crypto" || market === "USStockTokens") return `${b}-USD`;
+  if (market === "IN") return `${b}.NS`;
+  if (market === "Commodity") return _COMMODITY_YF[b] || b;
+  return b;   // US: bare ticker (candlesFor → INDmoney/Yahoo)
+};
+/* Resolve the user's connected, FILL-VERIFIED broker for a market (in priority order). Returns { broker, sess }
+   or null. Delta runs crypto + US-tokens; FYERS then Dhan run Indian equities; INDmoney runs US; Dhan runs MCX
+   commodity. Only fill-verified brokers are eligible (an unverified fill risks a phantom position). */
+const AUTO_BROKER_CANDIDATES = { Crypto: ["delta"], USStockTokens: ["delta"], IN: ["fyers", "dhan"], US: ["indmoney"], Commodity: ["dhan"] };
+async function resolveAutoBroker(userId, market) {
+  for (const b of (AUTO_BROKER_CANDIDATES[market] || [])) {
+    if (!FILL_VERIFIED_BROKERS.has(b)) continue;
+    try { const sess = await sessionFromCred(userId, b); if (sess) return { broker: b, sess }; } catch { /* try next */ }
+  }
+  return null;
+}
 
 /* Shared ENTRY for an auto source (screener / smart-buy / ideas). Runs all real-money gates then places &
    books the order (real) or simulates the fill into the server paper book (virtual). Returns {placed, reason}.
@@ -10078,15 +10103,18 @@ async function executeAutoEntry(ctx) {
        qty, FYERS "NSE:<BASE>-EQ" (deterministic + fill-verified; dhan/others need a security-id lookup, a later
        slice). The candle/quote symbol feeds indicatorsFor + liveMarkForOrder. */
     const isDelta = (market === "Crypto" || market === "USStockTokens");
-    const broker = isDelta ? "delta" : "fyers";
-    const brokerSym = isDelta ? `${base}USD` : `NSE:${base}-EQ`;
-    const symbol = base, yahoo = isDelta ? `${base}-USD` : `${base}.NS`;
+    /* Canonical order symbol per market. Delta: "<BASE>USD". IN: "NSE:<BASE>-EQ". US: the bare ticker. Commodity:
+       the bare commodity key (placeBuyOrder's Commodity branch resolves the near-month MCX contract from the Dhan
+       scrip master). The per-broker conversion (Dhan security-id, Kite tradingsymbol, Angel token, …) happens
+       INSIDE placeBuyOrder, so we only pick the canonical form here. */
+    const brokerSym = isDelta ? `${base}USD` : market === "IN" ? `NSE:${base}-EQ` : base;
+    const symbol = base, yahoo = _candleSym(market, base);
     const prod = product || "CNC";
     const dayIdx = _autoDayIdx();
     const dedupId = `auto_${source}_${userId}_${market}_${mode}_${base}_${short ? "s" : "l"}_${dayIdx}`;
     const qty = isDelta ? +(Number(notional) / Number(px)).toFixed(6) : Math.max(1, Math.floor(Number(notional) / Number(px)));
     if (!(qty > 0)) return { placed: false, reason: "amount-too-small" };
-    if (short && !isDelta) return { placed: false, reason: "short-not-supported" };   // IN auto-short not wired
+    if (short && !isDelta) return { placed: false, reason: "short-not-supported" };   // only Delta auto-short is wired
 
     // ---- VIRTUAL (paper): simulate a fill at the live price into the server-side paper book (Phase 3) ----
     if (mode === "virtual") {
@@ -10101,11 +10129,11 @@ async function executeAutoEntry(ctx) {
     // owner auth — fail closed
     let owner; try { owner = await db.getUser(stripPh(String(userId))); } catch { return { placed: false, reason: "owner-unverifiable" }; }
     if (!owner || owner.blocked || owner.deleted || owner.approved !== true) return { placed: false, reason: "account-inactive" };
-    // broker capability + fill-verified
+    // Resolve the user's connected, FILL-VERIFIED broker for this market (Delta / FYERS / Dhan / INDmoney).
+    const resolved = await resolveAutoBroker(userId, market);
+    if (!resolved) return { placed: false, reason: "no-broker-session" };
+    const { broker, sess } = resolved;
     if (capabilityBlock(broker, "unattendedAutomation")) return { placed: false, reason: "capability" };
-    if (!FILL_VERIFIED_BROKERS.has(broker)) return { placed: false, reason: "fill-unverified-broker" };
-    const sess = await sessionFromCred(userId, broker);
-    if (!sess) return { placed: false, reason: "no-broker-session" };
     // account-wide entry halt / risk lock (durable, cross-instance) — fail closed
     const storeKey = storageKeyFor(userId);
     if (!ENTRY_LOCK_DISABLED) {
