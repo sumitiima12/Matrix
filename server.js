@@ -10123,7 +10123,12 @@ async function executeAutoEntry(ctx) {
       return { placed: !!(r && r.ok), reason: r && r.reason };
     }
 
-    // ---- REAL: full gate stack, then place on Delta + register managed exit + journal ----
+    // ---- REAL: full gate stack, then place + register managed exit + journal ----
+    /* Commodity is an MCX DERIVATIVE — its real order needs contract resolution (Dhan scrip master) + the Dhan
+       derivative order route, NOT the equity/crypto placeBuyOrder path this helper uses. So real commodity
+       auto-entry is not placed here (it would mis-resolve "GOLD" as an equity). Paper commodity ran above; real
+       MCX automation still goes through Automation strategies. Wiring the derivative route here is a later slice. */
+    if (market === "Commodity") return { placed: false, reason: "commodity-real-needs-derivative-route" };
     if (!live) { console.log(`[auto:${source}] DRY-RUN would BUY ${qty} ${symbol} (${market}) for ${userId}`); return { placed: false, reason: "dry-run" }; }
     // owner auth — fail closed
     let owner; try { owner = await db.getUser(stripPh(String(userId))); } catch { return { placed: false, reason: "owner-unverifiable" }; }
