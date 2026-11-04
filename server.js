@@ -9915,6 +9915,9 @@ const haltedEntries = new Set();
 app.get("/api/automation/entry-halt", requireAuth, async (req, res) => {
   const key = String(storageKeyFor(req.authUserId));
   const halted = haltedEntries.has(key);
+  // Owner off-switch: when the entry lock is disabled, NOTHING blocks entries, so never surface a risk-lock /
+  // "trading paused" banner from a stale durable lock set by an old journal hiccup — report all-clear.
+  if (ENTRY_LOCK_DISABLED) return res.json({ halted, riskLocked: false, unknownCount: 0, safety: false });
   /* Lock #4 (visible banner): also report the DURABLE safety state so the client can show a "Trading paused —
      an order needs reconciling → Resolve" banner that is accurate on a fresh load (before any engine sweep has
      repopulated the in-memory set). riskLocked = durable safety lock; unknownCount = this user's unresolved order
@@ -9935,6 +9938,17 @@ app.post("/api/automation/entry-halt", requireAuth, requireActiveUser, async (re
   const halt = !!(req.body && req.body.halt);
   if (halt) haltedEntries.add(uid); else haltedEntries.delete(uid);
   try { await db.setEntryHalt(uid, halt); } catch (e) { return res.status(500).json({ error: "Could not save — try again." }); }
+  /* Owner off-switch: the entry lock is disabled, so it never blocks entries. Resume must NOT require the strict
+     book-reconciliation proof (which a large auto/strategy book won't satisfy) — just clear any stale durable lock
+     + unknown intents so the banner goes away, and return all-clear. */
+  if (ENTRY_LOCK_DISABLED) {
+    if (!halt) {
+      try { if (typeof db.setRiskLock === "function") await db.setRiskLock(uid, false); } catch { /* best-effort */ }
+      try { if (typeof db.releaseUnknownIdempotency === "function") await db.releaseUnknownIdempotency(uid); } catch { /* best-effort */ }
+      haltedEntries.delete(uid);
+    }
+    return res.json({ ok: true, halted: halt, riskLocked: false });
+  }
   /* R24-P1-03 / R25-C02: Resume is NOT a user attestation. The risk lock clears ONLY when a SERVER-side
      reconciliation (reconcileForUnlock) proves the book is fully consistent — zero ENTRY ledger↔journal drift
      (presence + quantity, broker-scoped), zero EXIT drift, NO outstanding pending-protection rows, and NO unknown
