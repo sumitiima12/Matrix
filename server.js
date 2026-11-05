@@ -10122,7 +10122,7 @@ async function resolveAutoBroker(userId, market) {
    Never throws — a failure is logged and reported so the sweep continues to the next candidate. */
 async function executeAutoEntry(ctx) {
   const { userId, market, mode, base, notional, px, sl = null, tp = null, tsl = null, short = false,
-    product = "CNC", tradeType, source, live, engineFence = null } = ctx;
+    product = "CNC", tradeType, source, live, engineFence = null, screenerKey = null, strategyName = null } = ctx;
   try {
     if (!AUTO_SRC_MARKETS.has(market)) return { placed: false, reason: "unsupported-market" };
     if (!(Number(px) > 0) || !(Number(notional) > 0) || !base) return { placed: false, reason: "bad-input" };
@@ -10150,7 +10150,7 @@ async function executeAutoEntry(ctx) {
     if (mode === "virtual") {
       const claimed = await db.claimSignal(dedupId, userId, "auto-paper").catch(() => true);
       if (!claimed) return { placed: false, reason: "already-today" };
-      const r = await paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry: Number(px), sl, tp, tsl, short, tradeType, source });
+      const r = await paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry: Number(px), sl, tp, tsl, short, tradeType, source, screenerKey, strategyName });
       return { placed: !!(r && r.ok), reason: r && r.reason };
     }
 
@@ -10214,6 +10214,7 @@ async function executeAutoEntry(ctx) {
     const journaled = await recordAuthoritativeFill(storeKey, {
       id: `${source}_${dedupId}`, sym: symbol, side: short ? "SELL" : "BUY", qty: fillQty, entry: fillPx, entryAt: Date.now(),
       market, real: true, broker, tradeType, orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
+      ...(screenerKey ? { screenerKey } : {}), ...(strategyName ? { strategy: strategyName, screenerName: strategyName } : {}),
     }, { haltUserIdOnFail: userId });
     if (!journaled) { haltedEntries.add(String(userId)); logFinancial(`auto.${source}.halted_unjournaled_fill`, { userId, symbol, orderId: r.orderId }); }
     logFinancial(`auto.${source}.filled`, { userId, broker, symbol, side: short ? "SELL" : "BUY", qty: fillQty, price: fillPx, orderId: r.orderId });
@@ -10274,7 +10275,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
@@ -10384,7 +10385,7 @@ async function runSignalAutoEngine() {
 /* ---- Phase 3: server-side VIRTUAL (paper) book ----
    A paper entry writes a server-authored virtual trade (real:false) the client reads via /api/trades, plus a
    paper_positions row the monitor below watches. No real money, no broker — fills at the live price. */
-async function paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry, sl, tp, tsl, short, tradeType, source }) {
+async function paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry, sl, tp, tsl, short, tradeType, source, screenerKey = null, strategyName = null }) {
   try {
     const open = await db.getPaperPositionsForUser(userId).catch(() => []);
     if (open.some((p) => p.status === "open" && _deltaBase(p.base) === _deltaBase(base) && p.market === market)) return { ok: false, reason: "already-open" };
@@ -10394,6 +10395,7 @@ async function paperOpenPosition({ userId, market, base, brokerSym, symbol, qty,
     await db.saveTrade(storageKeyFor(userId), {
       id: `${id}_t`, sym: symbol, side: short ? "SELL" : "BUY", qty: Number(qty), entry: Number(entry), entryAt: now,
       market, real: false, tradeType, exitType: "Open", paperPositionId: id, short: short || undefined,
+      ...(screenerKey ? { screenerKey } : {}), ...(strategyName ? { strategy: strategyName, screenerName: strategyName } : {}),
     }, { authoritative: true });
     logFinancial(`auto.${source}.paper_open`, { userId, symbol, qty, entry });
     console.log(`[auto:${source}] PAPER open ${qty} ${symbol} (${market}) @ ${entry} for ${userId}`);
