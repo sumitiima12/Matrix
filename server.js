@@ -359,6 +359,22 @@ async function recordAuthoritativeFill(userKey, trade, { haltUserIdOnFail = null
   }
   return false;
 }
+/* Fetch the user's Delta fills across ALL pages. Delta's /v2/fills caps page_size (~100) and returns the rest
+   behind a `meta.after` cursor, so the old single `?page_size=1000` call only ever saw the most-recent page —
+   older closing fills were invisible, so exit reconstruction fell back to a break-even $0 and reconciled closes
+   lost their realized P&L. The shared paginator follows the cursor to the authoritative end. Returns { fills,
+   complete }: complete=false means we didn't prove we reached the end, so callers must NOT treat a missing
+   closing fill as "no exit" (they keep the honest break-even marker rather than a wrong number). */
+async function fetchAllDeltaFills(userId, { timeoutMs = 45000 } = {}) {
+  try {
+    const { rows, complete } = await feeStatement.paginateDeltaFills(
+      (query) => withTimeout(deltaCall("GET", "/v2/fills", { query, userId }), 20000).catch(() => null),
+      { pageSize: 200, maxPages: 30 }
+    );
+    void timeoutMs;
+    return { fills: Array.isArray(rows) ? rows : null, complete: !!complete };
+  } catch { return { fills: null, complete: false }; }
+}
 /* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
    (entry AND exit) and can be reconciled against the risk journal / broker. Idempotent — keyed by the managed
    position id (`exit_<posId>`) so a retry, a stale-close reconcile or a second sweep can't double-count the
@@ -1442,14 +1458,14 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
        break-even placeholder. Best-effort: if fills/products can't be read, every row falls back to the honest
        break-even reconciled marker (never blocks reconcile, never fabricates). Only Delta-tagged rows are eligible,
        and only a fully-covering closing-fill sequence is used (reconstructExitFromDeltaFills is conservative). */
-    let deltaFills = null; const cvBySym = new Map();
+    let deltaFills = null; let fillsComplete = false; const cvBySym = new Map();
     try {
-      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { query: "?page_size=1000", userId: req.authUserId }), 45000, "Delta fills read");
-      if (fr && Array.isArray(fr.result)) deltaFills = fr.result;
+      const fr = await fetchAllDeltaFills(req.authUserId);
+      deltaFills = fr.fills; fillsComplete = fr.complete;
       const prods = await deltaCall("GET", "/v2/products", { signed: false }).catch(() => null);
       for (const p of (prods && prods.result) || []) { const s = String(p.symbol || "").toUpperCase().replace(/(USDT|USD|INR)$/i, ""); if (s) cvBySym.set(s, Number(p.contract_value) || 1); }
     } catch { deltaFills = null; }   // any failure → break-even fallback below
-    let reconstructed = 0;
+    let reconstructed = 0, breakEven = 0;
     for (const t of toClose) {
       let close = { exit: Number(t.entry) || t.exit || 0, exitAt: now, pnl: 0,
         reconcileReason: "Closed via Delta reconciliation — Delta held no matching position." };
@@ -1458,10 +1474,14 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
         const real = reconcile.reconstructExitFromDeltaFills(t, deltaFills, { contractValue: cv });
         if (real) { close = { exit: real.exit, exitAt: real.exitAt || now, pnl: real.pnl,
           reconcileReason: "Closed via Delta reconciliation — exit price/P&L reconstructed from Delta fills." }; reconstructed++; }
+        else breakEven++;
       }
       await db.updateTrade(userId, { ...t, ...close, status: "closed", reconciled: true, reconciledAt: now, exitType: "Closed (reconciled)" }).catch(() => {});
     }
-    logFinancial("trades.reconcileReal.exitReconstruct", { userId, closed: toClose.length, reconstructed });
+    // Diagnostic: when closes book break-even, say WHY (no fills read, pagination incomplete, or genuine no-match)
+    // so a recurrence of "every reconciled close shows $0 P&L" is debuggable from logs instead of a guess.
+    logFinancial("trades.reconcileReal.exitReconstruct", { userId, closed: toClose.length, reconstructed, breakEven,
+      fillsRead: deltaFills ? deltaFills.length : 0, fillsComplete, cvSymbols: cvBySym.size });
     rcBust(`trades:${userId}`);
     logFinancial("trades.reconcileReal", { userId, closed: toClose.length, held: heldSymbols });
     res.json({ ok: true, removed: toClose.length, heldSymbols,
@@ -1506,8 +1526,8 @@ app.post("/api/trades/backfill-exits", requireAuth, async (req, res) => {
     // Read Delta fills + per-symbol contract value once (same plumbing as reconcile-real). Fail-closed.
     let deltaFills = null; const cvBySym = new Map();
     try {
-      const fr = await withTimeout(deltaCall("GET", "/v2/fills", { query: "?page_size=1000", userId: req.authUserId }), 45000, "Delta fills read");
-      if (fr && Array.isArray(fr.result)) deltaFills = fr.result;
+      const fr = await fetchAllDeltaFills(req.authUserId);
+      deltaFills = fr.fills;
       const prods = await deltaCall("GET", "/v2/products", { signed: false }).catch(() => null);
       for (const p of (prods && prods.result) || []) { const s = baseSym(p.symbol); if (s) cvBySym.set(s, Number(p.contract_value) || 1); }
     } catch { deltaFills = null; }
@@ -9519,7 +9539,7 @@ async function runAutoExitEngine() {
     async function deltaFillsFor(uid) {
       if (deltaFillsByUser.has(uid)) return deltaFillsByUser.get(uid);
       let fills = null;
-      try { const fr = await withTimeout(deltaCall("GET", "/v2/fills", { query: "?page_size=1000", userId: uid }), 45000, "Delta fills read"); if (fr && Array.isArray(fr.result)) fills = fr.result; } catch { fills = null; }
+      try { const fr = await fetchAllDeltaFills(uid); fills = fr.fills; } catch { fills = null; }
       deltaFillsByUser.set(uid, fills);
       return fills;
     }
