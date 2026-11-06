@@ -10815,7 +10815,7 @@ async function runAutoBuyEngine() {
             const legJournaled = await recordAuthoritativeFill(storageKeyFor(st.userId), {
               id: `ab_${st.id}_${candleKey}_L${li}`, sym: legDisplay, side: "BUY", qty: legFillQty,
               entry: legFillPx, entryAt: Date.now(), market: "IN", real: true, broker: st.broker,
-              tradeType: "Auto Buy", orderId: rr.orderId || null, managedId: legPos.id, serverAuthored: true,
+              tradeType: "Automate", strategy: st.name || null, strategyId: st.id, orderId: rr.orderId || null, managedId: legPos.id, serverAuthored: true,
               productType: "OPTION", contractMultiplier: 1, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, underlying: optPlan.underlying,
             }, { haltUserIdOnFail: st.userId });
             if (!legJournaled) { haltedEntries.add(String(st.userId)); logFinancial("autobuy.halted_unjournaled_fill", { userId: st.userId, symbol: legDisplay, orderId: rr.orderId }); }
@@ -10850,7 +10850,10 @@ async function runAutoBuyEngine() {
         const journaled = await recordAuthoritativeFill(storageKeyFor(st.userId), {
           id: `ab_${st.id}_${candleKey}`, sym: st.symbol, side: st.short ? "SELL" : "BUY", qty: fillQty,
           entry: fillPx, entryAt: Date.now(), market: st.market, real: true, broker: st.broker,
-          tradeType: "Auto Buy", orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
+          // A DEPLOYED-STRATEGY fill is an "Automate" trade and MUST carry its strategy id/name, so it buckets into
+          // the Automate P&L (not Smart-Auto-Buy) and matches its strategy in the Automation dashboard.
+          tradeType: "Automate", strategy: st.name || null, strategyId: st.id,
+          orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
         }, { haltUserIdOnFail: st.userId });
         if (!journaled) {
           /* R21-P1-03: the fill could NOT be journaled. The durable halt+risk-lock are already set, but the
