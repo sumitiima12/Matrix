@@ -10371,8 +10371,11 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
     if (!onModes.length) continue;
     const syms = (Object.values(perMode).find((m) => m && Array.isArray(m.symbols) && m.symbols.length) || {}).symbols || [];
     if (!syms.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-symbols"); continue; }
-    const scan = await scanIdeasForSymbols(syms.map((x) => _candleSym(market, x))).catch(() => []);
-    if (!scan.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-idea-today"); continue; }
+    const scanAll = await scanIdeasForSymbols(syms.map((x) => _candleSym(market, x))).catch(() => []);
+    if (!scanAll.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-idea-today"); continue; }
+    // SELECTIVITY: don't auto-enter the WHOLE universe (the entire NSE list / all US names at once). Take only the
+    // strongest ideas of the day — top 10 by signal strength — so capital concentrates and trade count is sane.
+    const scan = [...scanAll].sort((a, b) => (Number(b.strength) || 0) - (Number(a.strength) || 0)).slice(0, 10);
     for (const idea of scan) {
       const base = _deltaBase(idea.sym);
       for (const mode of onModes) {

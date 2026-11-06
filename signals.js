@@ -105,9 +105,9 @@ function dailyPicks(list, opts = {}) {
   // >= 2.8 and keep only the top 12 by score, so capital concentrates on the highest-conviction picks.
   const longs = base
     .map((s) => ({ s, t: techSignal(s) }))
-    .filter((x) => x.t && x.t.score >= 2.8 && x.t.signal !== "Overbought" && x.t.signal !== "Oversold")
+    .filter((x) => x.t && x.t.score >= 3.0 && x.t.signal !== "Overbought" && x.t.signal !== "Oversold")
     .sort((a, b) => b.t.score - a.t.score)
-    .slice(0, 12)
+    .slice(0, 8)
     .map(({ s, t }) => Object.assign({}, s, { pickDir: "long", pickSide: "BUY", pickSignal: t.signal, pickSlPct: t.slPct, pickTpPct: t.tpPct, pickRR: t.rr, pickScore: t.score }));
   if (!opts.allowShorts) return longs;
   const longSyms = new Set(longs.map((s) => s.sym));
