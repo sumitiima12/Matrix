@@ -10167,6 +10167,14 @@ async function executeAutoEntry(ctx) {
     const prod = product || "CNC";
     const dayIdx = _autoDayIdx();
     const dedupId = `auto_${source}_${userId}_${market}_${mode}_${base}_${short ? "s" : "l"}_${dayIdx}`;
+    /* IN OPTION auto-entry (Screener / Ideas / Smart Auto-Buy): when the user chose "Option" for this engine+market,
+       buy the signal symbol's ATM CALL (long signal) or PUT (short signal) instead of the stock — reusing the exact
+       planOptionLegs resolver the Automate path uses. A short SIGNAL becomes a long PUT, so this also gives these
+       engines a (long-premium) short expression that IN equity shorting can't. Paper opens a premium-priced paper
+       option now; real stays gated behind the same certification flag as the Automate option path. */
+    if (market === "IN" && ctx.optConfig && ctx.optConfig.enabled === true) {
+      return await executeAutoOptionEntry(ctx, { base, px: Number(px), dedupId });
+    }
     const qty = isDelta ? +(Number(notional) / Number(px)).toFixed(6) : Math.max(1, Math.floor(Number(notional) / Number(px)));
     if (!(qty > 0)) return { placed: false, reason: "amount-too-small" };
     if (short && !isDelta) return { placed: false, reason: "short-not-supported" };   // only Delta auto-short is wired
@@ -10253,6 +10261,50 @@ async function executeAutoEntry(ctx) {
   }
 }
 
+/* Resolve + place ONE IN option for a Screener/Ideas/Smart-Auto-Buy signal. A long signal buys an ATM (or
+   configured-moneyness) CALL; a short signal buys a PUT (so these engines express "short" as long-premium puts,
+   which IN equity shorting can't do unattended). Buy-only by construction. PAPER opens a premium-priced paper
+   option immediately; REAL is fail-closed behind MATRIX_FO_MASTER_VALIDATED — the identical gate the Automate
+   option path uses — so no live option order is placed until that certification is on. Everything fail-closed:
+   an unresolved chain, a missing premium, or a plan error means NO trade, never a guessed contract. */
+async function executeAutoOptionEntry(ctx, { base, px, dedupId }) {
+  const { userId, market, mode, short = false, tradeType, source, live, screenerKey = null, strategyName = null, optConfig } = ctx;
+  // Single BUY leg: CALL for a long signal, PUT for a short signal, at the user's moneyness / expiry / lots.
+  const opt = {
+    enabled: true, expiry: optConfig.expiry || "Current week", strategy: strategyName || null,
+    legs: [{ side: "BUY", type: short ? "PE" : "CE", mny: String(optConfig.mny || "ATM").toUpperCase(), lots: Math.max(1, Math.floor(Number(optConfig.lots) || 1)) }],
+  };
+  // Resolve against the LIVE NSE option master (today's strikes + expiry). Fail closed if it can't be read.
+  const { rows: foRows, headerLooksValid } = await foSymbolRows();
+  if (!headerLooksValid || !foRows.length) return { placed: false, reason: "option-chain-unavailable" };
+  const plan = optionLegPlan.planOptionLegs({ opt, underlying: base, spot: Number(px), rows: foRows });
+  if (plan.error) { logFinancial(`auto.${source}.option_plan_failed`, { userId, base, detail: plan.detail || plan.error }); return { placed: false, reason: "option-unresolved" }; }
+  const leg = plan.legs[0];
+  const legDisplay = `${plan.underlying} ${leg.strike} ${leg.optionType === "CALL" ? "CE" : "PE"}`;
+  // IN options are limit-only; the live premium is both the paper fill price and the real marketable-limit base.
+  const prem = await fyersOptionLtp(leg.tradingSymbol).catch(() => null);
+  if (!(Number(prem) > 0)) return { placed: false, reason: "option-no-premium" };
+  const optMeta = { optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, underlying: plan.underlying, contractMultiplier: 1 };
+
+  // ---- PAPER: open a premium-priced paper option (exit monitor marks it at the option LTP). ----
+  if (mode === "virtual") {
+    const claimed = await db.claimSignal(`${dedupId}_opt`, userId, "auto-paper-opt").catch(() => true);
+    if (!claimed) return { placed: false, reason: "already-today" };
+    const r = await paperOpenPosition({
+      userId, market: "IN", base, brokerSym: leg.tradingSymbol, symbol: legDisplay,
+      qty: Number(leg.quantity), entry: Number(prem), sl: null, tp: null, tsl: null, short: false,
+      tradeType, source, screenerKey, strategyName, opt: optMeta,
+    });
+    return { placed: !!(r && r.ok), reason: r && r.reason };
+  }
+
+  // ---- REAL: gated behind the same certification as the Automate option path (off by default => no live order). ----
+  if (!live) return { placed: false, reason: "dry-run" };
+  const foValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || "")));
+  if (!foValidated) return { placed: false, reason: "option-live-not-certified" };
+  return { placed: false, reason: "option-live-not-certified" };   // real IN options for these engines run via Automate until certified here
+}
+
 /* Per-symbol entry scan (the body of /api/screener-scan), reused by the server-side screener engine. `syms`
    are candle-fetchable symbols (e.g. "BTC-USD"). Returns [{ sym, price }] for symbols whose entry rule fires now. */
 async function scanSymbolsForEntry(syms, cfg) {
@@ -10300,7 +10352,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
@@ -10327,7 +10379,7 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
         const cfgM = perMode[mode];
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
-        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, short: false, tradeType: "Ideas", source: "ideas", live });
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -10369,7 +10421,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       if (!(capital > 0)) { rec(market, "smartbuy", mode, false, "no-capital-set"); continue; }
       const per = capital / picks.length;
       for (const p of picks) {
-        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live });
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -10410,16 +10462,23 @@ async function runSignalAutoEngine() {
 /* ---- Phase 3: server-side VIRTUAL (paper) book ----
    A paper entry writes a server-authored virtual trade (real:false) the client reads via /api/trades, plus a
    paper_positions row the monitor below watches. No real money, no broker — fills at the live price. */
-async function paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry, sl, tp, tsl, short, tradeType, source, screenerKey = null, strategyName = null }) {
+async function paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry, sl, tp, tsl, short, tradeType, source, screenerKey = null, strategyName = null, opt = null }) {
   try {
     const open = await db.getPaperPositionsForUser(userId).catch(() => []);
     if (open.some((p) => p.status === "open" && _deltaBase(p.base) === _deltaBase(base) && p.market === market)) return { ok: false, reason: "already-open" };
     const id = `paper_${source}_${userId}_${market}_${base}_${_autoDayIdx()}`;
     const now = Date.now();
-    await db.savePaperPosition({ id, userId: String(userId), status: "open", base, brokerSym, symbol, market, qty: Number(qty), entry: Number(entry), sl, tp, tsl, short: !!short, source, openedAt: now });
+    // When `opt` is present this is an IN OPTION paper position: it is priced at the option PREMIUM (entry), not
+    // the underlying, so the paper exit monitor must mark it with the option LTP. Carry the option metadata onto
+    // both the position and the trade row so P&L, display and exit all treat it as the contract it is.
+    const optMeta = opt ? { isOpt: true, optType: opt.optType, strike: opt.strike, expiry: opt.expiry, underlying: opt.underlying, contractMultiplier: Number(opt.contractMultiplier) || 1 } : {};
+    // Persist attribution on the position too: the exit monitor rewrites the SAME trade id on close, so without
+    // this the screener/strategy tag (and option meta) would be lost when the paper position closes.
+    await db.savePaperPosition({ id, userId: String(userId), status: "open", base, brokerSym, symbol, market, qty: Number(qty), entry: Number(entry), sl, tp, tsl, short: !!short, source, openedAt: now, ...(screenerKey ? { screenerKey } : {}), ...(strategyName ? { strategyName } : {}), ...optMeta });
     await db.saveTrade(storageKeyFor(userId), {
       id: `${id}_t`, sym: symbol, side: short ? "SELL" : "BUY", qty: Number(qty), entry: Number(entry), entryAt: now,
       market, real: false, tradeType, exitType: "Open", paperPositionId: id, short: short || undefined,
+      ...(opt ? { productType: "OPTION", optType: opt.optType, strike: opt.strike, expiry: opt.expiry, underlying: opt.underlying, contractMultiplier: Number(opt.contractMultiplier) || 1 } : {}),
       ...(screenerKey ? { screenerKey } : {}), ...(strategyName ? { strategy: strategyName, screenerName: strategyName } : {}),
     }, { authoritative: true });
     logFinancial(`auto.${source}.paper_open`, { userId, symbol, qty, entry });
@@ -10436,7 +10495,11 @@ async function runPaperExitMonitor() {
     for (const p of open) {
       try {
         const entry = Number(p.entry); if (!(entry > 0)) continue;
-        const px = await liveMarkForOrder(p.brokerSym, p.market).catch(() => null);
+        // An OPTION paper position is priced at its premium (the brokerSym is the NFO contract), so mark it with
+        // the option LTP — never liveMarkForOrder, which would return the underlying's price and mis-exit it.
+        const px = p.isOpt
+          ? await fyersOptionLtp(p.brokerSym).catch(() => null)
+          : await liveMarkForOrder(p.brokerSym, p.market).catch(() => null);
         if (!(px > 0)) continue;
         const dir = p.short ? -1 : 1;
         const movePct = ((px - entry) / entry) * 100 * dir;   // favourable move is positive
@@ -10452,6 +10515,10 @@ async function runPaperExitMonitor() {
           entryAt: p.openedAt || now, exit: hit.px, exitAt: now, pnl, market: p.market, real: false,
           tradeType: p.source === "screener" ? "Screener Auto Buy" : p.source === "ideas" ? "Ideas" : "Auto Buy",
           exitType: hit.type, paperPositionId: p.id, short: p.short || undefined,
+          // Preserve attribution + option identity on close (this row has the same id as the open row, so it
+          // replaces it — without these the screener/strategy tag and the fact it's an option would be lost).
+          ...(p.screenerKey ? { screenerKey: p.screenerKey } : {}), ...(p.strategyName ? { strategy: p.strategyName, screenerName: p.strategyName } : {}),
+          ...(p.isOpt ? { productType: "OPTION", optType: p.optType, strike: p.strike, expiry: p.expiry, underlying: p.underlying, contractMultiplier: Number(p.contractMultiplier) || 1 } : {}),
         }, { authoritative: true });
         logFinancial(`auto.${p.source}.paper_exit`, { userId: p.userId, symbol: p.symbol, exit: hit.px, pnl, exitType: hit.type });
       } catch { /* per-position best-effort */ }
