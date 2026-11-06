@@ -7982,7 +7982,12 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
       } else {
         // M02: prefer Delta's own execution timestamp (updated_at/created_at) for the journal entry time.
         const deltaExecTs = reconcile.brokerFillTsMs([o.updated_at, o.created_at]) || Date.now();
-        deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: deltaSym, side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: deltaExecTs, market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true, ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}), ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}) }, { haltUserIdOnFail: sess.userId });
+        deltaJournaled = await recordAuthoritativeFill(storageKeyFor(sess.userId), { sym: deltaSym, side, qty: filled, entry: Number(o.average_fill_price) || Number(req.body?.entryPrice) || 0, entryAt: deltaExecTs, market: "Crypto", real: true, broker: "delta", tradeType: String(req.body?.tradeType || "Manual"), orderId: o.id ?? null, serverAuthored: true,
+          // A native Delta bracket (exchange-side SL/TP) protects this position even though the journal row
+          // carries no Matrix-managed sl/tp. Flag it so the UI shows "Protected" instead of wrongly warning
+          // "Unprotected" — but DON'T write sl/tp, which would make the Matrix exit engine also manage it.
+          ...(bracket && bracket.placed ? { brokerBracket: true } : {}),
+          ...(req.body?.strategyName ? { strategy: String(req.body.strategyName).slice(0, 120) } : {}), ...(req.body?.ideaId ? { ideaId: String(req.body.ideaId).slice(0, 160) } : {}) }, { haltUserIdOnFail: sess.userId });
       }
       // R25-H07: a filled Delta order whose fill couldn't be journaled is reconciliation-required, not a plain success.
       if (!deltaJournaled) {
