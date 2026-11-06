@@ -100,17 +100,21 @@ function techSignalShort(s) {
    Overbought/Oversold excluded; optional short picks for crypto). */
 function dailyPicks(list, opts = {}) {
   const base = (list || []).filter((s) => s.hasData && s.rsi != null && s.sma50 != null && s.sector !== "Volatility");
+  // SELECTIVITY: only take the strongest setups, and cap how many fire in one day. A lower bar (2.5) + no cap
+  // meant the engine entered a long tail of marginal signals — a big driver of the low hit rate. Require score
+  // >= 2.8 and keep only the top 12 by score, so capital concentrates on the highest-conviction picks.
   const longs = base
     .map((s) => ({ s, t: techSignal(s) }))
-    .filter((x) => x.t && x.t.score >= 2.5 && x.t.signal !== "Overbought" && x.t.signal !== "Oversold")
+    .filter((x) => x.t && x.t.score >= 2.8 && x.t.signal !== "Overbought" && x.t.signal !== "Oversold")
     .sort((a, b) => b.t.score - a.t.score)
+    .slice(0, 12)
     .map(({ s, t }) => Object.assign({}, s, { pickDir: "long", pickSide: "BUY", pickSignal: t.signal, pickSlPct: t.slPct, pickTpPct: t.tpPct, pickRR: t.rr, pickScore: t.score }));
   if (!opts.allowShorts) return longs;
   const longSyms = new Set(longs.map((s) => s.sym));
   const shorts = base
     .filter((x) => !longSyms.has(x.sym))
     .map((s) => ({ s, t: techSignalShort(s) }))
-    .filter((x) => x.t && x.t.score >= 2.4)
+    .filter((x) => x.t && x.t.score >= 2.6)
     .sort((a, b) => b.t.score - a.t.score)
     .slice(0, 4)
     .map(({ s, t }) => Object.assign({}, s, { pickDir: "short", pickSide: "SELL", pickSignal: t.signal, pickSlPct: t.slPct, pickTpPct: t.tpPct, pickRR: t.rr, pickScore: t.score }));
