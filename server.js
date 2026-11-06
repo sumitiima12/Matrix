@@ -4068,7 +4068,9 @@ async function scanOneIdea(sym) {
     const _isC = /-USD$/i.test(String(sym));
     const _tgtCapMul = _isC ? 1.12 : 1.6, _atrMul = _isC ? 1.5 : 2, _maxTp = _isC ? 15 : 40;
     const target = (chart && chart.target && chart.target > px && chart.target < px * _tgtCapMul) ? chart.target : px + _atrMul * atr;
-    const stop = (swingLow < px && swingLow > px * 0.85) ? swingLow : px - 1.2 * atr;
+    let stop = (swingLow < px && swingLow > px * 0.85) ? swingLow : px - 1.2 * atr;
+    // Crypto/US-tokens are leveraged (20–25×): clamp the ATR-based stop into the 0.5%–2% band. Equities unchanged.
+    if (_isC) stop = Math.min(Math.max(stop, px * 0.98), px * 0.995);
     const tpPct = +(((target / px) - 1) * 100).toFixed(1);
     const slPct = +((1 - stop / px) * 100).toFixed(1);
     if (!(tpPct >= 1 && tpPct <= _maxTp && slPct > 0.2 && slPct <= 25)) continue;

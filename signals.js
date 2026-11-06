@@ -49,7 +49,9 @@ function techSignal(s) {
   // WIN-RATE TUNING (kept in sync with the frontend): crypto targets tightened — cap +12% (was +30%) and
   // project 1.5×ATR (was 2.5×) so high-ATR coins stop setting 20%+ targets that rarely fill. Equities unchanged.
   const tpCap = px * (isCrypto ? 1.12 : 1.20);
-  const slFloor = px * (isCrypto ? 0.88 : 0.90);
+  // LEVERAGE-AWARE STOP: crypto/US-tokens run on 20–25× leverage, so the stop is capped at 2% of price (already
+  // ~40–50% of margin). Never wider. Equities (unleveraged) keep the 10% floor.
+  const slFloor = px * (isCrypto ? 0.98 : 0.90);
   let target = (res != null && res <= tpCap) ? res : px + (isCrypto ? 1.5 : 2.5) * atr;
   target = Math.min(Math.max(target, px * 1.01), tpCap);
   let stop = (sup != null && sup >= slFloor) ? Math.max(sup - 0.25 * atr, slFloor) : px - 2 * atr;
@@ -84,7 +86,8 @@ function techSignalShort(s) {
   if (s.rsi < 30) score -= 0.8;
   if (s.chg != null) score += Math.max(-1, Math.min(1, -s.chg * 0.15));
   const tpFloor = px * (isCrypto ? 0.88 : 0.80);
-  const slCap = px * (isCrypto ? 1.12 : 1.10);
+  // Leverage-aware: crypto short stop capped at 2% above entry (vs 10% for unleveraged equities).
+  const slCap = px * (isCrypto ? 1.02 : 1.10);
   let target = (sup != null && sup >= tpFloor) ? Math.min(sup + 0.25 * atr, px * 0.99) : px - (isCrypto ? 1.5 : 2.5) * atr;
   target = Math.max(Math.min(target, px * 0.99), tpFloor);
   let stop = (res != null && res <= slCap) ? Math.min(res + 0.25 * atr, slCap) : px + 2 * atr;
