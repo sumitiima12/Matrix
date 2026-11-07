@@ -1381,8 +1381,12 @@ app.post("/api/trades/clear-virtual", requireAuth, async (req, res) => {
   try {
     const userId = storageKeyFor(req.authUserId);   // from the verified token, NOT the client
     const removed = await db.clearVirtualTrades(userId);
+    // Also release today's VIRTUAL once-per-day entry claims so the auto engines can re-enter the same day —
+    // otherwise, after a clear, Smart-Buy / Ideas / Screener report "already entered today" with no trades to show.
+    let claimsCleared = 0;
+    try { claimsCleared = await db.clearVirtualSignalClaims(userId); } catch { /* best-effort */ }
     rcBust(`trades:${userId}`);
-    res.json({ ok: true, removed });
+    res.json({ ok: true, removed, claimsCleared });
   } catch (e) { serverError(res, e); }
 });
 
