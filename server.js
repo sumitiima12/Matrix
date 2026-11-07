@@ -10336,6 +10336,17 @@ async function scanIdeasForSymbols(syms) {
   return out;
 }
 
+/* Trailing-stop percentage for a market's auto-entries. Default is ON at 1% for every market EXCEPT Indian (the
+   exit monitor ratchets the stop up 1% for every 1% the symbol moves in the position's favour, and never loosens
+   it). Indian defaults OFF (equities are noisier intraday and a 1% trail would scalp out). A user can override per
+   market via settings.trailing[market] = { enabled, pct }; {enabled:false} turns it off (0), {enabled:true} on. The
+   trailing stop coexists with the hard SL — resolveExit takes the tighter of the two, so protection only improves. */
+function trailingPctFor(settings, market) {
+  const t = settings && settings.trailing && settings.trailing[market];
+  if (t && typeof t === "object") return t.enabled === false ? 0 : (Number(t.pct) > 0 ? Number(t.pct) : 1);
+  return market === "IN" ? 0 : 1;   // unset → on at 1% everywhere except Indian
+}
+
 /* Evaluate ONE user's enabled SCREENERS (both modes) and place entries for current matches. */
 async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
   const scr = (settings && settings.screeners) || {};
@@ -10354,7 +10365,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: trailingPctFor(settings, market), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
@@ -10384,7 +10395,7 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
         const cfgM = perMode[mode];
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
-        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null });
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -10426,7 +10437,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       if (!(capital > 0)) { rec(market, "smartbuy", mode, false, "no-capital-set"); continue; }
       const per = capital / picks.length;
       for (const p of picks) {
-        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null });
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
