@@ -6105,6 +6105,10 @@ const BROKERS = {
     name: "CoinSwitch", userCreds: true,   // per-user crypto (Ed25519 signature)
     key: () => "byo", secret: () => "byo", loginUrl: () => null,
   },
+  coinbase: {
+    name: "Coinbase", userCreds: true,   // per-user crypto (CDP API key NAME + EC private key; JWT ES256, no OAuth)
+    key: () => "byo", secret: () => "byo", loginUrl: () => null,
+  },
 };
 
 /* Binance signs with HMAC_SHA256 over the query string; the api key rides in X-MBX-APIKEY.
@@ -6141,6 +6145,56 @@ async function coinswitchSigned(apiKey, apiSecret, method, path, body = null) {
   });
   const d = await r.json().catch(() => ({}));
   return { r, d };
+}
+
+/* COINBASE Advanced Trade (CDP) — every request is authorised with a short-lived JWT, not a static HMAC. The CDP
+   API credential is a KEY NAME (e.g. "organizations/…/apiKeys/…") plus an EC P-256 private key (PEM). We mint an
+   ES256 JWT whose `uri` claim binds it to this exact METHOD + host + path (so a captured token can't be replayed on
+   another route), valid ~2 min. `dsaEncoding:"ieee-p1363"` yields the raw r‖s signature JOSE/JWT requires (Node's
+   default DER encoding would be rejected). The private key is pasted by the user; we normalise escaped "\n". */
+function coinbaseJwt(keyName, privateKeyPem, method, path) {
+  const host = "api.coinbase.com";
+  const pem = String(privateKeyPem || "").replace(/\\n/g, "\n").trim();
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "ES256", kid: keyName, typ: "JWT", nonce: crypto.randomBytes(16).toString("hex") };
+  const payload = { sub: keyName, iss: "cdp", nbf: now, exp: now + 120, uri: `${method.toUpperCase()} ${host}${path.split("?")[0]}` };
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const signingInput = `${b64(header)}.${b64(payload)}`;
+  const keyObj = crypto.createPrivateKey(pem);
+  const sig = crypto.sign("SHA256", Buffer.from(signingInput), { key: keyObj, dsaEncoding: "ieee-p1363" }).toString("base64url");
+  return `${signingInput}.${sig}`;
+}
+/* Signed Coinbase Advanced Trade call. `keyName` = CDP key name, `privateKey` = its EC PEM. Returns { r, d }. */
+async function coinbaseCall(keyName, privateKey, method, path, body = null) {
+  const jwt = coinbaseJwt(keyName, privateKey, method, path);
+  const r = await fetch(`https://api.coinbase.com${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const d = await r.json().catch(() => ({}));
+  return { r, d };
+}
+/* Total USD-equivalent cash + the per-asset balances for a Coinbase account. Reads brokerage accounts (paginated),
+   sums fiat/stablecoin balances as "cash". Best-effort; returns null on any auth/transport failure. */
+async function coinbaseBalances(keyName, privateKey) {
+  try {
+    let cursor = null, cash = 0; const assets = {};
+    for (let i = 0; i < 10; i++) {
+      const path = `/api/v3/brokerage/accounts?limit=250${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const { r, d } = await coinbaseCall(keyName, privateKey, "GET", path);
+      if (!r.ok || !d || !Array.isArray(d.accounts)) return null;
+      for (const a of d.accounts) {
+        const cur = String(a.currency || (a.available_balance && a.available_balance.currency) || "").toUpperCase();
+        const amt = Number((a.available_balance && a.available_balance.value) || 0) || 0;
+        if (amt > 0) assets[cur] = (assets[cur] || 0) + amt;
+        if (/^(USD|USDC|USDT)$/.test(cur)) cash += amt;
+      }
+      if (!d.has_next || !d.cursor) break;
+      cursor = d.cursor;
+    }
+    return { cash: +cash.toFixed(2), assets };
+  } catch { return null; }
 }
 
 /* ── Instrument-master resolvers for brokers that trade by NUMERIC id ──────────────────
@@ -6901,6 +6955,19 @@ app.post("/api/broker/session", requireAuth, requireActiveUser, async (req, res)
       const { r, d } = await coinswitchSigned(apiKey, apiSecret, "GET", "/trade/api/v2/user/portfolio");
       if (!r.ok || (d && d.message && !d.data)) throw new Error((d && d.message) || `CoinSwitch rejected the keys (${r.status}).`);
       const sid = putBrokerSession(userId, broker, "coinswitch", null, { apiKey, apiSecret });
+      return res.json({ sessionId: sid, user: null, broker });
+    }
+
+    if (broker === "coinbase") {
+      // Coinbase Advanced Trade (CDP): apiKey = the API KEY NAME, apiSecret = its EC private key PEM. We verify by
+      // reading the brokerage accounts — a successful signed read proves the JWT auth works end-to-end.
+      const extra = req.body.extra || {};
+      const apiKey = String(extra.apiKey || "").trim();
+      const apiSecret = String(extra.apiSecret || "").trim();
+      if (!apiKey || !apiSecret) throw new Error("Coinbase needs your CDP API key name and the EC private key (the full PEM, including the BEGIN/END lines).");
+      const bal = await coinbaseBalances(apiKey, apiSecret);
+      if (!bal) throw new Error("Coinbase rejected the credentials — check that the key NAME is the full 'organizations/…/apiKeys/…' string and the private key is the complete EC PEM.");
+      const sid = putBrokerSession(userId, broker, "coinbase", null, { apiKey, apiSecret });
       return res.json({ sessionId: sid, user: null, broker });
     }
 
@@ -8799,6 +8866,16 @@ app.get("/api/broker/portfolio", requireAuth, requireActiveUser, async (req, res
         .map((x) => ({ sym: x.currency || x.symbol, qty: Number(x.balance || x.quantity || 0), avg: null, ltp: null, pnl: null, value: null }))
         .filter((h) => h.qty > 0);
       return res.json({ broker, holdings, cash: null, currency: "USD" });
+    }
+
+    if (broker === "coinbase") {
+      const { apiKey, apiSecret } = sess.extra || {};
+      const bal = await coinbaseBalances(apiKey, apiSecret);
+      if (!bal) return res.status(502).json({ error: "Couldn't read your Coinbase balances right now — retry in a moment." });
+      const holdings = Object.entries(bal.assets)
+        .filter(([cur]) => !/^(USD|USDC|USDT)$/.test(cur))   // fiat/stablecoins are "cash", shown separately
+        .map(([cur, qty]) => ({ sym: cur, qty: +Number(qty).toFixed(8), avg: null, ltp: null, pnl: null, value: null }));
+      return res.json({ broker, holdings, cash: bal.cash, currency: "USD" });
     }
 
     if (broker === "delta") {
