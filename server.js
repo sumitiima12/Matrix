@@ -375,6 +375,41 @@ async function fetchAllDeltaFills(userId, { timeoutMs = 45000 } = {}) {
     return { fills: Array.isArray(rows) ? rows : null, complete: !!complete };
   } catch { return { fills: null, complete: false }; }
 }
+
+/* AUTHORITATIVE realised P&L from Delta's wallet-transaction ledger — the source behind the "Realised P&L" /
+   "Cashflow" columns of Delta's own order-history export. Per-fill reconstruction can't reproduce this (shorts
+   open with a SELL, perps carry funding, contracts need contract-value scaling), so we read Delta's OWN numbers:
+   sum every pnl-type ledger entry in the window. Returns { realised, funding, fees, types, complete }. The `types`
+   map (transaction_type → count) is returned so the operator can VERIFY which ledger types were counted on first
+   use (Delta's exact type strings vary by API version). Best-effort; never throws. */
+async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {}) {
+  try {
+    let after = null, pages = 0, realised = 0, funding = 0, fees = 0, complete = true;
+    const types = {};
+    for (;;) {
+      if (pages++ >= 40) { complete = false; break; }
+      let q = `?page_size=200`;
+      if (after) q += `&after=${encodeURIComponent(after)}`;
+      const r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
+      if (!r || !Array.isArray(r.result)) { complete = false; break; }
+      for (const t of r.result) {
+        const raw = Number(t.created_at || t.timestamp || 0);
+        const ts = raw > 1e14 ? Math.round(raw / 1000) : raw;
+        if (ts && (ts < from || ts > to)) continue;
+        const ty = String(t.transaction_type || t.type || "").toLowerCase();
+        const amt = Number(t.amount != null ? t.amount : (t.cashflow != null ? t.cashflow : 0)) || 0;
+        types[ty] = (types[ty] || 0) + 1;
+        if (/pnl/.test(ty)) realised += amt;                 // realised trade P&L (the number we want)
+        else if (/funding/.test(ty)) funding += amt;         // perp funding (part of wallet P&L, not trade P&L)
+        else if (/commission|fee|trading_fee/.test(ty)) fees += amt;
+      }
+      const next = (r.meta && (r.meta.after || r.meta.next)) || null;
+      if (!next || next === after) break;
+      after = next;
+    }
+    return { realised: +realised.toFixed(6), funding: +funding.toFixed(6), fees: +fees.toFixed(6), types, complete };
+  } catch { return { realised: null, complete: false }; }
+}
 /* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
    (entry AND exit) and can be reconciled against the risk journal / broker. Idempotent — keyed by the managed
    position id (`exit_<posId>`) so a retry, a stale-close reconcile or a second sweep can't double-count the
@@ -1256,6 +1291,20 @@ app.get("/api/trades", requireAuth, async (req, res) => {
     const to = req.query.to ? +req.query.to : Date.now();
     const trades = await rcWrap(`trades:${userId}:${from}:${to}`, () => db.getTrades(userId, from, to));
     res.json({ trades });
+  } catch (e) { serverError(res, e); }
+});
+
+/* AUTHORITATIVE realised P&L for the caller's Delta account over a window — read straight from Delta's own
+   wallet-transaction ledger (the source of the "Realised P&L" column in Delta's export), so the figure matches
+   the broker exactly even where per-fill reconstruction can't (shorts, perp funding, contract-value scaling).
+   The client uses this as the Orders/Home REAL headline; per-trade journal P&L stays as best-effort detail.
+   `types` is returned so the value can be verified against Delta on first use. Delta-only; read-only. */
+app.get("/api/broker/realised", requireAuth, async (req, res) => {
+  try {
+    const from = req.query.from != null && req.query.from !== "" ? Number(req.query.from) : 0;
+    const to = req.query.to != null && req.query.to !== "" ? Number(req.query.to) : Date.now();
+    const r = await fetchDeltaRealisedPnl(req.authUserId, { from, to });
+    res.json({ ok: true, ...r });
   } catch (e) { serverError(res, e); }
 });
 
