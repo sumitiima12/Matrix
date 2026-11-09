@@ -1473,14 +1473,21 @@ app.post("/api/trades/reconcile-real", requireAuth, async (req, res) => {
     for (const t of toClose) {
       let close = { exit: Number(t.entry) || t.exit || 0, exitAt: now, pnl: 0,
         reconcileReason: "Closed via Delta reconciliation — Delta held no matching position." };
+      let didReconstruct = false;
       if (deltaFills) {
         const cv = cvBySym.get(String(t.sym || "").toUpperCase().replace(/(USDT|USD|INR)$/i, "")) || 1;
         const real = reconcile.reconstructExitFromDeltaFills(t, deltaFills, { contractValue: cv });
         if (real) { close = { exit: real.exit, exitAt: real.exitAt || now, pnl: real.pnl,
-          reconcileReason: "Closed via Delta reconciliation — exit price/P&L reconstructed from Delta fills." }; reconstructed++; }
+          reconcileReason: "Closed via Delta reconciliation — exit price/P&L reconstructed from Delta fills." }; reconstructed++; didReconstruct = true; }
         else breakEven++;
       }
-      await db.updateTrade(userId, { ...t, ...close, status: "closed", reconciled: true, reconciledAt: now, exitType: "Closed (reconciled)" }).catch(() => {});
+      // HONEST labelling: only a position whose real exit we could reconstruct from Delta fills is "Closed
+      // (reconciled)" with a real P&L. One we couldn't match (the broker no longer held it, but fills didn't
+      // cover it — e.g. a partial-fill / pre-window exit) is marked "Closed (unreconciled)" and carries
+      // unreconciled:true, so the dashboards EXCLUDE it from P&L and win-rate instead of showing a fake $0 win/loss.
+      const exitType = didReconstruct ? "Closed (reconciled)" : "Closed (unreconciled)";
+      await db.updateTrade(userId, { ...t, ...close, status: "closed", reconciled: true, reconciledAt: now,
+        exitType, ...(didReconstruct ? {} : { unreconciled: true }) }).catch(() => {});
     }
     // Diagnostic: when closes book break-even, say WHY (no fills read, pagination incomplete, or genuine no-match)
     // so a recurrence of "every reconciled close shows $0 P&L" is debuggable from logs instead of a guess.
