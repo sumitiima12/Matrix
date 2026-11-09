@@ -399,15 +399,20 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
         const ty = String(t.transaction_type || t.type || "").toLowerCase();
         const amt = Number(t.amount != null ? t.amount : (t.cashflow != null ? t.cashflow : 0)) || 0;
         types[ty] = (types[ty] || 0) + 1;
-        if (/pnl/.test(ty)) realised += amt;                 // realised trade P&L (the number we want)
-        else if (/funding/.test(ty)) funding += amt;         // perp funding (part of wallet P&L, not trade P&L)
-        else if (/commission|fee|trading_fee/.test(ty)) fees += amt;
+        // Delta records realised trade P&L as "cashflow" ledger entries (the source of the export's "Realised P&L"
+        // column) — there is no "pnl" type. Deposits/withdrawals/funding/commission are their own types, excluded.
+        if (ty === "cashflow" || /realized_pnl|realised_pnl|trade_pnl|\bpnl\b/.test(ty)) realised += amt;
+        else if (/funding/.test(ty)) funding += amt;         // perp funding (a real wallet cost, reported separately)
+        else if (/commission|liquidation_fee|trading_fee/.test(ty)) fees += amt;
       }
+      // Net realised = trade P&L after the funding + fee costs that actually hit the wallet (the number closest to
+      // the broker wallet's realised change). Gross `realised` matches Delta's "Realised P&L" export column.
       const next = (r.meta && (r.meta.after || r.meta.next)) || null;
       if (!next || next === after) break;
       after = next;
     }
-    return { realised: +realised.toFixed(6), funding: +funding.toFixed(6), fees: +fees.toFixed(6), types, complete };
+    const netRealised = +(realised + funding + fees).toFixed(6);
+    return { realised: +realised.toFixed(6), netRealised, funding: +funding.toFixed(6), fees: +fees.toFixed(6), types, complete };
   } catch { return { realised: null, complete: false }; }
 }
 /* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
