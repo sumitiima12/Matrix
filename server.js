@@ -6152,17 +6152,31 @@ async function coinswitchSigned(apiKey, apiSecret, method, path, body = null) {
    ES256 JWT whose `uri` claim binds it to this exact METHOD + host + path (so a captured token can't be replayed on
    another route), valid ~2 min. `dsaEncoding:"ieee-p1363"` yields the raw r‖s signature JOSE/JWT requires (Node's
    default DER encoding would be rejected). The private key is pasted by the user; we normalise escaped "\n". */
-function coinbaseJwt(keyName, privateKeyPem, method, path) {
+function coinbaseJwt(keyName, secret, method, path) {
   const host = "api.coinbase.com";
-  const pem = String(privateKeyPem || "").replace(/\\n/g, "\n").trim();
+  const raw = String(secret || "").replace(/\\n/g, "\n").trim();
   const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "ES256", kid: keyName, typ: "JWT", nonce: crypto.randomBytes(16).toString("hex") };
+  // Coinbase CDP issues TWO key types: ECDSA (an EC PEM → ES256) and Ed25519 (a base64 string → EdDSA). Detect by
+  // shape and sign accordingly, so a user can paste whichever Coinbase gave them.
+  const isPem = /BEGIN [A-Z0-9 ]*PRIVATE KEY/.test(raw);
+  const alg = isPem ? "ES256" : "EdDSA";
+  const header = { alg, kid: keyName, typ: "JWT", nonce: crypto.randomBytes(16).toString("hex") };
   const payload = { sub: keyName, iss: "cdp", nbf: now, exp: now + 120, uri: `${method.toUpperCase()} ${host}${path.split("?")[0]}` };
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
   const signingInput = `${b64(header)}.${b64(payload)}`;
-  const keyObj = crypto.createPrivateKey(pem);
-  const sig = crypto.sign("SHA256", Buffer.from(signingInput), { key: keyObj, dsaEncoding: "ieee-p1363" }).toString("base64url");
-  return `${signingInput}.${sig}`;
+  let sig;
+  if (isPem) {
+    const keyObj = crypto.createPrivateKey(raw);
+    sig = crypto.sign("SHA256", Buffer.from(signingInput), { key: keyObj, dsaEncoding: "ieee-p1363" });   // JOSE r‖s, not DER
+  } else {
+    // Ed25519: the CDP secret is base64 of 64 bytes (32-byte seed + 32-byte public key) or just the 32-byte seed.
+    // Wrap the first 32 bytes (the seed) in the fixed PKCS8/Ed25519 DER prefix so Node can build the key, then EdDSA-sign.
+    const bytes = Buffer.from(raw, "base64");
+    const seed = bytes.subarray(0, 32);
+    const keyObj = crypto.createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]), format: "der", type: "pkcs8" });
+    sig = crypto.sign(null, Buffer.from(signingInput), keyObj);
+  }
+  return `${signingInput}.${sig.toString("base64url")}`;
 }
 /* Signed Coinbase Advanced Trade call. `keyName` = CDP key name, `privateKey` = its EC PEM. Returns { r, d }. */
 async function coinbaseCall(keyName, privateKey, method, path, body = null) {
