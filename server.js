@@ -10233,7 +10233,9 @@ async function executeAutoEntry(ctx) {
     );
     if (!check.ok) { logFinancial(`auto.${source}.risk_blocked`, { userId, symbol, reasons: check.reasons }); return { placed: false, reason: "risk:" + (check.reasons[0] || "blocked") }; }
     if (typeof db.deriveRiskFromFills === "function") {
-      const maxLossPct = Number(policy.maxDailyLossPct) || 90;
+      // Daily-loss breaker applies ONLY when the user has turned Risk limits ON (set a maxDailyLossPct). No platform
+      // default floor — with limits off there is NO daily-loss pause (operator decision 2026-11).
+      const maxLossPct = Number(policy.maxDailyLossPct) || 0;
       const dayStart = riskSessionDayStart(abMarketKind);
       let fillsRk; try { fillsRk = db.deriveRiskFromFills(await db.getFills(storeKey, dayStart, Date.now()), { from: dayStart, to: Date.now() }); }
       catch { return { placed: false, reason: "ledger-read-failed" }; }
@@ -10786,18 +10788,19 @@ async function runAutoBuyEngine() {
              IMMUTABLE, FEE-AWARE realized loss from the executions ledger (deriveRiskFromFills), not only the
              account/projection view, so a fabricated/omitted projection row can't loosen the auto-buy daily-loss
              breaker. Fail closed on a ledger read error. */
-          if (typeof db.deriveRiskFromFills === "function") {
-            const abMaxLossPct = Number(abPolicy.maxDailyLossPct) || 25;   // platform default floor
-            const IST_OFF = 19800000;
+          // Daily-loss breaker ONLY when the user turned Risk limits ON (set a maxDailyLossPct) — no platform floor.
+          const abMaxLossPct = Number(abPolicy.maxDailyLossPct) || 0;
+          if (abMaxLossPct > 0 && typeof db.deriveRiskFromFills === "function") {
             const abDayStart = riskSessionDayStart(abMarketKind);
             let abFillsRk;
             try { abFillsRk = db.deriveRiskFromFills(await db.getFills(abStoreKey, abDayStart, Date.now()), { from: abDayStart, to: Date.now() }); }
             catch { await db.updateRealStrategy(st.id, { lastError: "Couldn't read the execution ledger to risk-check this automated entry — skipped this cycle.", lastOrderStatus: "blocked" }).catch(() => {}); continue; }
             const abStartEquity = (Number(abAccount.wallet) || 0) - (Number(abFillsRk.realizedPnl) || 0);
             const abLossCap = Math.max(0, (abStartEquity * abMaxLossPct) / 100);
-            if (abLossCap > 0 && Number(abFillsRk.realizedLoss) >= abLossCap) {
-              await db.updateRealStrategy(st.id, { lastError: `Daily loss limit hit (execution-ledger authoritative): realized ${abFillsRk.realizedLoss.toFixed(0)} ≥ cap ${abLossCap.toFixed(0)}. New automated entries paused for the session.`, lastOrderStatus: "risk-blocked" });
-              logFinancial("autobuy.risk_blocked", { userId: st.userId, broker: st.broker, symbol: st.symbol, cap: "maxDailyLossPct", realizedLoss: abFillsRk.realizedLoss, lossCap: +abLossCap.toFixed(2), source: "fills-ledger" });
+            const abNetLoss = Math.max(0, -(Number(abFillsRk.realizedPnl) || 0));   // NET, not gross
+            if (abLossCap > 0 && abNetLoss >= abLossCap) {
+              await db.updateRealStrategy(st.id, { lastError: `Daily loss limit hit (execution-ledger authoritative): net loss ${abNetLoss.toFixed(0)} ≥ cap ${abLossCap.toFixed(0)}. New automated entries paused for the session.`, lastOrderStatus: "risk-blocked" });
+              logFinancial("autobuy.risk_blocked", { userId: st.userId, broker: st.broker, symbol: st.symbol, cap: "maxDailyLossPct", netLoss: abNetLoss, lossCap: +abLossCap.toFixed(2), source: "fills-ledger" });
               continue;
             }
           }

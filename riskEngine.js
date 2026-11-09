@@ -19,7 +19,8 @@ const DEFAULT_LIMITS = {
   maxPositionPct: 100,      // max % of that market's equity in a single position (kept permissive)
   maxOpenPositions: 50,     // per market — stops a runaway opening hundreds of positions
   maxTradesPerDay: 100,     // per market
-  maxDailyLossPct: 90,      // circuit breaker: halt a market only after −90% realised on the day (raised from 25%)
+  maxDailyLossPct: 0,       // 0 = OFF by default. The daily-loss circuit breaker applies ONLY when the user turns
+                            // Risk limits ON and sets a percentage (operator decision 2026-11). Clamped to 90 max.
   cooldownMs: 15000,        // 15s min gap between two entries in the same symbol
 };
 
@@ -170,9 +171,12 @@ function validateOrder(order, account) {
     .filter((t) => (t.exitAt || 0) >= sessionStart && (t.market || "IN") === market)
     .reduce((a, t) => a + (t.pnl || 0), 0);
   const startOfDayWallet = wallet - realisedToday;
-  const lossCap = -(startOfDayWallet * limits.maxDailyLossPct) / 100;
-  if (realisedToday < lossCap) {
-    reasons.push(`Daily loss limit hit in ${market} (${realisedToday.toFixed(0)} vs cap ${lossCap.toFixed(0)}).`);
+  // 0 (or unset) = breaker OFF — never block on a loss unless the user turned Risk limits ON with a percentage.
+  if (Number(limits.maxDailyLossPct) > 0) {
+    const lossCap = -(startOfDayWallet * limits.maxDailyLossPct) / 100;
+    if (realisedToday < lossCap) {
+      reasons.push(`Daily loss limit hit in ${market} (${realisedToday.toFixed(0)} vs cap ${lossCap.toFixed(0)}).`);
+    }
   }
 
   /* C-04: cooldown is a BLOCKING control, not a warning — it exists to kill resubmission loops that would
