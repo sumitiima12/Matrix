@@ -415,6 +415,70 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
     return { realised: +realised.toFixed(6), netRealised, funding: +funding.toFixed(6), fees: +fees.toFixed(6), types, complete };
   } catch { return { realised: null, complete: false }; }
 }
+
+/* Normalize a Delta product/contract symbol to the app's BASE symbol so wallet-ledger costs can be joined to the
+   app's trade rows (which store `sym` as the bare base, e.g. "BTC", "SOL"). Delta's product symbols look like
+   "BTCUSD", "SOLUSDT", "ETH-PERP", "MARAUSD" — strip the quote/suffix and any separators. Returns "" if nothing
+   usable, so unattributable costs don't get mis-joined to a real symbol. */
+function deltaBaseSymbol(raw) {
+  let s = String(raw || "").toUpperCase().trim();
+  if (!s) return "";
+  s = s.replace(/[-_/]/g, "");
+  s = s.replace(/(PERP|PERPETUAL)$/, "");
+  s = s.replace(/(USDT|USDC|USD|INR|BTC)$/, "");   // common Delta quote currencies
+  return s;
+}
+
+/* Per-symbol COST attribution for a Delta account over a window — the funding, commission/trading-fee and
+   liquidation-fee wallet entries that aren't the trade P&L itself, bucketed by the base symbol they hit and kept
+   as individual timestamped entries so the client can attribute each cost to the specific trade whose open→close
+   window contains it. Delta-only (Crypto + US Stock Tokens). Costs are stored as Delta reports them (NEGATIVE =
+   a debit from the wallet). Returns { bySymbol: { SYM: { funding, fees, liquidation, total, entries:[{ts,type,amount}] } },
+   total, funding, fees, liquidation, unattributed, complete }. Best-effort; never throws. Read-only. */
+async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debug = false } = {}) {
+  try {
+    let after = null, pages = 0, complete = true;
+    const bySymbol = {};
+    let total = 0, funding = 0, fees = 0, liquidation = 0, unattributed = 0;
+    const sampleCost = [];
+    const bucket = (sym, kind, amt, ts, ty) => {
+      const b = bySymbol[sym] || (bySymbol[sym] = { funding: 0, fees: 0, liquidation: 0, total: 0, entries: [] });
+      b[kind] += amt; b.total += amt; b.entries.push({ ts, type: ty, amount: +amt.toFixed(8) });
+    };
+    for (;;) {
+      if (pages++ >= 40) { complete = false; break; }
+      let q = `?page_size=200`;
+      if (after) q += `&after=${encodeURIComponent(after)}`;
+      const r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
+      if (!r || !Array.isArray(r.result)) { complete = false; break; }
+      for (const t of r.result) {
+        const raw = Number(t.created_at || t.timestamp || 0);
+        const ts = raw > 1e14 ? Math.round(raw / 1000) : raw;
+        if (ts && (ts < from || ts > to)) continue;
+        const ty = String(t.transaction_type || t.type || "").toLowerCase();
+        let kind = null;
+        if (/funding/.test(ty)) kind = "funding";
+        else if (/liquidation_fee/.test(ty)) kind = "liquidation";
+        else if (/commission|trading_fee/.test(ty)) kind = "fees";
+        if (!kind) continue;   // not a cost line (cashflow/deposit/withdrawal handled elsewhere)
+        const amt = Number(t.amount != null ? t.amount : (t.cashflow != null ? t.cashflow : 0)) || 0;
+        const md = (t.meta_data && typeof t.meta_data === "object") ? t.meta_data : {};
+        const symRaw = md.product_symbol || md.symbol || md.contract || t.product_symbol || t.symbol || md.product_id || "";
+        const sym = deltaBaseSymbol(symRaw);
+        total += amt; if (kind === "funding") funding += amt; else if (kind === "fees") fees += amt; else liquidation += amt;
+        if (sym) bucket(sym, kind, amt, ts, ty); else unattributed += amt;
+        if (debug && sampleCost.length < 6) sampleCost.push({ ty, amt, symRaw, sym, mdKeys: Object.keys(md) });
+      }
+      const next = (r.meta && (r.meta.after || r.meta.next)) || null;
+      if (!next || next === after) break;
+      after = next;
+    }
+    for (const k of Object.keys(bySymbol)) { const b = bySymbol[k]; b.funding = +b.funding.toFixed(6); b.fees = +b.fees.toFixed(6); b.liquidation = +b.liquidation.toFixed(6); b.total = +b.total.toFixed(6); }
+    const out = { bySymbol, total: +total.toFixed(6), funding: +funding.toFixed(6), fees: +fees.toFixed(6), liquidation: +liquidation.toFixed(6), unattributed: +unattributed.toFixed(6), complete };
+    if (debug) out.sampleCost = sampleCost;
+    return out;
+  } catch { return { bySymbol: {}, total: null, complete: false }; }
+}
 /* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
    (entry AND exit) and can be reconciled against the risk journal / broker. Idempotent — keyed by the managed
    position id (`exit_<posId>`) so a retry, a stale-close reconcile or a second sweep can't double-count the
@@ -1309,6 +1373,20 @@ app.get("/api/broker/realised", requireAuth, async (req, res) => {
     const from = req.query.from != null && req.query.from !== "" ? Number(req.query.from) : 0;
     const to = req.query.to != null && req.query.to !== "" ? Number(req.query.to) : Date.now();
     const r = await fetchDeltaRealisedPnl(req.authUserId, { from, to });
+    res.json({ ok: true, ...r });
+  } catch (e) { serverError(res, e); }
+});
+
+/* Per-symbol COST attribution (funding + commission + liquidation) for the caller's Delta account over a window —
+   the client joins these onto each Crypto / US-Stock-Token trade by symbol + open→close time window so the per
+   strategy / per screener P&L can be shown NET of the funding and fees that actually hit the wallet. Delta-only;
+   read-only. Pass ?debug=1 once to surface the ledger field names (sampleCost) for verification. */
+app.get("/api/broker/costs", requireAuth, async (req, res) => {
+  try {
+    const from = req.query.from != null && req.query.from !== "" ? Number(req.query.from) : 0;
+    const to = req.query.to != null && req.query.to !== "" ? Number(req.query.to) : Date.now();
+    const debug = String(req.query.debug || "") === "1";
+    const r = await fetchDeltaCostsBySymbol(req.authUserId, { from, to, debug });
     res.json({ ok: true, ...r });
   } catch (e) { serverError(res, e); }
 });
