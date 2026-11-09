@@ -2408,6 +2408,42 @@ app.post("/api/auto-settings", requireAuth, requireFreshSession, async (req, res
     res.json({ ok: true, anyEnabled });
   } catch (e) { serverError(res, e); }
 });
+/* One-shot BULK update of deployed capital/size across the caller's EXISTING screeners + strategies. Changing the
+   UI default only affects NEW ones; this rewrites the already-saved config so the live engines use the new amounts
+   on their next sweep. Body: { screenerCapital, smartCapital, strategyQty } — any field omitted is left unchanged. */
+app.post("/api/automation/bulk-capital", requireAuth, requireActiveUser, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const b = req.body || {};
+    const screenerCapital = b.screenerCapital != null && b.screenerCapital !== "" ? Number(b.screenerCapital) : null;
+    const smartCapital = b.smartCapital != null && b.smartCapital !== "" ? Number(b.smartCapital) : null;
+    const strategyQty = b.strategyQty != null && b.strategyQty !== "" ? Number(b.strategyQty) : null;
+    let screeners = 0, smart = 0, strats = 0;
+    if (screenerCapital != null || smartCapital != null) {
+      const settings = (await db.getAutoSettings(userId)) || {};
+      if (screenerCapital != null && settings.screeners) {
+        for (const mkt of Object.keys(settings.screeners)) for (const key of Object.keys(settings.screeners[mkt] || {})) {
+          const s = settings.screeners[mkt][key]; if (s && typeof s === "object") { s.capital = screenerCapital; screeners++; }
+        }
+      }
+      if (smartCapital != null && settings.smartAutoBuy) {
+        for (const mkt of Object.keys(settings.smartAutoBuy)) for (const mode of Object.keys(settings.smartAutoBuy[mkt] || {})) {
+          const m = settings.smartAutoBuy[mkt][mode]; if (m && typeof m === "object") { m.capital = smartCapital; smart++; }
+        }
+      }
+      await db.saveAutoSettings(userId, settings, computeAutoAnyEnabled(settings));
+      rcBust(`autoset:${userId}`);
+    }
+    if (strategyQty != null) {
+      const state = (await db.getState(userId)) || {};
+      if (Array.isArray(state.strats)) {
+        for (const s of state.strats) { if (s && typeof s === "object") { s.qty = strategyQty; s.cap = strategyQty; strats++; } }
+        await db.saveState(userId, state); rcBust(`state:${userId}`);
+      }
+    }
+    res.json({ ok: true, screenersUpdated: screeners, smartUpdated: smart, strategiesUpdated: strats });
+  } catch (e) { serverError(res, e); }
+});
 app.get("/api/auto-settings", requireAuth, async (req, res) => {
   try {
     const userId = storageKeyFor(req.authUserId);
@@ -6209,6 +6245,48 @@ async function coinbaseBalances(keyName, privateKey) {
     }
     return { cash: +cash.toFixed(2), assets };
   } catch { return null; }
+}
+/* Coinbase product id for a bare coin: the app passes "BTC" (or "BTCUSD"); Coinbase Advanced Trade quotes spot as
+   "BTC-USD". (A Coinbase India account trading INR would need "-INR" here — surfaced as a caveat; not auto-switched.) */
+function coinbaseProductId(sym) {
+  const base = String(sym || "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/(USDT|USD|INR|PERP)$/i, "");
+  return `${base}-USD`;
+}
+/* Place a MARKET order on Coinbase Advanced Trade. BUY/SELL by base_size (coin qty). Returns { orderId } or throws
+   with the broker's reason. IOC market order — immediate-or-cancel, the closest match to the other spot adapters. */
+async function coinbasePlaceOrder(keyName, privateKey, { productId, side, baseSize, clientId }) {
+  const body = {
+    client_order_id: String(clientId || crypto.randomUUID()).slice(0, 64),
+    product_id: productId,
+    side: String(side).toUpperCase() === "SELL" ? "SELL" : "BUY",
+    order_configuration: { market_market_ioc: { base_size: String(baseSize) } },
+  };
+  const { r, d } = await coinbaseCall(keyName, privateKey, "POST", "/api/v3/brokerage/orders", body);
+  if (!r.ok || d.success === false || d.error_response) {
+    const er = d.error_response || {};
+    throw new Error(er.message || er.error_details || d.error || `Coinbase order rejected (${r.status}).`);
+  }
+  const oid = (d.success_response && d.success_response.order_id) || d.order_id || null;
+  if (!oid) throw new Error("Coinbase accepted the request but returned no order id — treat as unconfirmed.");
+  return { orderId: oid };
+}
+/* Confirm a Coinbase order actually filled (acceptance ≠ fill). Polls the order by id until FILLED/CANCELLED.
+   Returns { filled, filledQty, avgPrice, status }. Never throws — an unreadable status stays pending (safe). */
+async function coinbaseVerifyFill(keyName, privateKey, orderId, wantQty = 0) {
+  for (let i = 0; i < 4; i++) {
+    try {
+      const { r, d } = await coinbaseCall(keyName, privateKey, "GET", `/api/v3/brokerage/orders/historical/${encodeURIComponent(orderId)}`);
+      const o = (d && d.order) || {};
+      const st = String(o.status || "").toUpperCase();
+      const filledQty = Number(o.filled_size || 0) || 0;
+      const avgPrice = Number(o.average_filled_price || 0) || 0;
+      if (st === "FILLED" || (filledQty > 0 && st !== "OPEN" && st !== "PENDING")) return { filled: true, filledQty: filledQty || wantQty, avgPrice, status: st };
+      if (st === "CANCELLED" || st === "REJECTED" || st === "EXPIRED" || st === "FAILED") return { filled: false, rejected: true, reason: o.reject_reason || st, status: st };
+      if (r && !r.ok) return { filled: false, pending: true, status: st || "unknown" };
+    } catch { /* retry */ }
+    await new Promise((res) => setTimeout(res, 800));
+  }
+  return { filled: false, pending: true, status: "pending" };
 }
 
 /* ── Instrument-master resolvers for brokers that trade by NUMERIC id ──────────────────
@@ -10079,6 +10157,19 @@ async function placeBuyOrder(sess, symbol, qty, market, product, slPct = null, t
     if (c.rejected) throw new Error(c.reason || `FYERS rejected the order (status ${c.status})`);
     if (!c.filled) throw new Error(`FYERS order ${d.id} accepted but not confirmed filled (status ${c.status ?? "pending"}) — awaiting fill`);
     return { orderId: d.id, filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice, state: "filled", partial: Number(qty) > 0 && c.filledQty > 0 && c.filledQty < Number(qty) };
+  }
+  if (broker === "coinbase") {
+    // Spot market order on Coinbase Advanced Trade. SELL is blocked unless the user actually holds the coin (spot
+    // has no shorting) — the shared short guard already refuses a non-Delta short upstream, so here side is BUY/SELL
+    // of a real position. Acceptance ≠ fill: place, then confirm from the order status before returning filled.
+    const { apiKey, apiSecret } = sess.extra || {};
+    if (!apiKey || !apiSecret) throw new Error("Coinbase credentials unavailable — reconnect the broker.");
+    const productId = coinbaseProductId(symbol);
+    const { orderId } = await coinbasePlaceOrder(apiKey, apiSecret, { productId, side: short ? "SELL" : "BUY", baseSize: Number(qty), clientId: clientOrderId });
+    const c = await coinbaseVerifyFill(apiKey, apiSecret, orderId, Number(qty));
+    if (c.rejected) throw new Error(c.reason || `Coinbase rejected the order (status ${c.status}).`);
+    if (!c.filled) throw new Error(`Coinbase order ${orderId} accepted but not confirmed filled (status ${c.status}) — awaiting fill`);
+    return { orderId, filledQty: c.filledQty || Number(qty), avgPrice: c.avgPrice || null, state: "filled", partial: Number(qty) > 0 && c.filledQty > 0 && c.filledQty < Number(qty) };
   }
   throw new Error(`auto-buy not supported for ${broker}`);
 }
