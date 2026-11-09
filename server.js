@@ -393,8 +393,7 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
       const r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
       if (!r || !Array.isArray(r.result)) { complete = false; break; }
       for (const t of r.result) {
-        const raw = Number(t.created_at || t.timestamp || 0);
-        const ts = raw > 1e14 ? Math.round(raw / 1000) : raw;
+        const ts = deltaTxMs(t);                               // ms since epoch (ISO string / µs / ms / s)
         if (ts && (ts < from || ts > to)) continue;
         const ty = String(t.transaction_type || t.type || "").toLowerCase();
         const amt = Number(t.amount != null ? t.amount : (t.cashflow != null ? t.cashflow : 0)) || 0;
@@ -414,6 +413,20 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
     const netRealised = +(realised + funding + fees).toFixed(6);
     return { realised: +realised.toFixed(6), netRealised, funding: +funding.toFixed(6), fees: +fees.toFixed(6), types, complete };
   } catch { return { realised: null, complete: false }; }
+}
+
+/* Parse a Delta wallet-transaction timestamp to MILLISECONDS since epoch. Delta returns `created_at` as an ISO-8601
+   string on this endpoint (not a number), and elsewhere as microseconds; also tolerate ms/seconds. Returns 0 when
+   nothing parses, so a row with no usable time simply isn't window-matched (never mis-attributed). */
+function deltaTxMs(t) {
+  const v = (t && (t.created_at != null ? t.created_at : (t.timestamp != null ? t.timestamp : t.created))) ?? null;
+  if (v == null) return 0;
+  if (typeof v === "string") { const d = Date.parse(v); return Number.isFinite(d) ? d : 0; }
+  const n = Number(v); if (!Number.isFinite(n) || n <= 0) return 0;
+  if (n > 1e15) return Math.round(n / 1000);   // microseconds → ms
+  if (n > 1e12) return Math.round(n);          // already ms
+  if (n > 1e9)  return Math.round(n * 1000);   // seconds → ms
+  return Math.round(n);
 }
 
 /* Normalize a Delta product/contract symbol to the app's BASE symbol so wallet-ledger costs can be joined to the
@@ -452,8 +465,7 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
       const r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
       if (!r || !Array.isArray(r.result)) { complete = false; break; }
       for (const t of r.result) {
-        const raw = Number(t.created_at || t.timestamp || 0);
-        const ts = raw > 1e14 ? Math.round(raw / 1000) : raw;
+        const ts = deltaTxMs(t);                               // ms since epoch (handles ISO string / µs / ms / s)
         if (ts && (ts < from || ts > to)) continue;
         const ty = String(t.transaction_type || t.type || "").toLowerCase();
         let kind = null;
