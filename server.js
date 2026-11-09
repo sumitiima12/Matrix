@@ -10312,11 +10312,54 @@ async function executeAutoOptionEntry(ctx, { base, px, dedupId }) {
     return { placed: !!(r && r.ok), reason: r && r.reason };
   }
 
-  // ---- REAL: gated behind the same certification as the Automate option path (off by default => no live order). ----
+  // ---- REAL: place the single BUY option leg as a marketable-LIMIT order (IN options are limit-only), mirroring the
+  // certified Automate real-option path. Gated on the F&O master certification (DERIVATIVES_DEFAULT_ON by default).
+  // Fails closed on any missing session/premium/journal so a half-placed or unverifiable order never opens. ----
   if (!live) return { placed: false, reason: "dry-run" };
   const foValidated = (DERIVATIVES_DEFAULT_ON || /^(1|true|yes)$/i.test(String(process.env.MATRIX_FO_MASTER_VALIDATED || "")));
   if (!foValidated) return { placed: false, reason: "option-live-not-certified" };
-  return { placed: false, reason: "option-live-not-certified" };   // real IN options for these engines run via Automate until certified here
+  if (short) return { placed: false, reason: "option-sell-leg-not-certified" };   // buy-only: a PUT is a long-premium BUY; a true SELL/write stays blocked
+  let owner; try { owner = await db.getUser(stripPh(String(userId))); } catch { return { placed: false, reason: "owner-unverifiable" }; }
+  if (!owner || owner.blocked || owner.deleted || owner.approved !== true) return { placed: false, reason: "account-inactive" };
+  const resolved = await resolveAutoBroker(userId, "IN");
+  if (!resolved || resolved.broker !== "fyers") return { placed: false, reason: "no-broker-session" };
+  const { broker, sess } = resolved;
+  if (capabilityBlock(broker, "unattendedAutomation")) return { placed: false, reason: "capability" };
+  const storeKey = storageKeyFor(userId);
+  if (!ENTRY_LOCK_DISABLED) {
+    let blocked; try { blocked = (await db.isRiskLocked(storeKey)) || (typeof db.getEntryHalt === "function" && await db.getEntryHalt(storeKey)); }
+    catch { return { placed: false, reason: "risk-state-unreadable" }; }
+    if (blocked) return { placed: false, reason: "reconciliation-locked" };
+  }
+  if (haltedEntries.has(String(userId))) return { placed: false, reason: "entries-halted" };
+  const claimed = await db.claimSignal(`${dedupId}_optreal`, userId, "auto-opt-real").catch(() => false);
+  if (!claimed) return { placed: false, reason: "already-today" };
+  const legLimit = +(Number(prem) * 1.01).toFixed(2);   // 1% marketable-limit buffer so a BUY crosses the spread and fills
+  const clientId = `mx_${source}_${dedupId}_opt`;
+  try {
+    const rr = await placeBuyOrder(sess, leg.tradingSymbol, leg.quantity, "IN", "intraday", null, null, false, clientId, "LIMIT", legLimit);
+    const fillQty = Number(rr.filledQty) > 0 ? Number(rr.filledQty) : leg.quantity;
+    const fillPx = Number(rr.avgPrice) > 0 ? Number(rr.avgPrice) : legLimit;
+    const pos = await registerManagedPosition({
+      sess, symbol: legDisplay, brokerSym: leg.tradingSymbol, qty: fillQty, entry: fillPx, market: "IN",
+      sl: null, tp: null, tsl: null, cfg: null, yahoo: null, interval: "5m", product: "intraday", short: false,
+      isOpt: true, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, contractMultiplier: 1, underlying: plan.underlying,
+    });
+    const journaled = await recordAuthoritativeFill(storeKey, {
+      id: `${source}_${dedupId}_opt`, sym: legDisplay, side: "BUY", qty: fillQty, entry: fillPx, entryAt: Date.now(),
+      market: "IN", real: true, broker, tradeType, orderId: rr.orderId || null, managedId: pos.id, serverAuthored: true,
+      productType: "OPTION", contractMultiplier: 1, optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, underlying: plan.underlying,
+      ...(screenerKey ? { screenerKey } : {}), ...(strategyName ? { strategy: strategyName, screenerName: strategyName } : {}),
+    }, { haltUserIdOnFail: userId });
+    if (!journaled) { haltedEntries.add(String(userId)); logFinancial(`auto.${source}.option_halted_unjournaled`, { userId, leg: legDisplay, orderId: rr.orderId }); }
+    logFinancial(`auto.${source}.option_filled`, { userId, broker, underlying: base, leg: legDisplay, qty: fillQty, premium: fillPx, orderId: rr.orderId });
+    console.log(`[auto:${source}] OPTION FILLED ${fillQty} ${leg.tradingSymbol} for ${userId} (order ${rr.orderId})`);
+    return { placed: true };
+  } catch (e) {
+    const msg = String((e && (e.message || e)) || "error");
+    logFinancial(`auto.${source}.option_error`, { userId, base, msg });
+    return { placed: false, reason: "error:" + msg };
+  }
 }
 
 /* Per-symbol entry scan (the body of /api/screener-scan), reused by the server-side screener engine. `syms`
