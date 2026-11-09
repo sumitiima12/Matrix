@@ -386,6 +386,7 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
   try {
     let after = null, pages = 0, realised = 0, funding = 0, fees = 0, complete = true;
     const types = {};
+    let sampleCashflow = null;   // first raw cashflow entry — returned so the operator can show its field shape
     for (;;) {
       if (pages++ >= 40) { complete = false; break; }
       let q = `?page_size=200`;
@@ -399,6 +400,7 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
         const ty = String(t.transaction_type || t.type || "").toLowerCase();
         const amt = Number(t.amount != null ? t.amount : (t.cashflow != null ? t.cashflow : 0)) || 0;
         types[ty] = (types[ty] || 0) + 1;
+        if (ty === "cashflow" && !sampleCashflow) sampleCashflow = t;   // capture one to inspect its real fields
         // Delta records realised trade P&L as "cashflow" ledger entries (the source of the export's "Realised P&L"
         // column) — there is no "pnl" type. Deposits/withdrawals/funding/commission are their own types, excluded.
         if (ty === "cashflow" || /realized_pnl|realised_pnl|trade_pnl|\bpnl\b/.test(ty)) realised += amt;
@@ -412,7 +414,7 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
       after = next;
     }
     const netRealised = +(realised + funding + fees).toFixed(6);
-    return { realised: +realised.toFixed(6), netRealised, funding: +funding.toFixed(6), fees: +fees.toFixed(6), types, complete };
+    return { realised: +realised.toFixed(6), netRealised, funding: +funding.toFixed(6), fees: +fees.toFixed(6), types, sampleCashflow, complete };
   } catch { return { realised: null, complete: false }; }
 }
 /* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
