@@ -79,6 +79,10 @@ function realizedPnlNet(t, policy) {
   if (!isClosed(t)) return null;
   const entry = _num(t.entry), exit = _num(t.exit), qty = Math.abs(_num(t.qty));
   if (!(entry > 0) || !(exit > 0) || !(qty > 0)) return null;
+  // AUTHORITATIVE realised: when Delta's own per-close realised P&L (cashflow) is attributed to this trade, use it
+  // instead of the reconstructed (exit−entry)×qty — this is what rescues the 90%+ of crypto closes the app books
+  // flat ($0) because it can't reconstruct the exit from fills. Net = Delta realised + attributed funding/fees.
+  if (t._attrRealised != null) return _num(t._attrRealised) + _num(t._attrCost);
   const { entryFee, exitFee } = feesFor(t, policy);
   return (exit - entry) * qty * dirOf(t) - entryFee - exitFee + _num(t._attrCost);
 }
@@ -178,7 +182,11 @@ function computePortfolio({ trades = [], marks = {}, filter = {}, feePolicy = {}
       // A close booked AT its entry price is an unreconciled placeholder (the real broker exit was never
       // reconstructed) — its rp is just the fees, which would otherwise count it as a decided LOSS and drag the
       // win rate to 0%. Treat it as undecided (breakeven) so win rate reflects only trades with a real exit.
-      if (Number(t.exit) === Number(t.entry) || Math.abs(rp) <= EPS) breakevens += 1;
+      // When Delta's own realised P&L is attributed (`_attrRealised`), the close is DECIDED by that number even
+      // though the placeholder exit==entry — it's a real win/loss, not a breakeven. Only a genuinely ~$0 result
+      // (no attribution and exit==entry, or |rp|≈0) is undecided and excluded from the win rate.
+      const flat = (t._attrRealised == null && Number(t.exit) === Number(t.entry)) || Math.abs(rp) <= EPS;
+      if (flat) breakevens += 1;
       else if (rp > 0) wins += 1; else losses += 1;
       closedTrades.push({ id: t.id, orderId: t.orderId || null, sym: t.sym, origin: originOf(t), category: cat, realizedPnl: +rp.toFixed(2), exitAt: t.exitAt });
       includedTradeIds.push(t.id);

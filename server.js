@@ -452,11 +452,16 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
   try {
     let after = null, pages = 0, complete = true;
     const bySymbol = {};
-    let total = 0, funding = 0, fees = 0, liquidation = 0, unattributed = 0;
-    const sampleCost = [];
+    const realisedBySymbol = {};   // Delta's per-close REALISED trade P&L (cashflow entries) bucketed by base symbol + ts
+    let total = 0, funding = 0, fees = 0, liquidation = 0, unattributed = 0, realisedTotal = 0, realisedUnattr = 0;
+    const sampleCost = [], sampleRealised = [];
     const bucket = (sym, kind, amt, ts, ty) => {
       const b = bySymbol[sym] || (bySymbol[sym] = { funding: 0, fees: 0, liquidation: 0, total: 0, entries: [] });
       b[kind] += amt; b.total += amt; b.entries.push({ ts, type: ty, amount: +amt.toFixed(8) });
+    };
+    const bucketRealised = (sym, amt, ts) => {
+      const b = realisedBySymbol[sym] || (realisedBySymbol[sym] = { realised: 0, entries: [] });
+      b.realised += amt; b.entries.push({ ts, amount: +amt.toFixed(8) });
     };
     for (;;) {
       if (pages++ >= 40) { complete = false; break; }
@@ -468,15 +473,24 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
         const ts = deltaTxMs(t);                               // ms since epoch (handles ISO string / µs / ms / s)
         if (ts && (ts < from || ts > to)) continue;
         const ty = String(t.transaction_type || t.type || "").toLowerCase();
-        let kind = null;
-        if (/funding/.test(ty)) kind = "funding";
-        else if (/liquidation_fee/.test(ty)) kind = "liquidation";
-        else if (/commission|trading_fee/.test(ty)) kind = "fees";
-        if (!kind) continue;   // not a cost line (cashflow/deposit/withdrawal handled elsewhere)
         const amt = Number(t.amount != null ? t.amount : (t.cashflow != null ? t.cashflow : 0)) || 0;
         const md = (t.meta_data && typeof t.meta_data === "object") ? t.meta_data : {};
         const symRaw = md.product_symbol || md.symbol || md.contract || t.product_symbol || t.symbol || md.product_id || "";
         const sym = deltaBaseSymbol(symRaw);
+        // REALISED trade P&L — Delta books it as a "cashflow" ledger entry per position close (the source of the
+        // export's "Realised P&L"). Attributed per trade, it replaces the app's $0 placeholder for closes whose
+        // exit price couldn't be reconstructed from fills.
+        if (ty === "cashflow" || /realized_pnl|realised_pnl|trade_pnl/.test(ty)) {
+          realisedTotal += amt;
+          if (sym) bucketRealised(sym, amt, ts); else realisedUnattr += amt;
+          if (debug && sampleRealised.length < 6) sampleRealised.push({ ty, amt, symRaw, sym, mdKeys: Object.keys(md) });
+          continue;
+        }
+        let kind = null;
+        if (/funding/.test(ty)) kind = "funding";
+        else if (/liquidation_fee/.test(ty)) kind = "liquidation";
+        else if (/commission|trading_fee/.test(ty)) kind = "fees";
+        if (!kind) continue;   // deposit/withdrawal/credits — not a per-trade cost
         total += amt; if (kind === "funding") funding += amt; else if (kind === "fees") fees += amt; else liquidation += amt;
         if (sym) bucket(sym, kind, amt, ts, ty); else unattributed += amt;
         if (debug && sampleCost.length < 6) sampleCost.push({ ty, amt, symRaw, sym, mdKeys: Object.keys(md) });
@@ -486,10 +500,11 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
       after = next;
     }
     for (const k of Object.keys(bySymbol)) { const b = bySymbol[k]; b.funding = +b.funding.toFixed(6); b.fees = +b.fees.toFixed(6); b.liquidation = +b.liquidation.toFixed(6); b.total = +b.total.toFixed(6); }
-    const out = { bySymbol, total: +total.toFixed(6), funding: +funding.toFixed(6), fees: +fees.toFixed(6), liquidation: +liquidation.toFixed(6), unattributed: +unattributed.toFixed(6), complete };
-    if (debug) out.sampleCost = sampleCost;
+    for (const k of Object.keys(realisedBySymbol)) realisedBySymbol[k].realised = +realisedBySymbol[k].realised.toFixed(6);
+    const out = { bySymbol, realisedBySymbol, total: +total.toFixed(6), funding: +funding.toFixed(6), fees: +fees.toFixed(6), liquidation: +liquidation.toFixed(6), unattributed: +unattributed.toFixed(6), realisedTotal: +realisedTotal.toFixed(6), realisedUnattr: +realisedUnattr.toFixed(6), complete };
+    if (debug) { out.sampleCost = sampleCost; out.sampleRealised = sampleRealised; }
     return out;
-  } catch { return { bySymbol: {}, total: null, complete: false }; }
+  } catch { return { bySymbol: {}, realisedBySymbol: {}, total: null, complete: false }; }
 }
 
 /* Stamp each REAL closed Crypto/US-token trade with `_attrCost` — the Delta wallet funding + commission +
@@ -498,25 +513,34 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
    dashboards. Entries are CONSUMED greedily (each ledger line to at most one trade, oldest close first) so
    overlapping same-symbol positions don't double-count. Mutates `trades` in place. `_attrCost` is ≤ 0 (a debit). */
 function attributeDeltaCostsToTrades(trades, costs) {
-  const bySymbol = costs && costs.bySymbol;
-  if (!Array.isArray(trades) || !bySymbol) return;
+  if (!Array.isArray(trades) || !costs) return;
   const isDeltaMkt = (m) => { const s = String(m || "").toLowerCase(); return s === "crypto" || s === "usstocktokens"; };
-  const pool = {};
-  for (const k of Object.keys(bySymbol)) {
-    const es = (bySymbol[k].entries || []).map((e) => ({ ts: Number(e.ts) || 0, amount: Number(e.amount) || 0, used: false }));
-    es.sort((a, b) => a.ts - b.ts); pool[k] = es;
-  }
   const BUF = 5 * 60 * 1000;
+  const mkPool = (bySym, key) => { const p = {}; for (const k of Object.keys(bySym || {})) { const es = (bySym[k].entries || []).map((e) => ({ ts: Number(e.ts) || 0, amount: Number(e.amount) || 0, used: false })); es.sort((a, b) => a.ts - b.ts); p[k] = es; } return p; };
+  const costPool = mkPool(costs.bySymbol);          // funding + commission + liquidation (≤0)
+  const realPool = mkPool(costs.realisedBySymbol);  // Delta's per-close realised trade P&L (cashflow)
+  // For the EXIT fee/funding window we look across the whole hold; for the REALISED cashflow we match the close
+  // moment (cashflow is booked at the close). closes processed oldest-first so entries are consumed once each.
   const closed = trades
     .filter((t) => t && t.real && isDeltaMkt(t.market) && t.exitAt != null && t.exit != null)
     .sort((a, b) => (Number(a.exitAt) || 0) - (Number(b.exitAt) || 0));
+  // COSTS (funding/fees/liquidation) are stamped precisely by Delta, so window-match them around the hold.
   for (const t of closed) {
     const base = deltaBaseSymbol(t.sym || t.symbol || t.brokerSym);
-    const es = pool[base]; if (!es || !es.length) continue;
     const lo = (Number(t.entryAt) || Number(t.exitAt) || 0) - BUF, hi = (Number(t.exitAt) || 0) + BUF;
-    let sum = 0, any = false;
-    for (const e of es) { if (e.used) continue; if (e.ts >= lo && e.ts <= hi) { sum += e.amount; e.used = true; any = true; } }
-    if (any) t._attrCost = +sum.toFixed(6);
+    const ces = costPool[base];
+    if (ces && ces.length) { let sum = 0, any = false; for (const e of ces) { if (e.used) continue; if (e.ts >= lo && e.ts <= hi) { sum += e.amount; e.used = true; any = true; } } if (any) t._attrCost = +sum.toFixed(6); }
+  }
+  // REALISED (cashflow): the app's exitAt can lag Delta's real close by minutes–hours (it's booked on a reconcile
+  // sweep), so a time window is unreliable. Pair FIFO per symbol instead — the nth close of a symbol gets the nth
+  // cashflow of that symbol, in chronological order. Robust to the timestamp lag; leftover cashflow stays unused.
+  const bySymClosed = {};
+  for (const t of closed) { const b = deltaBaseSymbol(t.sym || t.symbol || t.brokerSym); (bySymClosed[b] = bySymClosed[b] || []).push(t); }
+  for (const sym of Object.keys(bySymClosed)) {
+    const es = realPool[sym]; if (!es || !es.length) continue;
+    const ts = bySymClosed[sym];   // already chronological (closed sorted by exitAt)
+    const n = Math.min(es.length, ts.length);
+    for (let i = 0; i < n; i++) { ts[i]._attrRealised = +Number(es[i].amount).toFixed(6); es[i].used = true; }
   }
 }
 
