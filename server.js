@@ -491,6 +491,35 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
     return out;
   } catch { return { bySymbol: {}, total: null, complete: false }; }
 }
+
+/* Stamp each REAL closed Crypto/US-token trade with `_attrCost` — the Delta wallet funding + commission +
+   liquidation (from fetchDeltaCostsBySymbol) whose timestamp falls inside that position's open→close window — so
+   the canonical analytics (computePortfolio) can net the Home Total and category boxes just like the client
+   dashboards. Entries are CONSUMED greedily (each ledger line to at most one trade, oldest close first) so
+   overlapping same-symbol positions don't double-count. Mutates `trades` in place. `_attrCost` is ≤ 0 (a debit). */
+function attributeDeltaCostsToTrades(trades, costs) {
+  const bySymbol = costs && costs.bySymbol;
+  if (!Array.isArray(trades) || !bySymbol) return;
+  const isDeltaMkt = (m) => { const s = String(m || "").toLowerCase(); return s === "crypto" || s === "usstocktokens"; };
+  const pool = {};
+  for (const k of Object.keys(bySymbol)) {
+    const es = (bySymbol[k].entries || []).map((e) => ({ ts: Number(e.ts) || 0, amount: Number(e.amount) || 0, used: false }));
+    es.sort((a, b) => a.ts - b.ts); pool[k] = es;
+  }
+  const BUF = 5 * 60 * 1000;
+  const closed = trades
+    .filter((t) => t && t.real && isDeltaMkt(t.market) && t.exitAt != null && t.exit != null)
+    .sort((a, b) => (Number(a.exitAt) || 0) - (Number(b.exitAt) || 0));
+  for (const t of closed) {
+    const base = deltaBaseSymbol(t.sym || t.symbol || t.brokerSym);
+    const es = pool[base]; if (!es || !es.length) continue;
+    const lo = (Number(t.entryAt) || Number(t.exitAt) || 0) - BUF, hi = (Number(t.exitAt) || 0) + BUF;
+    let sum = 0, any = false;
+    for (const e of es) { if (e.used) continue; if (e.ts >= lo && e.ts <= hi) { sum += e.amount; e.used = true; any = true; } }
+    if (any) t._attrCost = +sum.toFixed(6);
+  }
+}
+
 /* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
    (entry AND exit) and can be reconciled against the risk journal / broker. Idempotent — keyed by the managed
    position id (`exit_<posId>`) so a retry, a stale-close reconcile or a second sweep can't double-count the
@@ -1429,6 +1458,12 @@ app.post("/api/analytics/portfolio", requireAuth, async (req, res) => {
       if (origin === PROV_ORIGIN.UNKNOWN && String((t || {}).tradeType || "").toLowerCase() === "manual") origin = PROV_ORIGIN.MANUAL;
       return { ...t, origin };
     });
+    // NET of real broker costs: attribute Delta wallet funding + commission + liquidation to each real Crypto/
+    // US-token trade so the Total + category boxes read net, matching the strategy/screener dashboards. REAL only
+    // (paper has no wallet costs); best-effort — a fetch failure just leaves P&L gross.
+    if (mode === "REAL" && enriched.some((t) => t.real && /^(crypto|usstocktokens)$/i.test(String(t.market || "")))) {
+      try { const costs = await fetchDeltaCostsBySymbol(req.authUserId, { from: 0, to: Date.now() }); if (costs && costs.bySymbol) attributeDeltaCostsToTrades(enriched, costs); } catch { /* leave gross */ }
+    }
     const report = computePortfolio({ trades: enriched, marks, filter: { userId, mode, market, broker, from, to, timeframeLabel: b.timeframeLabel || null, valuationTs: b.valuationTs != null ? Number(b.valuationTs) : Date.now(), valuationSource: b.valuationSource || "client-mark-snapshot" } });
     res.json({ ok: true, report });
   } catch (e) { serverError(res, e); }

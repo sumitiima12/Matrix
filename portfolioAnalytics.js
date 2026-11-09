@@ -70,13 +70,17 @@ function isClosed(t) {
   return t.exitAt != null && t.exit != null && _num(t.qty) !== 0 && t.status !== "rejected";
 }
 
-/* Realised P&L of a closed trade (short-aware), net of actual entry+exit fees. null if not a usable closed trade. */
+/* Realised P&L of a closed trade (short-aware), net of actual entry+exit fees AND any attributed broker ledger
+   cost. `_attrCost` is the Delta wallet funding + commission + liquidation attributed to this specific trade's
+   open→close window (a NEGATIVE number = a debit), stamped by the analytics endpoint for REAL Crypto/US-token
+   trades so the Home Total and category boxes read NET of real costs — matching the strategy/screener dashboards.
+   null if not a usable closed trade. */
 function realizedPnlNet(t, policy) {
   if (!isClosed(t)) return null;
   const entry = _num(t.entry), exit = _num(t.exit), qty = Math.abs(_num(t.qty));
   if (!(entry > 0) || !(exit > 0) || !(qty > 0)) return null;
   const { entryFee, exitFee } = feesFor(t, policy);
-  return (exit - entry) * qty * dirOf(t) - entryFee - exitFee;
+  return (exit - entry) * qty * dirOf(t) - entryFee - exitFee + _num(t._attrCost);
 }
 
 /* Unrealised P&L of an open position at a mark, net of entry fee (+ optional estimated exit fee per policy). */
