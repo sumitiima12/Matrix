@@ -10456,6 +10456,53 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
   }
 }
 
+/* Server-side VIRTUAL (paper) AUTOMATE engine. Real deployed strategies run via the separate real-strategy engine
+   (getActiveRealStrategies); this is the paper counterpart so a user's active Automate strategies enter in VIRTUAL
+   mode without the app being open (previously Automate paper entries only ran client-side). For each ACTIVE strategy
+   in the user's saved state we evaluate its entry rule on the latest CLOSED candle and, if it fires, paper-open via
+   the same executeAutoEntry path the other engines use (dedup, paper book, trailing stop all reused). One open paper
+   position per strategy; a per-sweep cap keeps a 100-strategy account from opening a burst in a single tick. */
+async function runUserVirtualStrategyEntries(userId, rec = () => {}) {
+  let state; try { state = await db.getState(userId); } catch { return; }
+  const strats = (state && Array.isArray(state.strats) ? state.strats : []).filter((s) => s && s.active === true);
+  if (!strats.length) return;
+  let openPaper = []; try { openPaper = await db.getPaperPositionsForUser(userId); } catch { openPaper = []; }
+  const heldByStrat = new Set(openPaper.filter((p) => p && p.status === "open" && p.strategyName).map((p) => String(p.strategyName)));
+  let placed = 0;
+  for (const s of strats) {
+    if (placed >= 12) break;   // per-user-per-sweep paper safety cap
+    try {
+      const sym0 = (s.symbols || [])[0]; if (!sym0) continue;
+      const base = _deltaBase(sym0);
+      // The strategy carries its own market (no server-side symbol→market map). Trust it; skip if absent/unsupported.
+      const market = s.market || null;
+      if (!market || !AUTO_SRC_MARKETS.has(market) || !marketOpenIST(market)) continue;
+      if (s.name && heldByStrat.has(String(s.name))) continue;   // one open paper position per strategy
+      const cfg = s.cfg || {};
+      if (!Array.isArray(cfg.entry) || !cfg.entry.length) continue;
+      const tf = s.tf || cfg.tf || "5m";
+      const candles = await candlesForTf(_candleSym(market, base), tf, tf === "1d" ? "1y" : "5d").catch(() => null);
+      if (!candles || candles.length < 30) continue;
+      const sig = strat.entrySignalFired({ ...cfg, tf }, candles);
+      if (!sig || !sig.fired) continue;
+      const px = Number(sig.price) || null; if (!(px > 0)) continue;
+      const isDelta = (market === "Crypto" || market === "USStockTokens");
+      const qty = Number(s.qty) > 0 ? Number(s.qty) : (isDelta ? 500 : 1);
+      const notional = isDelta ? qty : qty * px;   // Delta markets deploy an amount; others whole-share qty×price
+      const short = String((cfg.side || s.side || "")).toUpperCase() === "SELL";
+      const optConfig = (market === "IN" && s.instrument === "OPTION" && s.opt && Array.isArray(s.opt.legs) && s.opt.legs[0])
+        ? { enabled: true, mny: s.opt.legs[0].mny || "ATM", expiry: s.opt.expiry || "Current week", lots: Number(s.opt.legs[0].lots) || 1 } : null;
+      const res = await executeAutoEntry({ userId, market, mode: "virtual", base, notional, px,
+        sl: (cfg.sl != null && cfg.sl !== "" ? Number(cfg.sl) : null),
+        tp: (cfg.tp != null && cfg.tp !== "" ? Number(cfg.tp) : null),
+        tsl: (cfg.tsl != null && cfg.tsl !== "" ? Number(cfg.tsl) : trailingPctFor(state || {}, market)),
+        short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig });
+      rec(market, "automate", "virtual", !!(res && res.placed), res && res.reason);
+      if (res && res.placed) { placed++; if (s.name) heldByStrat.add(String(s.name)); }
+    } catch (e) { /* one strategy must never stop the sweep */ }
+  }
+}
+
 /* The sweep: every user with something enabled gets their screener + ideas + smart-buy evaluated. */
 let signalAutoRunning = false;
 async function runSignalAutoEngine() {
@@ -10480,6 +10527,7 @@ async function runSignalAutoEngine() {
       try { await runUserScreenerEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.screener.sweep_error", { userId: u.userId, err: e && e.message }); }
       try { await runUserIdeaEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.ideas.sweep_error", { userId: u.userId, err: e && e.message }); }
       try { await runUserSmartBuyEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.smartbuy.sweep_error", { userId: u.userId, err: e && e.message }); }
+      try { await runUserVirtualStrategyEntries(u.userId, rec); } catch (e) { logFinancial("auto.automate.sweep_error", { userId: u.userId, err: e && e.message }); }
       if (Object.keys(status).length && typeof db.saveAutoStatus === "function") {
         try { await db.saveAutoStatus(u.userId, { live, markets: status }); } catch { /* best-effort diagnostics */ }
       }
