@@ -1424,6 +1424,24 @@ app.get("/api/trades", requireAuth, async (req, res) => {
     const from = req.query.from ? +req.query.from : 0;
     const to = req.query.to ? +req.query.to : Date.now();
     const trades = await rcWrap(`trades:${userId}:${from}:${to}`, () => db.getTrades(userId, from, to));
+    // Join the server-managed exits onto OPEN rows so the UI can show each position's stop/target/trailing — the
+    // journal row itself never stored sl/tp (they live on the managed position). Best-effort: match by managedId,
+    // else by the open symbol. Percentages, exactly as the Screener/Automation SL%/TP% boxes expect.
+    try {
+      if (typeof db.getManagedPositionsForUser === "function") {
+        const mps = (await db.getManagedPositionsForUser(userId).catch(() => [])) || [];
+        if (mps.length) {
+          const byId = new Map(), bySym = new Map();
+          for (const p of mps) { if (!p || p.status && p.status !== "open") continue; if (p.id != null) byId.set(String(p.id), p); if (p.symbol) bySym.set(String(p.symbol).toUpperCase(), p); }
+          for (const t of trades) {
+            if (!t || t.exitAt != null || t.exit != null) continue;   // open rows only
+            if (t.sl != null || t.tp != null || t.tsl != null) continue;   // already has protection on the row
+            const mp = (t.managedId != null && byId.get(String(t.managedId))) || bySym.get(String(t.sym || "").toUpperCase());
+            if (mp) { if (mp.sl != null) t.sl = mp.sl; if (mp.tp != null) t.tp = mp.tp; if (mp.tsl != null) t.tsl = mp.tsl; }
+          }
+        }
+      }
+    } catch { /* protection join is best-effort — never block the trades payload */ }
     res.json({ trades });
   } catch (e) { serverError(res, e); }
 });
