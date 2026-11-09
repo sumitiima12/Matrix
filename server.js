@@ -7597,9 +7597,13 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
         if (maxLossPct > 0) {
           const startOfDayEquity = (Number(account.wallet) || 0) - (Number(fillsRk.realizedPnl) || 0);
           const lossCap = Math.max(0, (startOfDayEquity * maxLossPct) / 100);
-          if (lossCap > 0 && Number(fillsRk.realizedLoss) >= lossCap) {
-            logFinancial("risk.fills_block", { userId: uidKey, cap: "maxDailyLossPct", realizedLoss: fillsRk.realizedLoss, lossCap: +lossCap.toFixed(2), pct: maxLossPct });
-            return res.status(422).json({ error: `Order blocked by risk checks: today's realized loss (${fillsRk.realizedLoss.toFixed(0)}) has hit your daily-loss limit (${lossCap.toFixed(0)}, execution-ledger authoritative). Trading is paused for the session.`, reasons: ["daily loss limit (execution-ledger authoritative)"] });
+          // NET daily loss, not gross: the breaker protects against the day's net drawdown. Using gross realized
+          // loss paused net-POSITIVE days (winners offset by many small losers still tripped it) — wrong for a
+          // "daily loss limit". We pause only when the day's NET realized P&L is a loss that breaches the cap.
+          const netLoss = Math.max(0, -(Number(fillsRk.realizedPnl) || 0));
+          if (lossCap > 0 && netLoss >= lossCap) {
+            logFinancial("risk.fills_block", { userId: uidKey, cap: "maxDailyLossPct", netLoss, realizedLossGross: fillsRk.realizedLoss, lossCap: +lossCap.toFixed(2), pct: maxLossPct });
+            return res.status(422).json({ error: `Order blocked by risk checks: today's net realized loss (${netLoss.toFixed(0)}) has hit your daily-loss limit (${lossCap.toFixed(0)}, execution-ledger authoritative). Trading is paused for the session.`, reasons: ["daily loss limit (execution-ledger authoritative)"] });
           }
         }
       }
@@ -10235,7 +10239,9 @@ async function executeAutoEntry(ctx) {
       catch { return { placed: false, reason: "ledger-read-failed" }; }
       const startEquity = (Number(account.wallet) || 0) - (Number(fillsRk.realizedPnl) || 0);
       const lossCap = Math.max(0, (startEquity * maxLossPct) / 100);
-      if (lossCap > 0 && Number(fillsRk.realizedLoss) >= lossCap) { logFinancial(`auto.${source}.risk_blocked`, { userId, symbol, cap: "maxDailyLossPct" }); return { placed: false, reason: "daily-loss-limit" }; }
+      // NET daily loss (see manual-order breaker): a net-positive day must not pause auto-entries.
+      const netLoss = Math.max(0, -(Number(fillsRk.realizedPnl) || 0));
+      if (lossCap > 0 && netLoss >= lossCap) { logFinancial(`auto.${source}.risk_blocked`, { userId, symbol, cap: "maxDailyLossPct", netLoss }); return { placed: false, reason: "daily-loss-limit" }; }
     }
     // don't stack a duplicate open in this (broker, symbol) — first claim wins across ALL automation
     if (signalGuards.duplicateOpenSymbol(await db.getManagedPositionsForUser(userId).catch(() => []), broker, brokerSym)) return { placed: false, reason: "already-open" };
