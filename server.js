@@ -7858,6 +7858,10 @@ app.post("/api/broker/order", requireAuth, requireSchemaReady, requireFreshSessi
   // shows under the "US Tokens" tab instead of Crypto. Everything else about the Delta path is identical.
   const regMarket = ["delta", "coindcx", "binance", "coinswitch"].includes(broker)
     ? ((broker === "delta" && req.body?.market === "USStockTokens") ? "USStockTokens" : "Crypto") : "IN";
+  // Default a 1% TRAILING STOP (except Indian) on STRATEGY / auto-exit orders when the caller didn't set one — so
+  // existing strategies trail by default, matching Ideas/Screeners/virtual-Automate. Plain manual orders (no
+  // strategy, no autoExit) are untouched. A trailing stop only ever tightens the exit, so defaulting it on is safe.
+  if (!tslPct && (req.body?.autoExit === true || req.body?.strategy != null)) tslPct = regMarket === "IN" ? 0 : 1;
   async function registerAutoExit(qtyOverride, entryOverride) {
     if (!wantAutoExit) return null;   // register for BOTH longs and shorts (exit math is direction-aware)
     /* R14-P1-05/06: only arm an app-managed exit for brokers whose exit path returns VERIFIED fill truth
