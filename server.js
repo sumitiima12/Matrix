@@ -10928,6 +10928,16 @@ function trailingPctFor(settings, market) {
    blocks). executeAutoEntry uses it to skip LONGS in a clear downtrend and SHORTS in a clear uptrend. */
 const TREND_BENCH = { Crypto: "BTC-USD", USStockTokens: "BTC-USD", US: "SPY", IN: "^NSEI", Commodity: "GC=F" };
 const TREND_GATE_DEFAULT = { enabled: true, emaPeriod: 20, momPct: 1.5 };   // on by default; user-overridable via settings.trendGate
+/* Resolve the trend-gate config for one auto-entry: per-ITEM override (strategy/screener cfg.trendGate) → that TRADE
+   TYPE's setting (settings.trendGateByType[type]) → the OVERALL setting (settings.trendGate) → built-in default.
+   More-specific wins, so you can turn the overall gate OFF yet leave it ON for, say, Automation. */
+function resolveTrendGate(settings, type, itemTg) {
+  if (itemTg && typeof itemTg === "object") return itemTg;
+  const byType = settings && settings.trendGateByType;
+  if (byType && byType[type] && typeof byType[type] === "object") return byType[type];
+  if (settings && settings.trendGate && typeof settings.trendGate === "object") return settings.trendGate;
+  return null;   // executeAutoEntry applies TREND_GATE_DEFAULT (on) when null
+}
 async function marketBias(market, emaPeriod = 20, momPct = 1.5) {
   const emaP = Number(emaPeriod) > 1 ? Math.round(Number(emaPeriod)) : 20;
   const momThr = Number(momPct) >= 0 ? Number(momPct) : 1.5;
@@ -10965,7 +10975,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: (s.tsl != null && s.tsl !== "" ? Number(s.tsl) : trailingPctFor(settings, market)), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: (s.tsl != null && s.tsl !== "" ? Number(s.tsl) : trailingPctFor(settings, market)), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "screener", s.trendGate) });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
@@ -10995,7 +11005,7 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
         const cfgM = perMode[mode];
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
-        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "ideas", null) });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -11037,7 +11047,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       if (!(capital > 0)) { rec(market, "smartbuy", mode, false, "no-capital-set"); continue; }
       const per = capital / picks.length;
       for (const p of picks) {
-        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "smartbuy", null) });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -11084,7 +11094,7 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = 
         sl: (cfg.sl != null && cfg.sl !== "" ? Number(cfg.sl) : null),
         tp: (cfg.tp != null && cfg.tp !== "" ? Number(cfg.tp) : null),
         tsl: (cfg.tsl != null && cfg.tsl !== "" ? Number(cfg.tsl) : trailingPctFor(state || {}, market)),
-        short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig, trendGate: (settings && settings.trendGate) || null });
+        short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig, trendGate: resolveTrendGate(settings, "automate", (cfg && cfg.trendGate) || (s && s.trendGate)) });
       rec(market, "automate", "virtual", !!(res && res.placed), res && res.reason);
       if (res && res.placed) { placed++; if (s.name) heldByStrat.add(String(s.name)); }
     } catch (e) { /* one strategy must never stop the sweep */ }
