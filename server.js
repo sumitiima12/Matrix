@@ -1611,6 +1611,20 @@ app.post("/api/trades/clear-virtual", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* Delete SPECIFIC journal trades by id for the caller — used to clean up corrupt/phantom rows (e.g. a crypto coin
+   mis-booked under US/Commodity at whole-share size). Strictly scoped to the caller's own trades (the DELETE is
+   WHERE user_id = caller AND id IN ids), capped per call. Does not touch the immutable fills ledger. */
+app.post("/api/trades/delete", requireAuth, async (req, res) => {
+  try {
+    const userId = storageKeyFor(req.authUserId);
+    const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids.map(String).filter(Boolean).slice(0, 200) : [];
+    if (!ids.length) return res.status(400).json({ error: "Provide ids: [string,…] of trades to delete." });
+    const removed = await db.deleteTradesByIds(userId, ids);
+    rcBust(`trades:${userId}`);
+    res.json({ ok: true, removed });
+  } catch (e) { serverError(res, e); }
+});
+
 /* RECONCILE AGAINST DELTA — self-heal phantom records. Reads the caller's ACTUAL Delta positions (signed
    with their own keys) and DROPS any OPEN real crypto journal record for a symbol Delta doesn't actually
    hold. This fixes an inflated dashboard/P&L (e.g. positions the browser optimistically recorded that were
