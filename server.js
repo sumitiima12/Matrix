@@ -484,13 +484,13 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
       // is what made the backfill see "realisedTotal 0, complete false"). Only give up after 3 failed attempts.
       let r = null, lastErr = null;
       for (let attempt = 0; attempt < 2 && !r; attempt++) {
-        // 10s timeout per attempt (not 20s): a hanging Delta call — e.g. an IP-allowlist firewall drop — must fail
-        // fast, not stall this request (and the auto-engines) for a minute.
-        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 10000).catch((e) => { lastErr = (e && e.message) || String(e); return null; });
+        // 25s per attempt — the Delta read goes Render→Mumbai proxy→Delta, which runs 6–25s; a shorter timeout was
+        // cutting off legitimately-slow-but-healthy responses. Still bounded so a dead proxy fails in finite time.
+        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 25000).catch((e) => { lastErr = (e && e.message) || String(e); return null; });
         if (r && !Array.isArray(r.result)) { lastErr = "no .result array; keys=" + Object.keys(r).join(",") + (r.error ? " error=" + JSON.stringify(r.error).slice(0, 200) : ""); r = null; }
         if (!r && attempt < 1) { await new Promise((res) => setTimeout(res, 400)); }
       }
-      if (!r || !Array.isArray(r.result)) { complete = false; if (pages === 1) out_firstPageErr = lastErr || "deltaCall returned null/timed out"; break; }
+      if (!r || !Array.isArray(r.result)) { complete = false; if (pages === 1) out_firstPageErr = lastErr || "deltaCall returned null/timed out (proxy down or DELTA_PROXY_URL unset?)"; break; }
       for (const t of r.result) {
         const ts = deltaTxMs(t);                               // ms since epoch (handles ISO string / µs / ms / s)
         if (ts && (ts < from || ts > to)) continue;
