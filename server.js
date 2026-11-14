@@ -475,18 +475,20 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
         entryPx: Number(md && (md.entry_price != null ? md.entry_price : md.entryPrice)) || null,
         size: Number(md && (md.position_size != null ? md.position_size : md.size)) || null });
     };
+    let out_firstPageErr = null;
     for (;;) {
       if (pages++ >= 80) { complete = false; break; }   // larger cap — accounts grow past 8k wallet txns over time
       let q = `?page_size=200`;
       if (after) q += `&after=${encodeURIComponent(after)}`;
       // Retry each page a few times — a single transient Delta/network hiccup used to zero the whole result (which
       // is what made the backfill see "realisedTotal 0, complete false"). Only give up after 3 failed attempts.
-      let r = null;
+      let r = null, lastErr = null;
       for (let attempt = 0; attempt < 3 && !r; attempt++) {
-        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
-        if ((!r || !Array.isArray(r.result)) && attempt < 2) { r = null; await new Promise((res) => setTimeout(res, 500)); }
+        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch((e) => { lastErr = (e && e.message) || String(e); return null; });
+        if (r && !Array.isArray(r.result)) { lastErr = "no .result array; keys=" + Object.keys(r).join(",") + (r.error ? " error=" + JSON.stringify(r.error).slice(0, 200) : ""); r = null; }
+        if (!r && attempt < 2) { await new Promise((res) => setTimeout(res, 500)); }
       }
-      if (!r || !Array.isArray(r.result)) { complete = false; break; }
+      if (!r || !Array.isArray(r.result)) { complete = false; if (pages === 1) out_firstPageErr = lastErr || "deltaCall returned null"; break; }
       for (const t of r.result) {
         const ts = deltaTxMs(t);                               // ms since epoch (handles ISO string / µs / ms / s)
         if (ts && (ts < from || ts > to)) continue;
@@ -520,7 +522,7 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
     for (const k of Object.keys(bySymbol)) { const b = bySymbol[k]; b.funding = +b.funding.toFixed(6); b.fees = +b.fees.toFixed(6); b.liquidation = +b.liquidation.toFixed(6); b.total = +b.total.toFixed(6); }
     for (const k of Object.keys(realisedBySymbol)) realisedBySymbol[k].realised = +realisedBySymbol[k].realised.toFixed(6);
     const out = { bySymbol, realisedBySymbol, total: +total.toFixed(6), funding: +funding.toFixed(6), fees: +fees.toFixed(6), liquidation: +liquidation.toFixed(6), unattributed: +unattributed.toFixed(6), realisedTotal: +realisedTotal.toFixed(6), realisedUnattr: +realisedUnattr.toFixed(6), complete };
-    if (debug) { out.sampleCost = sampleCost; out.sampleRealised = sampleRealised; }
+    if (debug) { out.sampleCost = sampleCost; out.sampleRealised = sampleRealised; out.firstPageErr = out_firstPageErr; }
     return out;
   } catch { return { bySymbol: {}, realisedBySymbol: {}, total: null, complete: false }; }
 }
