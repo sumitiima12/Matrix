@@ -10992,6 +10992,15 @@ async function marketBias(market, emaPeriod = 20, momPct = 1.5) {
 /* Evaluate ONE user's enabled SCREENERS (both modes) and place entries for current matches. */
 async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
   const scr = (settings && settings.screeners) || {};
+  // MASTER switch — the user can pause ALL screener auto-entries without untoggling each card. Open positions and
+  // their exits are handled elsewhere, so pausing only stops NEW entries. Default running when unset.
+  if (settings && settings.screenerMaster === false) {
+    for (const market of Object.keys(scr)) for (const key of Object.keys(scr[market] || {})) {
+      const s = scr[market][key]; const modes = (s && s.modes) || {};
+      for (const mode of ["virtual", "real"]) if (modes[mode] === true) rec(market, "screener", mode, false, "screener-paused");
+    }
+    return;
+  }
   for (const market of Object.keys(scr)) {
     if (!AUTO_SRC_MARKETS.has(market)) continue;
     for (const key of Object.keys(scr[market] || {})) {
