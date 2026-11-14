@@ -4325,6 +4325,16 @@ async function scanOneIdea(sym) {
     if (interval === "1d") daily = candles;
     const px = candles[candles.length - 1].c;
     if (!(px > 0)) continue;
+    // LIQUIDITY GATE: skip thin micro-caps that gap straight through their stop — EVAA −24%, BEAT −18%, BILL −7%
+    // in the 7-day review all gapped past the SL. Require a minimum average dollar-volume (price × volume) over the
+    // recent window. Fails OPEN when the feed has no volume (avgDolVol 0), so majors are never wrongly excluded.
+    {
+      const _isCry = /-USD$/i.test(String(sym));
+      const recent = candles.slice(-20);
+      const avgDolVol = recent.reduce((a, x) => a + (Number(x.c) || 0) * (Number(x.v != null ? x.v : x.volume) || 0), 0) / Math.max(1, recent.length);
+      const minDolVol = _isCry ? (interval === "1d" ? 2e6 : 1e5) : (interval === "1d" ? 5e6 : 2e5);
+      if (avgDolVol > 0 && avgDolVol < minDolVol) return null;   // too thin to trust the stop — skip the symbol
+    }
     const chart = patterns.detectPatterns(candles).find((p) => p.dir === "bull");
     const cndl = patterns.bullishCandle(candles);
     if (!chart && !cndl) continue;
@@ -10585,6 +10595,11 @@ async function executeAutoEntry(ctx) {
     // base outside the Delta markets so the wrong-market/wrong-size row can't be created in the first place.
     if (CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) && !(market === "Crypto" || market === "USStockTokens"))
       return { placed: false, reason: "symbol-wrong-market" };
+    // TREND GATE: don't fight the tape. In a clear market downtrend, skip LONG auto-entries; in a clear uptrend,
+    // skip SHORT ones. "flat" never blocks. This directly cuts the counter-trend longs that lost most of the money.
+    const bias = await marketBias(market);
+    if (bias === "down" && !short) return { placed: false, reason: "trend-down-skip-long" };
+    if (bias === "up" && short) return { placed: false, reason: "trend-up-skip-short" };
     // Respect exchange hours: Crypto/US-Tokens are 24/7, but IN/US/Commodity only trade in-session (and not on
     // holidays). Skip otherwise — for both real (the broker would reject) and paper (mirror real behaviour).
     if (!marketOpenIST(market)) return { placed: false, reason: "market-closed" };
@@ -10824,6 +10839,29 @@ function trailingPctFor(settings, market) {
   const t = settings && settings.trailing && settings.trailing[market];
   if (t && typeof t === "object") return t.enabled === false ? 0 : (Number(t.pct) > 0 ? Number(t.pct) : 1);
   return market === "IN" ? 0 : 1;   // unset → on at 1% everywhere except Indian
+}
+
+/* MARKET TREND BIAS for the auto engines. The 7-day trade review showed LONGS bleeding (−$1.3k, 14% win) while
+   SHORTS won (42% win) in a down week — i.e. the engines fire counter-trend. This classifies the market's
+   benchmark trend (BTC for crypto/US-tokens; index/benchmark elsewhere) from price vs its 20-EMA + ~24h momentum,
+   memoized ~10 min so a sweep over many strategies costs ONE fetch. Returns "up" | "down" | "flat" (flat never
+   blocks). executeAutoEntry uses it to skip LONGS in a clear downtrend and SHORTS in a clear uptrend. */
+const TREND_BENCH = { Crypto: "BTC-USD", USStockTokens: "BTC-USD", US: "SPY", IN: "^NSEI", Commodity: "GC=F" };
+async function marketBias(market) {
+  return memo(`bias:${market}`, 10 * 60 * 1000, async () => {
+    try {
+      const candles = await candlesFor(TREND_BENCH[market] || "BTC-USD", "5d", "1h").catch(() => null);
+      const closes = (candles || []).map((c) => Number(c.close != null ? c.close : c.c)).filter((n) => n > 0);
+      if (closes.length < 30) return "flat";
+      const ema = (arr, p) => { const k = 2 / (p + 1); let e = arr[0]; for (let i = 1; i < arr.length; i++) e = arr[i] * k + e * (1 - k); return e; };
+      const last = closes[closes.length - 1], e20 = ema(closes.slice(-40), 20);
+      const momRef = closes[Math.max(0, closes.length - 24)];
+      const mom = momRef > 0 ? (last / momRef - 1) * 100 : 0;
+      if (last < e20 && mom < -1.5) return "down";
+      if (last > e20 && mom > 1.5) return "up";
+      return "flat";
+    } catch { return "flat"; }
+  });
 }
 
 /* Evaluate ONE user's enabled SCREENERS (both modes) and place entries for current matches. */
