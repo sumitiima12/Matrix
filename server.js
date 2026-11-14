@@ -10609,11 +10609,15 @@ async function executeAutoEntry(ctx) {
     // base outside the Delta markets so the wrong-market/wrong-size row can't be created in the first place.
     if (CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) && !(market === "Crypto" || market === "USStockTokens"))
       return { placed: false, reason: "symbol-wrong-market" };
-    // TREND GATE: don't fight the tape. In a clear market downtrend, skip LONG auto-entries; in a clear uptrend,
-    // skip SHORT ones. "flat" never blocks. This directly cuts the counter-trend longs that lost most of the money.
-    const bias = await marketBias(market);
-    if (bias === "down" && !short) return { placed: false, reason: "trend-down-skip-long" };
-    if (bias === "up" && short) return { placed: false, reason: "trend-up-skip-short" };
+    // TREND GATE (user-configurable via settings.trendGate = { enabled, emaPeriod, momPct }; default ON 20-EMA/1.5%).
+    // Don't fight the tape: in a clear downtrend skip LONG auto-entries; in a clear uptrend skip SHORTS. "flat" never
+    // blocks. Turn it off with enabled:false. This cuts the counter-trend longs that lost most of the money.
+    const tg = (ctx.trendGate && typeof ctx.trendGate === "object") ? ctx.trendGate : TREND_GATE_DEFAULT;
+    if (tg.enabled !== false) {
+      const bias = await marketBias(market, tg.emaPeriod, tg.momPct);
+      if (bias === "down" && !short) return { placed: false, reason: "trend-down-skip-long" };
+      if (bias === "up" && short) return { placed: false, reason: "trend-up-skip-short" };
+    }
     // Respect exchange hours: Crypto/US-Tokens are 24/7, but IN/US/Commodity only trade in-session (and not on
     // holidays). Skip otherwise — for both real (the broker would reject) and paper (mirror real behaviour).
     if (!marketOpenIST(market)) return { placed: false, reason: "market-closed" };
@@ -10861,18 +10865,21 @@ function trailingPctFor(settings, market) {
    memoized ~10 min so a sweep over many strategies costs ONE fetch. Returns "up" | "down" | "flat" (flat never
    blocks). executeAutoEntry uses it to skip LONGS in a clear downtrend and SHORTS in a clear uptrend. */
 const TREND_BENCH = { Crypto: "BTC-USD", USStockTokens: "BTC-USD", US: "SPY", IN: "^NSEI", Commodity: "GC=F" };
-async function marketBias(market) {
-  return memo(`bias:${market}`, 10 * 60 * 1000, async () => {
+const TREND_GATE_DEFAULT = { enabled: true, emaPeriod: 20, momPct: 1.5 };   // on by default; user-overridable via settings.trendGate
+async function marketBias(market, emaPeriod = 20, momPct = 1.5) {
+  const emaP = Number(emaPeriod) > 1 ? Math.round(Number(emaPeriod)) : 20;
+  const momThr = Number(momPct) >= 0 ? Number(momPct) : 1.5;
+  return memo(`bias:${market}:${emaP}:${momThr}`, 10 * 60 * 1000, async () => {
     try {
       const candles = await candlesFor(TREND_BENCH[market] || "BTC-USD", "5d", "1h").catch(() => null);
       const closes = (candles || []).map((c) => Number(c.close != null ? c.close : c.c)).filter((n) => n > 0);
-      if (closes.length < 30) return "flat";
+      if (closes.length < emaP + 5) return "flat";
       const ema = (arr, p) => { const k = 2 / (p + 1); let e = arr[0]; for (let i = 1; i < arr.length; i++) e = arr[i] * k + e * (1 - k); return e; };
-      const last = closes[closes.length - 1], e20 = ema(closes.slice(-40), 20);
+      const last = closes[closes.length - 1], eRef = ema(closes.slice(-(emaP * 2)), emaP);
       const momRef = closes[Math.max(0, closes.length - 24)];
       const mom = momRef > 0 ? (last / momRef - 1) * 100 : 0;
-      if (last < e20 && mom < -1.5) return "down";
-      if (last > e20 && mom > 1.5) return "up";
+      if (last < eRef && mom < -momThr) return "down";
+      if (last > eRef && mom > momThr) return "up";
       return "flat";
     } catch { return "flat"; }
   });
@@ -10896,7 +10903,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: trailingPctFor(settings, market), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: trailingPctFor(settings, market), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
@@ -10926,7 +10933,7 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
         const cfgM = perMode[mode];
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
-        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null });
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -10968,7 +10975,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       if (!(capital > 0)) { rec(market, "smartbuy", mode, false, "no-capital-set"); continue; }
       const per = capital / picks.length;
       for (const p of picks) {
-        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null });
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -10981,7 +10988,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
    in the user's saved state we evaluate its entry rule on the latest CLOSED candle and, if it fires, paper-open via
    the same executeAutoEntry path the other engines use (dedup, paper book, trailing stop all reused). One open paper
    position per strategy; a per-sweep cap keeps a 100-strategy account from opening a burst in a single tick. */
-async function runUserVirtualStrategyEntries(userId, rec = () => {}) {
+async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = null) {
   let state; try { state = await db.getState(userId); } catch { return; }
   const strats = (state && Array.isArray(state.strats) ? state.strats : []).filter((s) => s && s.active === true);
   if (!strats.length) return;
@@ -11015,7 +11022,7 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}) {
         sl: (cfg.sl != null && cfg.sl !== "" ? Number(cfg.sl) : null),
         tp: (cfg.tp != null && cfg.tp !== "" ? Number(cfg.tp) : null),
         tsl: (cfg.tsl != null && cfg.tsl !== "" ? Number(cfg.tsl) : trailingPctFor(state || {}, market)),
-        short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig });
+        short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig, trendGate: (settings && settings.trendGate) || null });
       rec(market, "automate", "virtual", !!(res && res.placed), res && res.reason);
       if (res && res.placed) { placed++; if (s.name) heldByStrat.add(String(s.name)); }
     } catch (e) { /* one strategy must never stop the sweep */ }
@@ -11046,7 +11053,7 @@ async function runSignalAutoEngine() {
       try { await runUserScreenerEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.screener.sweep_error", { userId: u.userId, err: e && e.message }); }
       try { await runUserIdeaEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.ideas.sweep_error", { userId: u.userId, err: e && e.message }); }
       try { await runUserSmartBuyEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.smartbuy.sweep_error", { userId: u.userId, err: e && e.message }); }
-      try { await runUserVirtualStrategyEntries(u.userId, rec); } catch (e) { logFinancial("auto.automate.sweep_error", { userId: u.userId, err: e && e.message }); }
+      try { await runUserVirtualStrategyEntries(u.userId, rec, u.settings); } catch (e) { logFinancial("auto.automate.sweep_error", { userId: u.userId, err: e && e.message }); }
       if (Object.keys(status).length && typeof db.saveAutoStatus === "function") {
         try { await db.saveAutoStatus(u.userId, { live, markets: status }); } catch { /* best-effort diagnostics */ }
       }
