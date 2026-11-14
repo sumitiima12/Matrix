@@ -483,12 +483,14 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
       // Retry each page a few times — a single transient Delta/network hiccup used to zero the whole result (which
       // is what made the backfill see "realisedTotal 0, complete false"). Only give up after 3 failed attempts.
       let r = null, lastErr = null;
-      for (let attempt = 0; attempt < 3 && !r; attempt++) {
-        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch((e) => { lastErr = (e && e.message) || String(e); return null; });
+      for (let attempt = 0; attempt < 2 && !r; attempt++) {
+        // 10s timeout per attempt (not 20s): a hanging Delta call — e.g. an IP-allowlist firewall drop — must fail
+        // fast, not stall this request (and the auto-engines) for a minute.
+        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 10000).catch((e) => { lastErr = (e && e.message) || String(e); return null; });
         if (r && !Array.isArray(r.result)) { lastErr = "no .result array; keys=" + Object.keys(r).join(",") + (r.error ? " error=" + JSON.stringify(r.error).slice(0, 200) : ""); r = null; }
-        if (!r && attempt < 2) { await new Promise((res) => setTimeout(res, 500)); }
+        if (!r && attempt < 1) { await new Promise((res) => setTimeout(res, 400)); }
       }
-      if (!r || !Array.isArray(r.result)) { complete = false; if (pages === 1) out_firstPageErr = lastErr || "deltaCall returned null"; break; }
+      if (!r || !Array.isArray(r.result)) { complete = false; if (pages === 1) out_firstPageErr = lastErr || "deltaCall returned null/timed out"; break; }
       for (const t of r.result) {
         const ts = deltaTxMs(t);                               // ms since epoch (handles ISO string / µs / ms / s)
         if (ts && (ts < from || ts > to)) continue;
