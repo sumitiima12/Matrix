@@ -387,10 +387,16 @@ async function fetchDeltaRealisedPnl(userId, { from = 0, to = Date.now() } = {})
     let after = null, pages = 0, realised = 0, funding = 0, fees = 0, complete = true;
     const types = {};
     for (;;) {
-      if (pages++ >= 40) { complete = false; break; }
+      if (pages++ >= 80) { complete = false; break; }   // larger cap — accounts grow past 8k wallet txns over time
       let q = `?page_size=200`;
       if (after) q += `&after=${encodeURIComponent(after)}`;
-      const r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
+      // Retry each page a few times — a single transient Delta/network hiccup used to zero the whole result (which
+      // is what made the backfill see "realisedTotal 0, complete false"). Only give up after 3 failed attempts.
+      let r = null;
+      for (let attempt = 0; attempt < 3 && !r; attempt++) {
+        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
+        if ((!r || !Array.isArray(r.result)) && attempt < 2) { r = null; await new Promise((res) => setTimeout(res, 500)); }
+      }
       if (!r || !Array.isArray(r.result)) { complete = false; break; }
       for (const t of r.result) {
         const ts = deltaTxMs(t);                               // ms since epoch (ISO string / µs / ms / s)
@@ -470,10 +476,16 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
         size: Number(md && (md.position_size != null ? md.position_size : md.size)) || null });
     };
     for (;;) {
-      if (pages++ >= 40) { complete = false; break; }
+      if (pages++ >= 80) { complete = false; break; }   // larger cap — accounts grow past 8k wallet txns over time
       let q = `?page_size=200`;
       if (after) q += `&after=${encodeURIComponent(after)}`;
-      const r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
+      // Retry each page a few times — a single transient Delta/network hiccup used to zero the whole result (which
+      // is what made the backfill see "realisedTotal 0, complete false"). Only give up after 3 failed attempts.
+      let r = null;
+      for (let attempt = 0; attempt < 3 && !r; attempt++) {
+        r = await withTimeout(deltaCall("GET", "/v2/wallet/transactions", { query: q, userId }), 20000).catch(() => null);
+        if ((!r || !Array.isArray(r.result)) && attempt < 2) { r = null; await new Promise((res) => setTimeout(res, 500)); }
+      }
       if (!r || !Array.isArray(r.result)) { complete = false; break; }
       for (const t of r.result) {
         const ts = deltaTxMs(t);                               // ms since epoch (handles ISO string / µs / ms / s)
