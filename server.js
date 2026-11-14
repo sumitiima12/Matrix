@@ -459,9 +459,15 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
       const b = bySymbol[sym] || (bySymbol[sym] = { funding: 0, fees: 0, liquidation: 0, total: 0, entries: [] });
       b[kind] += amt; b.total += amt; b.entries.push({ ts, type: ty, amount: +amt.toFixed(8) });
     };
-    const bucketRealised = (sym, amt, ts) => {
+    const bucketRealised = (sym, amt, ts, md) => {
       const b = realisedBySymbol[sym] || (realisedBySymbol[sym] = { realised: 0, entries: [] });
-      b.realised += amt; b.entries.push({ ts, amount: +amt.toFixed(8) });
+      b.realised += amt;
+      // Delta's cashflow meta carries the actual close: entry_price, exit_price, position_size. Capture them so the
+      // backfill can write the REAL exit into the journal instead of the flat placeholder.
+      b.entries.push({ ts, amount: +amt.toFixed(8),
+        exitPx: Number(md && (md.exit_price != null ? md.exit_price : md.exitPrice)) || null,
+        entryPx: Number(md && (md.entry_price != null ? md.entry_price : md.entryPrice)) || null,
+        size: Number(md && (md.position_size != null ? md.position_size : md.size)) || null });
     };
     for (;;) {
       if (pages++ >= 40) { complete = false; break; }
@@ -482,7 +488,7 @@ async function fetchDeltaCostsBySymbol(userId, { from = 0, to = Date.now(), debu
         // exit price couldn't be reconstructed from fills.
         if (ty === "cashflow" || /realized_pnl|realised_pnl|trade_pnl/.test(ty)) {
           realisedTotal += amt;
-          if (sym) bucketRealised(sym, amt, ts); else realisedUnattr += amt;
+          if (sym) bucketRealised(sym, amt, ts, md); else realisedUnattr += amt;
           if (debug && sampleRealised.length < 6) sampleRealised.push({ ty, amt, symRaw, sym, mdKeys: Object.keys(md) });
           continue;
         }
@@ -542,6 +548,51 @@ function attributeDeltaCostsToTrades(trades, costs) {
     const n = Math.min(es.length, ts.length);
     for (let i = 0; i < n; i++) { ts[i]._attrRealised = +Number(es[i].amount).toFixed(6); es[i].used = true; }
   }
+}
+
+/* RECONCILE THE JOURNAL AGAINST DELTA'S LEDGER (write-back). The reconcile sweep books a flat $0 placeholder
+   (exit = entry) when it can't reconstruct a Delta close from fills — that's why ~77% of real closes read $0 and
+   the counts/win-rate are meaningless. But Delta's cashflow ledger DOES carry the real close: exit_price + realised
+   P&L per position. This pairs each symbol's flat real closes (chronologically, FIFO) to that symbol's cashflow
+   entries and WRITES the real exit price + P&L into the journal — turning placeholders into true closes. Excess flat
+   rows beyond the ledger's close count (phantom/over-booked attempts) stay flagged unreconciled, so they remain
+   excluded from stats rather than counted as $0 losses. Idempotent (already-reconciled rows are skipped). */
+async function backfillDeltaRealised(authUserId, { dryRun = false } = {}) {
+  const costs = await fetchDeltaCostsBySymbol(authUserId, { from: 0, to: Date.now() }).catch(() => null);
+  if (!costs || !costs.realisedBySymbol) return { ok: false, reason: "no-ledger" };
+  const userId = storageKeyFor(authUserId);
+  const trades = (await db.getTrades(userId, 0, Date.now()).catch(() => [])) || [];
+  const isDeltaMkt = (m) => { const s = String(m || "").toLowerCase(); return s === "crypto" || s === "usstocktokens"; };
+  const bySym = {};
+  for (const t of trades) {
+    if (!(t && t.real && isDeltaMkt(t.market) && t.exitAt != null && t.exit != null)) continue;
+    if (t.reconcileReason === "delta-cashflow-backfill") continue;   // already reconciled by a prior run
+    const flat = Number(t.exit) === Number(t.entry) || t.unreconciled === true || Math.abs(Number(t.pnl) || 0) < 1e-9;
+    if (!flat) continue;
+    const b = deltaBaseSymbol(t.sym || t.symbol || t.brokerSym);
+    (bySym[b] = bySym[b] || []).push(t);
+  }
+  let matched = 0, updated = 0, unmatchedFlats = 0;
+  for (const sym of Object.keys(bySym)) {
+    const es = (((costs.realisedBySymbol[sym] || {}).entries) || []).slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    const ts = bySym[sym].sort((a, b) => (a.exitAt || 0) - (b.exitAt || 0));
+    const n = Math.min(es.length, ts.length);
+    unmatchedFlats += Math.max(0, ts.length - es.length);
+    for (let i = 0; i < n; i++) {
+      const e = es[i], t = ts[i]; matched++;
+      const dir = (t.side === "SELL" || t.short) ? -1 : 1;
+      const qty = Math.abs(Number(t.qty)) || Number(e.size) || 0;
+      // Prefer Delta's exact exit price; else derive it from the realised amount: exit = entry + realised/(qty·dir).
+      const exitPx = Number(e.exitPx) > 0 ? Number(e.exitPx) : (qty > 0 ? Number(t.entry) + (Number(e.amount) / (qty * dir)) : Number(t.exit));
+      const pnl = +Number(e.amount).toFixed(6);   // Delta's own realised (gross); funding/fees stay attributed separately
+      if (!dryRun) {
+        await db.updateTrade(userId, { ...t, exit: +Number(exitPx).toFixed(8), pnl, exitType: "Closed (reconciled)", unreconciled: false, reconciled: true, reconciledAt: Date.now(), reconcileReason: "delta-cashflow-backfill" }).catch(() => {});
+      }
+      updated++;
+    }
+  }
+  if (!dryRun && updated) rcBust(`trades:${userId}`);
+  return { ok: true, matched, updated, unmatchedFlats, symbols: Object.keys(bySym).length, dryRun };
 }
 
 /* INC-1: record a VERIFIED EXIT fill into the immutable ledger, so the ledger holds BOTH legs of a round-trip
@@ -1471,6 +1522,17 @@ app.get("/api/broker/costs", requireAuth, async (req, res) => {
     const debug = String(req.query.debug || "") === "1";
     const r = await fetchDeltaCostsBySymbol(req.authUserId, { from, to, debug });
     res.json({ ok: true, ...r });
+  } catch (e) { serverError(res, e); }
+});
+
+/* Reconcile the caller's flat $0 journal closes against Delta's cashflow ledger — writes the REAL exit price + P&L
+   into each placeholder (dedupe against the ledger, FIFO per symbol). ?dryRun=1 reports what WOULD change without
+   writing. The exit monitor's EOD job also runs this so it self-heals ongoing; this endpoint is the on-demand one. */
+app.post("/api/broker/backfill-realised", requireAuth, async (req, res) => {
+  try {
+    const dryRun = String(req.query.dryRun || "") === "1" || req.body?.dryRun === true;
+    const r = await backfillDeltaRealised(req.authUserId, { dryRun });
+    res.json(r);
   } catch (e) { serverError(res, e); }
 });
 
