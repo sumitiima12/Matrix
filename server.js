@@ -1541,6 +1541,18 @@ app.get("/api/broker/costs", requireAuth, async (req, res) => {
   } catch (e) { serverError(res, e); }
 });
 
+/* Report the backend's ACTUAL current outbound (egress) IP — the one Delta sees. Whitelist THIS exact IP on the
+   Delta API key (the key's whitelist is a single stale IP from when it was created, which no longer matches Render's
+   outbound IP, so Delta silently drops every request → the wallet reads hang/time out). Auth-gated. */
+app.get("/api/debug/egress-ip", requireAuth, async (req, res) => {
+  const svcs = ["https://api.ipify.org?format=json", "https://ifconfig.co/json", "https://ipinfo.io/json"];
+  let ip = null, src = null;
+  for (const u of svcs) {
+    try { const j = await withTimeout(fetch(u).then((r) => r.json()), 8000); ip = j.ip || j.ip_addr || null; if (ip) { src = u; break; } } catch { /* try next */ }
+  }
+  res.json({ ok: !!ip, egressIp: ip, src, note: "Whitelist this exact IP on your Delta API key." });
+});
+
 /* Reconcile the caller's flat $0 journal closes against Delta's cashflow ledger — writes the REAL exit price + P&L
    into each placeholder (dedupe against the ledger, FIFO per symbol). ?dryRun=1 reports what WOULD change without
    writing. The exit monitor's EOD job also runs this so it self-heals ongoing; this endpoint is the on-demand one. */
