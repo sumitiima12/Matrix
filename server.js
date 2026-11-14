@@ -10542,6 +10542,10 @@ async function withLease(name, ttlMs, fn) {
    replicas/restarts), mirroring the client's once-per-day guard. =================================== */
 
 const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens", "IN", "US", "Commodity"]);   // Delta + Indian + US + MCX
+/* Bases that ONLY exist as crypto (Delta). Used to reject a crypto coin accidentally scanned under a US / Commodity /
+   Indian market tab (which would book a wrong-market, whole-share-sized phantom position). Covers the app's crypto
+   universe majors + the small-cap coins seen in the journal; extend if new coins are added to the crypto universe. */
+const CRYPTO_ONLY_BASES = new Set(["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "MATIC", "LTC", "TRX", "ATOM", "UNI", "ONDO", "KAITO", "LAB", "BILL", "EVAA", "BEAT", "SLVON", "WDCB", "H", "RIVER"]);
 const _autoDayIdx = () => Math.floor(Date.now() / 86400000);
 const _deltaBase = (s) => String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/i, "").replace(/\.NS$/i, "").replace(/[^A-Z0-9]/g, "").replace(/(USDT|USD|INR|PERP)$/i, "");
 // Commodity app-symbol → Yahoo COMEX/NYMEX ticker (server Y_SPECIAL covers most; CRUDEOIL isn't listed there).
@@ -10575,6 +10579,12 @@ async function executeAutoEntry(ctx) {
   try {
     if (!AUTO_SRC_MARKETS.has(market)) return { placed: false, reason: "unsupported-market" };
     if (!(Number(px) > 0) || !(Number(notional) > 0) || !base) return { placed: false, reason: "bad-input" };
+    // DATA-INTEGRITY GUARD: a crypto coin can never be a US-equity / Commodity / Indian trade. A screener/strategy
+    // running under the wrong market tab once scanned BTC and booked a "Commodity BTC" / "US BTC" paper position
+    // sized qty=1 (the whole-share default) = a phantom ~$74k position that dwarfed the real P&L. Refuse any crypto
+    // base outside the Delta markets so the wrong-market/wrong-size row can't be created in the first place.
+    if (CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) && !(market === "Crypto" || market === "USStockTokens"))
+      return { placed: false, reason: "symbol-wrong-market" };
     // Respect exchange hours: Crypto/US-Tokens are 24/7, but IN/US/Commodity only trade in-session (and not on
     // holidays). Skip otherwise — for both real (the broker would reject) and paper (mirror real behaviour).
     if (!marketOpenIST(market)) return { placed: false, reason: "market-closed" };
