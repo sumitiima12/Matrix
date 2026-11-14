@@ -10965,7 +10965,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: trailingPctFor(settings, market), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: (s.tsl != null && s.tsl !== "" ? Number(s.tsl) : trailingPctFor(settings, market)), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: (settings && settings.trendGate) || null });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
