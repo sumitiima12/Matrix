@@ -10928,15 +10928,19 @@ function trailingPctFor(settings, market) {
    blocks). executeAutoEntry uses it to skip LONGS in a clear downtrend and SHORTS in a clear uptrend. */
 const TREND_BENCH = { Crypto: "BTC-USD", USStockTokens: "BTC-USD", US: "SPY", IN: "^NSEI", Commodity: "GC=F" };
 const TREND_GATE_DEFAULT = { enabled: true, emaPeriod: 20, momPct: 1.5 };   // on by default; user-overridable via settings.trendGate
-/* Resolve the trend-gate config for one auto-entry: per-ITEM override (strategy/screener cfg.trendGate) → that TRADE
-   TYPE's setting (settings.trendGateByType[type]) → the OVERALL setting (settings.trendGate) → built-in default.
-   More-specific wins, so you can turn the overall gate OFF yet leave it ON for, say, Automation. */
+/* Resolve the trend gate for one auto-entry as a CASCADE of on/off switches with SHARED thresholds:
+     OVERALL (settings.trendGate) is the master and holds the EMA + momentum thresholds.
+     Each lower level — the TRADE TYPE (settings.trendGateByType[type]) and the ITEM (strategy/screener cfg.trendGate)
+     — can only turn its own scope OFF; it can't re-enable a level that's already off above it.
+   So: overall off → off everywhere; overall on + type off → off for that type; overall+type on + item off → off for
+   that one item; otherwise on, using the overall's thresholds. Default: on, 20-EMA / 1.5%. */
 function resolveTrendGate(settings, type, itemTg) {
-  if (itemTg && typeof itemTg === "object") return itemTg;
+  const overall = (settings && settings.trendGate && typeof settings.trendGate === "object") ? settings.trendGate : TREND_GATE_DEFAULT;
+  if (overall.enabled === false) return { enabled: false };                       // master off
   const byType = settings && settings.trendGateByType;
-  if (byType && byType[type] && typeof byType[type] === "object") return byType[type];
-  if (settings && settings.trendGate && typeof settings.trendGate === "object") return settings.trendGate;
-  return null;   // executeAutoEntry applies TREND_GATE_DEFAULT (on) when null
+  if (byType && byType[type] && byType[type].enabled === false) return { enabled: false };   // this trade type off
+  if (itemTg === false || (itemTg && typeof itemTg === "object" && itemTg.enabled === false)) return { enabled: false };   // this item off
+  return { enabled: true, emaPeriod: overall.emaPeriod, momPct: overall.momPct };  // on, shared thresholds
 }
 async function marketBias(market, emaPeriod = 20, momPct = 1.5) {
   const emaP = Number(emaPeriod) > 1 ? Math.round(Number(emaPeriod)) : 20;
