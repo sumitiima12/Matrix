@@ -3666,9 +3666,16 @@ async function fyersHouseToken() {
             throw e;
           }
         })().finally(() => { _fyLoginInflight = null; });
+        _fyLoginInflight.catch(() => {});   // the error is handled below/within; this just stops a late rejection going unhandled after a timeout race
       }
-      const tok = await _fyLoginInflight;
+      // DON'T let a slow TOTP login hang the caller. Quote/history/option requests await this token; the login
+      // makes several proxied round-trips (each up to the 20s proxy connect cap), so a cold/slow login could take
+      // 60-100s and push the whole HTTP request past Render's gateway limit → 502. Cap the wait: the login keeps
+      // running in the BACKGROUND and caches the token on completion, so the NEXT request picks it up. The first
+      // request just returns no token (caller falls back to Yahoo/empty) instead of hanging.
+      const tok = await withTimeout(_fyLoginInflight, 12000, "fyers-house-login").catch(() => null);
       if (tok) { _fyHouse = { token: tok, at: Date.now() }; _fyLastError = null; _fyCooldownUntil = 0; return tok; }
+      if (!_fyHouse.token) return null;   // login still in flight — serve nothing this cycle (no cooldown set, so next request re-checks)
     } catch (e) {
       _fyLastError = "totp-login: " + e.message;
       _fyCooldownUntil = Date.now() + 5 * 60 * 1000;   // back off 5 min on failure
@@ -3853,10 +3860,11 @@ async function fyersHouseQuotes(ySyms) {
   const pairs = ySyms.map((y) => [y, yahooToFyers(y)]).filter(([, f]) => f);
   if (!pairs.length) return {};
   try {
-    const r = await pfetch(_fyRewrite(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`), {
+    // Bound the quote fetch too — a slow proxy hop shouldn't hang the request into a 502; return empty (→ Yahoo).
+    const r = await withTimeout(pfetch(_fyRewrite(`${FY_HOST}/data/quotes?symbols=${encodeURIComponent(pairs.map(([, f]) => f).join(","))}`), {
       headers: { Authorization: `${appId}:${token}` },
       ...fyFetchOpts,
-    });
+    }), 8000, "fyers-house-quotes");
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.s === "error") {
       if (d.code === -16 || /token/i.test(d.message || "")) _fyHouse = { token: null, at: 0 };   // force re-mint next time
@@ -10684,6 +10692,43 @@ async function resolveAutoBroker(userId, market) {
   return null;
 }
 
+/* LIQUIDITY GATE (Delta crypto / US-tokens). The 2026-11 backtest showed the worst losses were all thin micro-cap
+   tokens (EVAA, BEAT, RIVER, BILL, SLVON…) gapping straight through their stops — a −3% stop filling at −6 to −10%.
+   Gate auto-entries on 24h USD turnover from Delta's PUBLIC tickers feed (cached 10min). FAILS OPEN: if we can't
+   read volume, we allow the trade (never block a legit entry on a data hiccup). Default floor $5M/24h; override via
+   AUTO_MIN_TURNOVER_USD. */
+const AUTO_MIN_TURNOVER_USD = Number(process.env.AUTO_MIN_TURNOVER_USD) > 0 ? Number(process.env.AUTO_MIN_TURNOVER_USD) : 5_000_000;
+let _liqCache = { at: 0, map: null };
+async function deltaTurnoverMap() {
+  if (_liqCache.map && (Date.now() - _liqCache.at) < 10 * 60 * 1000) return _liqCache.map;
+  try {
+    const d = await withTimeout(deltaCall("GET", "/v2/tickers", { signed: false }), 15000);
+    const rows = (d && Array.isArray(d.result)) ? d.result : [];
+    const m = {};
+    for (const t of rows) {
+      const base = deltaBaseSymbol(String(t.symbol || ""));
+      if (!base) continue;
+      // Prefer Delta's USD turnover; fall back to volume × mark price. Keep the max across a base's contracts.
+      const usd = Number(t.turnover_usd) > 0 ? Number(t.turnover_usd)
+        : (Number(t.turnover) > 0 ? Number(t.turnover)
+        : (Number(t.volume) > 0 && Number(t.mark_price) > 0 ? Number(t.volume) * Number(t.mark_price) : 0));
+      if (usd > 0) m[base] = Math.max(m[base] || 0, usd);
+    }
+    if (Object.keys(m).length) _liqCache = { at: Date.now(), map: m };
+  } catch { /* fail open — leave the old cache (or null) so the gate allows the trade */ }
+  return _liqCache.map;
+}
+/* Returns true if the base is BELOW the liquidity floor (should be skipped). Fails OPEN: unknown/no-data → false. */
+async function isIlliquidForAuto(base) {
+  try {
+    const m = await deltaTurnoverMap();
+    if (!m) return false;                                   // no data → don't block
+    const v = m[String(base).toUpperCase()];
+    if (v == null) return false;                            // base not in feed → don't block
+    return v < AUTO_MIN_TURNOVER_USD;
+  } catch { return false; }
+}
+
 /* Shared ENTRY for an auto source (screener / smart-buy / ideas). Runs all real-money gates then places &
    books the order (real) or simulates the fill into the server paper book (virtual). Returns {placed, reason}.
    Never throws — a failure is logged and reported so the sweep continues to the next candidate. */
@@ -10699,6 +10744,9 @@ async function executeAutoEntry(ctx) {
     // base outside the Delta markets so the wrong-market/wrong-size row can't be created in the first place.
     if (CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) && !(market === "Crypto" || market === "USStockTokens"))
       return { placed: false, reason: "symbol-wrong-market" };
+    // LIQUIDITY GATE (Delta markets): skip thin micro-caps that gap through their stops. Fails open on no data.
+    if ((market === "Crypto" || market === "USStockTokens") && await isIlliquidForAuto(base))
+      return { placed: false, reason: "illiquid-skip" };
     // TREND GATE (user-configurable via settings.trendGate = { enabled, emaPeriod, momPct }; default ON 20-EMA/1.5%).
     // Don't fight the tape: in a clear downtrend skip LONG auto-entries; in a clear uptrend skip SHORTS. "flat" never
     // blocks. Turn it off with enabled:false. This cuts the counter-trend longs that lost most of the money.
@@ -10740,7 +10788,12 @@ async function executeAutoEntry(ctx) {
     if (mode === "virtual") {
       const claimed = await db.claimSignal(dedupId, userId, "auto-paper").catch(() => true);
       if (!claimed) return { placed: false, reason: "already-today" };
-      const r = await paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry: Number(px), sl, tp, tsl, short, tradeType, source, screenerKey, strategyName });
+      // PAPER PARITY: real Delta positions get a ~1% trailing stop from the broker's managed exit, which closes
+      // losers early — the main reason real screener win-rate (35%) >> paper (9%): without a trailing stop the paper
+      // book rides every loser to the full hard stop (the backtest showed 72% hard-stop-outs on paper). Default the
+      // same trailing on Delta paper entries so paper models the real exit, not a worst-case ride to the stop.
+      const paperTsl = (Number(tsl) > 0) ? Number(tsl) : ((market === "Crypto" || market === "USStockTokens") ? 1 : tsl);
+      const r = await paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry: Number(px), sl, tp, tsl: paperTsl, short, tradeType, source, screenerKey, strategyName });
       return { placed: !!(r && r.ok), reason: r && r.reason };
     }
 
@@ -11024,6 +11077,30 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
   }
 }
 
+/* --- Shared entry-quality rules for the SIGNAL engines (Ideas + Smart Auto-Buy) --- */
+// Minimum reward:risk. The 2026-11 backtest showed Ideas (7% win, ~1:1) and Smart Auto-Buy bleeding because the
+// target sat near the stop — a low win rate needs a WIDE target to stay profitable. Floor the target at 3× the
+// stop; never tightens an already-wider target. 3:1 means ~25% wins break even.
+const MIN_AUTO_RR = 3;
+function rrFloor(slPct, tpPct, minRR = MIN_AUTO_RR) {
+  const sl = Number(slPct) > 0 ? Number(slPct) : null;
+  let tp = Number(tpPct) > 0 ? Number(tpPct) : null;
+  if (sl == null) return { sl, tp };                 // no stop → can't compute RR, leave as-is
+  const floor = +(sl * minRR).toFixed(4);
+  tp = (tp == null) ? floor : Math.max(tp, floor);   // widen a too-tight target; keep a wider one
+  return { sl, tp };
+}
+// TRADE WITH THE TREND, baked in. These are momentum/signal engines, so a counter-trend entry is almost always
+// wrong — force the trend gate ON for them regardless of the user's per-type toggle, using the user's thresholds
+// (or defaults). This is the entry rule itself, not the optional gate.
+function forcedTrendGate(settings) {
+  const o = (settings && settings.trendGate) || TREND_GATE_DEFAULT;
+  return { enabled: true, emaPeriod: o.emaPeriod, momPct: o.momPct };
+}
+// Minimum setup strength to auto-enter an Idea (the app's "needs a ≥2.5 setup" bar). Filters out weak signals that
+// drove the 7%-win Ideas losses.
+const MIN_IDEA_STRENGTH = 2.5;
+
 /* Evaluate ONE user's enabled IDEAS auto-buy (both modes) and place entries for today's ideas. Reuses the
    same idea scan the /api/idea-scan endpoint uses so paper and real see the same signals. */
 async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
@@ -11037,16 +11114,22 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
     if (!syms.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-symbols"); continue; }
     const scanAll = await scanIdeasForSymbols(syms.map((x) => _candleSym(market, x))).catch(() => []);
     if (!scanAll.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-idea-today"); continue; }
-    // SELECTIVITY: don't auto-enter the WHOLE universe (the entire NSE list / all US names at once). Take only the
-    // strongest ideas of the day — top 10 by signal strength — so capital concentrates and trade count is sane.
-    const scan = [...scanAll].sort((a, b) => (Number(b.strength) || 0) - (Number(a.strength) || 0)).slice(0, 10);
+    // SELECTIVITY: don't auto-enter the WHOLE universe. Keep only ideas at/above the strength bar, then the top 5
+    // (was 10) by strength — tighter concentration after the 7%-win backtest. Combined with the 3:1 R:R floor and
+    // the forced trend gate below.
+    const scan = [...scanAll]
+      .filter((x) => (Number(x.strength) || 0) >= MIN_IDEA_STRENGTH)
+      .sort((a, b) => (Number(b.strength) || 0) - (Number(a.strength) || 0))
+      .slice(0, 5);
+    if (!scan.length) { for (const mode of onModes) rec(market, "ideas", mode, false, "no-qualifying-pick"); continue; }
     for (const idea of scan) {
       const base = _deltaBase(idea.sym);
       for (const mode of onModes) {
         const cfgM = perMode[mode];
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
-        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: Number(idea.slPct) || null, tp: Number(idea.tpPct) || null, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "ideas", null) });
+        const { sl: ideaSl, tp: ideaTp } = rrFloor(idea.slPct, idea.tpPct);   // enforce min 3:1 reward:risk
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: ideaSl, tp: ideaTp, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -11080,7 +11163,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
     const syms = (Object.values(perMode).find((m) => m && Array.isArray(m.symbols) && m.symbols.length) || {}).symbols || [];
     if (!syms.length) { for (const mode of onModes) rec(market, "smartbuy", mode, false, "no-symbols"); continue; }
     const allowShorts = (market === "Crypto" || market === "USStockTokens");
-    const picks = (await computeSmartPicks(market, syms, allowShorts)).slice(0, 10);   // cap entries/day/market
+    const picks = (await computeSmartPicks(market, syms, allowShorts)).slice(0, 5);   // tighter: top 5/day/market (was 10)
     if (!picks.length) { for (const mode of onModes) rec(market, "smartbuy", mode, false, "no-qualifying-pick"); continue; }
     for (const mode of onModes) {
       const cfgM = perMode[mode];
@@ -11088,7 +11171,8 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       if (!(capital > 0)) { rec(market, "smartbuy", mode, false, "no-capital-set"); continue; }
       const per = capital / picks.length;
       for (const p of picks) {
-        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: p.pickSlPct || null, tp: p.pickTpPct || null, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "smartbuy", null) });
+        const { sl: pSl, tp: pTp } = rrFloor(p.pickSlPct, p.pickTpPct);   // enforce min 3:1 reward:risk
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: pSl, tp: pTp, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
