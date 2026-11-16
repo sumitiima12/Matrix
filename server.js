@@ -7405,7 +7405,8 @@ app.get("/api/broker/quotes", requireAuth, async (req, res) => {
   const sess = getBrokerSession(req);
   /* 401 = the session is genuinely gone (expired, or wiped by a server restart — sessions
      live in memory on the free tier). The client should reconnect. This is DISTINCT from a
-     quote-fetch hiccup below, which is a 502 and must NOT drop the session. */
+     quote-fetch hiccup below, which returns a graceful degraded 200 (client falls back to
+     Yahoo/cached) and must NOT drop the session. */
   if (!sess) return res.status(401).json({ error: "no broker session", code: "SESSION_GONE" });
   const broker = sess.broker;
   const token = sess.accessToken;
@@ -7435,9 +7436,11 @@ app.get("/api/broker/quotes", requireAuth, async (req, res) => {
     }
 
     if (broker === "fyers") {
-      const r = await fyFetch(`https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(symbols.join(","))}`, {
+      // Bound the FYERS fetch — a slow proxy/broker must not hang the route into a Render gateway 502. Fails fast to
+      // the catch below, which returns a graceful degraded 200 (client falls back to Yahoo/cached prices).
+      const r = await withTimeout(fyFetch(`https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(symbols.join(","))}`, {
         headers: brokerAuth(broker, token, sess.userId),
-      });
+      }), 8000, "fyers-quotes");
       const d = await r.json();
       if (!r.ok || d.s === "error") throw new Error(d.message || `fyers ${r.status}`);
       (d.d || []).forEach((row) => {
@@ -7502,7 +7505,11 @@ app.get("/api/broker/quotes", requireAuth, async (req, res) => {
 
     res.json({ quotes: out, broker, live: true, at: Date.now() });
   } catch (e) {
-    res.status(502).json({ error: String(e.message || e) });
+    // A quote-fetch hiccup (slow broker / proxy / rate-limit) must NOT surface as a hard 502 in the client — the
+    // client already falls back to Yahoo/cached prices, so a 502 just litters the console and alarms the user.
+    // Return a graceful degraded 200 with empty quotes; the session stays intact (a genuinely-gone session is the
+    // 401 above). `degraded:true` lets the client tell "no live quote right now" from "real data".
+    res.json({ quotes: {}, broker, live: false, degraded: true, error: String(e.message || e), at: Date.now() });
   }
 });
 
