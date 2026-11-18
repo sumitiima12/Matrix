@@ -11046,7 +11046,7 @@ function resolveTrendGate(settings, type, itemTg) {
 async function biasFromCandles(candleSym, emaPeriod = 20, momPct = 1.5) {
   const emaP = Number(emaPeriod) > 1 ? Math.round(Number(emaPeriod)) : 20;
   const momThr = Number(momPct) >= 0 ? Number(momPct) : 1.5;
-  return memo(`bias:${candleSym}:${emaP}:${momThr}`, 10 * 60 * 1000, async () => {
+  return memo(`bias:${candleSym}:${emaP}:${momThr}`, 30 * 60 * 1000, async () => {
     try {
       const candles = await candlesFor(candleSym, "5d", "1h").catch(() => null);
       const closes = (candles || []).map((c) => Number(c.close != null ? c.close : c.c)).filter((n) => n > 0);
