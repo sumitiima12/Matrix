@@ -10759,7 +10759,9 @@ async function executeAutoEntry(ctx) {
     // blocks. Turn it off with enabled:false. This cuts the counter-trend longs that lost most of the money.
     const tg = (ctx.trendGate && typeof ctx.trendGate === "object") ? ctx.trendGate : TREND_GATE_DEFAULT;
     if (tg.enabled !== false) {
-      const bias = await marketBias(market, tg.emaPeriod, tg.momPct);
+      // PER-SYMBOL: judge THIS symbol on its own trend, not a market benchmark — so when BTC is down and SOL is up,
+      // BTC is only shorted and SOL is only longed. Uses the entry symbol's own candles (falls back to flat = allow).
+      const bias = await symbolBias(_candleSym(market, base), tg.emaPeriod, tg.momPct);
       if (bias === "down" && !short) return { placed: false, reason: "trend-down-skip-long" };
       if (bias === "up" && short) return { placed: false, reason: "trend-up-skip-short" };
     }
@@ -11038,28 +11040,31 @@ function resolveTrendGate(settings, type, itemTg) {
   if (itemTg === false || (itemTg && typeof itemTg === "object" && itemTg.enabled === false)) return { enabled: false };   // this item off
   return { enabled: true, emaPeriod: overall.emaPeriod, momPct: overall.momPct };  // on, shared thresholds
 }
-async function marketBias(market, emaPeriod = 20, momPct = 1.5) {
+/* Trend read for ONE candle symbol (EMA-led, stricter). Price vs its EMA decides the regime so a mild up day still
+   blocks counter-trend shorts; momentum is an EXTRA tunable filter that vetoes the regime only on a sharp
+   contradiction. Memoized per symbol ~10 min. Fails to "flat" (never blocks) when candles can't be read. */
+async function biasFromCandles(candleSym, emaPeriod = 20, momPct = 1.5) {
   const emaP = Number(emaPeriod) > 1 ? Math.round(Number(emaPeriod)) : 20;
   const momThr = Number(momPct) >= 0 ? Number(momPct) : 1.5;
-  return memo(`bias:${market}:${emaP}:${momThr}`, 10 * 60 * 1000, async () => {
+  return memo(`bias:${candleSym}:${emaP}:${momThr}`, 10 * 60 * 1000, async () => {
     try {
-      const candles = await candlesFor(TREND_BENCH[market] || "BTC-USD", "5d", "1h").catch(() => null);
+      const candles = await candlesFor(candleSym, "5d", "1h").catch(() => null);
       const closes = (candles || []).map((c) => Number(c.close != null ? c.close : c.c)).filter((n) => n > 0);
       if (closes.length < emaP + 5) return "flat";
       const ema = (arr, p) => { const k = 2 / (p + 1); let e = arr[0]; for (let i = 1; i < arr.length; i++) e = arr[i] * k + e * (1 - k); return e; };
       const last = closes[closes.length - 1], eRef = ema(closes.slice(-(emaP * 2)), emaP);
       const momRef = closes[Math.max(0, closes.length - 24)];
       const mom = momRef > 0 ? (last / momRef - 1) * 100 : 0;
-      // EMA-LED (stricter). Price vs the EMA decides the regime, so a mild up day still blocks counter-trend shorts
-      // (previously needed momentum > threshold too, so mild days fell to "flat" and nothing was blocked — the
-      // shorts-in-up-market bug). Momentum is an EXTRA tunable FILTER: it only vetoes the regime when it sharply
-      // CONTRADICTS the EMA (a hard counter-move flips back to "flat"). Raise momPct to demand stronger confirmation.
       if (last > eRef && mom > -momThr) return "up";     // above EMA and not sharply falling → uptrend (blocks shorts)
       if (last < eRef && mom < momThr) return "down";    // below EMA and not sharply rising → downtrend (blocks longs)
       return "flat";
     } catch { return "flat"; }
   });
 }
+// PER-SYMBOL trend (the gate judges each symbol on ITS OWN trend — BTC down → only short BTC; SOL up → only long SOL).
+async function symbolBias(candleSym, emaPeriod = 20, momPct = 1.5) { return biasFromCandles(candleSym, emaPeriod, momPct); }
+// Benchmark trend for a whole market (kept for any market-level callers).
+async function marketBias(market, emaPeriod = 20, momPct = 1.5) { return biasFromCandles(TREND_BENCH[market] || "BTC-USD", emaPeriod, momPct); }
 
 /* Evaluate ONE user's enabled SCREENERS (both modes) and place entries for current matches. */
 async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
