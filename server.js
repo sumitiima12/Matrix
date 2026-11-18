@@ -11008,6 +11008,14 @@ function trailingPctFor(settings, market) {
   if (t && typeof t === "object") return t.enabled === false ? 0 : (Number(t.pct) > 0 ? Number(t.pct) : 1);
   return market === "IN" ? 0 : 1;   // unset → on at 1% everywhere except Indian
 }
+/* Per-TRADE-TYPE trailing override → falls back to the per-market default. `type` is the engine source name
+   ("automate" | "screener" | "ideas" | "smartbuy"). A type+market override wins; otherwise inherit trailingPctFor. */
+function resolveTrailing(settings, type, market) {
+  const bt = settings && settings.trailingByType && settings.trailingByType[type];
+  const t = bt && bt[market];
+  if (t && typeof t === "object") return t.enabled === false ? 0 : (Number(t.pct) > 0 ? Number(t.pct) : 1);
+  return trailingPctFor(settings, market);
+}
 
 /* MARKET TREND BIAS for the auto engines. The 7-day trade review showed LONGS bleeding (−$1.3k, 14% win) while
    SHORTS won (42% win) in a down week — i.e. the engines fire counter-trend. This classifies the market's
@@ -11042,8 +11050,12 @@ async function marketBias(market, emaPeriod = 20, momPct = 1.5) {
       const last = closes[closes.length - 1], eRef = ema(closes.slice(-(emaP * 2)), emaP);
       const momRef = closes[Math.max(0, closes.length - 24)];
       const mom = momRef > 0 ? (last / momRef - 1) * 100 : 0;
-      if (last < eRef && mom < -momThr) return "down";
-      if (last > eRef && mom > momThr) return "up";
+      // EMA-LED (stricter). Price vs the EMA decides the regime, so a mild up day still blocks counter-trend shorts
+      // (previously needed momentum > threshold too, so mild days fell to "flat" and nothing was blocked — the
+      // shorts-in-up-market bug). Momentum is an EXTRA tunable FILTER: it only vetoes the regime when it sharply
+      // CONTRADICTS the EMA (a hard counter-move flips back to "flat"). Raise momPct to demand stronger confirmation.
+      if (last > eRef && mom > -momThr) return "up";     // above EMA and not sharply falling → uptrend (blocks shorts)
+      if (last < eRef && mom < momThr) return "down";    // below EMA and not sharply rising → downtrend (blocks longs)
       return "flat";
     } catch { return "flat"; }
   });
@@ -11076,7 +11088,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: (s.tsl != null && s.tsl !== "" ? Number(s.tsl) : trailingPctFor(settings, market)), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "screener", s.trendGate) });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: (s.tsl != null && s.tsl !== "" ? Number(s.tsl) : resolveTrailing(settings, "screener", market)), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "screener", s.trendGate) });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
@@ -11106,12 +11118,17 @@ function forcedTrendGate(settings) {
 }
 // Minimum setup strength to auto-enter an Idea (the app's "needs a ≥2.5 setup" bar). Filters out weak signals that
 // drove the 7%-win Ideas losses.
-const MIN_IDEA_STRENGTH = 2.5;
+const MIN_IDEA_STRENGTH = Number(process.env.MIN_IDEA_STRENGTH) >= 0 ? Number(process.env.MIN_IDEA_STRENGTH) : 1.8;
 
 /* Evaluate ONE user's enabled IDEAS auto-buy (both modes) and place entries for today's ideas. Reuses the
    same idea scan the /api/idea-scan endpoint uses so paper and real see the same signals. */
 async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
   const ideas = (settings && settings.ideas) || {};
+  // MASTER switch — pause ALL Ideas auto-entries without untoggling each market. Open positions/exits unaffected.
+  if (settings && settings.ideasMaster === false) {
+    for (const market of Object.keys(ideas)) for (const mode of ["virtual", "real"]) if (ideas[market] && ideas[market][mode] && ideas[market][mode].enabled === true) rec(market, "ideas", mode, false, "ideas-paused");
+    return;
+  }
   for (const market of Object.keys(ideas)) {
     if (!AUTO_SRC_MARKETS.has(market)) continue;
     const perMode = ideas[market] || {};
@@ -11136,7 +11153,7 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
         const { sl: ideaSl, tp: ideaTp } = rrFloor(idea.slPct, idea.tpPct);   // enforce min 3:1 reward:risk
-        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: ideaSl, tp: ideaTp, tsl: trailingPctFor(settings, market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: ideaSl, tp: ideaTp, tsl: resolveTrailing(settings, "ideas", market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -11179,7 +11196,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       const per = capital / picks.length;
       for (const p of picks) {
         const { sl: pSl, tp: pTp } = rrFloor(p.pickSlPct, p.pickTpPct);   // enforce min 3:1 reward:risk
-        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: pSl, tp: pTp, tsl: trailingPctFor(settings, market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: pSl, tp: pTp, tsl: resolveTrailing(settings, "smartbuy", market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -11193,6 +11210,9 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
    the same executeAutoEntry path the other engines use (dedup, paper book, trailing stop all reused). One open paper
    position per strategy; a per-sweep cap keeps a 100-strategy account from opening a burst in a single tick. */
 async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = null) {
+  // MASTER switch — pause ALL Automation (paper) auto-entries. Open positions/exits unaffected. (Real strategies are
+  // gated by the same flag in the real-strategy sweep.)
+  if (settings && settings.automationMaster === false) return;
   let state; try { state = await db.getState(userId); } catch { return; }
   const strats = (state && Array.isArray(state.strats) ? state.strats : []).filter((s) => s && s.active === true);
   if (!strats.length) return;
@@ -11225,7 +11245,7 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = 
       const res = await executeAutoEntry({ userId, market, mode: "virtual", base, notional, px,
         sl: (cfg.sl != null && cfg.sl !== "" ? Number(cfg.sl) : null),
         tp: (cfg.tp != null && cfg.tp !== "" ? Number(cfg.tp) : null),
-        tsl: (cfg.tsl != null && cfg.tsl !== "" ? Number(cfg.tsl) : trailingPctFor(state || {}, market)),
+        tsl: (cfg.tsl != null && cfg.tsl !== "" ? Number(cfg.tsl) : resolveTrailing(settings || {}, "automate", market)),
         short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig, trendGate: resolveTrendGate(settings, "automate", (cfg && cfg.trendGate) || (s && s.trendGate)) });
       rec(market, "automate", "virtual", !!(res && res.placed), res && res.reason);
       if (res && res.placed) { placed++; if (s.name) heldByStrat.add(String(s.name)); }
@@ -11356,11 +11376,19 @@ async function runAutoBuyEngine() {
     if (!posCache.has(uid)) posCache.set(uid, await db.getManagedPositionsForUser(uid).catch(() => []));
     return posCache.get(uid);
   };
+  // Per-sweep cache of each user's auto-settings so the Automation MASTER switch (automationMaster:false) can pause
+  // a user's REAL strategy entries without disarming each one. One DB read per user per sweep.
+  const setCache = new Map();
+  const autoMasterOffFor = async (uid) => {
+    if (!setCache.has(uid)) setCache.set(uid, (await db.getAutoSettings(uid).catch(() => null)) || {});
+    return setCache.get(uid).automationMaster === false;
+  };
   try {
     const strategies = await db.getActiveRealStrategies(500);
     for (const st of strategies) {
       checked++;
       try {
+        if (await autoMasterOffFor(st.userId)) continue;   // user paused all Automation entries (master switch off)
         if (!marketOpenIST(st.market)) continue;   // market closed — do not enter
         // R4/R5-P2-02 FAIL CLOSED: if we don't have the exchange holiday calendar for this market's
         // current year, we can't know weekday holidays — so a LIVE entry must NOT be placed (it could
