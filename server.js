@@ -10674,7 +10674,9 @@ const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens", "IN", "US", "Commod
 /* Bases that ONLY exist as crypto (Delta). Used to reject a crypto coin accidentally scanned under a US / Commodity /
    Indian market tab (which would book a wrong-market, whole-share-sized phantom position). Covers the app's crypto
    universe majors + the small-cap coins seen in the journal; extend if new coins are added to the crypto universe. */
-const CRYPTO_ONLY_BASES = new Set(["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "MATIC", "LTC", "TRX", "ATOM", "UNI", "ONDO", "KAITO", "LAB", "BILL", "EVAA", "BEAT", "SLVON", "WDCB", "H", "RIVER"]);
+const CRYPTO_ONLY_BASES = new Set(["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "MATIC", "LTC", "TRX", "ATOM", "UNI", "ONDO", "KAITO", "LAB", "BILL", "EVAA", "BEAT", "SLVON", "WDCB", "H", "RIVER", "RAVE", "TAC", "PIPPIN", "XAUT", "PAXG"]);
+// Indian INDEX underlyings — NOT tradeable as an equity; an auto-entry on one must be an option/future, never the raw index.
+const IN_INDEX_UNDERLYINGS = new Set(["NIFTY50", "NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "MIDCPNIFTY", "NIFTYNXT50", "BANKEX"]);
 const _autoDayIdx = () => Math.floor(Date.now() / 86400000);
 const _deltaBase = (s) => String(s || "").toUpperCase().replace(/^NSE:/, "").replace(/-EQ$/i, "").replace(/\.NS$/i, "").replace(/[^A-Z0-9]/g, "").replace(/(USDT|USD|INR|PERP)$/i, "");
 // Commodity app-symbol → Yahoo COMEX/NYMEX ticker (server Y_SPECIAL covers most; CRUDEOIL isn't listed there).
@@ -11290,8 +11292,14 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = 
       const qty = Number(s.qty) > 0 ? Number(s.qty) : (isDelta ? 500 : 1);
       const notional = isDelta ? qty : qty * px;   // Delta markets deploy an amount; others whole-share qty×price
       const short = String((cfg.side || s.side || "")).toUpperCase() === "SELL";
-      const optConfig = (market === "IN" && s.instrument === "OPTION" && s.opt && Array.isArray(s.opt.legs) && s.opt.legs[0])
+      let optConfig = (market === "IN" && s.instrument === "OPTION" && s.opt && Array.isArray(s.opt.legs) && s.opt.legs[0])
         ? { enabled: true, mny: s.opt.legs[0].mny || "ATM", expiry: s.opt.expiry || "Current week", lots: Number(s.opt.legs[0].lots) || 1 } : null;
+      // Fall back to the GLOBAL IN option config (the "trade the option instead of the stock" toggle the user set on
+      // Smart Auto-Buy) so a single setting makes Automation strategies trade the ATM option too.
+      if (!optConfig && market === "IN" && settings && settings.options && settings.options.IN && settings.options.IN.enabled === true) optConfig = settings.options.IN;
+      // An INDEX (NIFTY50/BANKNIFTY/…) is NOT tradeable as an equity — it must be an option/future. Don't book the raw
+      // index level as a paper "stock" (the ₹5M NIFTY50 qty=200 phantom). Skip unless an option config resolves it.
+      if (market === "IN" && IN_INDEX_UNDERLYINGS.has(String(base).toUpperCase()) && !optConfig) { rec(market, "automate", "virtual", false, "index-needs-option"); continue; }
       const res = await executeAutoEntry({ userId, market, mode: "virtual", base, notional, px,
         sl: (cfg.sl != null && cfg.sl !== "" ? Number(cfg.sl) : null),
         tp: (cfg.tp != null && cfg.tp !== "" ? Number(cfg.tp) : null),
