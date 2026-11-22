@@ -10735,13 +10735,52 @@ async function isIlliquidForAuto(base) {
     return v < AUTO_MIN_TURNOVER_USD;
   } catch { return false; }
 }
+/* LIQUIDITY-TIERED SIZING (Delta). A thinner (but above the gate floor) name gets a smaller slice so a gap-through-stop
+   hurts less. Returns a size multiplier in {1, 0.5, 0.25}. Only when the user enables it; unknown volume → full size. */
+async function liquiditySizeMult(market, base, enabled) {
+  if (!enabled || !(market === "Crypto" || market === "USStockTokens")) return 1;
+  try {
+    const m = await deltaTurnoverMap();
+    const v = m && m[String(base).toUpperCase()];
+    if (v == null) return 1;
+    if (v >= 50_000_000) return 1;       // deep book → full size
+    if (v >= 10_000_000) return 0.5;     // medium → half
+    return 0.25;                          // thin (passed the $5M gate) → quarter
+  } catch { return 1; }
+}
+/* PER-SYMBOL DAILY ENTRY CAP. Atomic counting via claimSignal slots (n=1..cap), per user+market+mode+symbol+day, so
+   one symbol can't be over-traded (the RAVE-141 problem). Returns true if a slot was taken (within cap), false if all
+   are gone (over cap). Fails OPEN on a DB hiccup. cap ≤ 0 / unset → unlimited. */
+async function takeSymbolDailySlot(userId, market, base, mode, dayIdx, cap) {
+  const c = Number(cap);
+  if (!(c > 0)) return true;
+  for (let n = 1; n <= c; n++) {
+    try { if (await db.claimSignal(`capd_${userId}_${market}_${mode}_${String(base).toUpperCase()}_${dayIdx}_${n}`, userId, `capd:${mode}`)) return true; }
+    catch { return true; }
+  }
+  return false;
+}
+/* Clamp SL/TP to the user's per-market caps (settings.slTpCaps[market] = { maxSl, maxTp } in %). 0/unset → no cap.
+   WARNING for leveraged crypto: a tight SL cap raises the stop-out rate — the UI explains this. Only clamps DOWN. */
+function capSlTp(settings, market, sl, tp) {
+  const caps = settings && settings.slTpCaps && settings.slTpCaps[market];
+  let s = sl, t = tp;
+  if (caps) {
+    if (Number(caps.maxSl) > 0 && Number(s) > Number(caps.maxSl)) s = Number(caps.maxSl);
+    if (Number(caps.maxTp) > 0 && Number(t) > Number(caps.maxTp)) t = Number(caps.maxTp);
+  }
+  return { sl: s, tp: t };
+}
 
 /* Shared ENTRY for an auto source (screener / smart-buy / ideas). Runs all real-money gates then places &
    books the order (real) or simulates the fill into the server paper book (virtual). Returns {placed, reason}.
    Never throws — a failure is logged and reported so the sweep continues to the next candidate. */
 async function executeAutoEntry(ctx) {
   const { userId, market, mode, base, notional, px, sl = null, tp = null, tsl = null, short = false,
-    product = "CNC", tradeType, source, live, engineFence = null, screenerKey = null, strategyName = null } = ctx;
+    product = "CNC", tradeType, source, live, engineFence = null, screenerKey = null, strategyName = null, settings = null } = ctx;
+  // Effective (post-cap/tier) sizing + exits — the user's risk caps and liquidity tiering adjust these below.
+  let effNotional = Number(notional) || 0;
+  const { sl: effSl, tp: effTp } = capSlTp(settings, market, sl, tp);
   try {
     if (!AUTO_SRC_MARKETS.has(market)) return { placed: false, reason: "unsupported-market" };
     if (!(Number(px) > 0) || !(Number(notional) > 0) || !base) return { placed: false, reason: "bad-input" };
@@ -10754,6 +10793,8 @@ async function executeAutoEntry(ctx) {
     // LIQUIDITY GATE (Delta markets): skip thin micro-caps that gap through their stops. Fails open on no data.
     if ((market === "Crypto" || market === "USStockTokens") && await isIlliquidForAuto(base))
       return { placed: false, reason: "illiquid-skip" };
+    // LIQUIDITY-TIERED SIZING: shrink the slice on thinner names (when the user enables it).
+    if (settings && settings.liquidityTiering) effNotional = effNotional * await liquiditySizeMult(market, base, true);
     // TREND GATE (user-configurable via settings.trendGate = { enabled, emaPeriod, momPct }; default ON 20-EMA/1.5%).
     // Don't fight the tape: in a clear downtrend skip LONG auto-entries; in a clear uptrend skip SHORTS. "flat" never
     // blocks. Turn it off with enabled:false. This cuts the counter-trend longs that lost most of the money.
@@ -10765,6 +10806,10 @@ async function executeAutoEntry(ctx) {
       if (bias === "down" && !short) return { placed: false, reason: "trend-down-skip-long" };
       if (bias === "up" && short) return { placed: false, reason: "trend-up-skip-short" };
     }
+    // PER-SYMBOL DAILY CAP: don't over-trade one symbol (the RAVE-141 problem). Customizable; unset → unlimited.
+    if (settings && Number(settings.maxPerSymbolDay) > 0
+      && !(await takeSymbolDailySlot(userId, market, base, mode, _autoDayIdx(), settings.maxPerSymbolDay)))
+      return { placed: false, reason: "symbol-daily-cap" };
     // Respect exchange hours: Crypto/US-Tokens are 24/7, but IN/US/Commodity only trade in-session (and not on
     // holidays). Skip otherwise — for both real (the broker would reject) and paper (mirror real behaviour).
     if (!marketOpenIST(market)) return { placed: false, reason: "market-closed" };
@@ -10789,7 +10834,7 @@ async function executeAutoEntry(ctx) {
     if (market === "IN" && ctx.optConfig && ctx.optConfig.enabled === true) {
       return await executeAutoOptionEntry(ctx, { base, px: Number(px), dedupId });
     }
-    const qty = isDelta ? +(Number(notional) / Number(px)).toFixed(6) : Math.max(1, Math.floor(Number(notional) / Number(px)));
+    const qty = isDelta ? +(effNotional / Number(px)).toFixed(6) : Math.max(1, Math.floor(effNotional / Number(px)));
     if (!(qty > 0)) return { placed: false, reason: "amount-too-small" };
     if (short && !isDelta) return { placed: false, reason: "short-not-supported" };   // only Delta auto-short is wired
 
@@ -10802,7 +10847,7 @@ async function executeAutoEntry(ctx) {
       // book rides every loser to the full hard stop (the backtest showed 72% hard-stop-outs on paper). Default the
       // same trailing on Delta paper entries so paper models the real exit, not a worst-case ride to the stop.
       const paperTsl = (Number(tsl) > 0) ? Number(tsl) : ((market === "Crypto" || market === "USStockTokens") ? 1 : tsl);
-      const r = await paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry: Number(px), sl, tp, tsl: paperTsl, short, tradeType, source, screenerKey, strategyName });
+      const r = await paperOpenPosition({ userId, market, base, brokerSym, symbol, qty, entry: Number(px), sl: effSl, tp: effTp, tsl: paperTsl, short, tradeType, source, screenerKey, strategyName });
       return { placed: !!(r && r.ok), reason: r && r.reason };
     }
 
@@ -10863,10 +10908,10 @@ async function executeAutoEntry(ctx) {
     if (engineFence != null) { let ok = false; try { ok = await db.fenceValid("engine:autobuy", engineFence); } catch { ok = false; } if (!ok) return { placed: false, reason: "lease-takeover" }; }
 
     const clientId = `mx_${source}_${dedupId}`;
-    const r = await placeBuyOrder(sess, brokerSym, qty, market, prod, sl, tp, short, clientId, "MARKET", 0);
+    const r = await placeBuyOrder(sess, brokerSym, qty, market, prod, effSl, effTp, short, clientId, "MARKET", 0);
     const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
     const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : Number(px);
-    const pos = await registerManagedPosition({ sess, symbol, brokerSym, qty: fillQty, entry: fillPx, market, sl, tp, tsl, cfg: null, yahoo, interval: "5m", product: prod, short });
+    const pos = await registerManagedPosition({ sess, symbol, brokerSym, qty: fillQty, entry: fillPx, market, sl: effSl, tp: effTp, tsl, cfg: null, yahoo, interval: "5m", product: prod, short });
     const journaled = await recordAuthoritativeFill(storeKey, {
       id: `${source}_${dedupId}`, sym: symbol, side: short ? "SELL" : "BUY", qty: fillQty, entry: fillPx, entryAt: Date.now(),
       market, real: true, broker, tradeType, orderId: r.orderId || null, managedId: pos.id, serverAuthored: true,
@@ -11093,7 +11138,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
         const base = _deltaBase(m.sym);
         for (const mode of ["virtual", "real"]) {
           if (modes[mode] !== true) continue;   // only auto-trade the book(s) the user enabled
-          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: (s.tsl != null && s.tsl !== "" ? Number(s.tsl) : resolveTrailing(settings, "screener", market)), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "screener", s.trendGate) });
+          const res = await executeAutoEntry({ userId, market, mode, base, notional: perNotional, px: m.price, sl: s.sl || null, tp: s.tp || null, tsl: (s.tsl != null && s.tsl !== "" ? Number(s.tsl) : resolveTrailing(settings, "screener", market)), short: !!s.short, tradeType: "Screener Auto Buy", source: "screener", live, screenerKey: key, strategyName: s.name || key, optConfig: (settings.options && settings.options[market]) || null , trendGate: resolveTrendGate(settings, "screener", s.trendGate), settings });
           rec(market, "screener", mode, !!(res && res.placed), res && res.reason);
         }
       }
@@ -11158,7 +11203,7 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
         const { sl: ideaSl, tp: ideaTp } = rrFloor(idea.slPct, idea.tpPct);   // enforce min 3:1 reward:risk
-        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: ideaSl, tp: ideaTp, tsl: resolveTrailing(settings, "ideas", market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
+        const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: ideaSl, tp: ideaTp, tsl: resolveTrailing(settings, "ideas", market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings), settings });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -11201,7 +11246,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       const per = capital / picks.length;
       for (const p of picks) {
         const { sl: pSl, tp: pTp } = rrFloor(p.pickSlPct, p.pickTpPct);   // enforce min 3:1 reward:risk
-        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: pSl, tp: pTp, tsl: resolveTrailing(settings, "smartbuy", market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings) });
+        const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: pSl, tp: pTp, tsl: resolveTrailing(settings, "smartbuy", market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings), settings });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
     }
@@ -11251,7 +11296,7 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = 
         sl: (cfg.sl != null && cfg.sl !== "" ? Number(cfg.sl) : null),
         tp: (cfg.tp != null && cfg.tp !== "" ? Number(cfg.tp) : null),
         tsl: (cfg.tsl != null && cfg.tsl !== "" ? Number(cfg.tsl) : resolveTrailing(settings || {}, "automate", market)),
-        short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig, trendGate: resolveTrendGate(settings, "automate", (cfg && cfg.trendGate) || (s && s.trendGate)) });
+        short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig, trendGate: resolveTrendGate(settings, "automate", (cfg && cfg.trendGate) || (s && s.trendGate)), settings: settings || {} });
       rec(market, "automate", "virtual", !!(res && res.placed), res && res.reason);
       if (res && res.placed) { placed++; if (s.name) heldByStrat.add(String(s.name)); }
     } catch (e) { /* one strategy must never stop the sweep */ }
