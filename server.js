@@ -10707,6 +10707,20 @@ async function resolveAutoBroker(userId, market) {
    read volume, we allow the trade (never block a legit entry on a data hiccup). Default floor $5M/24h; override via
    AUTO_MIN_TURNOVER_USD. */
 const AUTO_MIN_TURNOVER_USD = Number(process.env.AUTO_MIN_TURNOVER_USD) > 0 ? Number(process.env.AUTO_MIN_TURNOVER_USD) : 5_000_000;
+// Minimum hard-stop % for LEVERAGED crypto auto-entries. A sub-3% stop on 25x leverage is noise-level: the trade
+// review showed trades ejected at ~-1.9% while those that survived to the strategy's own exit signal won +4.5%. We
+// floor the stop here (and scale the target to keep the intended reward:risk) so normal wiggles don't stop recoverable
+// trades. 3% ≈ 75% of margin at 25x — wider than this risks liquidation, so it's the practical ceiling too.
+const AUTO_MIN_SL_CRYPTO = Number(process.env.AUTO_MIN_SL_CRYPTO) > 0 ? Number(process.env.AUTO_MIN_SL_CRYPTO) : 3;
+/* Widen a too-tight LEVERAGED-crypto stop to the noise-resistant minimum, scaling the target to keep the reward:risk.
+   Returns { sl, tp }. No-op for non-Delta markets or when the stop is already ≥ the floor / unset. */
+function floorCryptoSlTp(market, sl, tp) {
+  if ((market === "Crypto" || market === "USStockTokens") && Number(sl) > 0 && Number(sl) < AUTO_MIN_SL_CRYPTO) {
+    const k = AUTO_MIN_SL_CRYPTO / Number(sl);
+    return { sl: AUTO_MIN_SL_CRYPTO, tp: Number(tp) > 0 ? +(Number(tp) * k).toFixed(2) : tp };
+  }
+  return { sl, tp };
+}
 let _liqCache = { at: 0, map: null };
 async function deltaTurnoverMap() {
   if (_liqCache.map && (Date.now() - _liqCache.at) < 10 * 60 * 1000) return _liqCache.map;
@@ -10727,14 +10741,17 @@ async function deltaTurnoverMap() {
   } catch { /* fail open — leave the old cache (or null) so the gate allows the trade */ }
   return _liqCache.map;
 }
-/* Returns true if the base is BELOW the liquidity floor (should be skipped). Fails OPEN: unknown/no-data → false. */
-async function isIlliquidForAuto(base) {
+/* Returns true if the base is BELOW the liquidity floor (should be skipped). `minUsd` is the user's own floor (0/unset
+   → use the default; ≤0 → gate OFF). Fails OPEN: unknown/no-data → false. */
+async function isIlliquidForAuto(base, minUsd) {
+  const floor = (minUsd === 0) ? 0 : (Number(minUsd) > 0 ? Number(minUsd) : AUTO_MIN_TURNOVER_USD);
+  if (!(floor > 0)) return false;                           // gate turned off by the user
   try {
     const m = await deltaTurnoverMap();
     if (!m) return false;                                   // no data → don't block
     const v = m[String(base).toUpperCase()];
     if (v == null) return false;                            // base not in feed → don't block
-    return v < AUTO_MIN_TURNOVER_USD;
+    return v < floor;
   } catch { return false; }
 }
 /* LIQUIDITY-TIERED SIZING (Delta). A thinner (but above the gate floor) name gets a smaller slice so a gap-through-stop
@@ -10780,9 +10797,13 @@ function capSlTp(settings, market, sl, tp) {
 async function executeAutoEntry(ctx) {
   const { userId, market, mode, base, notional, px, sl = null, tp = null, tsl = null, short = false,
     product = "CNC", tradeType, source, live, engineFence = null, screenerKey = null, strategyName = null, settings = null } = ctx;
-  // Effective (post-cap/tier) sizing + exits — the user's risk caps and liquidity tiering adjust these below.
+  // Effective (post-floor/cap/tier) sizing + exits.
   let effNotional = Number(notional) || 0;
-  const { sl: effSl, tp: effTp } = capSlTp(settings, market, sl, tp);
+  let effSl = sl, effTp = tp;
+  // HARD-STOP FLOOR (leveraged crypto): widen a too-tight stop and scale the target. Applied BEFORE the user's cap,
+  // so an explicit SL cap below the floor still wins.
+  ({ sl: effSl, tp: effTp } = floorCryptoSlTp(market, effSl, effTp));
+  ({ sl: effSl, tp: effTp } = capSlTp(settings, market, effSl, effTp));
   try {
     if (!AUTO_SRC_MARKETS.has(market)) return { placed: false, reason: "unsupported-market" };
     if (!(Number(px) > 0) || !(Number(notional) > 0) || !base) return { placed: false, reason: "bad-input" };
@@ -10792,8 +10813,9 @@ async function executeAutoEntry(ctx) {
     // base outside the Delta markets so the wrong-market/wrong-size row can't be created in the first place.
     if (CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) && !(market === "Crypto" || market === "USStockTokens"))
       return { placed: false, reason: "symbol-wrong-market" };
-    // LIQUIDITY GATE (Delta markets): skip thin micro-caps that gap through their stops. Fails open on no data.
-    if ((market === "Crypto" || market === "USStockTokens") && await isIlliquidForAuto(base))
+    // LIQUIDITY GATE (Delta markets): skip thin micro-caps that gap through their stops. User-adjustable floor; fails
+    // open on no data.
+    if ((market === "Crypto" || market === "USStockTokens") && await isIlliquidForAuto(base, settings && settings.minTurnoverUsd))
       return { placed: false, reason: "illiquid-skip" };
     // LIQUIDITY-TIERED SIZING: shrink the slice on thinner names (when the user enables it).
     if (settings && settings.liquidityTiering) effNotional = effNotional * await liquiditySizeMult(market, base, true);
@@ -11437,10 +11459,11 @@ async function runAutoBuyEngine() {
   // Per-sweep cache of each user's auto-settings so the Automation MASTER switch (automationMaster:false) can pause
   // a user's REAL strategy entries without disarming each one. One DB read per user per sweep.
   const setCache = new Map();
-  const autoMasterOffFor = async (uid) => {
+  const settingsFor = async (uid) => {
     if (!setCache.has(uid)) setCache.set(uid, (await db.getAutoSettings(uid).catch(() => null)) || {});
-    return setCache.get(uid).automationMaster === false;
+    return setCache.get(uid);
   };
+  const autoMasterOffFor = async (uid) => (await settingsFor(uid)).automationMaster === false;
   try {
     const strategies = await db.getActiveRealStrategies(500);
     for (const st of strategies) {
@@ -11536,6 +11559,21 @@ async function runAutoBuyEngine() {
 
         const sig = strat.entrySignalFired(st.cfg, candles);
         if (!sig.fired) continue;
+
+        // PER-SYMBOL TREND GATE (parity with the signal engines). Real deployed strategies place DIRECTLY (not via
+        // executeAutoEntry), so without this they bypass the trend filter entirely — exactly the all-long, counter-
+        // trend entries that lost the most. Skip a LONG in the symbol's own downtrend and a SHORT in its uptrend.
+        // Respects the user's cascade + shared thresholds; default ON. Fails OPEN on a read error.
+        try {
+          const _tg = resolveTrendGate(await settingsFor(st.userId), "automate", (st.cfg && st.cfg.trendGate) || st.trendGate);
+          if (_tg.enabled !== false) {
+            const _bias = await symbolBias(st.yahoo || _candleSym(st.market, _deltaBase(st.symbol)), _tg.emaPeriod, _tg.momPct);
+            if ((_bias === "down" && !st.short) || (_bias === "up" && st.short)) {
+              await db.updateRealStrategy(st.id, { lastError: st.short ? "Skipped — symbol in an uptrend (trade-with-trend)" : "Skipped — symbol in a downtrend (trade-with-trend)", lastOrderStatus: "trend-skip" });
+              continue;
+            }
+          }
+        } catch { /* fail open — never block a real entry on a trend-read hiccup */ }
 
         // Cap: total open real positions for this user.
         const openCount = (await positionsFor(st.userId)).filter((p) => p.status === "open" || p.status === "closing").length;
@@ -11816,12 +11854,19 @@ async function runAutoBuyEngine() {
         // placeBuyOrder THROWS on a rejected/unfilled order (caught below → recorded as a reject
         // with reason, no position). Register the managed position at the ACTUAL fill quantity and
         // price, so P&L reflects what really executed, not what we requested.
-        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, st.sl || null, st.tp || null, !!st.short, pendingClientId, st.orderType || "MARKET", st.limitPrice || 0);
+        // HARD-STOP FLOOR (leveraged crypto): widen a too-tight stop to the noise-resistant minimum here too, so real
+        // deployed strategies get the same protection as the signal engines.
+        const { sl: stSl, tp: stTp } = floorCryptoSlTp(st.market, st.sl, st.tp);
+        const r = await placeBuyOrder(sess, st.brokerSym, qty, st.market, st.product, stSl || null, stTp || null, !!st.short, pendingClientId, st.orderType || "MARKET", st.limitPrice || 0);
         const fillQty = Number(r.filledQty) > 0 ? Number(r.filledQty) : qty;
         const fillPx = Number(r.avgPrice) > 0 ? Number(r.avgPrice) : px;
+        // TRAILING PARITY: a real deployed strategy armed without a trailing stop still gets the user's default
+        // trailing (resolveTrailing → per-type/per-market setting), so "trailing on every trade" actually holds for
+        // real strategies too — not just the signal engines. An explicit per-strategy tsl still wins.
+        const stTsl = (st.tsl != null && st.tsl !== "") ? Number(st.tsl) : resolveTrailing(await settingsFor(st.userId), "automate", st.market);
         const pos = await registerManagedPosition({
           sess, symbol: st.symbol, brokerSym: st.brokerSym, qty: fillQty, entry: fillPx, market: st.market,
-          sl: st.sl || null, tp: st.tp || null, tsl: st.tsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: !!st.short,
+          sl: stSl || null, tp: stTp || null, tsl: stTsl || null, cfg: st.cfg, yahoo: st.yahoo, interval: st.interval, product: st.product, short: !!st.short,
         });
         await db.updateRealStrategy(st.id, { openPositionId: pos.id, lastOrderAt: Date.now(), lastError: r.partial ? `Partial fill: ${fillQty}/${qty} filled` : null, lastOrderStatus: r.partial ? "partial" : "filled", pendingSince: null, pendingClientId: null });
         /* R19-P1-04: write an AUTHORITATIVE server-owned trade row on a real fill, keyed the same way the risk
