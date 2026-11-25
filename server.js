@@ -2660,7 +2660,11 @@ app.get("/api/state", requireAuth, async (req, res) => {
 function computeAutoAnyEnabled(s) {
   if (!s || typeof s !== "object") return false;
   const scr = s.screeners || {};
-  for (const mkt of Object.keys(scr)) { const m = scr[mkt] || {}; for (const k of Object.keys(m)) { if (m[k] === true) return true; } }
+  // A screener entry is an OBJECT ({ enabled, modes, entry, symbols… }) — the old `m[k] === true` check never matched
+  // it, so a user whose ONLY automation was screeners was never put on the engine's work-list (screeners never ran).
+  for (const mkt of Object.keys(scr)) { const m = scr[mkt] || {}; for (const k of Object.keys(m)) { const v = m[k]; if (v === true || (v && typeof v === "object" && v.enabled === true)) return true; } }
+  // Active Automation strategies (server paper engine) — the client mirrors this flag with the other settings.
+  if (s.automationActive === true) return true;
   for (const grp of [s.smartAutoBuy, s.ideas]) {
     if (!grp || typeof grp !== "object") continue;
     for (const mkt of Object.keys(grp)) { const modes = grp[mkt] || {}; for (const md of Object.keys(modes)) { if (modes[md] && modes[md].enabled === true) return true; } }
@@ -2729,6 +2733,50 @@ app.get("/api/auto-status", requireAuth, async (req, res) => {
     const userId = storageKeyFor(req.authUserId);
     const status = typeof db.getAutoStatus === "function" ? await db.getAutoStatus(userId) : null;
     res.json({ status: status || null });
+  } catch (e) { serverError(res, e); }
+});
+
+/* VIRTUAL (paper) position actions for SERVER-opened paper positions (Smart Auto-Buy / Screener / Ideas / Automation
+   paper entries made by the backend engines). Their journal rows are server-authored, so a browser close or SL/TP
+   edit posted to /api/trades was silently ignored (only notes/sl/tp merge, and never onto paper_positions) — the
+   Indian Smart Auto-Buy positions that "can't be closed from anywhere". These act on the paper_positions row itself
+   and write the authoritative journal exit. Paper only (no broker), strictly scoped to the caller. */
+app.post("/api/paper/close", requireAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const p = await findCallerPaperPosition(req.authUserId, { id: b.id, paperPositionId: b.paperPositionId });
+    if (!p) return res.status(404).json({ error: "Paper position not found." });
+    if (p.status !== "open") return res.status(409).json({ error: "This paper position is already closed." });
+    let px = p.isOpt
+      ? ((await fyersOptionLtp(p.brokerSym).catch(() => null)) || (await fyersOptionLtpForUser(p.userId, p.brokerSym).catch(() => null)))
+      : await liveMarkForOrder(p.brokerSym, p.market).catch(() => null);
+    // Paper only: if the server can't mark it right now, accept the app's on-screen price (it's what the user saw).
+    if (!(Number(px) > 0) && Number(b.price) > 0) px = Number(b.price);
+    if (!(Number(px) > 0)) return res.status(503).json({ error: "No live price right now — try again in a moment." });
+    const trade = await paperClosePosition(p, px, "Manual");
+    rcBust(`trades:${storageKeyFor(req.authUserId)}`);
+    res.json({ ok: true, trade });
+  } catch (e) { serverError(res, e); }
+});
+app.post("/api/paper/risk", requireAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const p = await findCallerPaperPosition(req.authUserId, { id: b.id, paperPositionId: b.paperPositionId });
+    if (!p) return res.status(404).json({ error: "Paper position not found." });
+    if (p.status !== "open") return res.status(409).json({ error: "This paper position is already closed." });
+    const clean = (v) => (v === null || v === "" ? null : (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : undefined));
+    const next = { ...p };
+    for (const k of ["sl", "tp", "tsl"]) {
+      if (b[k] === undefined) continue;
+      const v = clean(b[k]); if (v === undefined) return res.status(400).json({ error: `${k} must be a positive number or blank.` });
+      next[k] = v;
+    }
+    await db.savePaperPosition(next);
+    // Mirror onto the journal row (presentation fields) so every list shows the new levels.
+    const uid = storageKeyFor(req.authUserId);
+    await db.saveTrade(uid, { id: `${p.id}_t`, sym: p.symbol, sl: next.sl, tp: next.tp, tsl: next.tsl }, { authoritative: false }).catch(() => null);
+    rcBust(`trades:${uid}`);
+    res.json({ ok: true, sl: next.sl, tp: next.tp, tsl: next.tsl });
   } catch (e) { serverError(res, e); }
 });
 
@@ -3913,6 +3961,25 @@ async function fyersOptionLtp(fyersSymbol) {
   } catch (e) { _fyLastError = "opt quote error: " + e.message; return null; }
 }
 
+/* Option LTP through the USER's own connected FYERS session (fallback when the house feed has no token). Read-only
+   market data; returns null on any failure so the caller fails closed ("option-no-premium"), never guesses. */
+async function fyersOptionLtpForUser(userId, fyersSymbol) {
+  const sym = String(fyersSymbol || "").trim();
+  if (!sym || !userId) return null;
+  let sess = null;
+  try { sess = await sessionFromCred(userId, "fyers"); } catch { sess = null; }
+  if (!sess || !sess.accessToken) return null;
+  try {
+    const r = await withTimeout(fyFetch(`https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(sym)}`, {
+      headers: brokerAuth("fyers", sess.accessToken, sess.userId),
+    }), 8000, "fyers-opt-quote-user");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.s === "error") return null;
+    const v = (((d.d || [])[0]) || {}).v || {};
+    return v.lp != null && Number(v.lp) > 0 ? Number(v.lp) : null;
+  } catch { return null; }
+}
+
 /* ── MCX (Indian commodity) house feed ──────────────────────────────────────────────────
    OPT-IN via MCX_HOUSE_FEED. When on (and a FYERS house token exists), commodity quotes come from
    the near-month MCX futures contract in INR instead of COMEX/NYMEX in USD. MCX contracts roll
@@ -4680,7 +4747,7 @@ app.post("/api/optimize-exits", computeLimiter, async (req, res) => {
     if (!cfg.entry.length || !syms.length) return res.json({ entries: 0 });
     if (body.mode === "metric") cfg.mode = "metric";
     const objective = body.objective === "winrate" ? "winrate" : "pnl";
-    // Minimum reward/risk the optimiser must respect (TP ≥ rrMin × SL). User-tunable; default 1.5.
+    // Minimum risk:reward the optimiser must respect (TP ≥ rrMin × SL). User-tunable; default 1.5.
     const rrMin = (body.rrMin != null && Number(body.rrMin) >= 0) ? Number(body.rrMin) : 1.5;
     // Optional max stop-loss cap (%). When >0 the optimiser won't propose an SL above it.
     const maxSl = (body.maxSl != null && Number(body.maxSl) > 0) ? Number(body.maxSl) : 0;
@@ -10675,6 +10742,25 @@ const AUTO_SRC_MARKETS = new Set(["Crypto", "USStockTokens", "IN", "US", "Commod
    Indian market tab (which would book a wrong-market, whole-share-sized phantom position). Covers the app's crypto
    universe majors + the small-cap coins seen in the journal; extend if new coins are added to the crypto universe. */
 const CRYPTO_ONLY_BASES = new Set(["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "MATIC", "LTC", "TRX", "ATOM", "UNI", "ONDO", "KAITO", "LAB", "BILL", "EVAA", "BEAT", "SLVON", "WDCB", "H", "RIVER", "RAVE", "TAC", "PIPPIN", "XAUT", "PAXG"]);
+/* Delta US-STOCK TOKENS (xStocks "…X" / Backed "…B"). These trade on Delta, $-sized and fractional, and belong to the
+   "USStockTokens" tab — never Indian/US-equity/Commodity (the journal had AAPLX/TSLAX/AMZNX booked under Indian at
+   qty 200 = whole shares, and TSLAX/SNDKB under Crypto/Commodity). Extend as Delta lists more. */
+const US_TOKEN_BASES = new Set(["AAPLX", "AMZNX", "TSLAX", "METAX", "GOOGLX", "NVDAX", "COINX", "CRCLX", "QQQX", "SPYX", "SPCXX", "MSTRX",
+  "SNDKB", "PLTRB", "AMDB", "AVGOB", "MSFTB", "INTCB", "HOODB", "ORCLB", "ARMB", "MRVLB", "TSMB", "WDCB", "MSTRB", "SOXLB", "BABAB", "AAOIB", "MRNAB", "RKLBB"]);
+const _IN_COMMODITY = new Set(["GOLD", "SILVER", "CRUDEOIL", "CRUDE", "NATGAS", "NATURALGAS", "COPPER", "ALUMINIUM", "ZINC", "LEAD", "NICKEL", "GOLDM", "SILVERM"]);
+/* Best-effort market for a strategy/screener SYMBOL when the saved item carries no `market` (older custom strategies).
+   Only returns a market it is sure of; unknown → null (caller skips rather than guessing). */
+function inferMarketForSymbol(sym) {
+  const raw = String(sym || "").toUpperCase();
+  const b = _deltaBase(raw);
+  if (!b) return null;
+  if (US_TOKEN_BASES.has(b)) return "USStockTokens";
+  if (CRYPTO_ONLY_BASES.has(b)) return "Crypto";
+  if (/(USDT|USD|PERP)$/.test(raw.replace(/[^A-Z]/g, "")) || /-USD$/.test(raw)) return "Crypto";
+  if (/^NSE:|\.NS$|-EQ$/.test(raw) || IN_INDEX_UNDERLYINGS.has(b)) return "IN";
+  if (_IN_COMMODITY.has(b)) return "Commodity";
+  return null;
+}
 // Indian INDEX underlyings — NOT tradeable as an equity; an auto-entry on one must be an option/future, never the raw index.
 const IN_INDEX_UNDERLYINGS = new Set(["NIFTY50", "NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "MIDCPNIFTY", "NIFTYNXT50", "BANKEX"]);
 const _autoDayIdx = () => Math.floor(Date.now() / 86400000);
@@ -10709,10 +10795,10 @@ async function resolveAutoBroker(userId, market) {
 const AUTO_MIN_TURNOVER_USD = Number(process.env.AUTO_MIN_TURNOVER_USD) > 0 ? Number(process.env.AUTO_MIN_TURNOVER_USD) : 5_000_000;
 // Minimum hard-stop % for LEVERAGED crypto auto-entries. A sub-3% stop on 25x leverage is noise-level: the trade
 // review showed trades ejected at ~-1.9% while those that survived to the strategy's own exit signal won +4.5%. We
-// floor the stop here (and scale the target to keep the intended reward:risk) so normal wiggles don't stop recoverable
+// floor the stop here (and scale the target to keep the intended risk:reward) so normal wiggles don't stop recoverable
 // trades. 3% ≈ 75% of margin at 25x — wider than this risks liquidation, so it's the practical ceiling too.
 const AUTO_MIN_SL_CRYPTO = Number(process.env.AUTO_MIN_SL_CRYPTO) > 0 ? Number(process.env.AUTO_MIN_SL_CRYPTO) : 3;
-/* Widen a too-tight LEVERAGED-crypto stop to the noise-resistant minimum, scaling the target to keep the reward:risk.
+/* Widen a too-tight LEVERAGED-crypto stop to the noise-resistant minimum, scaling the target to keep the risk:reward.
    Returns { sl, tp }. No-op for non-Delta markets or when the stop is already ≥ the floor / unset. */
 function floorCryptoSlTp(market, sl, tp) {
   if ((market === "Crypto" || market === "USStockTokens") && Number(sl) > 0 && Number(sl) < AUTO_MIN_SL_CRYPTO) {
@@ -10743,8 +10829,13 @@ async function deltaTurnoverMap() {
 }
 /* Returns true if the base is BELOW the liquidity floor (should be skipped). `minUsd` is the user's own floor (0/unset
    → use the default; ≤0 → gate OFF). Fails OPEN: unknown/no-data → false. */
-async function isIlliquidForAuto(base, minUsd) {
-  const floor = (minUsd === 0) ? 0 : (Number(minUsd) > 0 ? Number(minUsd) : AUTO_MIN_TURNOVER_USD);
+/* US-stock TOKENS trade far less on Delta than crypto perps — a $5M/24h floor (sized for crypto micro-caps) rejected
+   almost every token as "illiquid", so US-Tokens screeners/auto never fired. Tokens get their own (lower) default
+   floor; the user's explicit floor still wins for both. */
+const AUTO_MIN_TURNOVER_USD_TOKENS = Number(process.env.AUTO_MIN_TURNOVER_USD_TOKENS) > 0 ? Number(process.env.AUTO_MIN_TURNOVER_USD_TOKENS) : 250_000;
+async function isIlliquidForAuto(base, minUsd, market = "Crypto") {
+  const dflt = market === "USStockTokens" ? AUTO_MIN_TURNOVER_USD_TOKENS : AUTO_MIN_TURNOVER_USD;
+  const floor = (minUsd === 0) ? 0 : (Number(minUsd) > 0 ? Number(minUsd) : dflt);
   if (!(floor > 0)) return false;                           // gate turned off by the user
   try {
     const m = await deltaTurnoverMap();
@@ -10795,8 +10886,10 @@ function capSlTp(settings, market, sl, tp) {
    books the order (real) or simulates the fill into the server paper book (virtual). Returns {placed, reason}.
    Never throws — a failure is logged and reported so the sweep continues to the next candidate. */
 async function executeAutoEntry(ctx) {
-  const { userId, market, mode, base, notional, px, sl = null, tp = null, tsl = null, short = false,
+  const { userId, market: _ctxMarket, mode, base, notional, px, sl = null, tp = null, tsl = null, short = false,
     product = "CNC", tradeType, source, live, engineFence = null, screenerKey = null, strategyName = null, settings = null } = ctx;
+  // A Delta US-stock token picked up under the Crypto tab is a US-Tokens trade (same broker, its own tab/journal).
+  const market = (_ctxMarket === "Crypto" && US_TOKEN_BASES.has(String(base || "").toUpperCase())) ? "USStockTokens" : _ctxMarket;
   // Effective (post-floor/cap/tier) sizing + exits.
   let effNotional = Number(notional) || 0;
   let effSl = sl, effTp = tp;
@@ -10811,11 +10904,11 @@ async function executeAutoEntry(ctx) {
     // running under the wrong market tab once scanned BTC and booked a "Commodity BTC" / "US BTC" paper position
     // sized qty=1 (the whole-share default) = a phantom ~$74k position that dwarfed the real P&L. Refuse any crypto
     // base outside the Delta markets so the wrong-market/wrong-size row can't be created in the first place.
-    if (CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) && !(market === "Crypto" || market === "USStockTokens"))
+    if ((CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) || US_TOKEN_BASES.has(String(base).toUpperCase())) && !(market === "Crypto" || market === "USStockTokens"))
       return { placed: false, reason: "symbol-wrong-market" };
     // LIQUIDITY GATE (Delta markets): skip thin micro-caps that gap through their stops. User-adjustable floor; fails
     // open on no data.
-    if ((market === "Crypto" || market === "USStockTokens") && await isIlliquidForAuto(base, settings && settings.minTurnoverUsd))
+    if ((market === "Crypto" || market === "USStockTokens") && await isIlliquidForAuto(base, settings && settings.minTurnoverUsd, market))
       return { placed: false, reason: "illiquid-skip" };
     // LIQUIDITY-TIERED SIZING: shrink the slice on thinner names (when the user enables it).
     if (settings && settings.liquidityTiering) effNotional = effNotional * await liquiditySizeMult(market, base, true);
@@ -10974,7 +11067,10 @@ async function executeAutoOptionEntry(ctx, { base, px, dedupId }) {
   const leg = plan.legs[0];
   const legDisplay = `${plan.underlying} ${leg.strike} ${leg.optionType === "CALL" ? "CE" : "PE"}`;
   // IN options are limit-only; the live premium is both the paper fill price and the real marketable-limit base.
-  const prem = await fyersOptionLtp(leg.tradingSymbol).catch(() => null);
+  // House FYERS feed first; if it's down/expired (it was — every Indian auto-entry then failed "option-no-premium",
+  // so options never traded), fall back to the USER's own connected FYERS session for the quote.
+  let prem = await fyersOptionLtp(leg.tradingSymbol).catch(() => null);
+  if (!(Number(prem) > 0)) prem = await fyersOptionLtpForUser(userId, leg.tradingSymbol).catch(() => null);
   if (!(Number(prem) > 0)) return { placed: false, reason: "option-no-premium" };
   const optMeta = { optType: leg.optionType, strike: leg.strike, expiry: leg.expiry, underlying: plan.underlying, contractMultiplier: 1 };
 
@@ -11171,7 +11267,7 @@ async function runUserScreenerEntries(userId, settings, live, rec = () => {}) {
 }
 
 /* --- Shared entry-quality rules for the SIGNAL engines (Ideas + Smart Auto-Buy) --- */
-// Minimum reward:risk. The 2026-11 backtest showed Ideas (7% win, ~1:1) and Smart Auto-Buy bleeding because the
+// Minimum risk:reward. The 2026-11 backtest showed Ideas (7% win, ~1:1) and Smart Auto-Buy bleeding because the
 // target sat near the stop — a low win rate needs a WIDE target to stay profitable. Floor the target at 3× the
 // stop; never tightens an already-wider target. 3:1 means ~25% wins break even.
 const MIN_AUTO_RR = 3;
@@ -11226,7 +11322,7 @@ async function runUserIdeaEntries(userId, settings, live, rec = () => {}) {
         const cfgM = perMode[mode];
         const px = Number(idea.entry) > 0 ? Number(idea.entry) : null;
         if (!(px > 0)) { rec(market, "ideas", mode, false, "no-idea-price"); continue; }
-        const { sl: ideaSl, tp: ideaTp } = rrFloor(idea.slPct, idea.tpPct);   // enforce min 3:1 reward:risk
+        const { sl: ideaSl, tp: ideaTp } = rrFloor(idea.slPct, idea.tpPct);   // enforce min 3:1 risk:reward
         const res = await executeAutoEntry({ userId, market, mode, base, notional: Number(cfgM.capital) || 0, px, sl: ideaSl, tp: ideaTp, tsl: resolveTrailing(settings, "ideas", market), short: false, tradeType: "Ideas", source: "ideas", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings), settings });
         rec(market, "ideas", mode, !!(res && res.placed), res && res.reason);
       }
@@ -11269,7 +11365,7 @@ async function runUserSmartBuyEntries(userId, settings, live, rec = () => {}) {
       if (!(capital > 0)) { rec(market, "smartbuy", mode, false, "no-capital-set"); continue; }
       const per = capital / picks.length;
       for (const p of picks) {
-        const { sl: pSl, tp: pTp } = rrFloor(p.pickSlPct, p.pickTpPct);   // enforce min 3:1 reward:risk
+        const { sl: pSl, tp: pTp } = rrFloor(p.pickSlPct, p.pickTpPct);   // enforce min 3:1 risk:reward
         const res = await executeAutoEntry({ userId, market, mode, base: p.sym, notional: per, px: Number(p.price), sl: pSl, tp: pTp, tsl: resolveTrailing(settings, "smartbuy", market), short: p.pickSide === "SELL", product: cfgM.product || "CNC", tradeType: "Auto Buy", source: "smartbuy", live, optConfig: (settings.options && settings.options[market]) || null , trendGate: forcedTrendGate(settings), settings });
         rec(market, "smartbuy", mode, !!(res && res.placed), res && res.reason);
       }
@@ -11291,17 +11387,27 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = 
   const strats = (state && Array.isArray(state.strats) ? state.strats : []).filter((s) => s && s.active === true);
   if (!strats.length) return;
   let openPaper = []; try { openPaper = await db.getPaperPositionsForUser(userId); } catch { openPaper = []; }
-  const heldByStrat = new Set(openPaper.filter((p) => p && p.status === "open" && p.strategyName).map((p) => String(p.strategyName)));
+  // One open paper position per (strategy, symbol) — a multi-symbol strategy can hold one position per symbol.
+  const heldKey = (name, base) => `${String(name)}|${String(base).toUpperCase()}`;
+  const heldByStrat = new Set(openPaper.filter((p) => p && p.status === "open" && p.strategyName).map((p) => heldKey(p.strategyName, _deltaBase(p.base || p.symbol || ""))));
   let placed = 0;
-  for (const s of strats) {
+  // Expand each strategy into its symbols (was: only symbols[0], so every other symbol of a strategy never traded).
+  const jobs = [];
+  for (const s of strats) for (const sym of (Array.isArray(s.symbols) ? s.symbols : []).slice(0, 20)) jobs.push({ s, sym0: sym });
+  for (const { s, sym0 } of jobs) {
     if (placed >= 12) break;   // per-user-per-sweep paper safety cap
     try {
-      const sym0 = (s.symbols || [])[0]; if (!sym0) continue;
+      if (!sym0) continue;
       const base = _deltaBase(sym0);
-      // The strategy carries its own market (no server-side symbol→market map). Trust it; skip if absent/unsupported.
-      const market = s.market || null;
+      // The strategy's market: its own field, else inferred from the symbol (custom strategies saved before the app
+      // stamped `market` had none, so the server skipped them and only the buggy browser loop traded them).
+      // The SYMBOL wins when it is unambiguous (a BTC strategy tagged "IN" is still a Crypto strategy).
+      const market = inferMarketForSymbol(sym0) || s.market || null;
       if (!market || !AUTO_SRC_MARKETS.has(market) || !marketOpenIST(market)) continue;
-      if (s.name && heldByStrat.has(String(s.name))) continue;   // one open paper position per strategy
+      // A crypto/US-token symbol can never run under an Indian/US/Commodity strategy tag (the "crypto in Indian
+      // portfolio" bug) — trust the symbol over a wrong tag.
+      if (CRYPTO_ONLY_BASES.has(String(base).toUpperCase()) && !(market === "Crypto" || market === "USStockTokens")) continue;
+      if (s.name && heldByStrat.has(heldKey(s.name, base))) continue;   // one open paper position per strategy+symbol
       const cfg = s.cfg || {};
       if (!Array.isArray(cfg.entry) || !cfg.entry.length) continue;
       const tf = s.tf || cfg.tf || "5m";
@@ -11314,11 +11420,17 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = 
       const qty = Number(s.qty) > 0 ? Number(s.qty) : (isDelta ? 500 : 1);
       const notional = isDelta ? qty : qty * px;   // Delta markets deploy an amount; others whole-share qty×price
       const short = String((cfg.side || s.side || "")).toUpperCase() === "SELL";
-      let optConfig = (market === "IN" && s.instrument === "OPTION" && s.opt && Array.isArray(s.opt.legs) && s.opt.legs[0])
+      // A strategy built with the Option leg saves opt = { enabled, expiry, legs } (no `instrument` field), so accept
+      // either marker — otherwise an option strategy silently traded the STOCK on the server.
+      let optConfig = (market === "IN" && (s.instrument === "OPTION" || (s.opt && s.opt.enabled === true)) && s.opt && Array.isArray(s.opt.legs) && s.opt.legs[0])
         ? { enabled: true, mny: s.opt.legs[0].mny || "ATM", expiry: s.opt.expiry || "Current week", lots: Number(s.opt.legs[0].lots) || 1 } : null;
       // Fall back to the GLOBAL IN option config (the "trade the option instead of the stock" toggle the user set on
       // Smart Auto-Buy) so a single setting makes Automation strategies trade the ATM option too.
-      if (!optConfig && market === "IN" && settings && settings.options && settings.options.IN && settings.options.IN.enabled === true) optConfig = settings.options.IN;
+      if (!optConfig && market === "IN" && s.instrument !== "STOCK" && settings && settings.options && settings.options.IN && settings.options.IN.enabled === true) optConfig = settings.options.IN;
+      // The Indian strategy card SHOWS "Option" when a strategy has no instrument saved (IN auto-trades default to
+      // options), but the server treated that same blank as STOCK — "Option selected everywhere, but only stocks
+      // trade". Match the UI: a blank instrument on an IN strategy means the ATM option.
+      if (!optConfig && market === "IN" && (s.instrument == null || s.instrument === "OPTION")) optConfig = { enabled: true, mny: "ATM", expiry: "Current week", lots: 1 };
       // An INDEX (NIFTY50/BANKNIFTY/…) is NOT tradeable as an equity — it must be an option/future. Don't book the raw
       // index level as a paper "stock" (the ₹5M NIFTY50 qty=200 phantom). Skip unless an option config resolves it.
       if (market === "IN" && IN_INDEX_UNDERLYINGS.has(String(base).toUpperCase()) && !optConfig) { rec(market, "automate", "virtual", false, "index-needs-option"); continue; }
@@ -11328,7 +11440,7 @@ async function runUserVirtualStrategyEntries(userId, rec = () => {}, settings = 
         tsl: (cfg.tsl != null && cfg.tsl !== "" ? Number(cfg.tsl) : resolveTrailing(settings || {}, "automate", market)),
         short, tradeType: "Automate", source: "automate", live: false, strategyName: s.name || null, optConfig, trendGate: resolveTrendGate(settings, "automate", (cfg && cfg.trendGate) || (s && s.trendGate)), settings: settings || {} });
       rec(market, "automate", "virtual", !!(res && res.placed), res && res.reason);
-      if (res && res.placed) { placed++; if (s.name) heldByStrat.add(String(s.name)); }
+      if (res && res.placed) { placed++; if (s.name) heldByStrat.add(heldKey(s.name, base)); }
     } catch (e) { /* one strategy must never stop the sweep */ }
   }
 }
@@ -11350,9 +11462,12 @@ async function runSignalAutoEngine() {
       const rec = (market, source, mode, placed, reason) => {
         const m = status[market] = status[market] || {};
         const key = `${source}:${mode}`;
-        const s = m[key] = m[key] || { source, mode, at: now, placed: 0, attempts: 0, lastReason: null };
+        const s = m[key] = m[key] || { source, mode, at: now, placed: 0, attempts: 0, lastReason: null, reasons: {} };
         s.attempts += 1; if (placed) s.placed += 1; s.at = now;
         s.lastReason = placed ? "placed" : (reason || s.lastReason);
+        // Tally every skip reason this sweep so the app can show the DOMINANT one ("8 of 10 skipped: downtrend"),
+        // not just whichever symbol happened to be evaluated last.
+        if (!placed && reason) s.reasons[reason] = (s.reasons[reason] || 0) + 1;
       };
       try { await runUserScreenerEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.screener.sweep_error", { userId: u.userId, err: e && e.message }); }
       try { await runUserIdeaEntries(u.userId, u.settings, live, rec); } catch (e) { logFinancial("auto.ideas.sweep_error", { userId: u.userId, err: e && e.message }); }
@@ -11392,6 +11507,44 @@ async function paperOpenPosition({ userId, market, base, brokerSym, symbol, qty,
     return { ok: true };
   } catch (e) { return { ok: false, reason: "error:" + (e && e.message) }; }
 }
+/* The journal tradeType for a server paper position's source. "automate" used to fall through to "Auto Buy", so every
+   server-run Automation paper exit was re-bucketed as Smart Auto-Buy (wrong box, wrong win rate). */
+function paperTradeTypeOf(source) {
+  return source === "screener" ? "Screener Auto Buy" : source === "ideas" ? "Ideas" : source === "automate" ? "Automate" : "Auto Buy";
+}
+/* Close ONE server paper position at a price and write the authoritative journal exit (same row id as the open row,
+   so it replaces it). Used by the user-initiated close endpoint — a browser close of a server paper row used to be
+   silently dropped (saveTrade only merges sl/tp/notes onto server-authored rows), so those positions could never be
+   closed from the app and stayed "open" forever. */
+async function paperClosePosition(p, px, exitType = "Manual") {
+  const entry = Number(p.entry), dir = p.short ? -1 : 1, now = Date.now();
+  const exit = _roundExitPx(Number(px));
+  const pnl = +((exit - entry) * Number(p.qty) * dir).toFixed(6);
+  await db.savePaperPosition({ ...p, status: "closed", exit, exitAt: now });
+  const row = {
+    id: `${p.id}_t`, sym: p.symbol, side: p.short ? "SELL" : "BUY", qty: Number(p.qty), entry,
+    entryAt: p.openedAt || now, exit, exitAt: now, pnl, market: p.market, real: false,
+    tradeType: paperTradeTypeOf(p.source), exitType, paperPositionId: p.id, short: p.short || undefined,
+    ...(p.sl != null ? { sl: p.sl } : {}), ...(p.tp != null ? { tp: p.tp } : {}), ...(p.tsl != null ? { tsl: p.tsl } : {}),
+    ...(p.screenerKey ? { screenerKey: p.screenerKey } : {}), ...(p.strategyName ? { strategy: p.strategyName, screenerName: p.strategyName } : {}),
+    ...(p.isOpt ? { productType: "OPTION", optType: p.optType, strike: p.strike, expiry: p.expiry, underlying: p.underlying, contractMultiplier: Number(p.contractMultiplier) || 1 } : {}),
+  };
+  const saved = await db.saveTrade(storageKeyFor(p.userId), row, { authoritative: true });
+  logFinancial(`auto.${p.source}.paper_exit`, { userId: p.userId, symbol: p.symbol, exit, pnl, exitType });
+  return saved || row;
+}
+/* Resolve the CALLER's server paper position from a journal row id or a paperPositionId. Strictly caller-scoped. */
+async function findCallerPaperPosition(authUserId, { id, paperPositionId }) {
+  // Paper positions are keyed by the auto-settings user key (= storageKeyFor(authUserId)), same as the engines.
+  const uid = String(storageKeyFor(authUserId));
+  const all = (await db.getPaperPositionsForUser(uid).catch(() => [])) || [];
+  const want = String(paperPositionId || "").trim();
+  const tid = String(id || "").trim();
+  return all.find((p) => p && String(storageKeyFor(String(p.userId))) === uid && (
+    (want && String(p.id) === want) || (tid && (`${p.id}_t` === tid || tid.endsWith(`${p.id}_t`)))
+  )) || null;
+}
+
 let paperExitRunning = false;
 async function runPaperExitMonitor() {
   if (paperExitRunning) return; paperExitRunning = true;
@@ -11404,7 +11557,7 @@ async function runPaperExitMonitor() {
         // An OPTION paper position is priced at its premium (the brokerSym is the NFO contract), so mark it with
         // the option LTP — never liveMarkForOrder, which would return the underlying's price and mis-exit it.
         const px = p.isOpt
-          ? await fyersOptionLtp(p.brokerSym).catch(() => null)
+          ? ((await fyersOptionLtp(p.brokerSym).catch(() => null)) || (await fyersOptionLtpForUser(p.userId, p.brokerSym).catch(() => null)))
           : await liveMarkForOrder(p.brokerSym, p.market).catch(() => null);
         if (!(px > 0)) continue;
         const dir = p.short ? -1 : 1;
@@ -11412,6 +11565,17 @@ async function runPaperExitMonitor() {
         let hit = null;
         if (p.tp != null && movePct >= Number(p.tp)) hit = { type: "Exit trigger", px: _roundExitPx(entry * (1 + dir * Number(p.tp) / 100)) };
         else if (p.sl != null && movePct <= -Number(p.sl)) hit = { type: "Stop loss", px: _roundExitPx(entry * (1 - dir * Number(p.sl) / 100)) };
+        else if (Number(p.tsl) > 0) {
+          // TRAILING STOP (paper parity with the real managed exit). The paper book used to IGNORE tsl, so every
+          // "trailing" paper position rode to its hard stop. Track the best favourable move seen (persisted on the
+          // position) and exit when price gives back `tsl` % from that peak — only once the peak is above entry.
+          const prevPeak = Number(p.peakPct) || 0;
+          const peak = Math.max(prevPeak, movePct);
+          if (peak > prevPeak + 1e-9) { try { await db.savePaperPosition({ ...p, peakPct: +peak.toFixed(4) }); } catch { /* best-effort */ } }
+          if (peak > 0 && movePct <= peak - Number(p.tsl)) {
+            hit = { type: "Trailing stop", px: _roundExitPx(entry * (1 + dir * (peak - Number(p.tsl)) / 100)) };
+          }
+        }
         if (!hit) continue;
         const now = Date.now();
         const pnl = +((hit.px - entry) * Number(p.qty) * dir).toFixed(6);
@@ -11419,7 +11583,7 @@ async function runPaperExitMonitor() {
         await db.saveTrade(storageKeyFor(p.userId), {
           id: `${p.id}_t`, sym: p.symbol, side: p.short ? "SELL" : "BUY", qty: Number(p.qty), entry,
           entryAt: p.openedAt || now, exit: hit.px, exitAt: now, pnl, market: p.market, real: false,
-          tradeType: p.source === "screener" ? "Screener Auto Buy" : p.source === "ideas" ? "Ideas" : "Auto Buy",
+          tradeType: paperTradeTypeOf(p.source),
           exitType: hit.type, paperPositionId: p.id, short: p.short || undefined,
           // Preserve attribution + option identity on close (this row has the same id as the open row, so it
           // replaces it — without these the screener/strategy tag and the fact it's an option would be lost).
